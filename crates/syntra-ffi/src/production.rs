@@ -629,6 +629,9 @@ pub extern "C" fn syntra_ffi_client_take_outcome(
             return SYNTRA_FFI_INVALID;
         }
         unsafe { *present = 0 };
+        if out.is_null() || out_len.is_null() {
+            return SYNTRA_FFI_INVALID;
+        }
         let mut inner = match client_lock(c) {
             Ok(g) => g,
             Err(code) => return code,
@@ -638,8 +641,12 @@ pub extern "C" fn syntra_ffi_client_take_outcome(
         }
         match inner.outcomes.remove(&request_id) {
             Some(bytes) => {
+                let rc = alloc_owned_vec(bytes, out, out_len);
+                if rc != SYNTRA_FFI_OK {
+                    return rc;
+                }
                 unsafe { *present = 1 };
-                alloc_owned_vec(bytes, out, out_len)
+                SYNTRA_FFI_OK
             },
             None => SYNTRA_FFI_OK,
         }
@@ -660,6 +667,9 @@ pub extern "C" fn syntra_ffi_client_poll_notification(
             return SYNTRA_FFI_INVALID;
         }
         unsafe { *present = 0 };
+        if out.is_null() || out_len.is_null() {
+            return SYNTRA_FFI_INVALID;
+        }
         let mut inner = match client_lock(c) {
             Ok(g) => g,
             Err(code) => return code,
@@ -669,8 +679,12 @@ pub extern "C" fn syntra_ffi_client_poll_notification(
         }
         match inner.notifications.pop_front() {
             Some(bytes) => {
+                let rc = alloc_owned_vec(bytes, out, out_len);
+                if rc != SYNTRA_FFI_OK {
+                    return rc;
+                }
                 unsafe { *present = 1 };
-                alloc_owned_vec(bytes, out, out_len)
+                SYNTRA_FFI_OK
             },
             None => SYNTRA_FFI_OK,
         }
@@ -1168,6 +1182,9 @@ pub extern "C" fn syntra_ffi_host_take_pending(
             return SYNTRA_FFI_INVALID;
         }
         unsafe { *present = 0 };
+        if out_req_frame.is_null() || out_len.is_null() {
+            return SYNTRA_FFI_INVALID;
+        }
         let mut inner = match host_lock(h) {
             Ok(g) => g,
             Err(code) => return code,
@@ -1177,13 +1194,17 @@ pub extern "C" fn syntra_ffi_host_take_pending(
         }
         match inner.pending_queue.pop_front() {
             Some((id, bytes)) => {
+                let rc = alloc_owned_vec(bytes, out_req_frame, out_len);
+                if rc != SYNTRA_FFI_OK {
+                    return rc;
+                }
                 unsafe {
                     *present = 1;
                     if !request_id_out.is_null() {
                         *request_id_out = id;
                     }
                 }
-                alloc_owned_vec(bytes, out_req_frame, out_len)
+                SYNTRA_FFI_OK
             },
             None => SYNTRA_FFI_OK,
         }
@@ -1382,6 +1403,9 @@ pub extern "C" fn syntra_ffi_host_next_outbound(
             return SYNTRA_FFI_INVALID;
         }
         unsafe { *present = 0 };
+        if out.is_null() || out_len.is_null() {
+            return SYNTRA_FFI_INVALID;
+        }
         let mut inner = match host_lock(h) {
             Ok(g) => g,
             Err(code) => return code,
@@ -1391,8 +1415,12 @@ pub extern "C" fn syntra_ffi_host_next_outbound(
         }
         match inner.outbound.pop_front() {
             Some(bytes) => {
+                let rc = alloc_owned_vec(bytes, out, out_len);
+                if rc != SYNTRA_FFI_OK {
+                    return rc;
+                }
                 unsafe { *present = 1 };
-                alloc_owned_vec(bytes, out, out_len)
+                SYNTRA_FFI_OK
             },
             None => SYNTRA_FFI_OK,
         }

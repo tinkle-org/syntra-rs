@@ -13,6 +13,12 @@ fixtures:
     frame_b64: "CAEQB2IeChIvZXhhbXBsZS5FY2hvL0VjaG8SBWhlbGxvGPQD"
     frame_length_bytes: 36
 
+  - id: http/V-HTTP-REQ-UNKNOWN-01
+    kind: request_envelope
+    logical: "Frame{version:1, request_id:7, request{/example.Unknown/Call, payload hello, timeout 500ms}}"
+    frame_b64: "CAEQB2IhChUvZXhhbXBsZS5Vbmtub3duL0NhbGwSBWhlbGxvGPQD"
+    frame_length_bytes: 39
+
   - id: http/V-HTTP-RES-OK-01
     kind: response_envelope
     logical: "Frame{version:1, request_id:7, result{payload hello}}"
@@ -47,7 +53,18 @@ exchanges:
 
   - id: http/X-HTTP-02
     name: "application error stays 200"
-    request: "same shape as X-HTTP-01 with method /example.Unknown/Call"
+    request_envelope: http/V-HTTP-REQ-UNKNOWN-01
+    response_envelope: http/V-HTTP-RES-ERR-01
+    request: |
+      POST /syntra/v1/rpc HTTP/1.1
+      Host: syntra.example
+      Content-Type: application/vnd.syntra.v1+protobuf
+      Content-Length: 39
+      Syntra-Min-Version: 1
+      Syntra-Max-Version: 1
+      Authorization: Syntra b3BhcXVlLXRlc3QtY3JlZGVudGlhbC1B
+      Cache-Control: no-store
+    request_body: "CAEQB2IhChUvZXhhbXBsZS5Vbmtub3duL0NhbGwSBWhlbGxvGPQD"
     response: |
       HTTP/1.1 200 OK
       Content-Type: application/vnd.syntra.v1+protobuf

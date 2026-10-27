@@ -9,8 +9,11 @@ import "syntra/v1/rpc.proto";
 option go_package = "github.com/tinklehq/syntra/bindings/go/gen/syntra/v1;syntrav1";
 
 // Frame is a versioned Syntra envelope, independent of transport framing
-// (SNTR-WIRE-001..008). See specifications/schema/reference.md for runtime
-// validation obligations and RFC 0001 for unresolved behavioral conflicts.
+// (SNTR-WIRE-001..008). See the pinned upstream
+// https://github.com/tinkle-org/syntra/blob/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/specifications/schema/reference.md
+// for runtime validation obligations and the pinned upstream
+// https://github.com/tinkle-org/syntra/blob/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/rfcs/0001-public-idl-layout.md
+// for unresolved behavioral conflicts.
 message Frame {
   // version is the proposed maximum in hello and the selected version thereafter
   // (SNTR-HS-003/010). Zero is not a negotiated version.
@@ -24,7 +27,9 @@ message Frame {
   reserved "event", "resume", "ack";
   // body selects one operation. Generated oneofs do not enforce all protocol
   // validation: an unset body is representable and duplicate wire alternatives
-  // may be collapsed by the decoder. See RFC 0001, B4.
+  // may be collapsed by the decoder. See the pinned upstream
+  // https://github.com/tinkle-org/syntra/blob/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/rfcs/0001-public-idl-layout.md
+  // §B4.
   oneof body {
     // hello begins host-owned authentication (SNTR-HS-003, SNTR-AUTH-001).
     ClientHello hello = 10;

@@ -21,7 +21,7 @@ Conventions:
   which are byte-exact for that fixture.
 - No raw TLS byte vectors are defined (TLS is negotiated, not frozen).
   Certificate fixtures are harness-named references (`test-pki:*`) owned by
-  `specifications/security/*`; no PEM or key bytes are embedded here.
+  the pinned upstream specifications/security/* (https://github.com/tinkle-org/syntra/tree/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/specifications/security); no PEM or key bytes are embedded here.
 - Vector IDs are stable: `protobuf/GOLD-PROT-*`, `tcp/V1…V12`, `http/V-HTTP-*`
   and `http/X-HTTP-*`, `websocket/VEC-WS-*`. Manifests cite them in
   `vector_refs`; runners resolve them by ID, never by copying bytes by hand.

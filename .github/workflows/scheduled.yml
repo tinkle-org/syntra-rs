@@ -1,0 +1,143 @@
+name: Scheduled validation
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: scheduled-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RUSTUP_TOOLCHAIN: "1.88.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  full-linux:
+    name: full validation (linux, 1.88.0)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: "1.88.0"
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.14"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ runner.os }}-1.88.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-1.88.0-
+      - name: Locked workspace tests
+        run: cargo test --locked --workspace
+      - name: Production + fixture FFI (separate, no --all-features)
+        run: |
+          cargo test --locked -p syntra-ffi --no-default-features --features production
+          cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
+          python3 crates/syntra-ffi/tests/build_contract.py
+      - name: WASM compile (non-FFI)
+        run: cargo check --locked -p syntra-core -p syntra-runtime -p syntra-ws -p syntra-web --target wasm32-unknown-unknown
+
+  compat-macos:
+    name: native compat (macOS)
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: "1.88.0"
+      - name: Native tests (workspace default + FFI modes)
+        run: |
+          cargo test --locked --workspace
+          cargo test --locked -p syntra-ffi --no-default-features --features production
+          cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
+      # C smoke via build_contract runs where nm/cc exist; macOS is covered
+      # here. Windows C-smoke stays in release validation (MSVC nm differences).
+
+  compat-windows:
+    name: native compat (windows)
+    runs-on: windows-2022
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: "1.88.0"
+      - name: Native tests (workspace default + FFI modes)
+        run: |
+          cargo test --locked --workspace
+          cargo test --locked -p syntra-ffi --no-default-features --features production
+          cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
+        shell: pwsh
+
+  coverage:
+    name: coverage baseline (informational)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: "1.88.0"
+      - name: Install cargo-llvm-cov (pinned)
+        run: cargo install --locked cargo-llvm-cov --version 0.9.1
+      - name: Coverage report (no threshold; not a security proof)
+        run: cargo llvm-cov --locked --workspace --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 14
+
+  vuln-extended:
+    name: extended vulnerability + outdated scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: "1.88.0"
+      - name: Install pinned tools
+        run: |
+          cargo install --locked cargo-deny --version 0.20.2
+          cargo install --locked cargo-audit --version 0.22.2
+      - name: cargo-deny full check
+        run: cargo deny --locked check
+      - name: cargo-audit full
+        run: cargo audit --deny warnings
+      # Longer fuzz / sanitizer campaigns are manual: see docs/ci.md §5.
+      # They run here as workflow_dispatch with explicit duration caps, never
+      # as required PR checks.

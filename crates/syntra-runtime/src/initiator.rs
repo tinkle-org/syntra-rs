@@ -706,9 +706,11 @@ impl Initiator {
     /// miss it.
     pub async fn next_notification_with_loss(&self) -> (Option<Vec<u8>>, (u64, u64)) {
         let mut loss_rx = self.conn.shared.notification_loss_tx.subscribe();
+        // Baseline from the subscription itself: a loss published between
+        // subscribe and loop entry must not be folded into the baseline.
+        let mut baseline = *loss_rx.borrow_and_update();
         let mut closed_rx = self.conn.subscribe_close();
         loop {
-            let before = self.notification_loss();
             tokio::select! {
                 biased;
                 next = self.conn.next_notification() => {
@@ -720,10 +722,10 @@ impl Initiator {
                     }
                     // Mark the new version seen; the cumulative counters
                     // are the signal, the watch only carries them.
-                    let _ = loss_rx.borrow_and_update();
-                    let after = self.notification_loss();
-                    if after != before {
-                        return (None, after);
+                    let cur = *loss_rx.borrow_and_update();
+                    if cur != baseline {
+                        baseline = cur;
+                        return (None, cur);
                     }
                     // Version moved without counter movement; keep waiting.
                 }

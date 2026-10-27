@@ -159,10 +159,7 @@ pub fn close_code_for_syntra(code: ErrorCode) -> CloseCode {
 fn tls13_connector() -> Result<tokio_tungstenite::Connector, TransportError> {
     let loaded = rustls_native_certs::load_native_certs();
     if !loaded.errors.is_empty() {
-        return Err(TransportError::Tls(format!(
-            "system roots unavailable: {:?}",
-            loaded.errors
-        )));
+        tracing::warn!(errors = ?loaded.errors, "some system root certificates failed to load");
     }
     let mut roots = rustls::RootCertStore::empty();
     roots.add_parsable_certificates(loaded.certs);

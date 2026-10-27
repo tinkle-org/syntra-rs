@@ -12,7 +12,7 @@ Harness automation of `specifications/transports/http.md` §1E. Each row: stimul
 | S-06 | `POST` to `/syntra/v1/rpc/`, `/syntra/v1/RPC`, `/syntra/v1/rpc2` | `404` | No envelope | `UNIMPLEMENTED` |
 | S-07 | Any query string, incl. `?credential=...` | `400` | No envelope | `INVALID_ARGUMENT` |
 | S-08 | Missing/wrong/parameterized `Content-Type` | `415` | No envelope | `INVALID_ARGUMENT` |
-| S-09 | Truncated body; non-`request` variant body; trailing bytes after the `Frame` | `400` | No envelope | `INVALID_ARGUMENT` |
+| S-09 | Truncated body; non-`request` variant body; trailing malformed protobuf bytes after the `Frame` (valid unknown-field suffixes remain accepted) | `400` | No envelope | `INVALID_ARGUMENT` |
 | S-10 | `Content-Length: 1048577`; chunked stream past bound | `413` | No envelope; body unread (declared case) | `RESOURCE_EXHAUSTED` |
 | S-11 | `Syntra-Min/Max-Version` missing, malformed, inverted, or with no overlap; `Frame.version` ≠ `Max` | `400` | No envelope | `INVALID_ARGUMENT` |
 | S-12 | Missing credential vs denying host; unknown/expired/revoked/malformed credential; foreign auth scheme | `401` + `WWW-Authenticate` | No envelope | `UNAUTHENTICATED` |

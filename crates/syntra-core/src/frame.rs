@@ -169,8 +169,17 @@ pub fn validate_frame(frame: &Frame, ctx: ValidationContext) -> Result<FrameKind
         }
         _ => {
             // Pre-handshake: hello carries proposed max; ready carries
-            // selected. Zero is never a negotiated version.
-            if frame.version == 0 {
+            // selected. Zero is never a negotiated version. In Closing the
+            // negotiated version persists, so require an exact match when it
+            // is known; otherwise require nonzero.
+            if let Some(v) = ctx.negotiated_version {
+                if frame.version != v {
+                    return Err(SyntraError::Protocol {
+                        code: ErrorCode::InvalidArgument,
+                        message: "frame version mismatch".to_string(),
+                    });
+                }
+            } else if frame.version == 0 {
                 return Err(SyntraError::Protocol {
                     code: ErrorCode::InvalidArgument,
                     message: "frame version must be nonzero".to_string(),
@@ -213,7 +222,10 @@ pub fn validate_frame(frame: &Frame, ctx: ValidationContext) -> Result<FrameKind
             // Initiator must not send application frames before ACTIVE;
             // second hello / ready-to-host etc. are handshake failures.
             match kind {
-                FrameKind::Request | FrameKind::Cancel | FrameKind::Notification => {
+                FrameKind::Request
+                | FrameKind::Result
+                | FrameKind::Cancel
+                | FrameKind::Notification => {
                     return Err(SyntraError::Protocol {
                         code: ErrorCode::FailedPrecondition,
                         message: "application frames forbidden before ACTIVE".to_string(),

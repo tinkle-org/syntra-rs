@@ -194,8 +194,11 @@ pub mod rpc_result {
 pub struct Cancel {
 }
 /// Frame is a versioned Syntra envelope, independent of transport framing
-/// (SNTR-WIRE-001..008). See specifications/schema/reference.md for runtime
-/// validation obligations and RFC 0001 for unresolved behavioral conflicts.
+/// (SNTR-WIRE-001..008). See the pinned upstream
+/// <https://github.com/tinkle-org/syntra/blob/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/specifications/schema/reference.md>
+/// for runtime validation obligations and the pinned upstream
+/// <https://github.com/tinkle-org/syntra/blob/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/rfcs/0001-public-idl-layout.md>
+/// for unresolved behavioral conflicts.
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Frame {
@@ -210,7 +213,9 @@ pub struct Frame {
     pub request_id: u64,
     /// body selects one operation. Generated oneofs do not enforce all protocol
     /// validation: an unset body is representable and duplicate wire alternatives
-    /// may be collapsed by the decoder. See RFC 0001, B4.
+    /// may be collapsed by the decoder. See the pinned upstream
+    /// <https://github.com/tinkle-org/syntra/blob/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/rfcs/0001-public-idl-layout.md>
+    /// §B4.
     #[prost(oneof="frame::Body", tags="10, 11, 12, 13, 14, 15")]
     pub body: ::core::option::Option<frame::Body>,
 }
@@ -218,7 +223,9 @@ pub struct Frame {
 pub mod frame {
     /// body selects one operation. Generated oneofs do not enforce all protocol
     /// validation: an unset body is representable and duplicate wire alternatives
-    /// may be collapsed by the decoder. See RFC 0001, B4.
+    /// may be collapsed by the decoder. See the pinned upstream
+    /// <https://github.com/tinkle-org/syntra/blob/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/rfcs/0001-public-idl-layout.md>
+    /// §B4.
     #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Body {

@@ -117,19 +117,19 @@ fn cache_key(checkpoint: &ProfileCheckpoint) -> Vec<u8> {
 /// Initiator-side recovery driver.
 ///
 /// Owns one [`ProfileEngine`] (all tracked streams for this connection),
-/// one [`MemoryStore`] adapter, one bounded [`DuplicateCache`], and one
-/// staged snapshot per stream. All methods are synchronous and
-/// transport-free; the caller transmits returned envelopes.
-pub struct InitiatorDriver {
+/// one durable [`DurableStore`] adapter (default [`MemoryStore`]), one bounded
+/// [`DuplicateCache`], and one staged snapshot per stream. All methods are
+/// synchronous and transport-free; the caller transmits returned envelopes.
+pub struct InitiatorDriver<S = MemoryStore> {
     ctx: ConnectionContext,
     engine: ProfileEngine,
-    store: MemoryStore,
+    store: S,
     cache: DuplicateCache,
     staged: HashMap<Vec<u8>, StagedSnapshot>,
     authorizer: Option<Arc<dyn RecoveryAuthorizer>>,
 }
 
-impl InitiatorDriver {
+impl InitiatorDriver<MemoryStore> {
     /// Driver for the bound connection/principal with an empty store and a
     /// bounded duplicate cache of `cache_capacity` entries.
     pub fn new(ctx: ConnectionContext, cache_capacity: usize) -> Self {
@@ -137,6 +137,20 @@ impl InitiatorDriver {
             ctx,
             engine: ProfileEngine::new(),
             store: MemoryStore::new(),
+            cache: DuplicateCache::new(cache_capacity),
+            staged: HashMap::new(),
+            authorizer: None,
+        }
+    }
+}
+
+impl<S: DurableStore> InitiatorDriver<S> {
+    /// Driver with an application-provided durable store.
+    pub fn with_store(ctx: ConnectionContext, cache_capacity: usize, store: S) -> Self {
+        Self {
+            ctx,
+            engine: ProfileEngine::new(),
+            store,
             cache: DuplicateCache::new(cache_capacity),
             staged: HashMap::new(),
             authorizer: None,
@@ -160,12 +174,12 @@ impl InitiatorDriver {
     }
 
     /// Underlying store (read-only hooks for tests/embeds).
-    pub fn store(&self) -> &MemoryStore {
+    pub fn store(&self) -> &S {
         &self.store
     }
 
     /// Mutable store (failure injection for tests).
-    pub fn store_mut(&mut self) -> &mut MemoryStore {
+    pub fn store_mut(&mut self) -> &mut S {
         &mut self.store
     }
 

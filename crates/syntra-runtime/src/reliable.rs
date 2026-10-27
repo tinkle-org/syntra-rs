@@ -274,6 +274,7 @@ struct SessionState {
     principal: String, version: u32, epoch: u64,
     last_activity_ms: u64, lease: ConfirmedLease,
     active_connection: Option<String>,
+    ever_attached: bool,
     outcomes: OutcomeStore, tombstones: TombstoneStore,
 }
 #[derive(Debug, Default)]
@@ -336,6 +337,7 @@ impl ReliableSessionManager {
         inner.sessions.insert(sid, SessionState {
             principal: principal.clone(), version, epoch: 1,
             last_activity_ms: now_ms, lease, active_connection: None,
+            ever_attached: false,
             outcomes: OutcomeStore::default(), tombstones: TombstoneStore::default(),
         });
         inner.resume_index.insert(cred.clone(), ResumeEntry { session_id: sid, principal, version, issued_at_ms: now_ms, expires_at_ms: exp });
@@ -402,6 +404,7 @@ impl ReliableSessionManager {
             let fenced = st.active_connection.clone();
             st.epoch = proposed;
             st.active_connection = Some(connection_id);
+            st.ever_attached = true;
             st.last_activity_ms = now_ms;
             st.lease = lease;
             inner.resume_index.remove(&cred.0);
@@ -423,7 +426,11 @@ impl ReliableSessionManager {
             if st.active_connection.is_some() {
                 return Err(failed_precondition("session already attached; present resume credential"));
             }
+            if st.ever_attached {
+                return Err(unauthenticated("credential-less re-attach forbidden; present resume credential"));
+            }
             st.active_connection = Some(connection_id);
+            st.ever_attached = true;
             st.last_activity_ms = now_ms;
             st.lease = lease;
             let epoch = st.epoch;
@@ -449,6 +456,9 @@ impl ReliableSessionManager {
         // anything stale is rejected before any outcome mutation.
         if st.epoch != expected_epoch {
             return Err(failed_precondition("stale attachment epoch; fenced connection cannot complete"));
+        }
+        if st.tombstones.get(now_ms, self.bounds.tombstone_retention_ms, &did).is_some() {
+            return Err(failed_precondition("delivery id is tombstoned; terminal state preserved"));
         }
         st.last_activity_ms = now_ms;
         st.outcomes.insert(&self.bounds, now_ms, did, method, payload, outcome)
@@ -599,14 +609,15 @@ impl ReliableSessionManager {
                 forgotten.content
             } else { None }
         } else { None };
-        // Expire-then-tombstone: drop the expired retained entry and free its
-        // bytes now that its digest is carried into the tombstone.
+        // Expire-then-tombstone: record the tombstone first so a failed
+        // record preserves the expired terminal state; only free the entry's
+        // bytes after the tombstone is durably recorded.
+        st.tombstones.record(&self.bounds, now_ms, did, code, content)?;
         if expired_digest.is_some() {
             if let Some(removed) = st.outcomes.entries.remove(&did) {
                 st.outcomes.bytes = st.outcomes.bytes.saturating_sub(removed.byte_len());
             }
         }
-        st.tombstones.record(&self.bounds, now_ms, did, code, content)?;
         st.outcomes.release_pending(&did);
         Ok(())
     }
@@ -635,9 +646,16 @@ impl ReliableSessionManager {
     }
     pub fn poll_idle(&self, now_ms: u64) -> Result<Vec<(SessionId, SessionSignal)>, SyntraError> {
         let mut inner = self.lock()?;
+        // Cap the batch at the remaining control-queue capacity (both count
+        // and bytes, 32 per signal) so every collected signal can be pushed
+        // without error.
+        let remaining_slots = self.bounds.max_control_queue.saturating_sub(inner.signals.len());
+        let remaining_bytes = self.bounds.max_control_bytes.saturating_sub(inner.signals.bytes);
+        let remaining_by_bytes = remaining_bytes / 32;
+        let capacity = remaining_slots.min(remaining_by_bytes);
         let mut idle: Vec<(SessionId, SessionSignal)> = Vec::new();
         for (id, st) in inner.sessions.iter() {
-            if idle.len() >= self.bounds.max_control_queue { break; }
+            if idle.len() >= capacity { break; }
             if st.active_connection.is_some()
                 && now_ms.saturating_sub(st.last_activity_ms) > u64::from(st.lease.idle_timeout_ms) {
                 idle.push((*id, SessionSignal::IdleTimeout));

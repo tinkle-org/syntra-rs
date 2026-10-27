@@ -14,7 +14,7 @@ Files:
   close handshake, oversize boundary, and the no-length-prefix negative proof.
 - `close-codes.md` — normative close-code mapping table with wire values.
 - WSS-only TLS fixtures (certificates, chains, revocation) are referenced by
-  harness name from `specifications/security/*` and are never embedded here;
+  harness name from the pinned upstream specifications/security/* (https://github.com/tinkle-org/syntra/tree/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/specifications/security) and are never embedded here;
   no private key material appears in this repository.
 
 All payloads use neutral methods (`/example.Echo/Echo`, `/example.KV/Get`) and

@@ -146,7 +146,7 @@ struct Slot {
 /// rejected with `FAILED_PRECONDITION` while the original waiter keeps
 /// running; `result` for an unknown id is ignored with a diagnostic
 /// (no error storm).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PendingTable {
     inner: Mutex<HashMap<u64, Slot>>,
     max_outstanding: usize,

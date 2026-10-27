@@ -387,7 +387,13 @@ async fn transport_loss_maps_unavailable() {
         let initiator = initiator.clone();
         async move { initiator.call(echo::ECHO_METHOD, b"x".to_vec(), 5000).await }
     });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while initiator.pending_len() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("outstanding call registers");
     assert_eq!(initiator.pending_len(), 1);
     initiator.on_transport_lost().await;
     let err = h.await.unwrap().unwrap_err();
