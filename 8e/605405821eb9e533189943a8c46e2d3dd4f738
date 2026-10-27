@@ -1,0 +1,101 @@
+crates/syntra-ws/src/native.rs
+  s_74192ea8fd2b66::t_d59a7626489e23 162
+conformance/test-vectors/websocket/README.md
+  s_74192ea8fd2b66::t_196cf2269b4f5e 17
+crates/syntra-core/src/frame.rs
+  s_74192ea8fd2b66::t_d88411e1c3da73 172-182
+  s_74192ea8fd2b66::t_1d3444a1b004b8 225-228
+crates/syntra-runtime/src/recovery/driver.rs
+  s_74192ea8fd2b66::t_3863cdb450a0bb 120-123,126,132,145-153
+  s_74192ea8fd2b66::t_187fda0d861561 177,182
+  s_74192ea8fd2b66::t_2fd146b562e913 154-156
+  s_74192ea8fd2b66::t_0e8763fb5228a5 157-158
+proto/syntra/v1/envelope.proto
+  s_74192ea8fd2b66::t_8c5346442eabd0 12-16
+  s_74192ea8fd2b66::t_68ca43dc8f36ad 30-32
+conformance/test-vectors/http/status-mapping.md
+  s_74192ea8fd2b66::t_ea2ffbd72f36f9 15
+.github/dependabot.yml
+  s_74192ea8fd2b66::t_298306e32da925 1-19
+buf.yaml
+  s_74192ea8fd2b66::t_20885b807abbff 2-3,13-15
+crates/syntra-runtime/tests/integration.rs
+  s_74192ea8fd2b66::t_bf9a4a8bdf1e4d 390-396
+conformance/test-vectors/tcp/README.md
+  s_74192ea8fd2b66::t_564c4ec289587d 3,5
+deny.toml
+  s_74192ea8fd2b66::t_5be41afff36de3 18,27
+  s_74192ea8fd2b66::t_6f6b3caab6eacd 19
+  s_74192ea8fd2b66::t_1abd17afc28fe7 16-17,31-33
+  s_74192ea8fd2b66::t_af7da1e43427c6 1-15,20-26,28-30,34-52
+scripts/check-upstream-pin.py
+  s_74192ea8fd2b66::t_9517e7d2c391b0 45-53
+  s_74192ea8fd2b66::t_21884345c282c1 1-44,54-82
+conformance/test-vectors/http/fixtures.yaml
+  s_74192ea8fd2b66::t_277e3b6557281f 56-67
+  s_74192ea8fd2b66::t_dd60e346226489 16-20
+  s_74192ea8fd2b66::t_bd15020eb92613 21
+crates/syntra-ffi/src/production.rs
+  s_74192ea8fd2b66::t_86713713245fa0 632-634,644-647,649,670-672,682-685,687
+  s_74192ea8fd2b66::t_33861fe0261d23 1185-1187,1197-1200,1207
+  s_74192ea8fd2b66::t_733ff09a1982c0 1406-1408,1418-1421,1423
+crates/syntra-core/src/generated/syntra.v1.rs
+  s_74192ea8fd2b66::t_69dd0214e1251f 197-201,216-218,226-228
+crates/syntra-core/src/rpc.rs
+  s_74192ea8fd2b66::t_068e64e49c87f4 149
+.github/workflows/scheduled.yml
+  s_74192ea8fd2b66::t_8d9576c5b131bd 140
+  s_74192ea8fd2b66::t_076953a9f26d97 1-139,141-143
+conformance/test-vectors/README.md
+  s_74192ea8fd2b66::t_4c3a379592d65c 24
+crates/syntra-runtime/src/initiator.rs
+  s_74192ea8fd2b66::t_8f84c4aeba30ea 709-711,725-728
+docs/ci.md
+  s_74192ea8fd2b66::t_f1a9d004cd1d7e 21-22
+  s_74192ea8fd2b66::t_95a40d185d5c8e 94-95
+  s_74192ea8fd2b66::t_4acc884549a75c 171-179
+  s_74192ea8fd2b66::t_a2cb1d7a05cb16 1-20,23-93,100-170,183-248,253-302
+  s_74192ea8fd2b66::t_aa11b3f29a213f 96-99
+  s_74192ea8fd2b66::t_5abb3ff8dc4d32 180-182
+  s_74192ea8fd2b66::t_84ba6490284423 249-252
+.github/workflows/release-plz.yml
+  s_74192ea8fd2b66::t_c36a65420c20a2 27-61,66-70,73
+  s_74192ea8fd2b66::t_72de3760f79773 93
+  s_74192ea8fd2b66::t_70bff317485403 1-26,71-72,74-80,82-92,94-120,122-125
+  s_74192ea8fd2b66::t_83b53cb2a4749d 81
+  s_74192ea8fd2b66::t_09c441ba224e5b 121
+  s_74192ea8fd2b66::t_28b94ca64007a4 62-65
+release-plz.toml
+  s_74192ea8fd2b66::t_1a11e649974869 1-26
+crates/syntra-runtime/src/reliable.rs
+  s_74192ea8fd2b66::t_d0e4200bf0059c 429-431,433
+  s_74192ea8fd2b66::t_8ed9ea17267dde 460-462
+  s_74192ea8fd2b66::t_8b3b9ac270ac75 612-615
+  s_74192ea8fd2b66::t_6dc5b39e175f98 649-655,658
+  s_74192ea8fd2b66::t_e47af199c5b947 340
+  s_74192ea8fd2b66::t_dfba1fb25078f6 407
+  s_74192ea8fd2b66::t_0456725be68c14 277
+.github/workflows/ci.yml
+  s_74192ea8fd2b66::t_5274b9ece77458 36
+  s_74192ea8fd2b66::t_8f6972bda809fc 162
+  s_74192ea8fd2b66::t_eb007bbf42965d 224,240-243
+  s_74192ea8fd2b66::t_fdc12b30d0cba7 1,8-11,17-18,21-35,37-74,76,78-80,82-85,89,92-99,102-103,114,116-118,120-123,126,132-158,160-161,163-184,186-223,225-239,244-249
+  s_74192ea8fd2b66::t_a506938ee87279 159
+  s_74192ea8fd2b66::t_f7292b707d414c 185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8e605405821eb9e533189943a8c46e2d3dd4f738",
+  "prompts": {},
+  "sessions": {
+    "s_74192ea8fd2b66": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e8097cf23ffeUtk0xixBSsFUUU",
+        "model": "muse-spark-1.3-contributor"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}
