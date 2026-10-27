@@ -1,0 +1,117 @@
+# Golden Protobuf vectors (Section J) — known valid encodings, verified with
+# `protoc --decode=syntra.v1.Frame` against proto/syntra/v1/*.proto.
+#
+# Task-name mapping (the task's informal names vs the v1 IDL):
+#   ClientHello   -> syntra.v1.ClientHello (hello field 10 of Frame)
+#   ServerHello   -> DOES NOT EXIST in v1. The host emits exactly one terminal
+#                    outcome: ServerReady on success, or a handshake error + close.
+#                    GOLD-PROT-READY-01 is the success half.
+#   Authentication-> No separate message. Carriage IS ClientHello.credential
+#                    (opaque bytes) plus optional post-ACTIVE generic RPCs.
+#                    GOLD-PROT-HELLO-01 shows the credential on the wire.
+#   RpcRequest    -> syntra.v1.RpcRequest (request field 12 of Frame)
+#   RpcResponse   -> syntra.v1.RpcResult (result field 13 of Frame; the published
+#                    response name is RpcResult, never renamed)
+#   RpcError      -> syntra.v1.RpcError (error outcome of RpcResult)
+#   Event         -> syntra.v1.Notification (notification field 15 of Frame)
+#   ProtocolError -> No separate message. A typed RpcError/handshake error where
+#                    an RPC/handshake context exists, else connection closure.
+#
+# IMPORTANT: these are known VALID encodings of the stated logical messages.
+# They DO NOT imply that all conforming serializers must emit byte-identical
+# output for semantically equivalent messages (SNTR-SER-002/901). Runners MUST
+# compare decoded fields (logical equality), never raw bytes — except the TCP
+# framing prefix + chosen fixture bytes, which are byte-exact for that fixture.
+format_version: "1.0"
+encoding: "proto3 binary wire format; fields below are (field_number: value); request_id 0 is omitted on the wire by implicit presence"
+vectors:
+  - id: GOLD-PROT-HELLO-01
+    message: ClientHello_in_Frame
+    human: "Frame{version: 1, request_id: 0 (omitted), hello{min_version: 1, max_version: 1, credential: \"opaque-test-credential-A\" (24 bytes, throwaway fixture)}}"
+    frame_hex: "0801521e080110011a186f70617175652d746573742d63726564656e7469616c2d41"
+    frame_length_bytes: 34
+    semantic_fields: { version: 1, request_id: 0, body: hello, min_version: 1, max_version: 1, credential_b64: "b3BhcXVlLXRlc3QtY3JlZGVudGlhbC1B" }
+
+  - id: GOLD-PROT-READY-01
+    message: ServerReady_in_Frame
+    human: "Frame{version: 1, request_id: 0 (omitted), ready{connection_id: \"fixture-conn-01\"}} (fixture ID; production IDs are unguessable, >=128-bit entropy, single-connection scoped)"
+    frame_hex: "08015a110a0f666978747572652d636f6e6e2d3031"
+    frame_length_bytes: 21
+    semantic_fields: { version: 1, request_id: 0, body: ready, connection_id: "fixture-conn-01" }
+
+  - id: GOLD-PROT-AUTHN-01
+    message: Authentication_carriage
+    human: "Authentication has no separate wire message: the credential travels as ClientHello.credential (GOLD-PROT-HELLO-01). This entry isolates the credential bytes for carriage tests."
+    credential_b64: "b3BhcXVlLXRlc3QtY3JlZGVudGlhbC1B"
+    credential_hex: "6f70617175652d746573742d63726564656e7469616c2d41"
+    semantic_fields: { mechanism: none_in_core, carriage: ClientHello_credential, empty_means: anonymous_attempt_per_policy }
+
+  - id: GOLD-PROT-REQ-01
+    message: RpcRequest_in_Frame
+    human: "Frame{version: 1, request_id: 7, request{method: \"/example.Echo/Echo\", payload: \"hello\", timeout_ms: 500}}"
+    frame_hex: "08011007621e0a122f6578616d706c652e4563686f2f4563686f120568656c6c6f18f403"
+    frame_length_bytes: 36
+    frame_b64: "CAEQB2IeChIvZXhhbXBsZS5FY2hvL0VjaG8SBWhlbGxvGPQD"
+    semantic_fields: { version: 1, request_id: 7, body: request, method: "/example.Echo/Echo", payload_b64: "aGVsbG8=", timeout_ms: 500 }
+
+  - id: GOLD-PROT-REQ-EMPTY-01
+    message: RpcRequest_empty_payload_in_Frame
+    human: "Frame{version: 1, request_id: 13, request{method: \"/example.Echo/Echo\", payload: \"\" (selected empty), timeout_ms: 500}} — empty payload invokes the method with empty input (never confused with unset)"
+    frame_hex: "0801100d62190a122f6578616d706c652e4563686f2f4563686f120018f403"
+    frame_length_bytes: 31
+    semantic_fields: { version: 1, request_id: 13, body: request, method: "/example.Echo/Echo", payload_b64: "", timeout_ms: 500 }
+
+  - id: GOLD-PROT-RES-OK-01
+    message: RpcResult_success_in_Frame
+    human: "Frame{version: 1, request_id: 7, result{payload: \"hello\"}}"
+    frame_hex: "080110076a070a0568656c6c6f"
+    frame_length_bytes: 13
+    frame_b64: "CAEQB2oHCgVoZWxsbw=="
+    semantic_fields: { version: 1, request_id: 7, body: result, outcome: payload, payload_b64: "aGVsbG8=" }
+
+  - id: GOLD-PROT-RES-EMPTY-01
+    message: RpcResult_empty_success_in_Frame
+    human: "Frame{version: 1, request_id: 13, result{payload: \"\"}} (payload outcome selected with zero bytes) — success with empty output, distinct from unset outcome (failure)"
+    frame_hex: "0801100d6a020a00"
+    frame_length_bytes: 8
+    semantic_fields: { version: 1, request_id: 13, body: result, outcome: payload, payload_b64: "" }
+
+  - id: GOLD-PROT-RES-ERR-01
+    message: RpcError_in_Frame
+    human: "Frame{version: 1, request_id: 7, result{error{code: UNIMPLEMENTED (12), message: \"unknown method\"}}}"
+    frame_hex: "080110076a141212080c120e756e6b6e6f776e206d6574686f64"
+    frame_length_bytes: 26
+    frame_b64: "CAEQB2oUEhIIDBIOdW5rbm93biBtZXRob2Q="
+    semantic_fields: { version: 1, request_id: 7, body: result, outcome: error, code: UNIMPLEMENTED, code_number: 12, message: "unknown method" }
+
+  - id: GOLD-PROT-EVENT-01
+    message: Notification_in_Frame
+    human: "Frame{version: 1, request_id: 0 (omitted), notification{payload: \"event-1\"}} — uncorrelated, completes no RPC"
+    frame_hex: "08017a090a076576656e742d31"
+    frame_length_bytes: 13
+    semantic_fields: { version: 1, request_id: 0, body: notification, payload_b64: "ZXZlbnQtMQ==" }
+
+  - id: GOLD-PROT-CANCEL-01
+    message: Cancel_in_Frame
+    human: "Frame{version: 1, request_id: 12, cancel{}} — Cancel carries no fields; the target is the enclosing request_id"
+    frame_hex: "0801100c7200"
+    frame_length_bytes: 6
+    semantic_fields: { version: 1, request_id: 12, body: cancel }
+
+  - id: GOLD-PROT-UNKNOWN-FIELD-01
+    message: RpcRequest_with_unknown_field
+    human: "GOLD-PROT-REQ-01 with unknown field 90 (length-delimited, 1 byte 0x78) appended — MUST be tolerated and skipped per SNTR-SER-003, yielding the identical logical message"
+    frame_hex: "08011007621e0a122f6578616d706c652e4563686f2f4563686f120568656c6c6f18f403d2050178"
+    frame_length_bytes: 40
+    semantic_fields: { decodes_to: GOLD-PROT-REQ-01, unknown_field: 90 }
+
+  - id: GOLD-PROT-EMPTY-FRAME-01
+    message: Bodyless_Frame_negative
+    human: "Frame{version: 1} with NO body set — encodable by codecs but INVALID on the wire; MUST be rejected (INVALID_ARGUMENT context), never processed"
+    frame_hex: "0801"
+    frame_length_bytes: 2
+    semantic_fields: { invalid_because: empty_body, handling: reject }
+verification:
+  tool: "protoc --decode=syntra.v1.Frame against proto/syntra/v1/*.proto"
+  note: "Every frame_hex above was decoded with protoc and yields the stated logical message (REQUNK decodes to REQ-01 plus unknown field 90)."
+  non_canonical_warning: "Field order, unknown-field retention, and default-value omission may differ across encoders; logical equality is the only valid comparison."

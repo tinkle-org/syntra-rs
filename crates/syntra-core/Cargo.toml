@@ -1,0 +1,21 @@
+[package]
+name = "syntra-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Syntra v1 protocol core: Frame codec, envelope validation, version negotiation, request-id rules. No transport, no application semantics."
+
+[dependencies]
+prost.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+
+[dev-dependencies]
+prost.workspace = true

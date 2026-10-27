@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package syntra.v1;
+
+import "syntra/v1/events.proto";
+import "syntra/v1/handshake.proto";
+import "syntra/v1/rpc.proto";
+
+option go_package = "github.com/tinklehq/syntra/bindings/go/gen/syntra/v1;syntrav1";
+
+// Frame is a versioned Syntra envelope, independent of transport framing
+// (SNTR-WIRE-001..008). See specifications/schema/reference.md for runtime
+// validation obligations and RFC 0001 for unresolved behavioral conflicts.
+message Frame {
+  // version is the proposed maximum in hello and the selected version thereafter
+  // (SNTR-HS-003/010). Zero is not a negotiated version.
+  uint32 version = 1;
+  // request_id is connection-scoped correlation, not an authenticator or an
+  // operation key. Zero is used by hello, ready, and notification; request,
+  // result, and cancel use nonzero IDs (SNTR-WIRE-003, SNTR-RPC-002/010).
+  uint64 request_id = 2;
+  // Former application replay operations must not be reused (SNTR-SER-008).
+  reserved 16, 17;
+  reserved "event", "resume", "ack";
+  // body selects one operation. Generated oneofs do not enforce all protocol
+  // validation: an unset body is representable and duplicate wire alternatives
+  // may be collapsed by the decoder. See RFC 0001, B4.
+  oneof body {
+    // hello begins host-owned authentication (SNTR-HS-003, SNTR-AUTH-001).
+    ClientHello hello = 10;
+    // ready confirms acceptance, not synchronized application state (SNTR-HS-004).
+    ServerReady ready = 11;
+    // request invokes an application-defined method (SNTR-RPC-001).
+    RpcRequest request = 12;
+    // result completes a call; notifications may precede it (SNTR-RPC-002/020).
+    RpcResult result = 13;
+    // cancel requests cancellation, never rollback (SNTR-RPC-005).
+    Cancel cancel = 14;
+    // notification carries opaque host-authorized data (SNTR-EVENT-001/002).
+    Notification notification = 15;
+  }
+}

@@ -1,0 +1,478 @@
+syntax = "proto3";
+
+package syntra.v1;
+
+option go_package = "github.com/tinklehq/syntra/bindings/go/gen/syntra/v1;syntrav1";
+
+// Update/recovery profile payloads for ordered delivery, bounded replay,
+// snapshot recovery, and committed progress (SYN-URP-001..007,
+// SYN-URP-010..026; SYN-URP-008/009 reserved).
+//
+// DRAFT proposal under RFC 0006, not accepted shipping authority. These
+// comments describe proposed validation; generated codecs alone do not
+// enforce it. No conformance or release claim may cite the draft as authority.
+//
+// All payloads are versioned bytes carried inside the existing request,
+// result, and notification envelopes with no envelope changes. Each
+// subscription is one independent logical stream with one continuity
+// generation. Checkpoints, handles, selectors, markers, and boundaries are
+// opaque bytes. Confirmation proves only persistence through the
+// application persistence point. Bounds below are deployment-documented
+// defaults: at most 64 subscriptions per connection, at most 256 per
+// principal, at most 16 pending profile calls per connection, at most
+// 262144 queued notification bytes per stream, at most 1048576 per
+// connection, at most 64 serialized batches and 262144 total bytes per
+// replay page with each serialized entry at most 262144 bytes, at most
+// 262144 bytes per snapshot page, at most 256 pages per snapshot offer,
+// effective deadline 5 s where the request carries no explicit bounded
+// deadline.
+//
+// Canonical generic RPC methods (SNTR-RPC-001, exactly two slashes) are:
+// `/syntra.v1.UpdateRecovery/Negotiate`,
+// `/syntra.v1.UpdateRecovery/Subscribe`,
+// `/syntra.v1.UpdateRecovery/Replay`,
+// `/syntra.v1.UpdateRecovery/CatchUp`,
+// `/syntra.v1.UpdateRecovery/Confirm` (batch variant
+// `RecoveryConfirmRequest`/`RecoveryConfirmResponse`),
+// `/syntra.v1.UpdateRecovery/SnapshotConfirm` (snapshot-boundary variant
+// `RecoverySnapshotConfirmRequest`/`RecoverySnapshotInstalled`),
+// `/syntra.v1.UpdateRecovery/SnapshotOffer`
+// (`RecoverySnapshotOfferRequest`/`RecoverySnapshotDescriptor`),
+// `/syntra.v1.UpdateRecovery/SnapshotFetch`,
+// `/syntra.v1.UpdateRecovery/Unsubscribe`
+// (`RecoveryUnsubscribeRequest`/`RecoveryUnsubscribeResponse`).
+// Notification payloads are versioned `RecoveryNotification` bytes carrying
+// exactly one of `RecoveryBatch`, `RecoveryReplayComplete`, or
+// `RecoveryBatchTrailer` with matching profile_version, inside the existing
+// `Notification.payload` with no envelope changes.
+//
+// Wire compatibility (SNTR-SER-003, SNTR-VER-004): unknown Protobuf fields
+// inside profile payloads MUST be ignored on receipt unless a field comment
+// explicitly marks that field `Critical`. Fields explicitly marked
+// `Ignorable` in their comments MUST be ignored on receipt. Defined fields
+// are validated per their field comments: profile_version and routing/identity
+// fields (stream_selector, subscription_handle, snapshot_handle, capability,
+// versions) missing or mismatched MUST be rejected with FAILED_PRECONDITION,
+// never silently applied. Checkpoint/boundary/marker fields follow per-field
+// emptiness rules, not a blanket non-empty rule: `start_checkpoint` empty
+// means initial (SYN-URP-022), `continuation_marker` empty means first request
+// or no further page (SYN-URP-022), `terminate_reason` empty means no
+// termination unless the terminated outcome is selected (SYN-URP-026), and
+// predecessor/result/boundary emptiness is governed by each field comment.
+// Unknown profile operations (method strings) MUST be rejected
+// with UNIMPLEMENTED.
+message RecoveryNegotiateRequest {
+  // profile_version is the profile payload version. Valid value is 1.
+  // Required.
+  uint32 profile_version = 1;
+  // min_version is the lowest offered profile version. Valid value is 1
+  // in this draft. Required.
+  uint32 min_version = 2;
+  // max_version is the highest offered profile version. Valid value is 1
+  // in this draft, MUST be >= min_version. Required.
+  uint32 max_version = 3;
+  // capability is the ASCII capability identifier. Non-empty, at most 256
+  // bytes. Required.
+  string capability = 4;
+}
+
+// RecoveryNegotiateResponse confirms the selected version and bounds.
+message RecoveryNegotiateResponse {
+  // profile_version is the profile payload version. Valid value is 1.
+  // Required.
+  uint32 profile_version = 1;
+  // selected_version is the highest overlap within the offered range.
+  // Valid value is 1 in this draft. Required.
+  uint32 selected_version = 2;
+  // max_subscriptions_per_connection is the confirmed bound. Required.
+  uint32 max_subscriptions_per_connection = 3;
+  // max_pending_rpcs_per_connection is the confirmed bound. Required.
+  uint32 max_pending_rpcs_per_connection = 4;
+  // max_page_bytes is the confirmed per-page byte bound. Required.
+  uint32 max_page_bytes = 5;
+  // max_snapshot_pages is the confirmed per-offer page count bound. Required.
+  uint32 max_snapshot_pages = 6;
+}
+message RecoverySubscribeRequest {
+  // profile_version is the profile payload version. Valid value is 1.
+  // Required.
+  uint32 profile_version = 1;
+  // stream_selector selects the stream. Opaque bytes, non-empty, at most 1024 bytes.
+  // Required.
+  bytes stream_selector = 2;
+  // start_checkpoint is the confirmed checkpoint to continue from. Opaque bytes,
+  // empty means initial, otherwise at most 4096 bytes.
+  bytes start_checkpoint = 3;
+}
+
+// RecoverySubscribeResponse confirms one subscription with its handle, generation,
+// and fixed catch-up boundary.
+message RecoverySubscribeResponse {
+  // profile_version is the profile payload version. Valid value is 1.
+  // Required.
+  uint32 profile_version = 1;
+  // subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
+  // at most 256 bytes. Required.
+  bytes subscription_handle = 2;
+  // generation is the continuity generation of the stream. Required.
+  uint64 generation = 3;
+  // catchup_boundary is the fixed boundary captured at subscribe accept where
+  // recovered history meets live delivery. Opaque bytes, non-empty, at most
+  // 4096 bytes. Required; empty means omitted and MUST be rejected with
+  // FAILED_PRECONDITION.
+  bytes catchup_boundary = 4;
+}
+
+// RecoveryUnsubscribeRequest ends one targeted subscription.
+message RecoveryUnsubscribeRequest {
+  // profile_version is the profile payload version. Valid value is 1.
+  // Required.
+  uint32 profile_version = 1;
+  // subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
+  // at most 256 bytes. Required.
+  bytes subscription_handle = 2;
+}
+
+// RecoveryUnsubscribeResponse acknowledges teardown of one targeted subscription.
+message RecoveryUnsubscribeResponse {
+  // profile_version is the profile payload version. Valid value is 1.
+  // Required.
+  uint32 profile_version = 1;
+  // subscription_handle identifies the terminated stream. Opaque bytes, non-empty,
+  // at most 256 bytes. Required. Echoes the request handle.
+  bytes subscription_handle = 2;
+  // generation is the continuity generation at termination. Required.
+  // Lets initiators fence late batches and duplicate unsubscribes.
+  uint64 generation = 3;
+}
+
+// RecoveryReplayRequest asks for bounded replay from a confirmed checkpoint.
+message RecoveryReplayRequest {
+  // profile_version is the profile payload version. Valid value is 1.
+  uint32 profile_version = 1;
+  // subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
+  // at most 256 bytes.
+  bytes subscription_handle = 2;
+  // from_checkpoint is the confirmed checkpoint to replay from. Opaque bytes,
+  // non-empty, at most 4096 bytes. On the first request it is the last
+  // confirmed checkpoint; on continuation it MUST equal the previous page's
+  // result_checkpoint.
+  bytes from_checkpoint = 3;
+  // max_batches bounds batches in one page. Valid range is 1 to 64.
+  uint32 max_batches = 4;
+  // max_bytes bounds page bytes. Valid range is 1 to 262144.
+  uint32 max_bytes = 5;
+  // continuation_marker echoes the previous page's marker. Opaque bytes, empty
+  // on the first request, otherwise MUST equal the previous
+  // RecoveryReplayPage.continuation_marker verbatim, at most 4096 bytes.
+  // Mismatch MUST be rejected with FAILED_PRECONDITION.
+  bytes continuation_marker = 6;
+}
+
+// RecoveryReplayPage carries one bounded replay page toward the catch-up boundary.
+message RecoveryReplayPage {
+  // profile_version is the profile payload version. Valid value is 1.
+  uint32 profile_version = 1;
+  // subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
+  // at most 256 bytes.
+  bytes subscription_handle = 2;
+  // predecessor_checkpoint is the checkpoint this page continues from. Opaque
+  // bytes, at most 4096 bytes.
+  bytes predecessor_checkpoint = 3;
+  // result_checkpoint is the checkpoint this page advances to. Opaque bytes,
+  // at most 4096 bytes.
+  bytes result_checkpoint = 4;
+  // continuation_marker orders the next page. Opaque bytes, empty means no
+  // further page, otherwise at most 4096 bytes.
+  bytes continuation_marker = 5;
+  // catchup_boundary is the live boundary being approached. Opaque bytes, at
+  // most 4096 bytes.
+  bytes catchup_boundary = 6;
+  // batch_payloads holds one serialized RecoveryBatch per entry. At most 64
+  // entries, each serialized entry at most 262144 bytes, total at most
+  // 262144 bytes. Consumers MUST validate each entry as a RecoveryBatch with
+  // matching generation and predecessor/result checkpoint continuity through
+  // the same pipeline as live batches.
+  repeated bytes batch_payloads = 7;
+}
+
+// RecoveryReplayComplete signals the stream has reached live.
+message RecoveryReplayComplete {
+  // profile_version is the profile payload version. Valid value is 1.
+  uint32 profile_version = 1;
+  // subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
+  // at most 256 bytes.
+  bytes subscription_handle = 2;
+  // generation is the continuity generation of the stream.
+  uint64 generation = 3;
+  // live_boundary_checkpoint is the checkpoint where replay met live. Opaque
+  // bytes, at most 4096 bytes.
+  bytes live_boundary_checkpoint = 4;
+}
+
+// RecoveryCatchUpRequest triggers catch-up streaming over the existing connection.
+message RecoveryCatchUpRequest {
+  // profile_version is the profile payload version. Valid value is 1.
+  // Required.
+  uint32 profile_version = 1;
+  // subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
+  // at most 256 bytes. Required.
+  bytes subscription_handle = 2;
+}
+
+// RecoveryCatchUpAccepted confirms accepted catch-up with its boundary.
+message RecoveryCatchUpAccepted {
+  // profile_version is the profile payload version. Valid value is 1.
+  // Required.
+  uint32 profile_version = 1;
+  // subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
+  // at most 256 bytes. Required.
+  bytes subscription_handle = 2;
+  // generation is the continuity generation of the stream. Required.
+  uint64 generation = 3;
+  // catchup_boundary is the fixed boundary being approached. Opaque bytes, at
+  // most 4096 bytes.
+  bytes catchup_boundary = 4;
+}
+
+// RecoverySnapshotOfferRequest accepts a snapshot offer for one targeted stream.
+message RecoverySnapshotOfferRequest {
+  // profile_version is the profile payload version. Valid value is 1.
+  // Required.
+  uint32 profile_version = 1;
+  // subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
+  // at most 256 bytes. Required.
+  bytes subscription_handle = 2;
+  // generation is the continuity generation at offer time. Required.
+  // Binds the offer to the current generation for supersede fencing.
+  uint64 generation = 3;
+}
+
+// RecoverySnapshotDescriptor offers a snapshot under a provider-proven boundary.
+message RecoverySnapshotDescriptor {
+  // profile_version is the profile payload version. Valid value is 1.
+  uint32 profile_version = 1;
+  // subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
+  // at most 256 bytes.
+  bytes subscription_handle = 2;
+  // snapshot_handle identifies the offered snapshot. Opaque bytes, non-empty,
+  // at most 256 bytes.
+  bytes snapshot_handle = 3;
+  // boundary_checkpoint is the provider-proven boundary subsequent batches chain
+  // from. Opaque bytes, at most 4096 bytes.
+  bytes boundary_checkpoint = 4;
+  // total_pages bounds pages in this offer. Valid range is 1 to 256.
+  uint32 total_pages = 5;
+  // page_bytes_max bounds each page. Valid range is 1 to 262144.
+  uint32 page_bytes_max = 6;
+}
+
+// RecoverySnapshotChunk carries one bounded snapshot page for storage without interpretation.
+message RecoverySnapshotChunk {
+  // profile_version is the profile payload version. Valid value is 1.
+  uint32 profile_version = 1;
+  // snapshot_handle identifies the offered snapshot. Opaque bytes, non-empty,
+  // at most 256 bytes.
+  bytes snapshot_handle = 2;
+  // page_index orders the page within the offer. Valid range is 0 to 255.
+  uint32 page_index = 3;
+  // page_bytes holds opaque snapshot bytes. Non-empty, at most 262144 bytes.
+  bytes page_bytes = 4;
+  // boundary_checkpoint binds the chunk to the offered boundary. Opaque bytes,
+  // at most 4096 bytes.
+  bytes boundary_checkpoint = 5;
+}
+
+// RecoverySnapshotComplete marks transfer of all pages in the offer.
+message RecoverySnapshotComplete {
+  // profile_version is the profile payload version. Valid value is 1.
+  uint32 profile_version = 1;
+  // snapshot_handle identifies the offered snapshot. Opaque bytes, non-empty,
+  // at most 256 bytes.
+  bytes snapshot_handle = 2;
+  // boundary_checkpoint is the offered boundary. Opaque bytes, at most 4096 bytes.
+  bytes boundary_checkpoint = 3;
+  // total_pages is the transferred page count. Valid range is 1 to 256.
+  uint32 total_pages = 4;
+  // total_bytes is the transferred byte count. Valid range is 1 to 67108864.
+  uint64 total_bytes = 5;
+}
+
+// RecoverySnapshotInstalled confirms installation only on boundary confirm.
+message RecoverySnapshotInstalled {
+  // profile_version is the profile payload version. Valid value is 1.
+  uint32 profile_version = 1;
+  // subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
+  // at most 256 bytes.
+  bytes subscription_handle = 2;
+  // boundary_checkpoint is the confirmed boundary. Opaque bytes, at most 4096 bytes.
+  bytes boundary_checkpoint = 3;
+  // generation is the continuity generation after installation.
+  uint64 generation = 4;
+}
+
+// RecoverySnapshotFetchRequest asks for one bounded snapshot page by index.
+message RecoverySnapshotFetchRequest {
+  // profile_version is the profile payload version. Valid value is 1.
+  // Required.
+  uint32 profile_version = 1;
+  // snapshot_handle identifies the offered snapshot. Opaque bytes, non-empty,
+  // at most 256 bytes. Required.
+  bytes snapshot_handle = 2;
+  // page_index orders the page within the offer. Valid range is 0 to 255.
+  // Required. The response page_index correlates the request.
+  uint32 page_index = 3;
+}
+
+// RecoveryConfirmRequest confirms a batch result checkpoint (batch variant).
+// Transport: `/syntra.v1.UpdateRecovery/Confirm`, yielding
+// RecoveryConfirmResponse. Snapshot-boundary confirms use
+// RecoverySnapshotConfirmRequest on
+// `/syntra.v1.UpdateRecovery/SnapshotConfirm` and yield
+// RecoverySnapshotInstalled. The two variants use distinct methods so batch
+// and snapshot confirms are wire-distinguishable.
+message RecoveryConfirmRequest {
+  // profile_version is the profile payload version. Valid value is 1.
+  // Required.
+  uint32 profile_version = 1;
+  // subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
+  // at most 256 bytes. Required.
+  bytes subscription_handle = 2;
+  // generation is the continuity generation of the stream. Required.
+  // MUST equal the current generation; cross-generation confirms MUST be
+  // rejected with FAILED_PRECONDITION.
+  uint64 generation = 3;
+  // checkpoint is the batch result checkpoint being confirmed. Opaque bytes,
+  // non-empty, at most 4096 bytes. Required. Re-presenting the same bytes is
+  // idempotent and MUST return confirmed without side effects or generation
+  // change (SYN-URP-025).
+  bytes checkpoint = 4;
+}
+
+// RecoverySnapshotConfirmRequest confirms a snapshot boundary checkpoint
+// (snapshot variant) on `/syntra.v1.UpdateRecovery/SnapshotConfirm`.
+// Yields RecoverySnapshotInstalled with the new generation.
+message RecoverySnapshotConfirmRequest {
+  // profile_version is the profile payload version. Valid value is 1.
+  // Required.
+  uint32 profile_version = 1;
+  // subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
+  // at most 256 bytes. Required.
+  bytes subscription_handle = 2;
+  // generation is the continuity generation at confirm time (pre-install).
+  // Required. MUST equal the current generation before a first install.
+  // Draft retained-install retry exception (SYN-URP-025): after successful
+  // installation, an exact duplicate for the same authorized subscription,
+  // profile version, pre-install generation, and boundary bytes MAY carry
+  // that pre-install generation only while its installed response is retained
+  // and the current generation still equals that response's installed
+  // generation. The host MUST return the original RecoverySnapshotInstalled
+  // without reinstalling or advancing generation. Supersede, termination,
+  // later continuity change, or retention expiry invalidates this exception;
+  // other stale-generation requests MUST fail with FAILED_PRECONDITION.
+  uint64 generation = 3;
+  // boundary_checkpoint is the offered boundary being confirmed. Opaque bytes,
+  // non-empty, at most 4096 bytes. Required. MUST equal the offered
+  // RecoverySnapshotDescriptor.boundary_checkpoint bytes; mismatch MUST be
+  // rejected with FAILED_PRECONDITION without installing.
+  // On the retained-install retry path, MUST equal the retained installed
+  // boundary exactly; matching bytes alone do not authorize a stale confirm.
+  bytes boundary_checkpoint = 4;
+}
+
+// RecoveryConfirmResponse confirms the persisted batch checkpoint.
+message RecoveryConfirmResponse {
+  // profile_version is the profile payload version. Valid value is 1.
+  // Required.
+  uint32 profile_version = 1;
+  // subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
+  // at most 256 bytes. Required.
+  bytes subscription_handle = 2;
+  // confirmed_checkpoint is the persisted checkpoint. Opaque bytes, at most
+  // 4096 bytes. Required; echoes the request checkpoint on success including
+  // idempotent retries.
+  bytes confirmed_checkpoint = 3;
+  // generation is the continuity generation of the stream. Required.
+  // Unchanged by batch confirms.
+  uint64 generation = 4;
+}
+
+// RecoveryBatch carries one ordered batch with predecessor/result pairing.
+message RecoveryBatch {
+  // profile_version is the profile payload version. Valid value is 1.
+  uint32 profile_version = 1;
+  // subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
+  // at most 256 bytes.
+  bytes subscription_handle = 2;
+  // generation is the continuity generation of the stream.
+  uint64 generation = 3;
+  // predecessor_checkpoint is the checkpoint this batch continues from. Opaque
+  // bytes, at most 4096 bytes.
+  bytes predecessor_checkpoint = 4;
+  // result_checkpoint is the checkpoint this batch advances to. Opaque bytes,
+  // at most 4096 bytes.
+  bytes result_checkpoint = 5;
+  // batch_payload holds opaque application batch bytes. The serialized
+  // RecoveryBatch entry is at most 262144 bytes, so batch_payload must leave
+  // room for subscription handle, generation, checkpoints, tags, and lengths.
+  bytes batch_payload = 6;
+}
+
+// RecoveryBatchTrailer marks catch-up completion, snapshot need, continuity loss,
+// or targeted termination for one stream. Outcomes are mutually exclusive;
+// exactly one outcome is selected per trailer.
+message RecoveryBatchTrailer {
+  // profile_version is the profile payload version. Valid value is 1.
+  uint32 profile_version = 1;
+  // subscription_handle identifies the targeted stream. Opaque bytes, non-empty,
+  // at most 256 bytes.
+  bytes subscription_handle = 2;
+  // generation is the continuity generation of the stream.
+  uint64 generation = 3;
+  // boundary_checkpoint is the catch-up or snapshot boundary. Opaque bytes, at
+  // most 4096 bytes.
+  bytes boundary_checkpoint = 4;
+  // outcome selects the terminal outcome for the stream. Outcomes are mutually
+  // exclusive; exactly one is selected per trailer. An unset outcome is
+  // representable by codecs but is not a valid trailer.
+  oneof outcome {
+    // next_generation carries the new generation on continuity loss. Selected
+    // only on continuity loss with a nonzero new generation.
+    uint64 next_generation = 5;
+    // catchup_complete is selected with true when the stream has reached live.
+    bool catchup_complete = 6;
+    // snapshot_required is selected with true when the requested checkpoint is
+    // outside retention and replay cannot complete.
+    bool snapshot_required = 7;
+    // terminated is selected with true when the host ends the targeted
+    // subscription. The trailer carries the typed terminal signal so the host
+    // can terminate one stream even when there is no outstanding invocation.
+    bool terminated = 8;
+  }
+  // terminate_reason carries the required machine-readable reason when the
+  // terminated outcome is selected. Opaque bytes, non-empty when terminated,
+  // at most 256 bytes. Empty means no termination.
+  bytes terminate_reason = 9;
+}
+
+// RecoveryNotification is the versioned discriminator/wrapper carried inside
+// the opaque Notification.payload bytes with no envelope changes. Every
+// profile Notification carries exactly one RecoveryNotification; the outer
+// profile_version MUST equal the inner payload profile_version and MUST be 1.
+// An unset notification outcome is representable by codecs but is not valid.
+message RecoveryNotification {
+  // profile_version is the profile payload version. Valid value is 1.
+  // Required. MUST equal the inner payload profile_version.
+  uint32 profile_version = 1;
+  // notification selects the profile event for one targeted stream.
+  // Exactly one is selected per Notification.
+  oneof notification {
+    // batch carries one ordered batch with predecessor/result pairing.
+    RecoveryBatch batch = 2;
+    // replay_complete signals the stream has reached live.
+    RecoveryReplayComplete replay_complete = 3;
+    // trailer marks catch-up completion, snapshot need, continuity loss,
+    // or targeted termination for one stream.
+    RecoveryBatchTrailer trailer = 4;
+  }
+}

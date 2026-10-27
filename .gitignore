@@ -1,0 +1,5 @@
+/target/
+/crates/syntra-web/pkg/
+.DS_Store
+__pycache__/
+*.pyc

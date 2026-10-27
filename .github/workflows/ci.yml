@@ -1,0 +1,49 @@
+name: Rust validation
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  RUSTUP_TOOLCHAIN: "1.88.0"
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88.0"
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Locked workspace tests (default features)
+        run: cargo test --locked --workspace
+      - name: Production FFI tests
+        run: cargo test --locked -p syntra-ffi --no-default-features --features production
+      - name: Test-fixture FFI tests
+        run: cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
+      - name: WASM compile check (non-FFI crates)
+        run: cargo check --locked -p syntra-core -p syntra-runtime -p syntra-ws -p syntra-web --target wasm32-unknown-unknown
+      - name: FFI exports, C smoke tests and expected WASM rejection
+        run: python3 crates/syntra-ffi/tests/build_contract.py
+
+  generated-rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          version: "1.59.0"
+          github_token: ${{ github.token }}
+      - name: Pinned Rust generation drift check
+        run: python3 scripts/check-generated.py
