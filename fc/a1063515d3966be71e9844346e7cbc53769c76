@@ -1,0 +1,239 @@
+crates/syntra-ffi/src/fixture.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-855
+crates/syntra-ffi/src/production.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-1742
+crates/syntra-core/src/lib.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-9,11,13-14,16-18,24-52
+  s_d9263120a30440::t_ab6dc08084083a 10,12,15,19-23
+crates/syntra-runtime/src/recovery/driver.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-684
+crates/syntra-core/src/reliable.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-234
+crates/syntra-runtime/src/session.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-259
+crates/syntra-runtime/src/lib.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-15,17-19,22-195
+  s_d9263120a30440::t_ab6dc08084083a 16,20-21
+proto/syntra/v1/events.proto
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-14
+crates/syntra-ffi/src/lib.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-53
+proto/syntra/v1/errors.proto
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-56
+conformance/test-vectors/tcp/byte-vectors.yaml
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-32
+crates/syntra-core/src/codec.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-35
+tests/integration/echo.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-28
+LICENSE
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-201
+crates/syntra-ffi/CHANGELOG.md
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-14
+crates/syntra-runtime/src/connection.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-834
+crates/syntra-runtime/tests/recovery_drivers.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-542
+crates/syntra-core/src/generated/syntra.v1.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-863
+.github/SECURITY.md
+  s_d9263120a30440::t_ab6dc08084083a 1-9
+conformance/test-vectors/http/request-response-examples.md
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-106
+crates/syntra-core/tests/encode_allocation.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-69
+crates/syntra-ws/tests/browser_fixture.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-97
+crates/syntra-core/src/frame.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-669
+crates/syntra-ffi/src/reliable.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-183
+crates/syntra-runtime/src/initiator.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-1238
+rust-toolchain.toml
+  s_d9263120a30440::t_ab6dc08084083a 1,3-5
+  s_5c4abee0a91914::t_92287fb692b3a0 2
+crates/syntra-runtime/src/recovery/snapshot.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-213
+proto/syntra/v1/session.proto
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-10
+crates/syntra-runtime/tests/reliable.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-429
+crates/syntra-ws/src/native.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-646
+crates/syntra-core/src/rpc.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-298
+proto/syntra/v1/capabilities.proto
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-9
+tests/integration/handshake.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-46
+tests/interoperability/vectors.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-82
+conformance/test-vectors/http/fixtures.yaml
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-87
+conformance/test-vectors/http/status-mapping.md
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-33
+crates/syntra-core/src/error.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-226
+crates/syntra-runtime/tests/conformance_runner.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-796
+crates/syntra-runtime/src/reliable.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-817
+crates/syntra-ws/src/config.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-303
+conformance/test-vectors/websocket/vectors.md
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-175
+crates/syntra-web/src/lib.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-260
+crates/syntra-runtime/src/recovery/profile.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-952
+conformance/test-vectors/protobuf/README.md
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-18
+crates/syntra-runtime/src/transport_teardown_tests.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-306
+MIGRATION.md
+  s_d9263120a30440::t_ab6dc08084083a 1-56,61-71
+  s_5c4abee0a91914::t_92287fb692b3a0 57-60
+conformance/test-vectors/protobuf/vectors.yaml
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-117
+crates/syntra-ws/CHANGELOG.md
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-12
+crates/syntra-web/tests/browser.html
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-65
+buf.gen.yaml
+  s_d9263120a30440::t_ab6dc08084083a 1-10
+buf.yaml
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-21
+crates/syntra-runtime/Cargo.toml
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-33
+crates/syntra-web/Cargo.toml
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-26
+crates/syntra-core/CHANGELOG.md
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-15
+crates/syntra-ffi/tests/build_contract.py
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-133
+scripts/check-generated.py
+  s_d9263120a30440::t_ab6dc08084083a 1-71
+proto/syntra/v1/rpc.proto
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-36
+crates/syntra-ffi/Cargo.toml
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-30
+conformance/test-vectors/websocket/README.md
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-22
+tests/integration/get_put.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-31
+crates/syntra-web/tests/browser.md
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-43
+.github/workflows/ci.yml
+  s_5c4abee0a91914::t_92287fb692b3a0 12,21
+  s_d9263120a30440::t_ab6dc08084083a 1-11,13-20,22-49
+crates/syntra-runtime/src/recovery/reconcile.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-205
+crates/syntra-ws/src/error.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-65
+Cargo.toml
+  s_d9263120a30440::t_ab6dc08084083a 17-18
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-16,19-31
+crates/syntra-ws/src/lib.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-43
+crates/syntra-runtime/src/recovery/cache.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-119
+crates/syntra-core/tests/codec_vectors.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-599
+crates/syntra-runtime/src/recovery/engine.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-569
+conformance/test-vectors/tcp/README.md
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-7
+crates/syntra-ws/tests/lifecycle.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-275
+crates/syntra-runtime/tests/integration.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-540
+crates/syntra-ffi/include/syntra.h
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-80
+crates/syntra-runtime/CHANGELOG.md
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-16
+conformance/test-vectors/websocket/close-codes.md
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-29
+crates/syntra-core/src/handshake.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-135
+crates/syntra-ws/Cargo.toml
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-44
+CONTRIBUTING.md
+  s_d9263120a30440::t_ab6dc08084083a 1-13,15-16,18-45
+  s_5c4abee0a91914::t_92287fb692b3a0 14,17
+crates/syntra-runtime/src/policy.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-328
+crates/syntra-ffi/tests/production_smoke.c
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-51
+crates/syntra-core/Cargo.toml
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-21
+crates/syntra-runtime/src/host.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-1695
+tests/integration/events.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-17
+conformance/test-vectors/tcp/vectors.json
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1
+crates/syntra-runtime/src/recovery.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-483
+crates/syntra-web/tests/client.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-39
+conformance/test-vectors/README.md
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-27
+crates/syntra-ws/src/wasm.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-222
+.gitignore
+  s_d9263120a30440::t_ab6dc08084083a 1-5
+crates/syntra-runtime/src/recovery/store.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-155
+crates/syntra-ffi/tests/fixture_smoke.c
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-41
+crates/syntra-ffi/include/syntra_production.h
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-132
+conformance/test-vectors/http/http2-sequence.md
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-28
+conformance/test-vectors/websocket/fixtures.yaml
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-85
+proto/syntra/v1/envelope.proto
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-42
+proto/syntra/v1/handshake.proto
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-29
+README.md
+  s_5c4abee0a91914::t_92287fb692b3a0 26,31,60
+  s_d9263120a30440::t_ab6dc08084083a 2-25,27-30,32-59,61-106
+crates/syntra-web/CHANGELOG.md
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-12
+crates/syntra-core/src/state.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-117
+crates/syntra-ws/tests/websocket_vectors.rs
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-537
+proto/syntra/v1/recovery_profile.proto
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-478
+conformance/test-vectors/http/README.md
+  s_5c4abee0a91914::t_30fe6398b2c7b3 1-7
+Cargo.lock
+  s_5c4abee0a91914::t_347d611e048528 1-1439
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fca1063515d3966be71e9844346e7cbc53769c76",
+  "prompts": {},
+  "sessions": {
+    "s_5c4abee0a91914": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e822dc2c8ffeuoSnmey9d4Bf5l",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    },
+    "s_d9263120a30440": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e80e83ac2ffegH0E2A3rch37H4",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}
