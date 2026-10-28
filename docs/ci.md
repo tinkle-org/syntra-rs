@@ -261,8 +261,12 @@ Branch ruleset for `main` (replace the current allowlist-only rule):
   re-runs `required`.
 - Dependency graph and Dependabot alerts: enable Settings → Code security →
   Dependency graph plus Dependabot alerts and security updates. The
-  `dependency review` job fails while the graph is disabled; it is excluded
-  from `required CI status` so it signals without blocking merge.
+  `dependency review` job tolerates failures only when the base graph is
+  unavailable and is excluded from `required CI status`. PR #1 adds the first
+  Cargo manifests while main has only README, so no base graph exists to
+  compare; after merge the graph populates and later PRs fail on high-severity
+  or denied-license findings. `cargo-deny` + `cargo-audit` remain blocking in
+  the security job.
 - Secrets: none for PR CI (`contents: read` only). Release needs only the
   OIDC `id-token: write` + environment approval; provenance/SHA256 are
   informational artifacts.

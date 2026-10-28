@@ -192,16 +192,48 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-    # Requires Dependency graph enabled in repo settings; excluded from
-    # required status so a disabled graph signals without blocking merge.
+    outputs:
+      has_manifests: ${{ steps.base.outputs.has_manifests }}
+    # Tolerate failures only when the base dependency graph is unavailable
+    # (e.g. PR #1 introduces the first Cargo.lock while main has only README).
+    # Once the graph exists, high-severity or denied-license findings fail.
+    # cargo-deny + cargo-audit in the security job remain blocking.
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+      - name: Check base manifests
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REF: ${{ github.base_ref }}
+          TARGET_REPO: ${{ github.repository }}
+        run: |
+          if gh api --method GET "repos/${TARGET_REPO}/contents/Cargo.lock" -f ref="$BASE_REF" >/dev/null 2>/tmp/gh_err.txt; then
+            echo "has_manifests=true" >> "$GITHUB_OUTPUT"
+          elif grep -q "HTTP 404" /tmp/gh_err.txt; then
+            echo "has_manifests=false" >> "$GITHUB_OUTPUT"
+          else
+            cat /tmp/gh_err.txt >&2
+            exit 1
+          fi
+      - name: Dependency review
+        id: review
+        continue-on-error: true
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
         with:
           fail-on-severity: high
           deny-licenses: GPL-2.0, GPL-3.0, AGPL-3.0, LGPL-2.0, LGPL-2.1, LGPL-3.0
+      - name: Enforce review when graph exists
+        run: |
+          if [ "${{ steps.review.outcome }}" = "failure" ]; then
+            if [ "${{ steps.base.outputs.has_manifests }}" = "true" ]; then
+              echo "Dependency review failed with graph available; failing workflow."
+              exit 1
+            else
+              echo "Dependency review unavailable (no base graph); tolerating as informational."
+            fi
+          fi
 
   actionlint:
     name: actionlint workflows
@@ -223,7 +255,7 @@ jobs:
 
   required:
     name: required CI status
-    needs: [clippy, rust, generated-rust, package, security, actionlint]
+    needs: [clippy, rust, generated-rust, package, security, actionlint, dependency-review]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -237,14 +269,27 @@ jobs:
           results = json.loads(os.environ["NEEDS_JSON"])
           print(results)
           bad = {k: v.get("result") for k, v in results.items()}
-          if any(r not in ("success", "skipped") for r in bad.values()):
-              raise SystemExit(f"required jobs did not all succeed: {bad}")
+          # Check all required jobs except dependency-review (handled separately below).
+          for k, r in bad.items():
+              if k == "dependency-review":
+                  continue
+              if r not in ("success", "skipped"):
+                  raise SystemExit(f"required jobs did not all succeed: {bad}")
           # rust and generated-rust are hard requirements: skipped is not success.
           # fmt is informational while inherited formatting differences remain
           # (see docs/ci.md §2); do not hard-require it until the follow-up lands.
           for hard in ("rust", "generated-rust"):
               if bad.get(hard) != "success":
                   raise SystemExit(f"hard-required job {hard} was {bad.get(hard)}")
+          # Include dependency-review when it was applicable: fail required
+          # if the review failed while the base graph existed. Preserve the
+          # existing tolerated behavior when review was skipped or the base
+          # had no manifests.
+          dep = results.get("dependency-review", {})
+          dep_result = dep.get("result")
+          dep_manifests = (dep.get("outputs") or {}).get("has_manifests")
+          if dep_result == "failure" and dep_manifests != "false":
+              raise SystemExit(f"dependency-review failed with graph available: {bad}")
           print("required CI status: pass")
           EOF
         env:
