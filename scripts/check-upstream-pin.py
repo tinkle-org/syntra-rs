@@ -1,10 +1,14 @@
-"""Verify the checked-in snapshot matches the pinned upstream Syntra revision.
+"""Verify pin-reference consistency for the pinned upstream Syntra revision
+and presence of local snapshot directories.
 
 Ensures reproducible builds do not silently follow a floating upstream main:
 - README.md, MIGRATION.md and buf.gen.yaml must reference the same pinned
   upstream commit.
 - The snapshot-comment files must use pinned upstream URLs, not
   repository-relative paths that resolve to absent local files.
+
+This checks reference consistency and directory presence only; it does not
+compare snapshot file contents against the upstream commit.
 
 Run: python3 scripts/check-upstream-pin.py
 Requires Python 3 (stdlib only). No network access.
@@ -52,7 +56,9 @@ def main() -> int:
     if "compatibility/v1-initial/image.json" in buf_stripped:
         return fail("buf.yaml has an unpinned compatibility reference")
 
-    if "specifications/schema/reference.md" in envelope and PINNED_URL not in envelope:
+    pinned_schema = f"{PINNED_URL}/specifications/schema/reference.md"
+    envelope_stripped = envelope.replace(pinned_schema, "")
+    if "specifications/schema/reference.md" in envelope_stripped:
         return fail("envelope.proto still uses a relative specification reference")
 
     # The three pin-link styles must all resolve to the same commit.
@@ -61,6 +67,8 @@ def main() -> int:
         return fail(f"mixed upstream pins found: {sorted(urls)} (expected only {PINNED})")
 
     # Local snapshot directories must exist; upstream authority stays remote.
+    # This checks pin-reference consistency and directory presence only, not
+    # snapshot contents against the pinned commit.
     for path in [ROOT / "proto", ROOT / "conformance/test-vectors"]:
         if not path.is_dir():
             return fail(f"missing local snapshot {path.relative_to(ROOT)}")

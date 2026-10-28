@@ -705,10 +705,17 @@ impl Initiator {
     /// carried totals; a waiter subscribed before the publish cannot
     /// miss it.
     pub async fn next_notification_with_loss(&self) -> (Option<Vec<u8>>, (u64, u64)) {
+        // Capture the baseline before subscribing so a loss published between
+        // the counter read and the subscription is not folded into it.
+        let baseline_pre = self.notification_loss();
         let mut loss_rx = self.conn.shared.notification_loss_tx.subscribe();
-        // Baseline from the subscription itself: a loss published between
-        // subscribe and loop entry must not be folded into the baseline.
-        let mut baseline = *loss_rx.borrow_and_update();
+        // If the watch already observes a newer value, preserve it instead of
+        // marking it seen and blocking for another change.
+        let cur = *loss_rx.borrow();
+        if cur != baseline_pre {
+            return (None, cur);
+        }
+        let mut baseline = baseline_pre;
         let mut closed_rx = self.conn.subscribe_close();
         loop {
             tokio::select! {

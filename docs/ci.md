@@ -180,9 +180,9 @@ record upstream commit + paths and update `MIGRATION.md`.
   features only (no ABI), never `--all-features`. The former hand-crafted
   `release.yml` tag workflow has been removed; release-plz is the sole release
   path.
-- Provenance: release jobs emit `SHA256SUMS.txt`; binary artifacts are
-  source-only crates (no required native binaries); attestations can be added
-  via the release environment without changing PR CI.
+- Provenance: binary artifacts are source-only crates (no required native
+  binaries); attestations can be added via the release environment without
+  changing PR CI.
 - Go interop: `tinkle-org/syntra-go` native tests use an explicit Rust
   revision (this PR: `fca1063515d3966be71e9844346e7cbc53769c76`; going forward:
   immutable per-crate tags or reviewed commits, recorded in the Go PR). Test
@@ -259,6 +259,10 @@ Branch ruleset for `main` (replace the current allowlist-only rule):
   publishing permissions before the first post-extraction release.
 - Dependabot: auto-update pinned actions; each bump is a reviewed PR that
   re-runs `required`.
+- Dependency graph and Dependabot alerts: enable Settings → Code security →
+  Dependency graph plus Dependabot alerts and security updates. The
+  `dependency review` job fails while the graph is disabled; it is excluded
+  from `required CI status` so it signals without blocking merge.
 - Secrets: none for PR CI (`contents: read` only). Release needs only the
   OIDC `id-token: write` + environment approval; provenance/SHA256 are
   informational artifacts.
