@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package syntra.v1;
+
+option go_package = "github.com/tinklehq/syntra/bindings/go/gen/syntra/v1;syntrav1";
+
+// Notification is the published uncorrelated event name (SNTR-EVENT-001..008).
+// It does not imply processing, durability, replay, or delivery acknowledgment.
+// Subscriptions use application-defined RPCs. Core stream state, cursors,
+// ReplayRequest/ReplayResponse, and acknowledgments await a capability RFC.
+message Notification {
+  // payload is opaque application bytes; empty is valid (SNTR-WIRE-007).
+  bytes payload = 1;
+}

@@ -1,0 +1,32 @@
+# Exact TCP byte vectors (Section K): [length][protobuf] (machine-readable)
+# Companion to test-vectors/tcp/vectors.json (identical wire_hex). Each unit on
+# the wire is the 4-byte big-endian length followed by exactly those bytes.
+# These bytes ARE byte-exact for the chosen contained fixture (framing prefix
+# plus that fixture). They do NOT freeze Protobuf encoding in general.
+format_version: "1.0"
+default_max_frame_bytes: 1048576
+units:
+  - { id: V1, meaning: "Valid hello unit, canonical order", wire_hex: "000000080801520408011001", handling: "accept" }
+  - { id: V2, meaning: "Same logical hello, fields reordered", wire_hex: "000000085204080110010801", handling: "accept identically to V1" }
+  - { id: V3, meaning: "Two concatenated V1 units (second violates single-hello rule)", wire_hex: "000000080801520408011001000000080801520408011001", handling: "first accepted; second fails handshake (FAILED_PRECONDITION) and closes" }
+  - { id: V4, meaning: "Maximum-boundary construction", prefix_hex: "00100000", payload: "exactly 1048576 bytes forming one valid Frame", handling: "accept iff a valid unit within the bound" }
+  - { id: V5, meaning: "Zero-length frame", wire_hex: "00000000", handling: "reject as malformed; close in all states" }
+  - { id: V6, meaning: "Oversized length prefix (max+1)", wire_hex: "00100001", payload: "none required — reject on the prefix alone before allocating", handling: "close immediately" }
+  - { id: V7, meaning: "Truncated prefix then EOF", wire_hex: "0000", handling: "truncated unit; close" }
+  - { id: V8, meaning: "Truncated payload then EOF", wire_hex: "00000008080152", handling: "truncated unit; close" }
+  - { id: V9, meaning: "Short length then remainder (strict framing)", wire_hex: "000000020801520408011001", handling: "first unit Frame{version:1} with no body (invalid envelope); remainder frames the next unit; no rescan" }
+  - id: V10
+    meaning: "Request unit (echo) from GOLD-PROT-REQ-01 with length prefix"
+    wire_hex: "0000002408011007621e0a122f6578616d706c652e4563686f2f4563686f120568656c6c6f18f403"
+    handling: "accept in ACTIVE; exactly one terminal result with request_id 7"
+  - id: V11
+    meaning: "Success result unit (echo) from GOLD-PROT-RES-OK-01 with length prefix"
+    wire_hex: "0000000d080110076a070a0568656c6c6f"
+    handling: "completes request 7 with bit-identical payload"
+  - id: V12
+    meaning: "Notification unit (event) from GOLD-PROT-EVENT-01 with length prefix"
+    wire_hex: "0000000d08017a090a076576656e742d31"
+    handling: "delivered as event; completes no RPC"
+notes:
+  - "V1/V2/V10/V11/V12 verified: contained payloads decode with protoc to the stated logical Frames."
+  - "Length prefix is the 4-byte big-endian count of the payload only. V10 prefix 0x24 = 36; V11/V12 prefix 0x0d = 13."

@@ -1,0 +1,85 @@
+# WebSocket fixtures (Section M) — Upgrade, subprotocol, framing, close (machine-readable)
+# Companion to test-vectors/websocket/vectors.md (identical bytes).
+# No raw TLS byte vectors are defined: WSS reuses every vector below with the
+# bytes carried inside the TLS 1.3 channel. TLS fixtures are harness-named
+# references owned by specifications/security/*, never embedded bytes.
+# C = initiator (masks frames), H = host (never masks).
+format_version: "1.0"
+fixtures:
+  - id: websocket/VEC-WS-001
+    kind: upgrade_request
+    text: |
+      GET /syntra/v1/ws HTTP/1.1
+      Host: syntra.example:80
+      Upgrade: websocket
+      Connection: Upgrade
+      Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+      Sec-WebSocket-Version: 13
+      Sec-WebSocket-Protocol: syntra.v1
+    asserts: ["exact path /syntra/v1/ws (no trailing slash)", "no credential in target, query, or headers", "syntra.v1 offered first", "Origin (if present) is a browser signal only, never authentication"]
+
+  - id: websocket/VEC-WS-002
+    kind: upgrade_response
+    text: |
+      HTTP/1.1 101 Switching Protocols
+      Upgrade: websocket
+      Connection: Upgrade
+      Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+      Sec-WebSocket-Protocol: syntra.v1
+    asserts: ["Accept derived per RFC 6455 4.2.2 from the VEC-WS-001 key", "absent or non-syntra.v1 protocol means NOT Syntra: client aborts without envelopes"]
+
+  - id: websocket/VEC-WS-003
+    kind: binary_message
+    shape: "H->C byte0 0x82 (FIN=1, opcode 0x2); byte1 LEN marker (0..125 directly, 0x7E+16-bit or 0x7F+64-bit for large); then exactly LEN bytes of protobuf(Frame), no transport prefix/suffix. C->H sets MASK, inserts a 4-byte masking key after the length, and XORs every payload byte with key[i mod 4]."
+    example: "ACTIVE echo: Frame{version:1, request_id:7, request{/example.Echo/Echo, opaque, 500ms}} as one message; peer returns one Frame{id:7, result{...}} message"
+    asserts: ["one message decodes directly to one Frame", "client frames masked, server frames unmasked"]
+
+  - id: websocket/VEC-WS-004
+    kind: fragmented_message
+    shape: "C->H 0x02 first chunk (FIN=0); H->C Ping; C->H masked Pong (VEC-WS-005); C->H 0x00 middle chunk (FIN=0); C->H 0x80 final chunk (FIN=1); every client frame sets MASK, includes a 4-byte masking key, and XORs its payload"
+    asserts: ["reassemble all chunks in order (total LEN) before decoding", "Ping/Pong handled at WS layer without disturbing reassembly", "exactly one Frame processed"]
+
+  - id: websocket/VEC-WS-005
+    kind: ping_pong
+    shape: "H->C 0x89 0x06 0x70 0x69 0x6E 0x67 0x2D 0x31; C->H 0x8A 0x86 0x37 0xFA 0x21 0x3D 0x47 0x93 0x4F 0x5A 0x1A 0xCB (MASK=1, key 37fa213d, XOR payload decodes to ping-1)"
+    server_wire_hex: "890670696e672d31"
+    client_wire_hex: "8a8637fa213d47934f5a1acb"
+    asserts: ["each Ping answered with identical payload", "unsolicited Pong accepted and ignored: no envelope, no event, no state change"]
+
+  - id: websocket/VEC-WS-006
+    kind: close_handshake
+    shape: "C->H 0x88 0x82 0x37 0xFA 0x21 0x3D 0x34 0x12 (Close 1000: MASK=1, key 37fa213d, XOR payload decodes to 03e8); H->C 0x88 0x02 0x03 0xE8; then TCP close (close_notify first for WSS)"
+    client_wire_hex: "888237fa213d3412"
+    server_wire_hex: "880203e8"
+    asserts: ["clean Close handshake per RFC 6455 section 7", "reason text (if any) carries no credentials or raw bytes"]
+
+  - id: websocket/VEC-WS-007
+    kind: close_codes
+    mapping:
+      text_message_received: { code: 1003, wire: "0x03EB", context: "UNSUPPORTED DATA" }
+      second_hello_or_preactive_rpc_or_request_id_misuse_or_unknown_variant: { code: 1002, wire: "0x03EA", context: "PROTOCOL ERROR" }
+      malformed_protobuf_or_reserved_16_17: { code: 1007, wire: "0x03EF", context: "INVALID PAYLOAD" }
+      auth_denial_post_101: { code: 1008, wire: "0x03F0", context: "POLICY VIOLATION" }
+      assembled_length_over_max: { code: 1009, wire: "0x03F1", context: "MESSAGE TOO BIG" }
+      host_internal_failure: { code: 1011, wire: "0x03F3", context: "INTERNAL ERROR" }
+      going_away_or_idle_or_shutdown: { code: 1001, wire: "0x03E9" }
+    asserts: ["codes 1005, 1006, 1015 MUST NEVER appear on the wire (local-only statuses)"]
+
+  - id: websocket/VEC-WS-008
+    kind: oversize_boundary
+    rule: "default MAX 1048576: exactly 1048576 accepted (subject to valid decode); exactly 1048577 (whole or fragmented) triggers stop-accumulating, discard, Close 1009, RESOURCE_EXHAUSTED context"
+    asserts: ["harness tests both sides of the serialized envelope boundary", "exactly-MAX acceptance requires a valid Frame within all field limits and legal state; adjust opaque payload length for tags/lengths/envelope overhead, using 0x55 only inside the payload, never as the whole message"]
+
+  - id: websocket/VEC-WS-009
+    kind: no_length_prefix_negative_proof
+    good: "C->H [0x82][MASK|LEN][4-byte key][XOR-masked protobuf(Frame)] -> accepted for frame_hex; H->C uses [0x82][LEN][protobuf(Frame)] for a host-legal Frame"
+    frame_hex: "0801520408011001"
+    frame_context: "C->H Frame{version:1, hello{min_version:1, max_version:1}} in CONNECTED with anonymous acceptance enabled (same protobuf payload as tcp/V1)"
+    unknown_field_good: "Append d2050178 (unknown field 90, length-delimited value x) to frame_hex and update WS LEN: accepted as the same logical Frame per SNTR-SER-003"
+    bad:
+      - "Payload 08 + frame_hex (varint length 8 prepended) -> rejected INVALID_ARGUMENT; malformed protobuf, no prefix stripping"
+      - "Payload 00000008 + frame_hex (u32 big-endian length 8 prepended) -> rejected INVALID_ARGUMENT; illegal field-zero tag"
+      - "Payload frame_hex + 0x00 (malformed suffix: illegal field-zero tag) -> rejected INVALID_ARGUMENT"
+    asserts: ["receivers decode the entire message payload directly as one Frame with no prefix stripping", "malformed suffix rejected; valid appended unknown fields accepted subject to bounds, reserved-tag rejection, and envelope validation; protobuf has no intrinsic message-end marker"]
+masking_notes: "Fixed keys above are deterministic test fixtures only. Real clients use fresh unpredictable masking keys for every frame per RFC 6455, including Pong and Close; servers never mask. All client payload bytes, including close codes/reasons, are XOR-masked."
+wss_notes: "All vectors above run unchanged over WSS inside the TLS 1.3 channel: TLS handshake (SNI, ALPN http/1.1 where negotiated, chain + hostname + expiry validation) -> Upgrade bytes (same path, wss scheme in the logical URI) -> binary messages (same opcodes) -> Close handshake -> close_notify -> TCP close. No Syntra byte precedes successful validation."

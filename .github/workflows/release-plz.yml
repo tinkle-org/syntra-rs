@@ -1,0 +1,125 @@
+name: Release-plz
+
+# Automated Release PRs and trusted-publishing releases for the five-crate
+# workspace. `release-pr` opens/updates a reviewed Release PR on pushes to
+# main; `release` publishes only when that Release PR merges (release_always
+# is false in release-plz.toml), so merging to main alone never publishes.
+# Per-crate tags use the default `{{ package }}-v{{ version }}` pattern, which
+# matches the required immutable `syntra-<crate>-vX.Y.Z` scheme.
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RUSTUP_TOOLCHAIN: "1.88.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate-release:
+    name: Release validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: "1.88.0"
+          targets: wasm32-unknown-unknown
+      - name: Install Python and Buf
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.14"
+      - name: Setup Buf
+        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+        with:
+          version: "1.59.0"
+          github_token: ${{ github.token }}
+      - name: Full validation plus release-profile checks
+        run: |
+          cargo test --locked --workspace
+          cargo test --locked -p syntra-ffi --no-default-features --features production
+          cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
+          cargo check --locked -p syntra-core -p syntra-runtime -p syntra-ws -p syntra-web --target wasm32-unknown-unknown
+          python3 crates/syntra-ffi/tests/build_contract.py
+          python3 scripts/check-generated.py
+          python3 scripts/check-upstream-pin.py
+          cargo install --locked cargo-deny --version 0.20.2
+          cargo install --locked cargo-audit --version 0.22.2
+          cargo deny --locked check advisories licenses sources
+          cargo audit --deny warnings
+          cargo build --locked --release -p syntra-ffi --no-default-features --features production
+          if command -v nm >/dev/null; then nm -D --defined-only target/release/libsyntra_ffi.so | grep -E "syntra_ffi_(client_open|host_open|abi_version)" || (echo "missing production symbols in release artifact" >&2; exit 1); fi
+          if nm -D --defined-only target/release/libsyntra_ffi.so 2>/dev/null | grep -q "syntra_open"; then echo "test-only syntra_open in production release artifact" >&2; exit 1; fi
+          for p in syntra-core syntra-runtime syntra-ws syntra-web syntra-ffi; do cargo package --locked -p "$p" --list; cargo package --locked -p "$p" --no-verify; done
+
+  release-plz-release:
+    name: Release-plz release
+    needs: [validate-release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    if: github.repository_owner == 'tinkle-org'
+    permissions:
+      contents: write
+      pull-requests: read
+      id-token: write
+    environment: crates-io-publish
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: "1.88.0"
+      - name: Run release-plz release
+        uses: MarcoIeni/release-plz-action@476794ede164c5137bfc3a1dc6ed3675275690f9 # v0.5.99
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    if: github.repository_owner == 'tinkle-org'
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-pr-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: "1.88.0"
+      - name: Run release-plz release-pr
+        uses: MarcoIeni/release-plz-action@476794ede164c5137bfc3a1dc6ed3675275690f9 # v0.5.99
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

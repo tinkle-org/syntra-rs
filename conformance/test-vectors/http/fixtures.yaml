@@ -1,0 +1,104 @@
+# HTTP fixtures (Section L) — example requests/responses (machine-readable)
+# Companion to test-vectors/http/request-response-examples.md (identical bytes).
+# Hosts are reserved documentation names (syntra.example); the credential is the
+# throwaway fixture opaque-test-credential-A (base64 b3BhcXVlLXRlc3QtY3JlZGVudGlhbC1B).
+# Bodies reference test-vectors/protobuf/vectors.yaml by frame_b64.
+format_version: "1.0"
+media_type: "application/vnd.syntra.v1+protobuf"
+path: "/syntra/v1/rpc"
+fixtures:
+  - id: http/V-HTTP-REQ-01
+    kind: request_envelope
+    logical: "Frame{version:1, request_id:7, request{/example.Echo/Echo, payload hello, timeout 500ms}}"
+    frame_b64: "CAEQB2IeChIvZXhhbXBsZS5FY2hvL0VjaG8SBWhlbGxvGPQD"
+    frame_length_bytes: 36
+
+  - id: http/V-HTTP-REQ-UNKNOWN-01
+    kind: request_envelope
+    logical: "Frame{version:1, request_id:7, request{/example.Unknown/Call, payload hello, timeout 500ms}}"
+    frame_b64: "CAEQB2IhChUvZXhhbXBsZS5Vbmtub3duL0NhbGwSBWhlbGxvGPQD"
+    frame_length_bytes: 39
+
+  - id: http/V-HTTP-RES-OK-01
+    kind: response_envelope
+    logical: "Frame{version:1, request_id:7, result{payload hello}}"
+    frame_b64: "CAEQB2oHCgVoZWxsbw=="
+    frame_length_bytes: 13
+
+  - id: http/V-HTTP-RES-ERR-01
+    kind: response_envelope
+    logical: "Frame{version:1, request_id:7, result{error{UNIMPLEMENTED, 'unknown method'}}}"
+    frame_b64: "CAEQB2oUEhIIDBIOdW5rbm93biBtZXRob2Q="
+    frame_length_bytes: 26
+
+exchanges:
+  - id: http/X-HTTP-01
+    name: "canonical success"
+    request: |
+      POST /syntra/v1/rpc HTTP/1.1
+      Host: syntra.example
+      Content-Type: application/vnd.syntra.v1+protobuf
+      Content-Length: 36
+      Syntra-Min-Version: 1
+      Syntra-Max-Version: 1
+      Authorization: Syntra b3BhcXVlLXRlc3QtY3JlZGVudGlhbC1B
+      Cache-Control: no-store
+    response: |
+      HTTP/1.1 200 OK
+      Content-Type: application/vnd.syntra.v1+protobuf
+      Content-Length: 13
+      Syntra-Version: 1
+      Cache-Control: no-store
+    asserts: ["status 200", "response Content-Type exact", "Syntra-Version equals envelope version", "echoed request_id 7", "outcome set -> success payload hello"]
+
+  - id: http/X-HTTP-02
+    name: "application error stays 200"
+    request_envelope: http/V-HTTP-REQ-UNKNOWN-01
+    response_envelope: http/V-HTTP-RES-ERR-01
+    request: |
+      POST /syntra/v1/rpc HTTP/1.1
+      Host: syntra.example
+      Content-Type: application/vnd.syntra.v1+protobuf
+      Content-Length: 39
+      Syntra-Min-Version: 1
+      Syntra-Max-Version: 1
+      Authorization: Syntra b3BhcXVlLXRlc3QtY3JlZGVudGlhbC1B
+      Cache-Control: no-store
+    request_body: "CAEQB2IhChUvZXhhbXBsZS5Vbmtub3duL0NhbGwSBWhlbGxvGPQD"
+    response: |
+      HTTP/1.1 200 OK
+      Content-Type: application/vnd.syntra.v1+protobuf
+      Content-Length: 26
+      Syntra-Version: 1
+      Cache-Control: no-store
+    asserts: ["UNIMPLEMENTED verdict travels inside the envelope", "harness MUST fail if this ever surfaces as 404/500"]
+
+  - id: http/X-HTTP-03
+    name: "bad credential is 401 with no envelope"
+    response: |
+      HTTP/1.1 401 Unauthorized
+      WWW-Authenticate: Syntra realm="syntra"
+      Content-Length: 0
+      Cache-Control: no-store
+    asserts: ["empty body", "initiator MUST NOT parse a body here", "local UNAUTHENTICATED without synthesizing RpcResult"]
+
+  - id: http/X-HTTP-04
+    name: "oversize body is 413 without reading"
+    request_note: "declares Content-Length: 1048577 (MAX+1)"
+    response: |
+      HTTP/1.1 413 Content Too Large
+      Content-Length: 0
+      Cache-Control: no-store
+
+  - id: http/X-HTTP-05
+    name: "wrong media type is 415"
+    request_note: "Content-Type: application/octet-stream"
+    response: |
+      HTTP/1.1 415 Unsupported Media Type
+      Content-Length: 0
+      Cache-Control: no-store
+
+  - id: http/X-HTTP-06
+    name: "anonymous attempt"
+    request: "X-HTTP-01 minus the Authorization header"
+    response: "200 envelope bound to least-privilege anonymous principal (accepting hosts) or X-HTTP-03 (denying hosts); no state carries to the next exchange"

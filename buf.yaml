@@ -1,0 +1,22 @@
+# Syntra schema module (Buf v2). No Buf Schema Registry publication:
+# distribution is Git tags + GitHub Releases only (see the pinned upstream
+# https://github.com/tinkle-org/syntra/blob/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/docs/schema-registry.md). Single module rooted at proto (the sole source
+# of truth), STANDARD lint and FILE breaking with no exceptions, and zero
+# external dependencies (all imports resolve inside the module), so no
+# buf.lock is required. Any lint/breaking exception MUST cite its RFC.
+version: v2
+modules:
+  - path: proto
+    # No `name:` field by design. A module identity (`buf.build/...`) is
+    # only needed for `buf push` / `--against-registry` breaking checks,
+    # and this repository never pushes to BSR. Breaking baselines are Git
+    # checkouts and committed images (pinned upstream
+    # https://github.com/tinkle-org/syntra/blob/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/compatibility/v1-initial/image.json);
+    # see the pinned upstream schema-registry doc §§1, 9. Do not re-add a registry name
+    # without a maintainer decision recorded on a governance RFC.
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE

@@ -1,0 +1,9 @@
+// Reserved documentation entry point; there are no capability wire types yet.
+// SNTR-CAP-001..005 require an RFC-defined identifier and explicit binding.
+// No collection, parameters, or negotiation field is allocated before that
+// RFC specifies bounded lengths/counts and confirmation behavior (RFC 0001).
+syntax = "proto3";
+
+package syntra.v1;
+
+option go_package = "github.com/tinklehq/syntra/bindings/go/gen/syntra/v1;syntrav1";

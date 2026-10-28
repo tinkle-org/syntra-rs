@@ -1,0 +1,65 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Syntra real browser transport fixture</title>
+<pre id="result">Running configured fixtures…</pre>
+<script type="module">
+// See browser.md. All endpoints and the generated module are explicit;
+// there is deliberately no loopback:// or plaintext production fallback.
+const result = document.querySelector('#result');
+const params = new URL(location.href).searchParams;
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+const required = name => {
+  const value = params.get(name);
+  if (!value) throw new Error(`Missing fixture parameter: ${name}`);
+  return value;
+};
+const rejects = async promise => {
+  let rejected = false, reason;
+  try { await promise; } catch (error) { rejected = true; reason = error; }
+  assert(rejected, 'Expected rejection, not success/timeout');
+  return reason;
+};
+const bounded = (promise, ms) => new Promise((resolve, reject) => {
+  const timer = setTimeout(() => reject(new Error(`Fixture exceeded ${ms}ms`)), ms);
+  promise.then(resolve, reject).finally(() => clearTimeout(timer));
+});
+const ids = new Set();
+let api;
+try {
+  api = await import(required('module'));
+  await api.default();
+  const normal = required('normal'), oversize = required('oversize'), stall = required('stall');
+  for (const url of [normal, oversize, stall]) assert(new URL(url).protocol === 'wss:', 'Fixtures require trusted WSS');
+  const id = await bounded(api.connect(normal, new Uint8Array()), 12000);
+  ids.add(id);
+  await rejects(api.call(id, '/example.Nope/Missing', new Uint8Array(), 1000));
+  const payload = new Uint8Array([0, 255, 127]);
+  const echoed = await api.call(id, '/example.Echo/Echo', payload, 1000);
+  assert(echoed.length === 3 && echoed.every((b, i) => b === payload[i]), 'Echo after unknown method');
+  assert(await api.poll_notify(id, 20) === undefined, 'Open idle poll must time out');
+  // Install rejection handling before close to avoid unhandled rejections.
+  const pending = bounded(rejects(api.poll_notify(id, 10000)), 1000);
+  await api.close(id);
+  ids.delete(id);
+  await pending;
+  assert(!await api.close(id), 'Second close must be false');
+  await rejects(api.poll_notify(id, 20));
+  await rejects(api.call(id, '/example.Echo/Echo', payload, 1000));
+  const large = await bounded(api.connect(oversize, new Uint8Array()), 12000);
+  ids.add(large);
+  // The fixture sends MAX+1 after ready. It must never become a notification
+  // or a successful None timeout. Browser owns assembly and close wire code.
+  await bounded(rejects(api.poll_notify(large, 10000)), 2000);
+  const started = performance.now();
+  const timeoutError = await bounded(rejects(api.connect(stall, new Uint8Array())), 12000);
+  assert(String(timeoutError).includes('timed out'), 'Stalled fixture must hit configured connect deadline');
+  assert(performance.now() - started < 12000, 'Establishment deadline');
+  result.textContent = 'PASS: real browser WSS echo/rejection/timeout/close/oversize/connect deadline';
+  document.documentElement.dataset.result = 'pass';
+} catch (error) {
+  result.textContent = `FAIL: ${error.stack || error}`;
+  document.documentElement.dataset.result = 'fail';
+} finally {
+  if (api) for (const id of ids) await api.close(id);
+}
+</script>

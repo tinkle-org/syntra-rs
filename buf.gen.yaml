@@ -1,0 +1,10 @@
+# Rust-only extraction of the upstream template at
+# 2a91da7fdb96f3e75badf07614c14e4f85c9ba1c. Use Buf CLI 1.59.0.
+# Runtime: prost =0.13.5. Generated Rust must remain byte-identical.
+# Read-only drift check: python3 scripts/check-generated.py
+version: v2
+clean: true
+plugins:
+  - remote: buf.build/community/neoeinstein-prost:v0.4.0
+    revision: 1
+    out: crates/syntra-core/src/generated

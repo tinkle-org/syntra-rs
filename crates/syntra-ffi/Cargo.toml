@@ -1,0 +1,30 @@
+[package]
+name = "syntra-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Native C ABI surface: test fixture plus production frame-pump; no default ABI exports; WASM unsupported."
+
+[lib]
+name = "syntra_ffi"
+crate-type = ["cdylib", "staticlib"]
+
+[features]
+default = []
+# Test-only loopback ABI, NOT a production transport. Never enable in shipped
+# binaries (including via --all-features). Default builds expose no C ABI.
+test-fixture = ["dep:syntra-core", "dep:syntra-runtime", "dep:tokio"]
+# Production transport-agnostic frame-pump ABI. Native-only, no WASM.
+production = ["dep:syntra-core", "dep:prost"]
+
+[dependencies]
+prost = { workspace = true, optional = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+syntra-core = { path = "../syntra-core", version = "1.0.0-rc.1", optional = true }
+syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.1", optional = true }
+tokio = { version = "1", default-features = false, features = ["sync", "time", "rt-multi-thread", "macros"], optional = true }
