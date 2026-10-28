@@ -1,0 +1,26 @@
+docs/ci.md
+  s_74192ea8fd2b66::t_46b74a071626e4 264-269
+.github/workflows/ci.yml
+  s_74192ea8fd2b66::t_d7fb8af7a4e4b3 272
+  s_74192ea8fd2b66::t_e36707db21fdbe 195-196,214,216-218
+  s_74192ea8fd2b66::t_b22aeae8a70852 209-210
+  s_74192ea8fd2b66::t_5d2ed9c8bd74f0 212
+  s_74192ea8fd2b66::t_e0a0ba1f2eb87c 258,273-277,284-292
+  s_74192ea8fd2b66::t_753f0b140a43a8 197-200,205-208,211,213,215,219-223,227-236
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "90343ada5df40eed99cb19004f040ab44259777e",
+  "prompts": {},
+  "sessions": {
+    "s_74192ea8fd2b66": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e8097cf23ffeUtk0xixBSsFUUU",
+        "model": "muse-spark-1.3-contributor"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}
