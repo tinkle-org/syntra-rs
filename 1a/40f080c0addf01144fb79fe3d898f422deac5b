@@ -1,0 +1,29 @@
+crates/syntra-runtime/src/initiator.rs
+  s_74192ea8fd2b66::t_2957d88eec1e31 708-710,712-718
+.github/workflows/ci.yml
+  s_74192ea8fd2b66::t_0329ec47d76986 195-196
+scripts/check-upstream-pin.py
+  s_74192ea8fd2b66::t_e41840bb4827e3 1-2,10-11
+  s_74192ea8fd2b66::t_33fced8bfea6a4 59-61
+  s_74192ea8fd2b66::t_8fd538ffd309c1 70-71
+  s_74192ea8fd2b66::t_1f35826f53dd89 12
+docs/ci.md
+  s_74192ea8fd2b66::t_e58bc7ec57eca8 183-185
+  s_74192ea8fd2b66::t_5f974f54c20df4 262-265
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1a40f080c0addf01144fb79fe3d898f422deac5b",
+  "prompts": {},
+  "sessions": {
+    "s_74192ea8fd2b66": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e8097cf23ffeUtk0xixBSsFUUU",
+        "model": "muse-spark-1.3-contributor"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}
