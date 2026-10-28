@@ -288,8 +288,8 @@ jobs:
           dep = results.get("dependency-review", {})
           dep_result = dep.get("result")
           dep_manifests = (dep.get("outputs") or {}).get("has_manifests")
-          if dep_result == "failure" and dep_manifests != "false":
-              raise SystemExit(f"dependency-review failed with graph available: {bad}")
+          if dep_manifests != "false" and dep_result not in ("success", "skipped"):
+              raise SystemExit(f"dependency-review was {dep_result} with graph available: {bad}")
           print("required CI status: pass")
           EOF
         env:
