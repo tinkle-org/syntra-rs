@@ -90,7 +90,7 @@ jobs:
         with:
           toolchain: "1.88.0"
       - name: Run release-plz release
-        uses: MarcoIeni/release-plz-action@476794ede164c5137bfc3a1dc6ed3675275690f9 # v0.5.99
+        uses: MarcoIeni/release-plz-action@b2baf303c463c223526d52a8a91b0777f052cf3f # v0.5.146
         with:
           command: release
         env:
@@ -118,7 +118,7 @@ jobs:
         with:
           toolchain: "1.88.0"
       - name: Run release-plz release-pr
-        uses: MarcoIeni/release-plz-action@476794ede164c5137bfc3a1dc6ed3675275690f9 # v0.5.99
+        uses: MarcoIeni/release-plz-action@b2baf303c463c223526d52a8a91b0777f052cf3f # v0.5.146
         with:
           command: release-pr
         env:
