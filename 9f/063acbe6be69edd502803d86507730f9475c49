@@ -1,0 +1,19 @@
+.github/workflows/release-plz.yml
+  s_1cb9193a3cee49::t_801452e59a49bc 93,121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9f063acbe6be69edd502803d86507730f9475c49",
+  "prompts": {},
+  "sessions": {
+    "s_1cb9193a3cee49": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e76318abeffeyfGbAZ0dIhNoaw",
+        "model": "muse-spark-1.3-contributor"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}
