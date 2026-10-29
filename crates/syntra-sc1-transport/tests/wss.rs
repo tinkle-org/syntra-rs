@@ -551,10 +551,16 @@ async fn invalid_raw_upgrade_responses_never_receive_m1() {
                 .expect("client must close after invalid Upgrade");
             assert!(!matches!(next, Ok(n) if n > 0), "M1 leaked: {label}");
         });
-        assert!(
-            matches!(dial(&url, client).await, Err(Error::Configuration)),
-            "{label}"
-        );
+        let result = dial(&url, client).await;
+        if label == "truncated headers" {
+            // Peer closed before completing headers: socket failure, not validation.
+            assert!(matches!(result, Err(Error::Closed)), "{label}");
+        } else {
+            assert!(
+                matches!(result, Err(Error::Configuration)),
+                "{label}"
+            );
+        }
         task.await.unwrap();
     }
 }

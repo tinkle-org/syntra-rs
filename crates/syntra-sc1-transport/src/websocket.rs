@@ -36,6 +36,28 @@ pub const ENDPOINT_PATH: &str = "/syntra/v1/sc1/ws";
 const MAX_UPGRADE_HEADERS: usize = 16 * 1024;
 const MAX_UPGRADE_FIELDS: usize = 64;
 
+static NATIVE_ROOTS: std::sync::OnceLock<rustls::RootCertStore> = std::sync::OnceLock::new();
+
+// Platform root loading does file I/O and parsing (~300 KiB on some
+// platforms), so keep it off the async worker and cache it for repeated
+// dials. Empty stores are cached as well to keep the empty-root rejection
+// stable without retrying the expensive load.
+async fn native_roots() -> Result<rustls::RootCertStore, Error> {
+    if let Some(cached) = NATIVE_ROOTS.get() {
+        return Ok(cached.clone());
+    }
+    let roots = tokio::task::spawn_blocking(|| {
+        let loaded = rustls_native_certs::load_native_certs();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add_parsable_certificates(loaded.certs);
+        roots
+    })
+    .await
+    .map_err(|_| Error::Configuration)?;
+    let _ = NATIVE_ROOTS.set(roots.clone());
+    Ok(roots)
+}
+
 // Compatibility with tungstenite 0.26.2: its response verifier compares the
 // whole Connection value instead of its tokens and leaves extension validation
 // as TODO. Validate the original bytes here, then retain tungstenite's framing.
@@ -127,13 +149,13 @@ where
         }
         let n = stream.read(&mut chunk).await.map_err(|error| {
             if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                Error::Configuration
+                Error::Closed
             } else {
                 Error::Io(error)
             }
         })?;
         if n == 0 {
-            return Err(Error::Configuration);
+            return Err(Error::Closed);
         }
         received.extend_from_slice(&chunk[..n]);
     }
@@ -307,12 +329,10 @@ async fn connect_inner(
         HeaderValue::from_static(SUBPROTOCOL),
     );
     let connector = if parsed.scheme() == "wss" {
-        let roots = roots.unwrap_or_else(|| {
-            let loaded = rustls_native_certs::load_native_certs();
-            let mut roots = rustls::RootCertStore::empty();
-            roots.add_parsable_certificates(loaded.certs);
-            roots
-        });
+        let roots = match roots {
+            Some(roots) => roots,
+            None => native_roots().await?,
+        };
         if roots.is_empty() {
             return Err(Error::Configuration);
         }
