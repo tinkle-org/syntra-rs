@@ -1,0 +1,22 @@
+.github/workflows/ci.yml
+  s_ad7fcd4ea56150::t_97e4e740bcbdc9 230,232,234-236
+crates/syntra-integration/tests/sc1_containers.rs
+  s_ad7fcd4ea56150::t_3a4774ead2e767 84-86
+  s_ad7fcd4ea56150::t_e6f7649b1f7889 83
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "12517386e38c113527a54de70b06e37e836b8e92",
+  "prompts": {},
+  "sessions": {
+    "s_ad7fcd4ea56150": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e7a730078ffejE2LcVjPHHjaah",
+        "model": "gpt-6.1-terra"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}
