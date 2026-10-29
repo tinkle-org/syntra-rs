@@ -6,6 +6,16 @@ name: Release-plz
 # is false in release-plz.toml), so merging to main alone never publishes.
 # Per-crate tags use the default `{{ package }}-v{{ version }}` pattern, which
 # matches the required immutable `syntra-<crate>-vX.Y.Z` scheme.
+#
+# Toolchain split: `validate-release` builds and tests the crates pinned at
+# rust-toolchain.toml's 1.88.0, while the tooling lanes (`release-pr` and
+# `release`) run on stable rustc. The release-plz action bundles its own
+# cargo-semver-checks (hard-pinned inside the action, no input to override;
+# currently 0.51, which declares minimum rustc 1.93.0), and each semver-checks
+# release tracks the current stable rustc, so the 1.88.0 pin must not gate
+# these lanes. The job-level RUSTUP_TOOLCHAIN below overrides the workflow
+# default: the dtolnay action only sets `rustup default`, which an exported
+# RUSTUP_TOOLCHAIN shadows.
 
 on:
   push:
@@ -79,6 +89,9 @@ jobs:
       pull-requests: read
       id-token: write
     environment: crates-io-publish
+    # Tooling lane: stable rustc, not the 1.88.0 crate pin (see header).
+    env:
+      RUSTUP_TOOLCHAIN: "stable"
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -88,7 +101,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: "1.88.0"
+          toolchain: "stable"
       - name: Run release-plz release
         uses: MarcoIeni/release-plz-action@b2baf303c463c223526d52a8a91b0777f052cf3f # v0.5.146
         with:
@@ -107,6 +120,9 @@ jobs:
     concurrency:
       group: release-plz-pr-${{ github.ref }}
       cancel-in-progress: false
+    # Tooling lane: stable rustc, not the 1.88.0 crate pin (see header).
+    env:
+      RUSTUP_TOOLCHAIN: "stable"
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -116,7 +132,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: "1.88.0"
+          toolchain: "stable"
       - name: Run release-plz release-pr
         uses: MarcoIeni/release-plz-action@b2baf303c463c223526d52a8a91b0777f052cf3f # v0.5.146
         with:
