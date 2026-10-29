@@ -65,6 +65,7 @@ class BuildContract(unittest.TestCase):
             "--features", "production",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("syntra_open", self.symbols())
         for symbol in [
             "syntra_ffi_abi_version",
             "syntra_ffi_free",
@@ -100,6 +101,8 @@ class BuildContract(unittest.TestCase):
             "--features", "test-fixture",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("syntra_ffi_client_open", self.symbols())
+        self.assertNotIn("syntra_ffi_host_open", self.symbols())
         for symbol in ["syntra_open", "syntra_call", "syntra_poll_notify", "syntra_free"]:
             self.assertIn(symbol, self.symbols())
         executable = self.target / "fixture-smoke"

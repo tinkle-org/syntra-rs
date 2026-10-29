@@ -244,11 +244,16 @@ pub fn validate_frame(frame: &Frame, ctx: ValidationContext) -> Result<FrameKind
             _ => {}
         },
         ConnectionState::Closing => {
-            // Only drain existing RPCs. No re-handshake or event delivery.
-            if !matches!(kind, FrameKind::Result | FrameKind::Cancel) {
+            // Drain existing RPCs while tolerating already-queued events.
+            // Notifications never complete an RPC and never require admission;
+            // rejecting them here would turn a clean drain into misbehavior.
+            if !matches!(
+                kind,
+                FrameKind::Result | FrameKind::Cancel | FrameKind::Notification
+            ) {
                 return Err(SyntraError::Protocol {
                     code: ErrorCode::FailedPrecondition,
-                    message: "only result/cancel legal in CLOSING".to_string(),
+                    message: "only result/cancel/notification legal in CLOSING".to_string(),
                 });
             }
         }
@@ -396,7 +401,10 @@ fn scan_top_level(bytes: &[u8]) -> Result<ScanStats, SyntraError> {
         }
         i = skip_top_value(bytes, i, wire, field)?;
     }
-    Ok(ScanStats { unknown_present, body_present: body_count == 1 })
+    Ok(ScanStats {
+        unknown_present,
+        body_present: body_count == 1,
+    })
 }
 
 fn reject_reserved(field: u32) -> Result<(), SyntraError> {
@@ -618,12 +626,18 @@ mod tests {
         let wire_err = validate_wire_structure(&raw).expect_err("unknown-only must fail");
         assert!(matches!(
             wire_err,
-            SyntraError::Protocol { code: crate::error::ErrorCode::Unimplemented, .. }
+            SyntraError::Protocol {
+                code: crate::error::ErrorCode::Unimplemented,
+                ..
+            }
         ));
         let decode_err = decode_frame(&raw, ctx_active()).expect_err("unknown-only must fail");
         assert!(matches!(
             decode_err,
-            SyntraError::Protocol { code: crate::error::ErrorCode::Unimplemented, .. }
+            SyntraError::Protocol {
+                code: crate::error::ErrorCode::Unimplemented,
+                ..
+            }
         ));
     }
 

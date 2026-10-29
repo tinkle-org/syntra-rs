@@ -19,7 +19,8 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use subtle::ConstantTimeEq;
+use web_time::Instant;
 
 use syntra_core::{ErrorCode, SyntraError};
 
@@ -139,11 +140,7 @@ impl Authenticator for StaticToken {
         if self.token.is_empty() || credential.len() != self.token.len() {
             return Err(AuthError::unauthenticated());
         }
-        let mut diff = 0u8;
-        for (a, b) in credential.iter().zip(self.token.iter()) {
-            diff |= a ^ b;
-        }
-        if diff == 0 {
+        if bool::from(credential.ct_eq(self.token.as_slice())) {
             Ok(Principal::new(self.subject.clone()))
         } else {
             Err(AuthError::unauthenticated())
@@ -165,9 +162,15 @@ pub struct Session {
 /// Owns the connection-bound sessions of one host. Sessions are keyed by
 /// `connection_id` and discarded on close; there is deliberately no
 /// lookup-by-token and no resume path (SNTR-SESS-006).
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct SessionManager {
     inner: Arc<Mutex<HashMap<String, Session>>>,
+}
+
+impl std::fmt::Debug for SessionManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionManager").finish_non_exhaustive()
+    }
 }
 
 impl SessionManager {
@@ -213,6 +216,18 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_manager_debug_does_not_dump_principal() {
+        let manager = SessionManager::new();
+        manager.bind(Session {
+            connection_id: "private-id".into(),
+            principal: Principal::new("private-principal"),
+            version: 1,
+            established_at: Instant::now(),
+        });
+        assert_eq!(format!("{manager:?}"), "SessionManager { .. }");
+    }
 
     #[test]
     fn static_token_debug_redacts_credentials() {

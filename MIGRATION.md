@@ -69,3 +69,18 @@ Browser execution and cross-repository Go/native testing are separate.
 Crate names, versions, dependencies, lockfile, generated Rust, source logic
 and test fixtures retain the source baseline. This migration adds no Noise
 or SC1 implementation and makes no protocol behavior changes.
+
+## Post-extraction local additions
+
+On `feat/sc1-connectivity-and-benchmarks`, the workspace adds local-only
+crates that did not exist in the extraction commit: `syntra-secure-channel`
+(the SC1 Noise channel), `syntra-tcp` (the native TCP adapter and shared
+frame pump), `syntra-ws-sc1` plus `syntra-ws-sc1/tests/sc1.rs` (the native
+WebSocket SC1 binding), `syntra-integration` (the Docker-based connectivity
+suite and echo peer) and Criterion benchmarks under
+`crates/syntra-core/benches`, `crates/syntra-secure-channel/benches` and
+`crates/syntra-tcp/benches`. Root documents `SC1.md`, `BENCHMARKS.md` and
+`AUDIT.md` record this branch's implementation-specific SC1 local revision
+1 contract, timing boundaries and evidence ledger. None of these additions
+reinterprets the pinned upstream schema, and no upstream snapshot files were
+modified for them.

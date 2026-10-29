@@ -23,6 +23,7 @@ use std::sync::{
     Arc, Mutex as StdMutex,
 };
 use std::time::Duration;
+use web_time::Instant;
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, Notify, RwLock};
@@ -309,7 +310,7 @@ async fn wasm_sleep(d: Duration) {
     if d.is_zero() {
         return;
     }
-    let ms = d.as_millis().min(u32::MAX as u128) as u32;
+    let ms = d.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as u32;
     let promise = js_sys::Promise::new(&mut |resolve, _reject| {
         let global = js_sys::global();
         let set_timeout =
@@ -327,9 +328,12 @@ async fn wasm_sleep(d: Duration) {
 }
 
 /// Sleep until an absolute deadline (no-op when already past).
-pub(crate) async fn sleep_until(deadline: std::time::Instant) {
-    let now = std::time::Instant::now();
-    if deadline > now {
+pub(crate) async fn sleep_until(deadline: Instant) {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
         sleep(deadline - now).await;
     }
 }
@@ -490,6 +494,8 @@ pub(crate) struct Shared {
     pub handshake_tx: AsyncMutex<Option<oneshot::Sender<Result<HandshakeDone, SyntraError>>>>,
     pub config: ConnectionConfig,
     pub closed: AtomicBool,
+    pub(crate) principal_withdrawn: AtomicBool,
+    terminal_reason: StdMutex<Option<SyntraError>>,
     /// Intentional outbound admission fence. Unlike CLOSED, this leaves
     /// inbound validation and existing RPC waiters live until the pump drains.
     writer_fenced: AtomicBool,
@@ -540,6 +546,8 @@ impl Shared {
             handshake_tx: AsyncMutex::new(None),
             config,
             closed: AtomicBool::new(false),
+            principal_withdrawn: AtomicBool::new(false),
+            terminal_reason: StdMutex::new(None),
             writer_fenced: AtomicBool::new(false),
             misbehavior: AtomicU32::new(0),
             notification_dropped: AtomicU64::new(0),
@@ -688,10 +696,7 @@ impl Connection {
         }
     }
 
-    /// Graceful close from ACTIVE: stop new RPCs, then teardown.
-    /// Transport adapters observe CLOSING for the close handshake before
-    /// dropping; the core itself ends at CLOSED with in-flight RPCs
-    /// mapped to `UNAVAILABLE` (SNTR-HS-006/013).
+    /// Abortive close, settling unfinished RPCs with unknown outcome.
     pub async fn close(&self) {
         self.finish_close(
             SyntraError::Closed("connection closed".to_string()),
@@ -712,6 +717,69 @@ impl Connection {
         .await;
     }
 
+    /// First terminal local reason; subsequent teardown cannot overwrite it.
+    pub fn terminal_reason(&self) -> Option<SyntraError> {
+        self.shared
+            .terminal_reason
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn record_terminal_reason(&self, failure: SyntraError) {
+        self.shared
+            .terminal_reason
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(failure);
+    }
+
+    pub(crate) async fn fail_protocol_and_close(&self, failure: SyntraError) {
+        self.finish_close(failure, false, false).await;
+    }
+
+    pub(crate) async fn begin_closing(&self) {
+        let mut state = self.shared.state.write().await;
+        if *state == ConnectionState::Active {
+            *state = ConnectionState::Closing;
+        }
+    }
+
+    pub(crate) async fn drain_until(&self, deadline: Instant, drained: impl Fn() -> bool) {
+        let mut closed = self.subscribe_close();
+        while !self.is_closed() {
+            if drained() && self.shared.writer.capacity() == self.shared.writer.max_capacity() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            tokio::select! {
+                biased;
+                _ = closed.changed() => return,
+                _ = sleep_until(deadline.min(Instant::now() + Duration::from_millis(1))) => {},
+            }
+        }
+    }
+
+    pub(crate) async fn send_worker_result(
+        &self,
+        bytes: Vec<u8>,
+        complete: impl FnOnce(),
+    ) -> Result<(), SyntraError> {
+        let permit = self.reserve_writer().await?;
+        let _state = self.shared.state.read().await;
+        if self.is_closed()
+            || self.writer_is_fenced()
+            || self.shared.principal_withdrawn.load(Ordering::Acquire)
+        {
+            return Err(SyntraError::Closed("connection closed".to_string()));
+        }
+        permit.send(bytes);
+        complete();
+        Ok(())
+    }
+
     async fn finish_close(&self, failure: SyntraError, abrupt: bool, handshake_only: bool) {
         let mut state = self.shared.state.write().await;
         if handshake_only
@@ -727,6 +795,10 @@ impl Connection {
         // acquiring locks cannot leave a half-closed connection. No new
         // handshake can register between waiter failure and terminal state.
         let mut waiter = self.shared.handshake_tx.lock().await;
+        if self.is_closed() {
+            return;
+        }
+        self.record_terminal_reason(failure.clone());
         let cur = *state;
         let next = if abrupt {
             ConnectionState::Closed
@@ -823,9 +895,7 @@ impl Connection {
     pub fn notification_loss(&self) -> (u64, u64) {
         let _guard = self.shared.notification_loss_lock.lock().unwrap();
         (
-            self.shared
-                .notification_dropped
-                .load(Ordering::Relaxed),
+            self.shared.notification_dropped.load(Ordering::Relaxed),
             self.shared
                 .notification_dropped_bytes
                 .load(Ordering::Relaxed),

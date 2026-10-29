@@ -1,0 +1,66 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"
+
+concurrency:
+  group: benchmarks-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RUSTUP_TOOLCHAIN: "1.88.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benches:
+    name: in-memory benchmarks (report-only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: "1.88.0"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ runner.os }}-1.88.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-1.88.0-
+      - name: Compile benchmarks
+        run: cargo bench --workspace -- --test
+      - name: Run benchmarks (short, report-only)
+        # Target only the three Criterion harnesses: passing Criterion timing
+        # flags to the default libtest harness fails the run
+        # (`Unrecognized option`). The compile step above still covers every
+        # bench target with the harness-neutral `--test` selector.
+        run: |
+          cargo bench -p syntra-core --bench frame_codec -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
+          cargo bench -p syntra-secure-channel --bench channel -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
+          cargo bench -p syntra-tcp --bench pipe -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
+      - name: Record revision and toolchain
+        run: |
+          mkdir -p bench-meta
+          git rev-parse HEAD > bench-meta/revision.txt
+          git status --short --branch >> bench-meta/revision.txt
+          rustc --version > bench-meta/toolchain.txt
+          cargo --version >> bench-meta/toolchain.txt
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: criterion-${{ github.sha }}
+          path: |
+            target/criterion
+            bench-meta
+          retention-days: 14

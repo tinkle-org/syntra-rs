@@ -10,6 +10,14 @@
  *
  * Build the Rust library with:
  *   cargo build -p syntra-ffi --features production
+ *
+ * Non-null pointers must be aligned, live and valid for their stated lengths.
+ * Outputs must be writable and must not overlap other outputs or inputs.
+ * Every scalar/output-buffer pointer is required. An ID array may be NULL
+ * only when its capacity is zero. Invalid output pointers are rejected before
+ * mutating session state. Empty successful reads write NULL/0 and present=0.
+ * Panic containment does not make invalid non-null pointers, allocation aborts
+ * or panic=abort safe.
  */
 
 #include <stddef.h>
@@ -32,7 +40,9 @@ extern "C" {
 #define SYNTRA_FFI_EXPIRED (-5)
 #define SYNTRA_FFI_INTERNAL (-6)
 
-/* Opaque handles. Open exactly once, close exactly once. */
+/* Opaque handles. Close consumes and frees a handle, including on INTERNAL.
+ * Discard the pointer after close; no concurrent or subsequent use (including
+ * another close) is valid. CLOSED cannot diagnose use of a freed pointer. */
 typedef struct syntra_ffi_client syntra_ffi_client_t;
 typedef struct syntra_ffi_host syntra_ffi_host_t;
 
@@ -42,20 +52,28 @@ uint32_t syntra_ffi_abi_version(void);
 void syntra_ffi_free(uint8_t *ptr, uintptr_t len);
 
 /* Initiator core. credential (may be NULL iff len==0, max 16 KiB) is copied.
- * default_timeout_ms==0 defaults to 3000; max_concurrent==0 defaults to 16. */
+ * default_timeout_ms==0 defaults to 3000; max_concurrent==0 defaults to 16.
+ * Pending calls plus unread outcomes share max_concurrent admission slots
+ * (hard maximum 256), each frame at most 1 MiB. Take outcomes to release slots.
+ * Reusing an ID with an unread outcome is INVALID. Use distinct request IDs
+ * for the lifetime of a connection to avoid stale-response correlation. */
 /* hello/out buffers below are owned: free exactly once with syntra_ffi_free. */
 int32_t syntra_ffi_client_open(uint32_t min_version, uint32_t max_version,
     const uint8_t *credential, uintptr_t credential_len,
     uint32_t default_timeout_ms, uint32_t max_concurrent,
     syntra_ffi_client_t **out);
+/* Builds Hello once and drops the stored credential. Retain the returned
+ * frame if transport retry is needed. Activate requires Hello construction;
+ * duplicate Hello construction or activation is INVALID. This tracks frame
+ * construction, not actual transport delivery. No secure erasure is promised. */
 int32_t syntra_ffi_client_hello_frame(syntra_ffi_client_t *c,
     uint8_t **out, uintptr_t *out_len);
 int32_t syntra_ffi_client_activate(syntra_ffi_client_t *c,
     const uint8_t *ready_frame, uintptr_t len);
 /* Ingests max 1 MiB frame. terminal_ids must hold terminal_cap entries;
- * terminal_n always written. If terminal_ids==NULL or terminal_cap==0 the
- * completed id is consumed but not reported. notifications is always
- * written: 1 if a notification arrived, else 0. */
+ * terminal_n written on success. With terminal_cap==0 the completed id is not
+ * reported; its outcome remains available. notifications is written on success:
+ * 1 if a notification was queued, else 0. */
 int32_t syntra_ffi_client_on_frame(syntra_ffi_client_t *c,
     const uint8_t *frame, uintptr_t len,
     uint64_t *terminal_ids, uintptr_t terminal_cap, uintptr_t *terminal_n,
@@ -86,10 +104,20 @@ int32_t syntra_ffi_client_close(syntra_ffi_client_t *c);
 /* Responder core. Dispatch lives in the embedding application.
  * host_accept_hello rejects a second hello (negotiated already set or active).
  * host_auth_complete: principal is borrowed UTF-8, 1..512 bytes; returns owned
- * ready frame and activates the host. host_answer: expired=1 (with OK) means
- * the id was unknown or past deadline; still returns OK. host_on_frame:
- * cancel_ids must hold cancel_cap entries; cancel_n always written. If
- * cancel_ids==NULL or cancel_cap==0 cancels are consumed but not reported. */
+ * ready frame and activates the host. Connection IDs contain 128 random bits
+ * from the OS; entropy failure returns INTERNAL without activation.
+ * host_answer queues the supplied result, or a deadline error for an expired
+ * call. expired=1 with OK means unknown or past deadline; unknown IDs queue
+ * nothing. An answer also removes any undispatched queue entry for that ID.
+ * Answers, expiry results and notifications share outbound admission limits
+ * of 256 frames and 16 MiB encoded bytes. NOMEM leaves pending calls and their
+ * cancellation/dispatch state intact; drain outbound and retry. Reaping is
+ * atomic for the selected batch and writes n=0 on admission failure.
+ * host_on_frame: cancel_ids must hold cancel_cap entries; cancel_n is written
+ * on success. With cancel_cap==0 cancels are consumed but not reported.
+ * host_answer identifies work by request_id only, without a completion token.
+ * Do not reuse IDs on the connection: a late application completion could
+ * otherwise answer a newer call using the same ID. */
 int32_t syntra_ffi_host_open(uint32_t min_version, uint32_t max_version,
     uint32_t max_concurrent, syntra_ffi_host_t **out);
 int32_t syntra_ffi_host_accept_hello(syntra_ffi_host_t *h,

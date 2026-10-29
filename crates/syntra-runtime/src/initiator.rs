@@ -29,7 +29,7 @@
 //!   result branch first; a timer that fires first still re-checks for
 //!   an arrived result before reporting expiry).
 
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use prost::Message;
 use tokio::sync::oneshot::error::RecvError;
@@ -197,20 +197,23 @@ impl Initiator {
         let frame = match syntra_core::decode_frame(bytes, ctx) {
             Ok(f) => f,
             Err(e) => {
-                self.on_decode_error(e).await;
+                self.on_decode_error(bytes, e).await;
                 return;
             }
         };
         self.dispatch(frame).await;
     }
 
-    async fn on_decode_error(&self, e: SyntraError) {
-        // Framing-layer failures before ACTIVE are terminal for the
-        // connection; in ACTIVE the affected unit fails locally (the
-        // connection closes only if exhausted/misbehaving per policy,
-        // SNTR-ASEC-020/SNTR-REL-007).
+    async fn on_decode_error(&self, raw: &[u8], e: SyntraError) {
+        // Handshake failures and ACTIVE envelope/state violations are
+        // terminal. Correlated outcome errors settle one RPC; other malformed
+        // units follow the exhaustion/misbehavior policy.
         tracing::debug!(error = ?e, "inbound frame rejected");
-        if !self.conn.state().await.is_active() {
+        let state = self.conn.state().await;
+        if state == ConnectionState::Closed {
+            return;
+        }
+        if !matches!(state, ConnectionState::Active | ConnectionState::Closing) {
             let (code, message) = match e {
                 SyntraError::Protocol { code, message } => (code, message),
                 other => (other.code(), other.to_string()),
@@ -218,12 +221,52 @@ impl Initiator {
             self.conn.fail_handshake_and_close(code, message).await;
             return;
         }
+        // Correlation and envelope classification require structurally valid
+        // bytes: Prost alone merges duplicate oneofs and ignores reserved tags.
+        if syntra_core::validate_wire_structure(raw).is_ok() {
+            if let Ok(frame) = Frame::decode(raw) {
+                if matches!(frame.body, Some(Body::Hello(_)) | Some(Body::Ready(_)))
+                    || Some(frame.version) != self.conn.negotiated_version().await
+                {
+                    self.conn.fail_protocol_and_close(e).await;
+                    return;
+                }
+                if let Some(Body::Result(ref result)) = frame.body {
+                    let invalid_outcome = result.outcome.is_none()
+                        || matches!(result.outcome, Some(syntra_core::proto::rpc_result::Outcome::Error(ref error)) if error.code == 0);
+                    if frame.request_id != 0 && invalid_outcome {
+                        self.conn.shared.pending.complete(
+                            frame.request_id,
+                            syntra_core::RpcResult {
+                                outcome: Some(syntra_core::proto::rpc_result::Outcome::Error(
+                                    syntra_core::proto::RpcError {
+                                        code: ErrorCode::InvalidArgument.as_i32(),
+                                        message: "invalid result outcome".to_string(),
+                                    },
+                                )),
+                            },
+                        );
+                        return;
+                    }
+                }
+                // Structurally valid, correctly versioned notifications in
+                // CLOSING are tolerated for drain and never count as
+                // misbehavior. They carry no correlation and require no
+                // admission.
+                if state == ConnectionState::Closing
+                    && matches!(frame.body, Some(Body::Notification(_)))
+                    && frame.request_id == 0
+                {
+                    return;
+                }
+            }
+        }
         let fatal = matches!(
             e,
             SyntraError::ResourceExhausted(_) | SyntraError::Protocol { .. }
         ) && matches!(e.code(), ErrorCode::ResourceExhausted);
         if fatal {
-            self.conn.close().await;
+            self.conn.fail_protocol_and_close(e).await;
             return;
         }
         let n = self
@@ -233,7 +276,7 @@ impl Initiator {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n >= 8 {
             tracing::warn!("too many malformed frames; closing");
-            self.conn.close().await;
+            self.conn.fail_protocol_and_close(e).await;
         }
     }
 
@@ -258,7 +301,7 @@ impl Initiator {
             _ => {
                 let st = self.conn.state().await;
                 tracing::debug!(?kind, state = ?st, "unexpected inbound frame");
-                if !st.is_active() {
+                if !matches!(st, ConnectionState::Active | ConnectionState::Closing) {
                     self.conn
                         .fail_handshake_and_close(
                             ErrorCode::FailedPrecondition,
@@ -357,7 +400,10 @@ impl Initiator {
             Some(Body::Result(r)) => r,
             _ => return,
         };
-        if !self.conn.state().await.is_active() {
+        if !matches!(
+            self.conn.state().await,
+            ConnectionState::Active | ConnectionState::Closing
+        ) {
             // Pre-ACTIVE results are handshake failures, never RPC
             // completions (SNTR-HS-012; carrier B1: surface locally,
             // close, emit nothing).
@@ -380,7 +426,7 @@ impl Initiator {
             _ => return,
         };
         let state = self.conn.shared.state.read().await;
-        if !state.is_active() {
+        if !matches!(*state, ConnectionState::Active | ConnectionState::Closing) {
             drop(state);
             // Pre-ACTIVE notifications fail the handshake per
             // handshake.md section 1B (recorded conflict B2).
@@ -392,6 +438,8 @@ impl Initiator {
                 .await;
             return;
         }
+        // In CLOSING notifications are tolerated for drain; they never
+        // complete an RPC and never extend the drain.
         // Notifications never complete an RPC. Bounded notification
         // queue stays non-blocking: overflow drops with loss accounting,
         // never unbounded queueing.
@@ -406,10 +454,7 @@ impl Initiator {
             // Cumulative loss accounting stays the signal; the latest
             // totals are published for every loss waiter, and the drop
             // diagnostic is throttled so a burst cannot amplify into logs.
-            let (dropped, dropped_bytes) = self
-                .conn
-                .shared
-                .record_notification_loss(dropped_len);
+            let (dropped, dropped_bytes) = self.conn.shared.record_notification_loss(dropped_len);
             if loss_warn_on_drop(dropped) {
                 tracing::warn!(
                     dropped,
@@ -743,12 +788,29 @@ impl Initiator {
         }
     }
 
-    /// Graceful close from ACTIVE: stop new RPCs, drain already-queued
-    /// inbound results via the pump, then teardown (SNTR-HS-006/013).
+    /// Abortive close: immediately settle pending RPCs with unknown outcome.
     pub async fn close(&self) {
         use syntra_core::StateEvent;
         let _ = self.conn.transition(StateEvent::GracefulClose).await;
         self.conn.close().await;
+    }
+
+    /// Stop RPC admission, accept results/cancellation while CLOSING, then
+    /// close when pending RPCs and the writer queue drain or `grace` expires.
+    /// The transport pump must keep running and flush dequeued bytes before
+    /// releasing its carrier. Unfinished RPCs settle with unknown outcome.
+    pub async fn close_gracefully(&self, grace: Duration) {
+        let deadline = Instant::now() + grace;
+        self.conn.begin_closing().await;
+        self.conn
+            .drain_until(deadline, || self.pending_len() == 0)
+            .await;
+        self.conn.close().await;
+    }
+
+    /// First terminal local reason, retained for transport-adapter diagnostics.
+    pub fn terminal_reason(&self) -> Option<SyntraError> {
+        self.conn.terminal_reason()
     }
 
     /// Report abrupt transport loss: `UNAVAILABLE` to all in-flight RPCs
