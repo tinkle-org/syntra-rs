@@ -8,6 +8,20 @@ throughput. Root benchmarks require no Docker. Session cases exercise the
 linked Tokio runtime; securechannel and transport cases exercise the local
 SC1 implementation.
 
+Current transport cases live in the experimental, unpublished
+`syntra-sc1-transport`, replacing `syntra-tcp`/`syntra-ws-sc1`. Its `pipe` bench
+requires `development-carriers` because it uses the restricted TCP stream
+fixture over in-memory duplex I/O. Default features are empty and expose WSS
+as the default carrier; these pipe cases do not measure WSS or TLS. The channel
+now uses the RFC 0007 section 11 canonical-context proposal at
+`94404d7378136d8b6c88ece28bf945c88d1653ba`; see [SC1.md](SC1.md).
+The latest local execution report on Rust 1.88.0, darwin/arm64 records
+passing Criterion smoke runs for all three targets: `frame_codec`, `channel`
+and `pipe` (with `development-carriers`). This is execution evidence, not a new
+timed performance capture or a speed/energy superiority claim. See
+[AUDIT.md](AUDIT.md#current-recorded-verification). Post-documentation checks
+passed. The baseline below remains historical.
+
 ## Cases and accounting
 
 - `syntra-core/frame_codec` uses validated hello, ready, error and cancel
@@ -17,46 +31,50 @@ SC1 implementation.
   the 1MiB limit. Fixture creation happens outside timing.
   `Throughput::Bytes` is the actual serialized size. Scans skip opaque byte
   contents: their MB/s is logical envelope throughput, not memory bandwidth.
-- `syntra-secure-channel/channel` measures canonical context append and parse,
-  plus full NK bootstrap handshakes with one verified record in each
-  direction, and warm record encrypt/decrypt pairs at 64, 1,024 and 65,519
-  plaintext bytes with buffer reuse outside timing. Nonce state advances
-  without reset. Payload comparison happens inside timing to keep the
-  optimizer honest; provisioning and cipher setup remain outside.
-- `syntra-tcp/pipe` measures preallocated u16 carrier-prefix and u32
+- `syntra-secure-channel/channel` measures canonical context encoding and
+  parsing, full NK bootstrap handshakes plus one client-to-server verified
+  record, and returning-mode warm record encrypt/decrypt pairs at 64, 1,024
+  and 65,519 plaintext bytes. Nonces advance without reset; payload comparison
+  happens inside timing. See the setup/allocation boundaries below.
+- `syntra-sc1-transport/pipe` measures preallocated u16 carrier-prefix and u32
   frame-prefix writes without socket or crypto work, plus serial encrypted
   echo RPCs over in-memory duplex streams. Handshake and fixture allocation
   are outside timing for header cases; establishment and echo payload
   verification are timed for pipe cases. `Throughput::Bytes` counts twice
-  the application-frame length for echo (both directions).
+  the application payload length for echo (both directions), excluding envelopes,
+  encrypted prefixes, tags and carrier overhead.
 
 Session shutdown cancels pumps and joins with bounded budgets before releasing
 transports. RPCs use five-second budgets. No pooling is introduced.
 
 ### SC1 and transport cases
 
-- `channel::append_context` and `channel::parse_context` time the exact
-  canonical context bytes into preallocated storage; `Throughput::Bytes`
-  counts context bytes. Fixture setup and the final canonical-byte comparison
-  are outside timing.
+- `channel::append_context` times `Context::encode`, including allocation;
+  `channel::parse_context` times parsing a prebuilt M1-sized public wrapper,
+  including owned scope reconstruction and validation. The parser suffix is
+  dummy bytes, not a Noise vector. `Throughput::Bytes` counts context bytes.
 - `channel::handshake_bootstrap` times a full NK handshake with real OS
-  randomness, one verified record in each direction, and channel close.
-  Static provisioning fixtures are outside timing.
-- `channel::record_warm/*` measures one encrypt/decrypt pair for bootstrap
-  and returning modes, both directions, at 64, 1,024 and 65,519 plaintext
-  bytes. Cipher setup and one warmup pair are outside timing. Buffers are
-  reused, nonces advance without reset, and final payload/nonce checks happen
-  outside timing. `Throughput::Bytes` counts one plaintext length per
-  complete pair.
+  randomness and server-key/config setup inside timing, followed by one
+  client-to-server encrypted record and payload comparison. Channel destruction
+  is included; there is no measured server-to-client confirmation record.
+- `channel::record_warm/*` measures one returning-mode client-to-server
+  encrypt/decrypt pair at 64, 1,024 and 65,519 plaintext bytes. Cipher setup,
+  the initial confirmation record and payload allocation are outside timing.
+  Returned ciphertext/plaintext buffer allocations and payload comparison are
+  inside timing; nonces advance without reset. `Throughput::Bytes` counts one
+  plaintext length per complete pair.
 - `pipe::prefix_u16_preallocated` and `pipe::prefix_u32_preallocated` measure
   preallocated carrier-prefix writes without socket or crypto work.
 - `pipe::duplex_echo/{64,1024,65536}` sends/reassembles frames through the
-  production encrypted pump over `tokio::io::duplex`. Handshake and fixture
-  allocation are outside timing; send/receive and worker synchronization are
-  timed. This is in-process carrier work, not a network deployment benchmark.
+  shared experimental encrypted pump over `tokio::io::duplex`. Each timed
+  iteration includes server-key/config and duplex setup, returning-mode SC1,
+  Syntra readiness, one echo RPC, payload comparison and bounded teardown.
+  The initial payload and Tokio runtime are created outside timing; the per-call
+  payload clone is inside timing. This is in-process carrier work, not a network
+  deployment benchmark.
 - `pipe::establishment_duplex` times the complete duplex lifecycle, from
-  channel handshake through Syntra readiness and teardown. It sends no
-  application RPC.
+  server-key/config and duplex setup through returning-mode channel handshake,
+  Syntra readiness and teardown. It sends no application RPC.
 
 ## Targeted checks
 
@@ -66,13 +84,13 @@ benchmark files:
 ```sh
 cargo bench -p syntra-core --bench frame_codec -- --test
 cargo bench -p syntra-secure-channel --bench channel -- --test
-cargo bench -p syntra-tcp --bench pipe -- --test
+cargo bench -p syntra-sc1-transport --features development-carriers --bench pipe -- --test
 ```
 
 To smoke-test every benchmark in the workspace:
 
 ```sh
-cargo bench --workspace -- --test
+cargo bench --workspace --features syntra-sc1-transport/development-carriers -- --test
 ```
 
 ## Benchmark workflow
@@ -86,14 +104,22 @@ harness):
 ```sh
 cargo bench -p syntra-core --bench frame_codec -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
 cargo bench -p syntra-secure-channel --bench channel -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
-cargo bench -p syntra-tcp --bench pipe -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
+cargo bench -p syntra-sc1-transport --features development-carriers --bench pipe -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
 ```
 
 The artifact records raw samples, source revision and toolchain. Timing is
 report-only: no fixed ns/op threshold or automatic baseline-comparison gate
 is used; execution errors still fail the job.
 
-## Initial baseline
+## Historical initial baseline (pre-consolidation)
+
+The capture below predates the canonical-context migration and crate
+consolidation. Its old `syntra-tcp` selector and recorded ranges are retained
+as historical evidence; that command is not valid for the current workspace.
+It is not a new WSS, canonical-context or emission-gate performance result.
+Use the selectors above for current runs and record a new revision and results
+before comparing. Historical case labels/accounting below are not revalidated
+by this documentation update.
 
 The initial capture started from the feature branch tip with the
 benchmarked code paths in place. It covers the frame codec cases,

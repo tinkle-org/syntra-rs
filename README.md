@@ -2,18 +2,21 @@
 
 Rust implementation of Syntra v1 with generated Protobuf types, bounded
 codecs, client/host runtimes, reliable-session and recovery helpers, and
-experimental SC1 local-revision-1 channels over TCP and native WebSocket.
+experimental SC1 channels over native WSS, with opt-in development carriers.
 
 Extracted from [`tinkle-org/syntra`](https://github.com/tinkle-org/syntra) at
 [`2a91da7fdb96f3e75badf07614c14e4f85c9ba1c`](https://github.com/tinkle-org/syntra/commit/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c).
 See [MIGRATION.md](MIGRATION.md) for provenance and the path mapping.
 
-**SC1 local revision 1 is an implementation-specific draft, not an accepted
-upstream profile or an independently audited secure channel.** Read
-[SC1.md](SC1.md) for the exact wire format and runnable examples, and
-[AUDIT.md](AUDIT.md) for implementation evidence, limitations and unresolved
-upstream questions. The core `Frame` schema is unchanged. Schema and fixture
-provenance is in [MIGRATION.md](MIGRATION.md).
+**SC1 is an experimental implementation of the RFC 0007 section 11 canonical
+context proposal, not an activated upstream profile or an independently audited
+secure channel.** Its review pin is
+`94404d7378136d8b6c88ece28bf945c88d1653ba`, distinct from the extraction pin
+above. Read [SC1.md](SC1.md) for the wire format and source-backed API sketch,
+and [AUDIT.md](AUDIT.md) for recorded results and historical evidence.
+The core `Frame` schema and baseline `syntra-ws` framing/endpoints remain
+unchanged; custom runtime writers must adopt the emission-gate contract below.
+Schema and fixture provenance is in [MIGRATION.md](MIGRATION.md).
 
 Use **Rust 1.88.0** for production builds and current verification. The
 crate MSRV floor is **1.88**; it is a build compatibility constraint, not a
@@ -39,9 +42,15 @@ native binaries.
 
 ```sh
 export RUSTUP_TOOLCHAIN=1.88.0
-cargo build --locked --workspace
-cargo test --locked --workspace
+cargo build --locked
+cargo test --locked
 ```
+
+Root `default-members` excludes `syntra-integration`. Explicit `--workspace`
+includes it and intentionally enables the transport's development carriers
+through that crate's dependency. CI separately tests isolated WSS-only defaults
+and explicit development features; a workspace run alone does not prove default
+feature isolation.
 
 ## Workspace and scope
 
@@ -50,24 +59,33 @@ cargo test --locked --workspace
 | `syntra-core` | Envelope codec, validation, handshake and protocol state |
 | `syntra-runtime` | Transport-independent `Initiator`/`Host`, sessions, RPC correlation, notifications, recovery drivers |
 | `syntra-secure-channel` | Socket-free SC1: `Context`, `ClientHandshake`, `respond`, `Channel`, `Secret32`, `KeyStore` |
-| `syntra-tcp` | SC1 TCP `connect`/`Listener`/`connect_stream`/`accept_stream` and the shared bounded frame pump |
 | `syntra-ws` | Native WS/WSS adapters (binary-only, one message per `Frame`) |
-| `syntra-ws-sc1` | Native WebSocket SC1 binding: `connect`/`accept`/`accept_stream` (local-only draft, not published) |
+| `syntra-sc1-transport` | Experimental, unpublished native SC1: WSS `websocket`, opt-in `ReconnectingClient`, carrier-neutral `pump`, development `tcp` and loopback WS |
 | `syntra-web` | Browser-facing WASM client; native fixtures for tests |
 | `syntra-ffi` | Native C ABI with explicit production and test-fixture modes |
-| `syntra-integration` | Docker-based SC1 TCP/WebSocket connectivity tests (not published) |
+| `syntra-integration` | Migrated Docker SC1 carrier fixtures (not published; container execution outstanding) |
 
 `Transport` adapters exchange exactly one serialized `Frame` per pump step in
 each direction. The supplied SC1 adapters add encrypted record framing and
 bounded socket I/O. Upstream's production TLS baseline remains in effect;
 this experimental draft does not supersede it.
 
+`syntra-sc1-transport` replaces the prerelease `syntra-tcp` and
+`syntra-ws-sc1` crates. Its default feature set is empty (`default = []`);
+the default carrier API exposes WSS only. `development-carriers` adds the
+restricted-development `tcp` module and plaintext loopback WS. The public
+`syntra_sc1_transport::pump` has no dependency on that TCP module. This is an
+intentional prerelease source/API/wire break; legacy aliases and fallback are
+not supported. Baseline `syntra-ws` remains a separate Frame-per-message adapter.
+
 Credential verification is host-owned. `Authenticator` verifies opaque hello
 bytes and returns a `Principal`; `AllowAnonymous` and static-token helpers
 are test/example conveniences, not credential verifiers. For SC1,
-`AuthenticatorFactory::create(&VerifiedIdentity)` replaces that lookup and
-requires fresh channel confirmation plus the explicit hello credential. An
-empty credential never implicitly means "use the channel principal."
+`AuthenticatorFactory::create(&VerifiedIdentity)` receives freshly confirmed
+channel context and constructs the application's `Authenticator`, which still
+verifies the explicit hello credential. Same-principal binding, current validity
+and periodic revocation checks are host contracts, not a supplied identity system.
+An empty credential never implicitly means "use the channel principal."
 
 `Handler::authorize` runs before every method's handler effects. **The
 default denies every RPC.** Use a principal-aware policy, or `AllowAll` for
@@ -77,32 +95,41 @@ the principal, settles other calls and closes the connection.
 
 ### Dial and call
 
-Use `syntra_tcp::Listener::bind` to accept TCP connections and
-`syntra_tcp::connect` to dial them. The client is ready to call when dialing
-succeeds:
+Use `syntra_sc1_transport::websocket::connect` for native WSS. Supply a
+`ClientConfig` whose context binds `Carrier::SecureWebSocket`, an authenticated
+Noise server pin and exact provisioned scope. The client is ready to call when
+the connection succeeds:
 
 ```rust,ignore
-let client = syntra_tcp::connect(address, security, credential, runtime, limits).await?;
+let client = syntra_sc1_transport::websocket::connect(
+    "wss://example.service/syntra/v1/sc1/ws", security, credential, runtime, limits,
+).await?;
 let result = client.conn.call("/example.Service/Method", b"hello".to_vec(), 1000).await?;
 client.close().await;
 ```
 
-The complete [SC1 runnable sketch](SC1.md#api-sketch) shows provisioning
-fixtures, an explicit factory capturing the sealed channel identity, and
-`accept_stream` for caller-owned streams. Native WS uses
-`syntra_ws_sc1::{connect, accept, accept_stream}` with the
-`syntra.sc1.local1.ws` subprotocol.
+The [SC1 API sketch](SC1.md#api-sketch) documents `connect_with_roots`,
+`TlsServerSettings::new` and `accept_tls_stream`. The canonical endpoint is
+`/syntra/v1/sc1/ws`, with exactly the `syntra.sc1.v1` subprotocol. WSS requires
+verified TLS 1.3 as well as the Noise pin; TCP/WS are never automatic fallback.
+The opt-in `ReconnectingClient` owns a bounded reconnect loop with explicit
+`ReconnectConfig` and pause/network/wake controls. Its status receiver returns
+owned current-state snapshots, and calls/results are fenced by connection
+generation. `CoreReady` is not recovery readiness, and mutations are never
+automatically replayed. See [the client usage contract](SC1.md#reconnecting-client)
+for fresh connector inputs, retry budgets, failure classification and shutdown.
 
 Dialing has a **15-second total connection attempt budget**, including
-socket/upgrade, SC1 and core readiness. Each SC1 handshake and the client
-encrypted-hello confirmation share a five-second channel limit. The returned
-client's lifetime is independent of the dial future: always close it.
-There is no automatic reconnect, RPC replay or fallback.
+socket/TLS/upgrade, SC1 and core readiness. On the responder, SC1 establishment
+and the client's encrypted-hello confirmation share a five-second channel limit.
+The returned client's lifetime is independent of the dial future: always close it.
+These low-level connect functions do not reconnect. Reconnect is opt-in through
+the client wrapper; neither path automatically replays RPCs or weakens the carrier.
 
-`Listener::bind(address, maximum_connections)` acquires admission before
-accepting; new accept calls backpressure when the limit is reached. Close is
-abortive by default and bounded; `close_gracefully` shares one absolute
-grace deadline across runtime drain and carrier flush. See
+The development `tcp::Listener::bind(address, maximum_connections)` acquires
+admission before accepting; new accept calls backpressure when the limit is
+reached. Close is abortive by default and bounded; `close_gracefully` shares one
+absolute grace deadline across runtime drain and carrier flush. See
 [SC1.md](SC1.md#limits-cancellation-and-ownership) for ownership, budgets
 and the adapter-owned graceful protocol.
 
@@ -112,6 +139,15 @@ saturation terminates the connection with `RESOURCE_EXHAUSTED`. Each write
 defaults to a ten-second timeout for one frame's complete record sequence.
 Shutdown poisons cipher state, joins I/O and runs transport-loss teardown so
 pending calls settle as unknown outcomes.
+
+Custom initiator writers must pass each **original `Vec<u8>`** dequeued from
+the byte-pump receiver, without cloning or reallocating, to
+`Initiator::prepare_outbound` exactly once immediately before synchronous
+carrier handoff/encryption. `None` skips a stale item; `Some(bytes)` carries
+the live request with floored positive remaining milliseconds. Finish that
+unit in order or abort the carrier. Never re-gate fragments or ciphertext.
+The receiver still yields one serialized `Frame` per `Vec`; see
+[SC1.md](SC1.md#runtime-emission-gate) for the handoff contract.
 
 Application payload schemas, identity systems, messenger subscriptions,
 presence, JSON gateways, service discovery and gRPC clients are outside the
@@ -152,6 +188,9 @@ Production FFI keeps its own protocol state machine behind the C ABI and is
 not the async runtime behind a different entry point; runtime fixes do not
 automatically reach it. The test-fixture loopback ABI is a separate build
 for tests only.
+
+This production ABI is not automatically an SC1 SDK; the consolidated native
+transport does not add SC1 to the FFI state machine.
 
 ```sh
 cargo build --locked -p syntra-ffi --no-default-features
@@ -238,3 +277,13 @@ generation drift and security jobs; the scheduled lane adds native compat
 and coverage. See [CONTRIBUTING.md](CONTRIBUTING.md),
 [crates/syntra-integration/README.md](crates/syntra-integration/README.md)
 and [BENCHMARKS.md](BENCHMARKS.md).
+
+The latest local run records 372 workspace tests passed, 0 failed and
+2 ignored (Docker/browser), separate WSS-only and development-carrier runs,
+FFI/WASM checks, tooling/security checks and all three Criterion smoke targets.
+See [AUDIT.md](AUDIT.md#current-recorded-verification) for exact results and
+[implementation status](docs/implementation-status.md) for the Rust backlog.
+Docker was not executed because the daemon was unavailable; browser execution
+also remains unverified. Post-documentation checks passed. Release
+gates remain upstream activation, independent pure-Go/Rust interoperability in
+both roles and modes, recovery and mobile validation, and independent human review.

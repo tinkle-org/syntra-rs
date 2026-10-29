@@ -1,12 +1,92 @@
 # Implementation audit notes
 
+## Current migration scope
+
+The current prerelease migration consolidates `syntra-tcp` and `syntra-ws-sc1`
+into the experimental, unpublished `syntra-sc1-transport`. The empty default
+feature set exposes native WSS; `development-carriers` adds restricted TCP and
+plaintext loopback WS. Its public root `pump` is carrier-neutral with no TCP
+module dependency. Baseline `syntra-ws` retains its framing/endpoints; custom
+runtime writers must honor the added emission-gate behavior contract.
+
+The review target is the RFC 0007 section 11 canonical-context **proposal** at
+`94404d7378136d8b6c88ece28bf945c88d1653ba`, distinct from the historical
+extraction/schema pin. [SC1.md](SC1.md) specifies `syntra.sc1.v1`, modes 1/2,
+TCP/WS/WSS codes 1/2/3, context-only prologue, M1 86–340 bytes, M2 48 bytes,
+and `/syntra/v1/sc1/ws` with exactly the `syntra.sc1.v1` subprotocol. Historical
+local-revision-1 bytes and aliases are rejected rather than supported by fallback.
+The prerelease source/API/wire break is intentional.
+
+The runtime also adds the original-`Vec` `Initiator::prepare_outbound` emission
+gate while preserving the byte-pump API. The opt-in `ReconnectingClient` owns
+bounded retry and generation-fenced operations; [SC1.md](SC1.md#reconnecting-client)
+documents its controls, owned status snapshots and retained shutdown ownership.
+Partial establishment stays inline until ready, with complete ready-batch ingestion
+and preserved partial-frame deadlines. Browser SC1 is not added; production FFI
+retains a separate state machine and is not automatically an SC1 SDK.
+
+The exact context/prologue fixtures are public encoding examples only, not
+independent cryptographic vectors or executed pure-Go/Rust interoperability.
+Integration peer/tests now use the consolidated modules and canonical endpoint.
+Root `default-members` excludes integration; `--workspace` intentionally enables
+development carriers through integration. CI tests WSS-only defaults separately.
+
+Release gates remain upstream activation; independent pure-Go/Rust
+interoperability in both roles and modes; recovery, including issuance/delivery/ack
+and rotation workflows; mobile validation; and independent security review.
+No MTProto implementation code was copied. The root manifest and `LICENSE`
+identify the repository implementation as Apache-2.0, not MIT.
+
+## Current recorded verification
+
+Executed locally on 2026-10-29 with **Rust 1.88.0, darwin/arm64**, on
+`feat/canonical-sc1-wss-lifecycle` based on `ce4db11`. The changes remain
+uncommitted; these are worktree results, not revision-pinned release evidence.
+Post-documentation formatting, diff, workflow-lint and upstream-pin checks passed.
+
+| Check | Recorded result |
+| --- | --- |
+| `cargo test --locked --workspace --quiet` | 372 passed, 0 failed, 2 ignored (Docker and browser) |
+| `cargo test --locked -p syntra-sc1-transport --no-default-features` | 50 passed: library 29, WSS 21; development-only test binaries ran 0 tests |
+| `cargo test --locked -p syntra-sc1-transport --features development-carriers` | 58 passed: library 29, TCP 6, WS 3, WSS 20 |
+| Explicit production FFI / test-fixture FFI suites | 13 / 11 passed, in separate feature invocations |
+| `python3 crates/syntra-ffi/tests/build_contract.py` | 5 checks passed |
+| Locked `wasm32-unknown-unknown` check for `syntra-core`, `syntra-runtime`, `syntra-ws`, `syntra-web` | Passed compilation; no browser execution |
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --locked --workspace --all-targets -- --no-deps` | Passed with inherited warnings; no suppressions added |
+| `python3 scripts/check-generated.py` / `python3 scripts/check-upstream-pin.py` | Both passed |
+| Actionlint for CI, benchmarks and integration workflows | Passed |
+| `cargo audit --deny warnings` | Passed |
+| `cargo deny --locked check advisories licenses sources` | Passed |
+| Criterion `frame_codec`, `channel`, `pipe` smoke targets | All three passed; `pipe` used `development-carriers`; no performance superiority claim |
+| Docker availability / container execution | `docker info` failed: daemon missing; container suite **not executed** |
+| Browser execution | Ignored; no runtime/browser evidence |
+
+The WSS counts above are separate feature-configuration runs, not additive claims
+about a single run. Workspace feature unification intentionally exercises development
+carriers and does not replace the isolated default-feature result.
+
+Two code-agent source reviews reported findings that have all been fixed. These
+are local automated review evidence, **not independent human security review**.
+Passing local checks does not close the release gates. The current Rust backlog
+and missing independent/protocol/deployment evidence are listed in
+[implementation status](docs/implementation-status.md).
+
+## Historical evidence ledger (pre-consolidation)
+
+Everything below records earlier extraction/local-revision-1 work and its stated
+review scope. Old source paths, specification pins and test outcomes are retained
+as historical evidence, not silently reinterpreted as results for the current
+canonical-context/WSS migration. The original entries include separate container
+observations from different points in development; none is current-branch proof.
+
 This is an implementation review and evidence ledger for
 `feat/sc1-connectivity-and-benchmarks`. It is **not an independent security
 audit, certification or complete conformance report**. Findings below describe
 source and regression coverage; passing local tests does not establish
 absence of vulnerabilities.
 
-## Final working-tree verification
+## Historical final working-tree verification
 
 The following passed on `feat/sc1-connectivity-and-benchmarks`, using Rust
 1.88.0 on darwin/arm64 unless another lane is named:
@@ -46,7 +126,7 @@ no macOS container platform, revision or outcome is presented as validation.
 The Linux container lane remains the authoritative gate; see the remaining
 findings below.
 
-## Authority and source pins
+## Historical authority and source pins
 
 - Upstream specification review reference:
   [`tinkle-org/syntra@e27fa275f647ccc925b7cf79eb2dd332f20a3d02`](https://github.com/tinkle-org/syntra/tree/e27fa275f647ccc925b7cf79eb2dd332f20a3d02).
@@ -69,7 +149,7 @@ serve different purposes. Wire agreement is not behavioral conformance, and
 the container round trip does not provide independent cross-language SC1
 interoperability.
 
-## Completed implementation reviews
+## Historical completed implementation reviews
 
 "Completed" identifies the stated local review/fix and its regression
 evidence. It does not close the broader TODOs listed below.
@@ -89,7 +169,7 @@ Test names abbreviated after the first name retain that row's file prefix.
 Coverage is local unit/integration evidence, not a result from an external
 reviewer.
 
-## Remaining gaps and audited TODOs
+## Historical remaining gaps and audited TODOs
 
 ### Container fixture handle retention
 

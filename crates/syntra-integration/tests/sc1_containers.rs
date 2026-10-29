@@ -1,7 +1,7 @@
 use syntra_core::ErrorCode;
 use syntra_runtime::ConnectionConfig;
+use syntra_sc1_transport::{tcp, websocket, Limits};
 use syntra_secure_channel::{generate_server_key, Carrier, ClientConfig, Context, Mode};
-use syntra_tcp::Limits;
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::{AsyncBuilder, AsyncRunner},
@@ -73,16 +73,12 @@ ENTRYPOINT ["/usr/local/bin/peer"]
             "./crates/syntra-secure-channel",
         )
         .with_file(
-            format!("{workspace}/crates/syntra-tcp"),
-            "./crates/syntra-tcp",
+            format!("{workspace}/crates/syntra-sc1-transport"),
+            "./crates/syntra-sc1-transport",
         )
         .with_file(
             format!("{workspace}/crates/syntra-ws"),
             "./crates/syntra-ws",
-        )
-        .with_file(
-            format!("{workspace}/crates/syntra-ws-sc1"),
-            "./crates/syntra-ws-sc1",
         )
         .with_file(
             format!("{workspace}/crates/syntra-ffi"),
@@ -127,7 +123,7 @@ ENTRYPOINT ["/usr/local/bin/peer"]
         authorization_key: None,
     };
     let tcp_addr = format!("{host}:{tcp_port}");
-    let client = match syntra_tcp::connect(
+    let client = match tcp::connect(
         tcp_addr,
         tcp_client_cfg,
         b"test-credential".to_vec(),
@@ -209,8 +205,8 @@ ENTRYPOINT ["/usr/local/bin/peer"]
         server_public_key: public_key,
         authorization_key: None,
     };
-    let ws_url = format!("ws://{host}:{ws_port}/syntra/local/sc1/1/ws");
-    let ws_client = syntra_ws_sc1::connect(
+    let ws_url = format!("ws://{host}:{ws_port}{}", websocket::ENDPOINT_PATH);
+    let ws_client = websocket::connect(
         &ws_url,
         ws_client_cfg,
         b"test-credential".to_vec(),

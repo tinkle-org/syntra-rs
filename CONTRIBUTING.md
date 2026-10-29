@@ -8,22 +8,36 @@ a security-patched toolchain. Current pins are `prost =0.13.5`,
 0.26 and `rustls 0.23`. Keep dependency versions and checksums consistent
 unless updating them is part of the change.
 
-Read [SC1.md](SC1.md) for the implementation-specific local-revision-1
-contract and [AUDIT.md](AUDIT.md) for completed local reviews and open gaps.
-Keep claims tied to evidence: this channel is neither accepted upstream nor
-independently audited. Reference upstream specification commit
-[`e27fa275f647ccc925b7cf79eb2dd332f20a3d02`](https://github.com/tinkle-org/syntra/tree/e27fa275f647ccc925b7cf79eb2dd332f20a3d02)
-when discussing draft requirements and identify a new reviewed pin when that
-reference changes.
+Read [SC1.md](SC1.md) for the RFC 0007 section 11 canonical-context proposal
+contract and [AUDIT.md](AUDIT.md) for historical local reviews and current gaps.
+The proposal review pin is `94404d7378136d8b6c88ece28bf945c88d1653ba`;
+identify a new reviewed pin when that reference changes. Keep it distinct from
+the extraction/schema pin in [MIGRATION.md](MIGRATION.md), which is checked by
+`scripts/check-upstream-pin.py`. This channel is neither activated upstream nor
+independently audited. Latest local results are recorded in
+[AUDIT.md](AUDIT.md#current-recorded-verification); historical runs remain
+separate. Post-documentation checks passed.
+
+`syntra-sc1-transport` is experimental and unpublished, replacing the prerelease
+`syntra-tcp` and `syntra-ws-sc1` crates with an intentional source/API/wire break.
+Its empty default feature set exposes native WSS; `development-carriers` adds
+restricted TCP and plaintext loopback WS. The public `pump` stays carrier-neutral
+and independent of the gated TCP module. Keep baseline `syntra-ws` framing and
+endpoints unchanged while honoring the runtime writer emission-gate contract.
+Browser SC1 is not implemented, and production FFI has its own state machine
+rather than automatically becoming an SC1 SDK. The opt-in reconnecting client's
+owned-status, generation, retry and close contracts are in
+[SC1.md](SC1.md#reconnecting-client).
 
 ## Checks
 
 ```sh
 export RUSTUP_TOOLCHAIN=1.88.0
-cargo fmt --all -- --check           # informational while the formatting
-                                     # baseline is uncleared; the CI fmt job
-                                     # does not gate
+cargo fmt --all -- --check
 cargo test --locked --workspace
+cargo test --locked -p syntra-sc1-transport --no-default-features
+cargo test --locked -p syntra-sc1-transport --features development-carriers
+cargo bench --locked -p syntra-sc1-transport --features development-carriers --bench pipe -- --test
 cargo clippy --locked --workspace --all-targets -- --no-deps
 cargo test --locked -p syntra-ffi --no-default-features --features production
 cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
@@ -31,6 +45,13 @@ python3 crates/syntra-ffi/tests/build_contract.py
 cargo check --locked -p syntra-core -p syntra-runtime -p syntra-ws -p syntra-web --target wasm32-unknown-unknown
 git diff --check
 ```
+
+Root builds/tests without `--workspace` use `default-members`, excluding the
+container integration crate. `--workspace` intentionally includes integration
+and unifies `development-carriers` into `syntra-sc1-transport`. Keep the isolated
+`--no-default-features` and explicit development-feature invocations separate;
+CI has separate steps for them. Workspace success alone is not WSS-default
+isolation evidence.
 
 Install the `wasm32-unknown-unknown` target for this toolchain first. The
 FFI contract also requires Python 3, `nm` and a C compiler. Run the relevant
@@ -62,6 +83,12 @@ pump split-point and fault-injection tests. Conformance vectors in
 `conformance/test-vectors/` must keep passing. Local fixture tests, carrier
 integration tests and true independent Rust wire interop are separate
 evidence; name the level actually exercised.
+
+The exact context/prologue fixture tests cover **public encoding only**, not
+independent Noise cryptographic vectors. Release gates remain upstream activation,
+independent pure-Go/Rust interoperability in both roles and modes, recovery and
+mobile validation, and independent security review. Do not infer completion from
+same-library round trips or public fixture matches.
 
 Workflows (all actions SHA-pinned, `contents: read`, timeouts, concurrency
 cancel for PRs):
@@ -100,6 +127,26 @@ issuance/delivery/ack recovery, rotation, subscription routing and
 execution-terminal proofs remain open integration work; do not describe them
 as implemented merely because a primitive/helper regression passes. Snow and
 runtime secret-erasure limits must remain explicit until evidence changes.
+
+Custom initiator writers must preserve the byte-pump's original `Vec<u8>`
+allocation and pass it once to `Initiator::prepare_outbound` immediately before
+synchronous carrier handoff/encryption. Skip `None`; after `Some`, finish that
+unit in order or abort. Never re-gate fragments or ciphertext. Check the source
+doc comment and [SC1.md](SC1.md#runtime-emission-gate) when changing a writer;
+the gate preserves the byte-pump API while adding an emission contract.
+
+For reconnect changes, preserve single-dial ownership, cancellation-safe inline
+establishment, complete ready-batch ingestion and existing partial-frame deadlines.
+Status snapshots must stay owned, not borrowed watch guards; generation-fenced
+calls must never migrate/replay into a successor. Exercise explicit controls,
+elapsed outage budgets through pauses, terminal blocking and retained cleanup
+ownership on close timeout. Passing source reviews by code agents does not replace
+independent human review. Track protocol/host-policy, durable recovery and FFI/mobile
+work in [implementation status](docs/implementation-status.md).
+
+Repository implementation licensing is Apache-2.0 (`LICENSE` and the root
+manifest). No MTProto implementation code was copied; do not conflate external
+design-document references or their licensing with source-code provenance.
 
 ## Schema and generated code
 

@@ -132,6 +132,10 @@ pub async fn connect(
                         tracing::warn!("outgoing frame exceeds bound; dropping");
                         continue;
                     }
+                    let Some(bytes) = write_conn.prepare_outbound(bytes) else {
+                        continue;
+                    };
+                    // The browser owns buffering after this synchronous handoff.
                     if sink
                         .send(ws_stream_wasm::WsMessage::Binary(bytes))
                         .await

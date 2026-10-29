@@ -1,4 +1,4 @@
-#![cfg(feature = "sockets")]
+#![cfg(feature = "development-carriers")]
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -10,11 +10,11 @@ use syntra_runtime::{
     AllowAnonymous, AuthError, Authenticator, ConnectionConfig, FnHandler, Handler, HandlerOutcome,
     RejectAll, StaticToken,
 };
-use syntra_secure_channel::*;
-use syntra_tcp::{
+use syntra_sc1_transport::{
     pump::{RecordReader, RecordWriter},
-    *,
+    tcp::*,
 };
+use syntra_secure_channel::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct Store;
@@ -162,7 +162,7 @@ async fn replayed_first_flight_never_calls_factory() {
         let result = tokio::time::timeout(Duration::from_secs(1), accept)
             .await
             .unwrap();
-        assert!(matches!(result, Err(syntra_tcp::Error::Timeout)));
+        assert!(matches!(result, Err(syntra_sc1_transport::Error::Timeout)));
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
@@ -288,7 +288,7 @@ async fn absolute_handshake_deadline_rejects_trickle() {
         limits,
     )
     .await;
-    assert!(matches!(result, Err(syntra_tcp::Error::Timeout)));
+    assert!(matches!(result, Err(syntra_sc1_transport::Error::Timeout)));
     trickle.abort();
 }
 

@@ -1,4 +1,4 @@
-#![cfg(not(target_arch = "wasm32"))]
+#![cfg(feature = "development-carriers")]
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -10,8 +10,8 @@ use syntra_runtime::{
     AuthError, Authenticator, ConnectionConfig, FnHandler, Handler, HandlerOutcome, Principal,
     RejectAll,
 };
+use syntra_sc1_transport::{websocket as sc1, AuthenticatorFactory, Limits};
 use syntra_secure_channel::*;
-use syntra_ws_sc1::{self as sc1, AuthenticatorFactory, Limits};
 
 struct Store;
 impl KeyStore for Store {
@@ -195,4 +195,82 @@ async fn separate_endpoint_and_subprotocol_are_required() {
         assert!(task.await.unwrap().is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
+}
+
+#[tokio::test]
+async fn development_ws_rejects_non_loopback_and_secure_carrier() {
+    use syntra_sc1_transport::Error as TransportError;
+    for url in [
+        "ws://192.0.2.1/syntra/v1/sc1/ws",
+        "ws://example.invalid/syntra/v1/sc1/ws",
+        "ws://127.0.0.1.example.invalid/syntra/v1/sc1/ws",
+        "ws://[::ffff:192.0.2.1]/syntra/v1/sc1/ws",
+    ] {
+        let (client, _) = configs(Mode::Bootstrap);
+        let result = sc1::connect(
+            url,
+            client,
+            vec![],
+            ConnectionConfig::default(),
+            Limits::default(),
+        )
+        .await;
+        assert!(matches!(result, Err(TransportError::Configuration)));
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "ws://{}{}",
+        listener.local_addr().unwrap(),
+        sc1::ENDPOINT_PATH
+    );
+    let (mut client, mut server) = configs(Mode::Bootstrap);
+    client.context.carrier = Carrier::SecureWebSocket;
+    server.carrier = Carrier::SecureWebSocket;
+    assert!(matches!(
+        sc1::connect(
+            &url,
+            client,
+            vec![],
+            ConnectionConfig::default(),
+            Limits::default()
+        )
+        .await,
+        Err(TransportError::Configuration)
+    ));
+    let factory: Arc<dyn AuthenticatorFactory> = Arc::new(
+        |_: &VerifiedIdentity| -> Result<Arc<dyn Authenticator>, AuthError> {
+            panic!("must not authenticate")
+        },
+    );
+    // Listener mismatch is rejected before waiting for an incoming connection.
+    assert!(matches!(
+        sc1::accept(
+            &listener,
+            &server,
+            factory.clone(),
+            echo(),
+            ConnectionConfig::default(),
+            Limits::default()
+        )
+        .await,
+        Err(TransportError::Configuration)
+    ));
+    let (raw, _) = tokio::io::duplex(1024);
+    assert!(matches!(
+        sc1::accept_stream(
+            raw,
+            &server,
+            factory,
+            echo(),
+            ConnectionConfig::default(),
+            Limits::default()
+        )
+        .await,
+        Err(TransportError::Configuration)
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err()
+    );
 }
