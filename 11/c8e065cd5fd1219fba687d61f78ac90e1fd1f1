@@ -1,0 +1,82 @@
+crates/syntra-tcp/Cargo.toml
+  s_ad7fcd4ea56150::t_9805ce59274c55 7-10
+CONTRIBUTING.md
+  s_ad7fcd4ea56150::t_f447831b2b4705 23-25
+crates/syntra-integration/tests/sc1_containers.rs
+  s_ad7fcd4ea56150::t_6b837ea2854c7f 209
+MIGRATION.md
+  s_ad7fcd4ea56150::t_fd182f9d9d8701 78
+crates/syntra-secure-channel/benches/channel.rs
+  s_ad7fcd4ea56150::t_acab755fa4e41a 126
+crates/syntra-tcp/src/lib.rs
+  s_ad7fcd4ea56150::t_c9e6fe27d34f19 120-124
+  s_ad7fcd4ea56150::t_b3a7deed0d97c8 148-155,164-181
+  s_ad7fcd4ea56150::t_9a5b23bada6458 182
+  s_ad7fcd4ea56150::t_cf9d7b6fc0ac1c 186-189,191
+crates/syntra-tcp/benches/pipe.rs
+  s_ad7fcd4ea56150::t_713b61a6ba4b75 121
+AUDIT.md
+  s_ad7fcd4ea56150::t_c79347438fea02 81
+  s_ad7fcd4ea56150::t_a9d9b40502f581 18-21
+  s_ad7fcd4ea56150::t_963e10e0210bcd 44-46
+Cargo.toml
+  s_ad7fcd4ea56150::t_bdecde446e9dc1 8
+.github/workflows/benchmarks.yml
+  s_ad7fcd4ea56150::t_f3fc432f4e914e 33
+  s_ad7fcd4ea56150::t_52e7685571c407 44-66
+crates/syntra-integration/src/bin/peer.rs
+  s_ad7fcd4ea56150::t_1129776bddd22c 203-204,206-209,212,214-217,219-248
+  s_ad7fcd4ea56150::t_807b2cc96d28ae 79,86-87,94
+  s_ad7fcd4ea56150::t_f23fc80e744e03 133-134,136-153,155-156,160-171,174
+.github/workflows/integration.yml
+  s_ad7fcd4ea56150::t_5360f436940146 35
+crates/syntra-ws-sc1/Cargo.toml
+  s_ad7fcd4ea56150::t_afd181ff14797d 1-34
+crates/syntra-integration/Cargo.toml
+  s_ad7fcd4ea56150::t_7db1244b71986d 20
+README.md
+  s_ad7fcd4ea56150::t_4c5a8eb5d9e14a 54-55,93
+  s_ad7fcd4ea56150::t_47015d0e02ed9e 7-10
+crates/syntra-integration/README.md
+  s_ad7fcd4ea56150::t_c7b5ac17d7ce72 33
+  s_ad7fcd4ea56150::t_a9adf1a0c01abb 42-46
+  s_ad7fcd4ea56150::t_64f73e57382aca 28-29
+SC1.md
+  s_ad7fcd4ea56150::t_c0051f1525383b 364-366
+  s_ad7fcd4ea56150::t_b1cc5c823f5d1f 4,330
+  s_ad7fcd4ea56150::t_373890c99b1d14 131
+BENCHMARKS.md
+  s_ad7fcd4ea56150::t_8933d17c677bb7 80-84,87-89
+crates/syntra-runtime/src/host.rs
+  s_ad7fcd4ea56150::t_0a3c2eadc15af5 992-1021,1025-1028
+  s_ad7fcd4ea56150::t_b7a5c8c979bff8 190-192,195,238
+crates/syntra-ws-sc1/src/lib.rs
+  s_ad7fcd4ea56150::t_5106ab37c505c8 1-8
+  s_ad7fcd4ea56150::t_7874fd9394899a 120-128
+crates/syntra-ws-sc1/tests/sc1.rs
+  s_ad7fcd4ea56150::t_051dfe867a8a87 14
+.github/workflows/ci.yml
+  s_ad7fcd4ea56150::t_5f5baff9b5a698 245,249
+  s_ad7fcd4ea56150::t_d580edef59912e 224-234
+  s_ad7fcd4ea56150::t_de667eebb44711 197-204
+crates/syntra-secure-channel/Cargo.toml
+  s_ad7fcd4ea56150::t_b3560d0e469449 7-11
+Cargo.lock
+  s_ad7fcd4ea56150::t_80f33cf95a72a9 2416,2508-2528
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "11c8e065cd5fd1219fba687d61f78ac90e1fd1f1",
+  "prompts": {},
+  "sessions": {
+    "s_ad7fcd4ea56150": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e7a730078ffejE2LcVjPHHjaah",
+        "model": "gpt-6.1-terra"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}
