@@ -81,6 +81,10 @@ ENTRYPOINT ["/usr/local/bin/peer"]
             "./crates/syntra-ws",
         )
         .with_file(
+            format!("{workspace}/crates/syntra-ws-sc1"),
+            "./crates/syntra-ws-sc1",
+        )
+        .with_file(
             format!("{workspace}/crates/syntra-ffi"),
             "./crates/syntra-ffi",
         )

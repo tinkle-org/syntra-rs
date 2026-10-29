@@ -227,10 +227,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TARGET_REPO: ${{ github.repository }}
         run: |
-          if gh api "repos/${TARGET_REPO}/dependency-graph/sbom" >/dev/null 2>&1; then
+          if gh api "repos/${TARGET_REPO}/dependency-graph/sbom" >/dev/null 2>/tmp/graph_err.txt; then
             echo "available=true" >> "$GITHUB_OUTPUT"
-          else
+          elif grep -Eq "HTTP 404|Not Found" /tmp/graph_err.txt; then
             echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            cat /tmp/graph_err.txt >&2
+            exit 1
           fi
       - name: Dependency review
         id: review
