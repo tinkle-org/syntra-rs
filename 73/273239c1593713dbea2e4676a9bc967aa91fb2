@@ -1,0 +1,23 @@
+.github/workflows/release-plz.yml
+  s_56975cb1a77b17::t_42bf5f5a1fd005 123-125,135
+  s_56975cb1a77b17::t_0811b70fc9bfa1 92-94,104
+  s_56975cb1a77b17::t_17dfd93ec44bfa 9-18
+docs/ci.md
+  s_56975cb1a77b17::t_75eefdbb7668cb 99-107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "73273239c1593713dbea2e4676a9bc967aa91fb2",
+  "prompts": {},
+  "sessions": {
+    "s_56975cb1a77b17": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e75fdcbdeffeZkj7h6YJyP9LjG",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}
