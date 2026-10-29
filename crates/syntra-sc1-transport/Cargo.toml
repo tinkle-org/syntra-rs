@@ -24,7 +24,7 @@ prost.workspace = true
 zeroize = { version = "1", features = ["alloc"] }
 futures-util.workspace = true
 url.workspace = true
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 httparse = "=1.10.1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-native-certs = "0.8"
