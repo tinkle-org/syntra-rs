@@ -37,7 +37,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use prost::Message;
 use tokio::sync::{mpsc, Notify};
@@ -183,6 +183,12 @@ pub struct Host {
     /// handshake timer exits promptly instead of retaining the
     /// `Connection` until the handshake deadline.
     handshake_done: Arc<Notify>,
+    /// Persistent withdrawal work, retained across cancellation so a
+    /// dropped `withdraw_principal` future can be retried to completion.
+    /// `withdraw_ids` are terminal `UNAUTHENTICATED` results still to queue;
+    /// `withdraw_workers` are fenced workers still to join.
+    withdraw_ids: Mutex<Vec<u64>>,
+    withdraw_workers: Mutex<Vec<InflightEntry>>,
 }
 
 impl Host {
@@ -223,6 +229,8 @@ impl Host {
             bound_id: Mutex::new(None),
             handshake_task: Mutex::new(None),
             handshake_done: handshake_done.clone(),
+            withdraw_ids: Mutex::new(Vec::new()),
+            withdraw_workers: Mutex::new(Vec::new()),
         });
         // Handshake timer (SNTR-HS-002/011): ACTIVE or explicit close.
         // The `handshake_done` signal lets a successful handshake stop the
@@ -273,6 +281,13 @@ impl Host {
             .len()
     }
 
+    fn withdraw_pending_len(&self) -> usize {
+        self.withdraw_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
     /// Ingest one transport unit (exactly one serialized `Frame`).
     pub async fn ingest(&self, bytes: &[u8]) {
         let ctx = self.conn.ctx().await;
@@ -288,7 +303,10 @@ impl Host {
 
     async fn on_decode_error(&self, raw: &[u8], e: SyntraError) {
         let st = self.conn.state().await;
-        if !st.is_active() {
+        if st == ConnectionState::Closed {
+            return;
+        }
+        if !matches!(st, ConnectionState::Active | ConnectionState::Closing) {
             // Handshake-phase failures are terminal for the connection
             // (handshake.md section 5; carrier B1: code surfaced locally,
             // connection closed, no Frame emitted).
@@ -299,39 +317,35 @@ impl Host {
             self.fail_handshake_and_close(code, message).await;
             return;
         }
-        // ACTIVE-phase: a well-formed `request` that failed semantic
-        // validation (method shape) still gets its terminal RPC error —
-        // the connection stays usable. Classify from the raw bytes
-        // (prost decode only; validation already ran).
+        // Structural violations cannot supply a trusted correlation id.
+        if syntra_core::validate_wire_structure(raw).is_err() {
+            self.record_decode_failure(e).await;
+            return;
+        }
+        // Only a structurally valid request can receive a semantic RPC error.
         if let Ok(frame) = Frame::decode(raw) {
             match &frame.body {
                 // hello/ready in ACTIVE: fatal protocol violation + close.
                 Some(Body::Hello(_)) | Some(Body::Ready(_)) => {
                     warn!("hello/ready in ACTIVE; closing");
-                    let _ = self
-                        .conn
-                        .transition(StateEvent::ProtocolViolationFatal)
-                        .await;
-                    self.close().await;
+                    self.fail_protocol_and_close(e).await;
                     return;
                 }
                 _ => {}
             }
             if frame.version != self.version_or_zero().await {
                 warn!("version mismatch in ACTIVE; closing");
-                let _ = self
-                    .conn
-                    .transition(StateEvent::ProtocolViolationFatal)
-                    .await;
-                self.close().await;
+                self.fail_protocol_and_close(e).await;
+                return;
+            }
+            if st == ConnectionState::Closing {
                 return;
             }
             if let Some(Body::Request(_)) = &frame.body {
                 if frame.request_id != 0 {
                     let code = e.code();
                     if code == ErrorCode::InvalidArgument {
-                        // Method-shape failure (or sibling shape error):
-                        // terminal INVALID_ARGUMENT, no dispatch, no close.
+                        // Method-shape failure: terminal INVALID_ARGUMENT.
                         self.send_result(
                             frame.request_id,
                             outcome_error(ErrorCode::InvalidArgument, "invalid request"),
@@ -342,16 +356,20 @@ impl Host {
                     if code == ErrorCode::ResourceExhausted {
                         // Oversize envelope: connection-level exhaustion.
                         warn!("oversize envelope in ACTIVE; closing");
-                        self.close().await;
+                        self.fail_protocol_and_close(e).await;
                         return;
                     }
                 }
             }
         }
+        self.record_decode_failure(e).await;
+    }
+
+    async fn record_decode_failure(&self, e: SyntraError) {
         // Any other ACTIVE-phase decode failure: count misbehavior;
         // close only on exhaustion or repeated abuse.
         if matches!(e.code(), ErrorCode::ResourceExhausted) {
-            self.close().await;
+            self.fail_protocol_and_close(e).await;
             return;
         }
         let n = self
@@ -362,7 +380,7 @@ impl Host {
         debug!(error = ?e, "ACTIVE decode failure");
         if n >= 8 {
             warn!("too many malformed frames; closing");
-            self.close().await;
+            self.fail_protocol_and_close(e).await;
         }
     }
 
@@ -397,7 +415,7 @@ impl Host {
                 self.on_request(frame.request_id, frame.version, req).await;
             }
             Some(Body::Result(_)) => {
-                if !st.is_active() {
+                if !matches!(st, ConnectionState::Active | ConnectionState::Closing) {
                     // Pre-ACTIVE results fail the handshake (SNTR-HS-012;
                     // carrier B1: local code + close, emit nothing).
                     self.protocol_violation(ErrorCode::FailedPrecondition, "result before ACTIVE")
@@ -408,7 +426,7 @@ impl Host {
                 debug!("result for unknown request_id; ignoring");
             }
             Some(Body::Cancel(_)) => {
-                if !st.is_active() {
+                if !matches!(st, ConnectionState::Active | ConnectionState::Closing) {
                     self.protocol_violation(ErrorCode::FailedPrecondition, "cancel before ACTIVE")
                         .await;
                     return;
@@ -416,7 +434,7 @@ impl Host {
                 self.on_cancel(frame.request_id).await;
             }
             Some(Body::Notification(_)) => {
-                if !st.is_active() {
+                if !matches!(st, ConnectionState::Active | ConnectionState::Closing) {
                     // Handshake.md section 1B governs (fail/close);
                     // the events-draft ignore default is recorded as
                     // conflict B2 and NOT applied here.
@@ -428,7 +446,9 @@ impl Host {
                     return;
                 }
                 // Initiator->host notifications have no meaning; ignore
-                // with a diagnostic (never complete an RPC).
+                // with a diagnostic (never complete an RPC). In CLOSING
+                // they are tolerated for drain rather than treated as a
+                // violation.
                 debug!("initiator notification ignored");
             }
             None => {}
@@ -439,15 +459,21 @@ impl Host {
     /// ACTIVE: fatal protocol violation + close.
     async fn protocol_violation(&self, code: ErrorCode, message: &str) {
         if self.conn.state().await.is_active() {
-            let _ = self
-                .conn
-                .transition(StateEvent::ProtocolViolationFatal)
-                .await;
-            self.close().await;
+            self.fail_protocol_and_close(SyntraError::Protocol {
+                code,
+                message: message.to_string(),
+            })
+            .await;
         } else {
             self.fail_handshake_and_close(code, message.to_string())
                 .await;
         }
+    }
+
+    async fn fail_protocol_and_close(&self, failure: SyntraError) {
+        self.conn.fail_protocol_and_close(failure).await;
+        self.unbind_session().await;
+        self.shutdown_tasks().await;
     }
 
     async fn fail_handshake_and_close(&self, code: ErrorCode, message: String) {
@@ -623,17 +649,17 @@ impl Host {
         };
         let Some(session) = session else {
             drop(state);
-            self.send_result(
-                id,
-                outcome_error(ErrorCode::Unauthenticated, "credential not accepted"),
-            )
-            .await;
+            self.withdraw_principal_with_request(Some(id)).await;
             return;
         };
         let admitted = self.start_request(id, negotiated, req, session, deadline);
         drop(state);
         if let Err((code, message)) = admitted {
-            self.send_result(id, outcome_error(code, message)).await;
+            if code == ErrorCode::Unauthenticated {
+                self.withdraw_principal_with_request(Some(id)).await;
+            } else {
+                self.send_result(id, outcome_error(code, message)).await;
+            }
         }
     }
 
@@ -659,6 +685,15 @@ impl Host {
         if let Some((code, message)) = rejection {
             return Err((code, message));
         }
+        // Authorization is synchronous and nonblocking. Admission holds the
+        // lifecycle read lock so withdrawal fences every admitted worker.
+        if let Err(error) = self.handler.authorize(&session.principal, &req.method) {
+            return Err(if error.code == ErrorCode::Unauthenticated {
+                (ErrorCode::Unauthenticated, "credential not accepted")
+            } else {
+                (ErrorCode::PermissionDenied, "access denied")
+            });
+        }
         // Responder deadline starts BEFORE queue admission (measured from
         // receipt of the complete validated frame, SNTR-RPC-004/1F).
         let cancel = crate::connection::CancelToken::new();
@@ -674,30 +709,32 @@ impl Host {
         let cancel_task = cancel.clone();
         let sessions = self.sessions.clone();
         let task = spawn_task(async move {
-            if sender.is_closed() {
-                cancel_task.cancel();
-                sessions.unbind(&session.connection_id);
-                inflight
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&id);
-                return;
-            }
+            let work = {
+                let _state = sender.shared.state.read().await;
+                if sender.is_closed()
+                    || sender
+                        .shared
+                        .principal_withdrawn
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    cancel_task.cancel();
+                    sessions.unbind(&session.connection_id);
+                    inflight
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&id);
+                    return;
+                }
+                handler.handle(method, payload, cancel_task.clone())
+            };
             // Completion wins races (biased, handler branch first);
             // cancel-vs-deadline ties prefer CANCELLED (recorded B10).
-            // Single terminal send: this task is the ONLY sender for the
-            // id. Cancellation only sets the token (no abort, no second
-            // send), so at most one result frame is ever emitted — on
-            // every target, including wasm where abort is unavailable.
+            // Queueing and slot release share the lifecycle lock. Withdrawal
+            // takes terminal ownership of the remaining slots and fences
+            // worker sends, including on targets with cooperative cancellation.
             let outcome = tokio::select! {
                 biased;
-                res = async {
-                    match handler.authorize(&session.principal, &method) {
-                        Ok(()) => handler.handle(method.clone(), payload, cancel_task.clone()).await,
-                        Err(e) if e.code == ErrorCode::Unauthenticated => HandlerOutcome::error(ErrorCode::Unauthenticated, "credential not accepted"),
-                        Err(_) => HandlerOutcome::error(ErrorCode::PermissionDenied, "access denied"),
-                    }
-                } => res,
+                res = work => res,
                 _ = cancel_task.cancelled() => HandlerOutcome::error(ErrorCode::Cancelled, "cancelled"),
                 _ = sleep_until(deadline) => {
                     if cancel_task.is_cancelled() {
@@ -735,15 +772,22 @@ impl Host {
                 };
                 bytes = frame.encode_to_vec();
             }
-            if sender.send_bytes(bytes).await.is_err() {
+            if sender
+                .send_worker_result(bytes, || {
+                    inflight
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&id);
+                })
+                .await
+                .is_err()
+            {
                 sessions.unbind(&session.connection_id);
+                inflight
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id);
             }
-            // Release the id only after the terminal result is queued:
-            // until now, a duplicate id is a duplicate (original wins).
-            inflight
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id);
         });
         // Admission, task ownership, and insertion share one short lock.
         // A fast worker cannot remove an entry before it is installed;
@@ -757,9 +801,8 @@ impl Host {
             return;
         }
         // Best-effort: signal the handler. Unknown or already-completed
-        // ids are ignored (race tolerance). The request task remains the
-        // sole sender of the terminal result, so completion still wins
-        // and no second `result` is ever emitted.
+        // ids are ignored (race tolerance). Cancellation sends no result of
+        // its own, so completion still wins without a second terminal send.
         if let Some(entry) = self
             .inflight
             .lock()
@@ -805,20 +848,25 @@ impl Host {
         };
         validate_frame(&frame, self.conn.ctx().await)?;
         let bytes = frame.encode_to_vec();
-        let result = self.conn.send_bytes(bytes).await;
-        if result.is_err() {
-            self.on_transport_lost().await;
+        let permit = match self.conn.reserve_writer().await {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.on_transport_lost().await;
+                return Err(error);
+            }
+        };
+        let state = self.conn.shared.state.read().await;
+        if *state != ConnectionState::Active
+            || self.conn.is_closed()
+            || self.conn.writer_is_fenced()
+        {
+            return Err(SyntraError::Closed("connection closing".to_string()));
         }
-        result
+        permit.send(bytes);
+        Ok(())
     }
 
-    /// Graceful close: stop new RPCs, drain already-queued results via the
-    /// transport pump, then teardown (SNTR-HS-006/013). Already-queued
-    /// terminal results are delivered by the pump drain in `loopback_pair`
-    /// (real adapters drain the writer before teardown); in-flight handlers
-    /// that complete after close observe `is_closed` and their late sends
-    /// fail, mapping to UNAVAILABLE/CANCELLED per spec. Bounded by the
-    /// shared SHUTDOWN_GRACE in `shutdown_tasks`.
+    /// Abortive close: stop admission and cancel unfinished handlers.
     pub async fn close(&self) {
         // Move ACTIVE->CLOSING first so new RPCs fail fast at admission
         // while already-queued frames still drain (sends succeed until
@@ -827,6 +875,165 @@ impl Host {
         self.conn.close().await;
         self.unbind_session().await;
         self.shutdown_tasks().await;
+    }
+
+    /// Stop admission, continue processing cancellation and queueing terminal
+    /// results in CLOSING, then close after workers and the writer drain or
+    /// `grace` expires. The pump must keep running and flush dequeued bytes
+    /// before releasing the carrier. The entire drain and task cleanup share
+    /// one deadline; unfinished handlers are cancelled at expiry.
+    pub async fn close_gracefully(&self, grace: Duration) {
+        let deadline = Instant::now() + grace;
+        self.conn.begin_closing().await;
+        self.conn
+            .drain_until(deadline, || {
+                self.inflight_len() == 0 && self.withdraw_pending_len() == 0
+            })
+            .await;
+        self.conn.close().await;
+        self.unbind_session().await;
+        self.abort_inflight_until(deadline).await;
+        self.stop_handshake_timer_until(deadline).await;
+    }
+
+    /// First terminal local reason, retained for transport-adapter diagnostics.
+    pub fn terminal_reason(&self) -> Option<SyntraError> {
+        self.conn.terminal_reason()
+    }
+
+    /// Withdraw the bound principal, stop admission, and settle unfinished
+    /// RPCs with generic UNAUTHENTICATED results before closing. Queueing and
+    /// cleanup share a one-second shutdown budget; an unavailable writer can
+    /// prevent delivery. Already-queued terminal results remain authoritative.
+    pub async fn withdraw_principal(&self) {
+        self.withdraw_principal_with_request(None).await;
+    }
+
+    async fn withdraw_principal_with_request(&self, request_id: Option<u64>) {
+        use std::sync::atomic::Ordering;
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        // Fence once, then persist all terminal work so dropping this future
+        // can be retried. A second caller resumes rather than returning early
+        // while the connection is still open.
+        let first_withdraw = {
+            let mut state = self.conn.shared.state.write().await;
+            if self.conn.is_closed() {
+                return;
+            }
+            let first = !self
+                .conn
+                .shared
+                .principal_withdrawn
+                .swap(true, Ordering::AcqRel);
+            if first {
+                *state = ConnectionState::Closing;
+                self.conn.record_terminal_reason(SyntraError::Protocol {
+                    code: ErrorCode::Unauthenticated,
+                    message: "credential not accepted".to_string(),
+                });
+                let mut bound = self.bound_id.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(id) = bound.take() {
+                    self.sessions.unbind(&id);
+                }
+            }
+            // Capture newly fenced workers even on resume: a concurrent
+            // admission cannot succeed after the flag is set, but an RPC
+            // admitted just before the flag may still be in `inflight`.
+            let drained: Vec<(u64, InflightEntry)> = self
+                .inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain()
+                .collect();
+            if !drained.is_empty() {
+                let mut workers = self
+                    .withdraw_workers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let mut ids = self.withdraw_ids.lock().unwrap_or_else(|e| e.into_inner());
+                for (id, entry) in drained {
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                    workers.push(entry);
+                }
+            }
+            if let Some(id) = request_id {
+                let mut ids = self.withdraw_ids.lock().unwrap_or_else(|e| e.into_inner());
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            first
+        };
+        // Abort is idempotent; re-aborting resumed workers is safe.
+        {
+            let workers = self
+                .withdraw_workers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for entry in workers.iter() {
+                if !entry.task.is_current() {
+                    entry.cancel.cancel();
+                    entry.task.abort();
+                }
+            }
+        }
+        // Queue one generic terminal result per withdrawn RPC. Successful
+        // queues are removed immediately so a retry sends only the remainder.
+        // The shared one-second budget bounds a full writer; expiry leaves
+        // the remainder queued for retry rather than silently dropping it.
+        // `send_result` internally funnels through the bounded writer.
+        loop {
+            let next = {
+                self.withdraw_ids
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .first()
+                    .copied()
+            };
+            let Some(id) = next else { break };
+            let sent = tokio::select! {
+                biased;
+                _ = sleep_until(deadline) => false,
+                _ = self.send_result(id, outcome_error(ErrorCode::Unauthenticated, "credential not accepted")) => true,
+            };
+            if !sent {
+                break;
+            }
+            self.withdraw_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|kept| *kept != id);
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        // Close even when the writer stayed full: the connection must not
+        // remain half-closed. Unsent IDs stay queued for a retry while the
+        // connection is still open, and `close_gracefully` observes them.
+        self.conn
+            .fail_protocol_and_close(SyntraError::Protocol {
+                code: ErrorCode::Unauthenticated,
+                message: "credential not accepted".to_string(),
+            })
+            .await;
+        // Join fenced workers under the remaining budget. Detaching on expiry
+        // is bounded; native abort already preempted them.
+        let workers: Vec<InflightEntry> = self
+            .withdraw_workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        for entry in workers {
+            entry
+                .task
+                .join_bounded(deadline.saturating_duration_since(Instant::now()))
+                .await;
+        }
+        self.stop_handshake_timer_until(deadline).await;
+        let _ = first_withdraw;
     }
 
     /// Abrupt transport loss: `UNAVAILABLE` (unknown outcome) to all

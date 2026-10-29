@@ -95,9 +95,15 @@ pub enum ProfileInput {
         observed_base: Vec<u8>,
     },
     /// Stream loss or explicit continuity loss for the stream.
-    ContinuityLost { stream_selector: Vec<u8>, committed: Vec<u8> },
+    ContinuityLost {
+        stream_selector: Vec<u8>,
+        committed: Vec<u8>,
+    },
     /// The application reports that continuation is expired or unavailable.
-    ContinuationExpired { stream_selector: Vec<u8>, committed: Vec<u8> },
+    ContinuationExpired {
+        stream_selector: Vec<u8>,
+        committed: Vec<u8>,
+    },
     /// The application installed a snapshot at the given checkpoint.
     SnapshotInstalled { checkpoint: ProfileCheckpoint },
 }
@@ -111,11 +117,17 @@ pub enum ProfileAction {
     /// Apply the batch, then confirm its checkpoint after effects persist.
     CommitCheckpoint { checkpoint: ProfileCheckpoint },
     /// Recover from the committed position using an application call.
-    RecoveryNeeded { stream_selector: Vec<u8>, committed: Vec<u8> },
+    RecoveryNeeded {
+        stream_selector: Vec<u8>,
+        committed: Vec<u8>,
+    },
     /// Obtain an authoritative snapshot before resuming the stream.
     /// Emitted by continuation expiry; while pending, validated batches
     /// are blocked until a snapshot confirms.
-    SnapshotRequired { stream_selector: Vec<u8>, committed: Vec<u8> },
+    SnapshotRequired {
+        stream_selector: Vec<u8>,
+        committed: Vec<u8>,
+    },
 }
 
 /// Alias for the coordinator action.
@@ -162,9 +174,9 @@ impl ProviderError {
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::UnknownStream | Self::UnknownOperation => ErrorCode::Unimplemented,
-            Self::Unconfirmed
-            | Self::StaleCheckpoint
-            | Self::OutsideRetention => ErrorCode::FailedPrecondition,
+            Self::Unconfirmed | Self::StaleCheckpoint | Self::OutsideRetention => {
+                ErrorCode::FailedPrecondition
+            }
             Self::Unauthorized => ErrorCode::PermissionDenied,
             Self::Unauthenticated => ErrorCode::Unauthenticated,
             Self::Overloaded => ErrorCode::ResourceExhausted,
@@ -239,7 +251,8 @@ pub trait ReplayProvider {
 /// coordinator emits a snapshot-required action.
 pub trait SnapshotProvider {
     /// Offers a snapshot under a provider-proven boundary checkpoint.
-    fn offer_snapshot(&self, committed: &CommittedPosition) -> Result<SnapshotOffer, ProviderError>;
+    fn offer_snapshot(&self, committed: &CommittedPosition)
+        -> Result<SnapshotOffer, ProviderError>;
     /// Returns one bounded snapshot page for storage without
     /// interpretation.
     fn snapshot_page(
@@ -422,22 +435,32 @@ impl ProfileRecovery {
                     is_snapshot: false,
                 });
                 vec![ProfileAction::CommitCheckpoint { checkpoint }]
-            },
-            ProfileInput::GapDetected { stream_selector, expected_base: _, observed_base: _ } => {
+            }
+            ProfileInput::GapDetected {
+                stream_selector,
+                expected_base: _,
+                observed_base: _,
+            } => {
                 if stream_selector != self.stream_selector {
                     return vec![];
                 }
                 self.pending = None;
                 self.recovery_needed()
-            },
-            ProfileInput::ContinuityLost { stream_selector, committed: _ } => {
+            }
+            ProfileInput::ContinuityLost {
+                stream_selector,
+                committed: _,
+            } => {
                 if stream_selector != self.stream_selector {
                     return vec![];
                 }
                 self.pending = None;
                 self.recovery_needed()
-            },
-            ProfileInput::ContinuationExpired { stream_selector, committed } => {
+            }
+            ProfileInput::ContinuationExpired {
+                stream_selector,
+                committed,
+            } => {
                 if stream_selector != self.stream_selector {
                     return vec![];
                 }
@@ -450,7 +473,7 @@ impl ProfileRecovery {
                 self.pending = None;
                 self.snapshot_pending = true;
                 self.snapshot_required()
-            },
+            }
             ProfileInput::SnapshotInstalled { checkpoint } => {
                 if checkpoint.stream_selector != self.stream_selector {
                     return vec![];
@@ -489,7 +512,7 @@ impl ProfileRecovery {
                     is_snapshot: true,
                 });
                 vec![ProfileAction::CommitCheckpoint { checkpoint }]
-            },
+            }
         }
     }
 
@@ -538,7 +561,7 @@ impl ProfileRecovery {
             // Only a checkpoint previously returned as committable advances
             // committed progress.
             match &self.pending {
-                Some(offer) if offer.checkpoint == *checkpoint => {},
+                Some(offer) if offer.checkpoint == *checkpoint => {}
                 _ => return self.recovery_needed(),
             }
             if checkpoint.base_cursor != self.committed {
@@ -551,7 +574,7 @@ impl ProfileRecovery {
         // New-generation progress advances only through a snapshot
         // previously returned as committable through the snapshot path.
         match &self.pending {
-            Some(offer) if offer.checkpoint == *checkpoint && offer.is_snapshot => {},
+            Some(offer) if offer.checkpoint == *checkpoint && offer.is_snapshot => {}
             _ => return self.recovery_needed(),
         }
         self.generation = checkpoint.generation;
@@ -582,7 +605,7 @@ impl ProfileRecovery {
                 return false;
             }
             match &self.pending {
-                Some(offer) if offer.checkpoint == *checkpoint => {},
+                Some(offer) if offer.checkpoint == *checkpoint => {}
                 _ => return false,
             }
             if checkpoint.base_cursor != self.committed {
@@ -627,7 +650,9 @@ mod tests {
     fn profile_commit_order_persist_then_confirm() {
         let mut r = coordinator(b"cursor-40");
         let cp = checkpoint(b"cursor-40", b"cursor-43");
-        let actions = r.observe(ProfileInput::BatchValidated { checkpoint: cp.clone() });
+        let actions = r.observe(ProfileInput::BatchValidated {
+            checkpoint: cp.clone(),
+        });
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0], ProfileAction::CommitCheckpoint { .. }));
         // Observing alone must not advance committed progress.
@@ -649,12 +674,13 @@ mod tests {
         let gapped = checkpoint(b"cursor-45", b"cursor-47");
         let actions = r.observe(ProfileInput::BatchValidated { checkpoint: gapped });
         assert_eq!(actions.len(), 1);
-        assert!(matches!(
-            actions[0],
-            ProfileAction::RecoveryNeeded { .. }
-        ));
+        assert!(matches!(actions[0], ProfileAction::RecoveryNeeded { .. }));
         assert_eq!(r.committed(), b"cursor-40");
-        if let ProfileAction::RecoveryNeeded { stream_selector, committed } = &actions[0] {
+        if let ProfileAction::RecoveryNeeded {
+            stream_selector,
+            committed,
+        } = &actions[0]
+        {
             assert_eq!(stream_selector, &selector());
             assert_eq!(committed, b"cursor-40");
         } else {
@@ -688,8 +714,9 @@ mod tests {
             base_cursor: b"cursor-40".to_vec(),
             result_cursor: b"cursor-43".to_vec(),
         };
-        let actions =
-            r.observe(ProfileInput::BatchValidated { checkpoint: next_gen_batch });
+        let actions = r.observe(ProfileInput::BatchValidated {
+            checkpoint: next_gen_batch,
+        });
         assert!(matches!(actions[0], ProfileAction::RecoveryNeeded { .. }));
         assert_eq!(r.generation(), 7);
         assert_eq!(r.committed(), b"cursor-40");
@@ -701,7 +728,10 @@ mod tests {
             result_cursor: b"cursor-09".to_vec(),
         };
         let stale_actions = r.observe(ProfileInput::SnapshotInstalled { checkpoint: stale });
-        assert!(matches!(stale_actions[0], ProfileAction::RecoveryNeeded { .. }));
+        assert!(matches!(
+            stale_actions[0],
+            ProfileAction::RecoveryNeeded { .. }
+        ));
         // Snapshot under a new generation may start from a fresh base and,
         // once confirmed, moves the continuity epoch forward.
         let snap = ProfileCheckpoint {
@@ -710,8 +740,13 @@ mod tests {
             base_cursor: b"boundary-00".to_vec(),
             result_cursor: b"boundary-100".to_vec(),
         };
-        let snap_actions = r.observe(ProfileInput::SnapshotInstalled { checkpoint: snap.clone() });
-        assert!(matches!(snap_actions[0], ProfileAction::CommitCheckpoint { .. }));
+        let snap_actions = r.observe(ProfileInput::SnapshotInstalled {
+            checkpoint: snap.clone(),
+        });
+        assert!(matches!(
+            snap_actions[0],
+            ProfileAction::CommitCheckpoint { .. }
+        ));
         assert_eq!(r.generation(), 7);
         assert_eq!(r.committed(), b"cursor-40");
         assert!(r.confirm_persisted(&snap).is_empty());
@@ -740,18 +775,25 @@ mod tests {
         assert!(r.snapshot_pending());
         // Otherwise-valid batch must not commit while the gate holds.
         let batch = checkpoint(b"cursor-40", b"cursor-43");
-        let blocked = r.observe(ProfileInput::BatchValidated { checkpoint: batch.clone() });
+        let blocked = r.observe(ProfileInput::BatchValidated {
+            checkpoint: batch.clone(),
+        });
         assert!(matches!(blocked[0], ProfileAction::SnapshotRequired { .. }));
         assert_eq!(r.committed(), b"cursor-40");
         // Same-generation confirm is blocked as well; only a new-generation
         // snapshot confirm clears the gate.
         let blocked_confirm = r.confirm_persisted(&batch);
-        assert!(matches!(blocked_confirm[0], ProfileAction::SnapshotRequired { .. }));
+        assert!(matches!(
+            blocked_confirm[0],
+            ProfileAction::SnapshotRequired { .. }
+        ));
         assert_eq!(r.committed(), b"cursor-40");
         assert!(r.snapshot_pending());
         // Same-generation snapshot is held by the gate.
         let same_gen = checkpoint(b"cursor-40", b"cursor-43");
-        let held = r.observe(ProfileInput::SnapshotInstalled { checkpoint: same_gen });
+        let held = r.observe(ProfileInput::SnapshotInstalled {
+            checkpoint: same_gen,
+        });
         assert!(matches!(held[0], ProfileAction::SnapshotRequired { .. }));
         // New-generation snapshot commits and, once confirmed, clears the gate.
         let snap = ProfileCheckpoint {
@@ -760,8 +802,13 @@ mod tests {
             base_cursor: b"boundary-00".to_vec(),
             result_cursor: b"boundary-100".to_vec(),
         };
-        let snap_actions = r.observe(ProfileInput::SnapshotInstalled { checkpoint: snap.clone() });
-        assert!(matches!(snap_actions[0], ProfileAction::CommitCheckpoint { .. }));
+        let snap_actions = r.observe(ProfileInput::SnapshotInstalled {
+            checkpoint: snap.clone(),
+        });
+        assert!(matches!(
+            snap_actions[0],
+            ProfileAction::CommitCheckpoint { .. }
+        ));
         assert!(r.confirm_persisted(&snap).is_empty());
         assert!(!r.snapshot_pending());
         assert_eq!(r.generation(), 8);
@@ -772,19 +819,24 @@ mod tests {
     fn profile_duplicate_tolerated_across_boundary() {
         let mut r = coordinator(b"cursor-40");
         let cp = checkpoint(b"cursor-40", b"cursor-43");
-        let actions = r.observe(ProfileInput::BatchValidated { checkpoint: cp.clone() });
+        let actions = r.observe(ProfileInput::BatchValidated {
+            checkpoint: cp.clone(),
+        });
         assert!(matches!(actions[0], ProfileAction::CommitCheckpoint { .. }));
         assert!(r.confirm_persisted(&cp).is_empty());
         assert_eq!(r.committed(), b"cursor-43");
         // Replayed batch whose result is already committed is tolerated.
         let duplicate = checkpoint(b"cursor-40", b"cursor-43");
-        let tolerated = r.observe(ProfileInput::BatchValidated { checkpoint: duplicate });
+        let tolerated = r.observe(ProfileInput::BatchValidated {
+            checkpoint: duplicate,
+        });
         assert!(tolerated.is_empty());
         assert_eq!(r.committed(), b"cursor-43");
         // Live batch repeating the committed result is tolerated as well.
         let live_duplicate = checkpoint(b"cursor-43", b"cursor-43");
-        let tolerated_live =
-            r.observe(ProfileInput::BatchValidated { checkpoint: live_duplicate });
+        let tolerated_live = r.observe(ProfileInput::BatchValidated {
+            checkpoint: live_duplicate,
+        });
         assert!(tolerated_live.is_empty());
         // Duplicate confirmation is idempotent.
         let reconfirm = r.confirm_persisted(&cp);
@@ -797,7 +849,9 @@ mod tests {
     fn profile_stale_continuation_expiry_ignored() {
         let mut r = coordinator(b"cursor-40");
         let cp = checkpoint(b"cursor-40", b"cursor-43");
-        let actions = r.observe(ProfileInput::BatchValidated { checkpoint: cp.clone() });
+        let actions = r.observe(ProfileInput::BatchValidated {
+            checkpoint: cp.clone(),
+        });
         assert!(matches!(actions[0], ProfileAction::CommitCheckpoint { .. }));
         assert!(r.confirm_persisted(&cp).is_empty());
         assert_eq!(r.committed(), b"cursor-43");
@@ -868,7 +922,9 @@ mod tests {
             result_cursor: b"boundary-100".to_vec(),
         };
         // Snapshot returned as committable through the snapshot path.
-        let offered = r.observe(ProfileInput::SnapshotInstalled { checkpoint: snap.clone() });
+        let offered = r.observe(ProfileInput::SnapshotInstalled {
+            checkpoint: snap.clone(),
+        });
         assert!(matches!(offered[0], ProfileAction::CommitCheckpoint { .. }));
         assert!(r.snapshot_pending());
         // Confirm advances generation and committed progress and clears
@@ -884,14 +940,19 @@ mod tests {
         let mut r = coordinator(b"cursor-40");
         let first = checkpoint(b"cursor-40", b"cursor-43");
         let second = checkpoint(b"cursor-40", b"cursor-44");
-        let first_actions =
-            r.observe(ProfileInput::BatchValidated { checkpoint: first.clone() });
-        assert!(matches!(first_actions[0], ProfileAction::CommitCheckpoint { .. }));
+        let first_actions = r.observe(ProfileInput::BatchValidated {
+            checkpoint: first.clone(),
+        });
+        assert!(matches!(
+            first_actions[0],
+            ProfileAction::CommitCheckpoint { .. }
+        ));
         // Competing offer from the same base with a different result reaches
         // the pending-offer check, so it returns recovery-needed without
         // replacing the pending offer.
-        let second_actions =
-            r.observe(ProfileInput::BatchValidated { checkpoint: second.clone() });
+        let second_actions = r.observe(ProfileInput::BatchValidated {
+            checkpoint: second.clone(),
+        });
         assert!(matches!(
             second_actions[0],
             ProfileAction::RecoveryNeeded { .. }
@@ -905,7 +966,9 @@ mod tests {
     fn profile_gap_invalidates_pending_offer() {
         let mut r = coordinator(b"cursor-40");
         let cp = checkpoint(b"cursor-40", b"cursor-43");
-        let actions = r.observe(ProfileInput::BatchValidated { checkpoint: cp.clone() });
+        let actions = r.observe(ProfileInput::BatchValidated {
+            checkpoint: cp.clone(),
+        });
         assert!(matches!(actions[0], ProfileAction::CommitCheckpoint { .. }));
         let gap = r.observe(ProfileInput::GapDetected {
             stream_selector: selector(),
@@ -919,7 +982,9 @@ mod tests {
         assert_eq!(r.committed(), b"cursor-40");
         // Continuity loss invalidates a pending offer the same way.
         let mut r = coordinator(b"cursor-40");
-        let actions = r.observe(ProfileInput::BatchValidated { checkpoint: cp.clone() });
+        let actions = r.observe(ProfileInput::BatchValidated {
+            checkpoint: cp.clone(),
+        });
         assert!(matches!(actions[0], ProfileAction::CommitCheckpoint { .. }));
         let lost = r.observe(ProfileInput::ContinuityLost {
             stream_selector: selector(),
@@ -927,24 +992,54 @@ mod tests {
         });
         assert!(matches!(lost[0], ProfileAction::RecoveryNeeded { .. }));
         let after_lost = r.confirm_persisted(&cp);
-        assert!(matches!(after_lost[0], ProfileAction::RecoveryNeeded { .. }));
+        assert!(matches!(
+            after_lost[0],
+            ProfileAction::RecoveryNeeded { .. }
+        ));
         assert_eq!(r.committed(), b"cursor-40");
     }
 
     #[test]
     fn profile_provider_error_maps_to_typed_codes() {
-        assert_eq!(ProviderError::UnknownStream.code(), ErrorCode::Unimplemented);
-        assert_eq!(ProviderError::UnknownOperation.code(), ErrorCode::Unimplemented);
-        assert_eq!(ProviderError::Unconfirmed.code(), ErrorCode::FailedPrecondition);
-        assert_eq!(ProviderError::StaleCheckpoint.code(), ErrorCode::FailedPrecondition);
-        assert_eq!(ProviderError::OutsideRetention.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            ProviderError::UnknownStream.code(),
+            ErrorCode::Unimplemented
+        );
+        assert_eq!(
+            ProviderError::UnknownOperation.code(),
+            ErrorCode::Unimplemented
+        );
+        assert_eq!(
+            ProviderError::Unconfirmed.code(),
+            ErrorCode::FailedPrecondition
+        );
+        assert_eq!(
+            ProviderError::StaleCheckpoint.code(),
+            ErrorCode::FailedPrecondition
+        );
+        assert_eq!(
+            ProviderError::OutsideRetention.code(),
+            ErrorCode::FailedPrecondition
+        );
         assert!(ProviderError::OutsideRetention.requires_snapshot());
         assert!(!ProviderError::StaleCheckpoint.requires_snapshot());
-        assert_eq!(ProviderError::Unauthorized.code(), ErrorCode::PermissionDenied);
-        assert_eq!(ProviderError::Unauthenticated.code(), ErrorCode::Unauthenticated);
-        assert_eq!(ProviderError::Overloaded.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(
+            ProviderError::Unauthorized.code(),
+            ErrorCode::PermissionDenied
+        );
+        assert_eq!(
+            ProviderError::Unauthenticated.code(),
+            ErrorCode::Unauthenticated
+        );
+        assert_eq!(
+            ProviderError::Overloaded.code(),
+            ErrorCode::ResourceExhausted
+        );
         assert_eq!(ProviderError::TransportLost.code(), ErrorCode::Unavailable);
-        assert_eq!(ProviderError::DeadlineExpired.code(), ErrorCode::DeadlineExceeded);
+        assert_eq!(
+            ProviderError::DeadlineExpired.code(),
+            ErrorCode::DeadlineExceeded
+        );
         assert_eq!(ProviderError::Internal.code(), ErrorCode::Internal);
         let code: ErrorCode = ProviderError::Overloaded.into();
         assert_eq!(code, ErrorCode::ResourceExhausted);

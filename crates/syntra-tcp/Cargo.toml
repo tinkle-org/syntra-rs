@@ -1,0 +1,30 @@
+[package]
+name = "syntra-tcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native SC1 ordered stream adapter and shared frame pump"
+
+[features]
+default = ["sockets"]
+sockets = ["tokio/net"]
+
+[dependencies]
+syntra-secure-channel = { path = "../syntra-secure-channel", version = "1.0.0-rc.1" }
+syntra-core = { path = "../syntra-core", version = "1.0.0-rc.1" }
+syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.1" }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "io-util"] }
+tracing.workspace = true
+thiserror.workspace = true
+prost.workspace = true
+zeroize = { version = "1", features = ["alloc"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+futures-util = "0.3"
+
+[[bench]]
+name = "pipe"
+harness = false

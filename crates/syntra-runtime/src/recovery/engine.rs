@@ -59,18 +59,15 @@ pub struct ProfileEngine {
 impl ProfileEngine {
     /// Empty engine with no tracked streams.
     pub fn new() -> Self {
-        Self { streams: HashMap::new() }
+        Self {
+            streams: HashMap::new(),
+        }
     }
 
     /// Tracks a stream from its last confirmed position, replacing any
     /// existing state for the selector. Resets the catch-up boundary,
     /// loss counter, and pending offer for the stream.
-    pub fn insert_stream(
-        &mut self,
-        stream_selector: Vec<u8>,
-        generation: u64,
-        committed: Vec<u8>,
-    ) {
+    pub fn insert_stream(&mut self, stream_selector: Vec<u8>, generation: u64, committed: Vec<u8>) {
         self.streams.insert(
             stream_selector.clone(),
             StreamState {
@@ -104,17 +101,23 @@ impl ProfileEngine {
 
     /// Last confirmed cursor for the stream, if tracked.
     pub fn committed(&self, stream_selector: &[u8]) -> Option<&[u8]> {
-        self.streams.get(stream_selector).map(|s| s.recovery.committed())
+        self.streams
+            .get(stream_selector)
+            .map(|s| s.recovery.committed())
     }
 
     /// Continuity generation for the stream, if tracked.
     pub fn generation(&self, stream_selector: &[u8]) -> Option<u64> {
-        self.streams.get(stream_selector).map(|s| s.recovery.generation())
+        self.streams
+            .get(stream_selector)
+            .map(|s| s.recovery.generation())
     }
 
     /// Last confirmed position for the stream, if tracked.
     pub fn position(&self, stream_selector: &[u8]) -> Option<CommittedPosition> {
-        self.streams.get(stream_selector).map(|s| s.recovery.position())
+        self.streams
+            .get(stream_selector)
+            .map(|s| s.recovery.position())
     }
 
     /// Pending committable checkpoint awaiting confirmation, if any.
@@ -123,18 +126,25 @@ impl ProfileEngine {
     /// successful confirmation and on gap, continuity-loss, and matched
     /// continuation-expiry reports, mirroring the coordinator.
     pub fn pending(&self, stream_selector: &[u8]) -> Option<&ProfileCheckpoint> {
-        self.streams.get(stream_selector).and_then(|s| s.pending.as_ref())
+        self.streams
+            .get(stream_selector)
+            .and_then(|s| s.pending.as_ref())
     }
 
     /// Whether the stream requires a snapshot before batch commits resume.
     /// False for untracked selectors.
     pub fn snapshot_pending(&self, stream_selector: &[u8]) -> bool {
-        self.streams.get(stream_selector).map(|s| s.recovery.snapshot_pending()).unwrap_or(false)
+        self.streams
+            .get(stream_selector)
+            .map(|s| s.recovery.snapshot_pending())
+            .unwrap_or(false)
     }
 
     /// Recorded catch-up boundary for the stream, if any.
     pub fn catchup_boundary(&self, stream_selector: &[u8]) -> Option<&[u8]> {
-        self.streams.get(stream_selector).and_then(|s| s.catchup_boundary.as_deref())
+        self.streams
+            .get(stream_selector)
+            .and_then(|s| s.catchup_boundary.as_deref())
     }
 
     /// Forgets the recorded catch-up boundary for the stream.
@@ -154,9 +164,15 @@ impl ProfileEngine {
         match input {
             ProfileInput::BatchValidated { checkpoint }
             | ProfileInput::SnapshotInstalled { checkpoint } => &checkpoint.stream_selector,
-            ProfileInput::GapDetected { stream_selector, .. }
-            | ProfileInput::ContinuityLost { stream_selector, .. }
-            | ProfileInput::ContinuationExpired { stream_selector, .. } => stream_selector,
+            ProfileInput::GapDetected {
+                stream_selector, ..
+            }
+            | ProfileInput::ContinuityLost {
+                stream_selector, ..
+            }
+            | ProfileInput::ContinuationExpired {
+                stream_selector, ..
+            } => stream_selector,
         }
     }
 
@@ -243,16 +259,14 @@ impl ProfileEngine {
     /// and invalidates the pending offer. Equal counts return no actions.
     /// A decreased count is treated as a counter reset: it is recorded
     /// with no actions.
-    pub fn poll_loss(
-        &mut self,
-        stream_selector: &[u8],
-        loss_count: u64,
-    ) -> Vec<ProfileAction> {
+    pub fn poll_loss(&mut self, stream_selector: &[u8], loss_count: u64) -> Vec<ProfileAction> {
         let committed = match self.streams.get(stream_selector) {
             Some(state) => {
                 if loss_count < state.last_loss {
-                    let state =
-                        self.streams.get_mut(stream_selector).expect("checked above");
+                    let state = self
+                        .streams
+                        .get_mut(stream_selector)
+                        .expect("checked above");
                     state.last_loss = loss_count;
                     return vec![];
                 }
@@ -260,11 +274,14 @@ impl ProfileEngine {
                     return vec![];
                 }
                 state.recovery.committed().to_vec()
-            },
+            }
             None => return vec![],
         };
         {
-            let state = self.streams.get_mut(stream_selector).expect("checked above");
+            let state = self
+                .streams
+                .get_mut(stream_selector)
+                .expect("checked above");
             state.last_loss = loss_count;
         }
         self.observe(ProfileInput::GapDetected {
@@ -300,7 +317,7 @@ impl ProfileEngine {
             None => {
                 state.catchup_boundary = Some(boundary);
                 vec![]
-            },
+            }
             Some(existing) if *existing == boundary => vec![],
             Some(_) => vec![ProfileAction::RecoveryNeeded {
                 stream_selector: state.recovery.stream_selector().to_vec(),
@@ -337,7 +354,7 @@ impl ProfileEngine {
             None => {
                 state.catchup_boundary = Some(page.catchup_boundary.clone());
                 vec![]
-            },
+            }
             Some(boundary) if *boundary == page.catchup_boundary => vec![],
             Some(_) => vec![ProfileAction::RecoveryNeeded {
                 stream_selector: state.recovery.stream_selector().to_vec(),
@@ -423,23 +440,35 @@ mod tests {
 
         let first = page_with_boundary(b"boundary-100");
         assert!(engine.observe_replay_page(&selector(), &first).is_empty());
-        assert_eq!(engine.catchup_boundary(&selector()), Some(b"boundary-100".as_slice()));
+        assert_eq!(
+            engine.catchup_boundary(&selector()),
+            Some(b"boundary-100".as_slice())
+        );
 
         let second = page_with_boundary(b"boundary-100");
         assert!(engine.observe_replay_page(&selector(), &second).is_empty());
-        assert_eq!(engine.catchup_boundary(&selector()), Some(b"boundary-100".as_slice()));
+        assert_eq!(
+            engine.catchup_boundary(&selector()),
+            Some(b"boundary-100".as_slice())
+        );
 
         let moved = page_with_boundary(b"boundary-101");
         let actions = engine.observe_replay_page(&selector(), &moved);
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0], ProfileAction::RecoveryNeeded { .. }));
         // Recorded boundary stays fixed at the first value.
-        assert_eq!(engine.catchup_boundary(&selector()), Some(b"boundary-100".as_slice()));
+        assert_eq!(
+            engine.catchup_boundary(&selector()),
+            Some(b"boundary-100".as_slice())
+        );
 
         engine.clear_catchup_boundary(&selector());
         assert_eq!(engine.catchup_boundary(&selector()), None);
         assert!(engine.observe_replay_page(&selector(), &moved).is_empty());
-        assert_eq!(engine.catchup_boundary(&selector()), Some(b"boundary-101".as_slice()));
+        assert_eq!(
+            engine.catchup_boundary(&selector()),
+            Some(b"boundary-101".as_slice())
+        );
     }
 
     #[test]
@@ -453,22 +482,40 @@ mod tests {
         assert_eq!(engine.catchup_boundary(&selector()), None);
 
         // Record subscribed boundary from subscribe response.
-        assert!(engine.set_subscribed_boundary(&selector(), b"boundary-100".to_vec()).is_empty());
-        assert_eq!(engine.catchup_boundary(&selector()), Some(b"boundary-100".as_slice()));
+        assert!(engine
+            .set_subscribed_boundary(&selector(), b"boundary-100".to_vec())
+            .is_empty());
+        assert_eq!(
+            engine.catchup_boundary(&selector()),
+            Some(b"boundary-100".as_slice())
+        );
 
         // Matching page passes; mismatched page fails without replacing.
-        assert!(engine.observe_replay_page(&selector(), &page_with_boundary(b"boundary-100")).is_empty());
+        assert!(engine
+            .observe_replay_page(&selector(), &page_with_boundary(b"boundary-100"))
+            .is_empty());
         let moved = engine.observe_replay_page(&selector(), &page_with_boundary(b"boundary-101"));
         assert!(matches!(moved[0], ProfileAction::RecoveryNeeded { .. }));
-        assert_eq!(engine.catchup_boundary(&selector()), Some(b"boundary-100".as_slice()));
+        assert_eq!(
+            engine.catchup_boundary(&selector()),
+            Some(b"boundary-100".as_slice())
+        );
 
         // Matching completion passes; mismatched or empty completion fails.
-        assert!(engine.observe_completion_boundary(&selector(), b"boundary-100").is_empty());
+        assert!(engine
+            .observe_completion_boundary(&selector(), b"boundary-100")
+            .is_empty());
         let bad = engine.observe_completion_boundary(&selector(), b"boundary-101");
         assert!(matches!(bad[0], ProfileAction::RecoveryNeeded { .. }));
         let empty_completion = engine.observe_completion_boundary(&selector(), b"");
-        assert!(matches!(empty_completion[0], ProfileAction::RecoveryNeeded { .. }));
-        assert_eq!(engine.catchup_boundary(&selector()), Some(b"boundary-100".as_slice()));
+        assert!(matches!(
+            empty_completion[0],
+            ProfileAction::RecoveryNeeded { .. }
+        ));
+        assert_eq!(
+            engine.catchup_boundary(&selector()),
+            Some(b"boundary-100".as_slice())
+        );
     }
 
     #[test]
@@ -477,10 +524,17 @@ mod tests {
         engine.insert_stream(selector(), 7, Vec::new());
 
         // Initial subscription records subscribed boundary with no pages.
-        assert!(engine.set_subscribed_boundary(&selector(), b"boundary-100".to_vec()).is_empty());
+        assert!(engine
+            .set_subscribed_boundary(&selector(), b"boundary-100".to_vec())
+            .is_empty());
         // Completion at the subscribed boundary passes and releases held batches.
-        assert!(engine.observe_completion_boundary(&selector(), b"boundary-100").is_empty());
-        assert_eq!(engine.catchup_boundary(&selector()), Some(b"boundary-100".as_slice()));
+        assert!(engine
+            .observe_completion_boundary(&selector(), b"boundary-100")
+            .is_empty());
+        assert_eq!(
+            engine.catchup_boundary(&selector()),
+            Some(b"boundary-100".as_slice())
+        );
     }
 
     #[test]
@@ -494,9 +548,16 @@ mod tests {
         assert_eq!(engine.catchup_boundary(&selector()), None);
 
         // Recording B first makes the same completion succeed.
-        assert!(engine.set_subscribed_boundary(&selector(), b"boundary-100".to_vec()).is_empty());
-        assert!(engine.observe_completion_boundary(&selector(), b"boundary-100").is_empty());
-        assert_eq!(engine.catchup_boundary(&selector()), Some(b"boundary-100".as_slice()));
+        assert!(engine
+            .set_subscribed_boundary(&selector(), b"boundary-100".to_vec())
+            .is_empty());
+        assert!(engine
+            .observe_completion_boundary(&selector(), b"boundary-100")
+            .is_empty());
+        assert_eq!(
+            engine.catchup_boundary(&selector()),
+            Some(b"boundary-100".as_slice())
+        );
     }
 
     #[test]
@@ -510,7 +571,11 @@ mod tests {
         let gap = engine.poll_loss(&selector(), 1);
         assert_eq!(gap.len(), 1);
         assert!(matches!(gap[0], ProfileAction::RecoveryNeeded { .. }));
-        if let ProfileAction::RecoveryNeeded { stream_selector, committed } = &gap[0] {
+        if let ProfileAction::RecoveryNeeded {
+            stream_selector,
+            committed,
+        } = &gap[0]
+        {
             assert_eq!(stream_selector, &selector());
             assert_eq!(committed, b"cursor-40");
         } else {
@@ -538,7 +603,9 @@ mod tests {
         assert!(!engine.snapshot_pending(&selector()));
 
         let cp = batch(b"cursor-40", b"cursor-43");
-        let offered = engine.observe(ProfileInput::BatchValidated { checkpoint: cp.clone() });
+        let offered = engine.observe(ProfileInput::BatchValidated {
+            checkpoint: cp.clone(),
+        });
         assert!(matches!(offered[0], ProfileAction::CommitCheckpoint { .. }));
         assert_eq!(engine.pending(&selector()), Some(&cp));
 
@@ -556,14 +623,21 @@ mod tests {
             base_cursor: b"boundary-00".to_vec(),
             result_cursor: b"boundary-100".to_vec(),
         };
-        let snap_offered =
-            engine.observe(ProfileInput::SnapshotInstalled { checkpoint: snap.clone() });
-        assert!(matches!(snap_offered[0], ProfileAction::CommitCheckpoint { .. }));
+        let snap_offered = engine.observe(ProfileInput::SnapshotInstalled {
+            checkpoint: snap.clone(),
+        });
+        assert!(matches!(
+            snap_offered[0],
+            ProfileAction::CommitCheckpoint { .. }
+        ));
         assert_eq!(engine.pending(&selector()), Some(&snap));
         assert!(engine.confirm_persisted(&snap).is_empty());
         assert_eq!(engine.pending(&selector()), None);
         assert!(!engine.snapshot_pending(&selector()));
         assert_eq!(engine.generation(&selector()), Some(8));
-        assert_eq!(engine.committed(&selector()), Some(b"boundary-100".as_slice()));
+        assert_eq!(
+            engine.committed(&selector()),
+            Some(b"boundary-100".as_slice())
+        );
     }
 }

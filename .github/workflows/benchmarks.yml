@@ -1,0 +1,44 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"
+
+concurrency:
+  group: benchmarks-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RUSTUP_TOOLCHAIN: "1.88.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benches:
+    name: in-memory benchmarks (report-only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: "1.88.0"
+      - uses: actions/cache@0057852bfaa89a56745d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ runner.os }}-1.88.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-1.88.0-
+      - name: Compile benchmarks
+        run: cargo bench --workspace -- --test
+      - name: Run benchmarks (short, report-only)
+        run: cargo bench --workspace -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10

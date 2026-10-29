@@ -19,3 +19,8 @@ futures-util.workspace = true
 
 [dev-dependencies]
 prost.workspace = true
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "frame_codec"
+harness = false

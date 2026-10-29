@@ -16,7 +16,7 @@
 //! itself; it only emits `RecoveryNeeded` so the normal replay path runs.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use super::engine::ProfileEngine;
 use super::profile::{ProfileAction, ProfileCheckpoint};
@@ -70,7 +70,8 @@ impl CheckpointReconciler {
     /// stream. Called on every batch/replay page, including the final batch
     /// of a stream that then goes idle.
     pub fn note_observed(&mut self, checkpoint: ProfileCheckpoint) {
-        self.observed.insert(checkpoint.stream_selector.clone(), checkpoint);
+        self.observed
+            .insert(checkpoint.stream_selector.clone(), checkpoint);
     }
 
     /// Forget a stream (unsubscribe / generation advance clears it).
@@ -140,7 +141,9 @@ impl CheckpointReconciler {
         }
         if let Some(last) = out.last() {
             let last_selector = match last {
-                ProfileAction::RecoveryNeeded { stream_selector, .. } => stream_selector.clone(),
+                ProfileAction::RecoveryNeeded {
+                    stream_selector, ..
+                } => stream_selector.clone(),
                 _ => return out,
             };
             self.next_cursor = Some(last_selector);
@@ -175,7 +178,9 @@ mod tests {
         });
         let now = Instant::now();
         let batch = cp(b"s", b"c-40", b"c-43");
-        let offered = engine.observe(ProfileInput::BatchValidated { checkpoint: batch.clone() });
+        let offered = engine.observe(ProfileInput::BatchValidated {
+            checkpoint: batch.clone(),
+        });
         assert!(matches!(offered[0], ProfileAction::CommitCheckpoint { .. }));
         rec.note_observed(batch);
         let found = rec.tick(now, &engine, &store);

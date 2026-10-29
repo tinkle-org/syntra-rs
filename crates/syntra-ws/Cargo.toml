@@ -22,6 +22,8 @@ tracing.workspace = true
 # Native-only WS stack: tokio + tungstenite. Gated to not(wasm32) because
 # mio/net break wasm32-unknown-unknown.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+syntra-secure-channel = { path = "../syntra-secure-channel", version = "1.0.0-rc.1" }
+syntra-tcp = { path = "../syntra-tcp", version = "1.0.0-rc.1", default-features = false }
 tokio = { version = "1", features = ["full"] }
 tungstenite = "0.26"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }

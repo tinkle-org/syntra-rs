@@ -246,8 +246,7 @@ fn emit_bytes(out_ptr: *mut *mut u8, out_len: *mut usize, data: Vec<u8>) -> i32 
 #[no_mangle]
 pub extern "C" fn syntra_open(auth_mode: u32, token_ptr: *const u8, token_len: usize) -> i64 {
     let r = catch_unwind(AssertUnwindSafe(|| -> Result<u64, i32> {
-        let token =
-            read_bytes_bounded(token_ptr, token_len, syntra_core::MAX_CREDENTIAL_BYTES)?;
+        let token = read_bytes_bounded(token_ptr, token_len, syntra_core::MAX_CREDENTIAL_BYTES)?;
         // Everything async (Host::new spawns its handshake timer) must
         // run inside the runtime context.
         global_runtime().block_on(async {
@@ -289,8 +288,7 @@ pub extern "C" fn syntra_open(auth_mode: u32, token_ptr: *const u8, token_len: u
 #[no_mangle]
 pub extern "C" fn syntra_handshake(handle: u64, cred_ptr: *const u8, cred_len: usize) -> i32 {
     let r = catch_unwind(AssertUnwindSafe(|| -> i32 {
-        let cred = match read_bytes_bounded(cred_ptr, cred_len, syntra_core::MAX_CREDENTIAL_BYTES)
-        {
+        let cred = match read_bytes_bounded(cred_ptr, cred_len, syntra_core::MAX_CREDENTIAL_BYTES) {
             Ok(c) => c,
             Err(code) => return code,
         };
@@ -338,11 +336,11 @@ pub extern "C" fn syntra_call(
             Ok(m) => m,
             Err(code) => return code,
         };
-        let payload = match read_bytes_bounded(payload_ptr, payload_len, syntra_core::MAX_FRAME_BYTES)
-        {
-            Ok(p) => p,
-            Err(code) => return code,
-        };
+        let payload =
+            match read_bytes_bounded(payload_ptr, payload_len, syntra_core::MAX_FRAME_BYTES) {
+                Ok(p) => p,
+                Err(code) => return code,
+            };
         with_conn(
             handle,
             |c| {

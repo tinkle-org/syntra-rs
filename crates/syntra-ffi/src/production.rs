@@ -21,8 +21,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::slice;
-use std::sync::{atomic::AtomicU64, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use prost::Message;
 
@@ -62,7 +62,9 @@ const HARD_MAX_PENDING: u32 = 256;
 /// Cap for drained terminal IDs per call.
 const MAX_DRAIN_IDS: usize = 256;
 
-static CONNECTION_SEQ: AtomicU64 = AtomicU64::new(1);
+/// Shared admission limits for host results, expiry results and notifications.
+const MAX_OUTBOUND_FRAMES: usize = 256;
+const MAX_OUTBOUND_BYTES: usize = 16 * MAX_FRAME_BYTES;
 
 // -- Opaque handles --------------------------------------------------------
 
@@ -88,6 +90,7 @@ struct ClientInner {
     min_version: u32,
     max_version: u32,
     credential: Vec<u8>,
+    hello_sent: bool,
     default_timeout_ms: u32,
     max_pending: u32,
     negotiated: u32,
@@ -119,10 +122,41 @@ struct HostInner {
     pending_map: HashMap<u64, HostCall>,
     cancelled: HashSet<u64>,
     outbound: VecDeque<Vec<u8>>,
+    outbound_bytes: usize,
     closed: bool,
 }
 
+impl HostInner {
+    /// Reserve before retiring any pending call so backpressure is retryable.
+    fn reserve_outbound(&mut self, frames: usize, bytes: usize) -> Result<(), i32> {
+        if frames > MAX_OUTBOUND_FRAMES - self.outbound.len()
+            || bytes > MAX_OUTBOUND_BYTES - self.outbound_bytes
+        {
+            return Err(SYNTRA_FFI_NOMEM);
+        }
+        self.outbound
+            .try_reserve(frames)
+            .map_err(|_| SYNTRA_FFI_NOMEM)
+    }
+
+    fn push_outbound(&mut self, bytes: Vec<u8>) {
+        self.outbound_bytes += bytes.len();
+        self.outbound.push_back(bytes);
+    }
+}
+
 // -- Buffer helpers --------------------------------------------------------
+
+fn init_output(out: *mut *mut u8, out_len: *mut usize) -> Result<(), i32> {
+    if out.is_null() || out_len.is_null() {
+        return Err(SYNTRA_FFI_INVALID);
+    }
+    unsafe {
+        *out = ptr::null_mut();
+        *out_len = 0;
+    }
+    Ok(())
+}
 
 fn borrow_bytes(ptr: *const u8, len: usize) -> Result<Vec<u8>, i32> {
     if len == 0 {
@@ -159,11 +193,7 @@ fn alloc_owned(bytes: &[u8], out_ptr: *mut *mut u8, out_len: *mut usize) -> i32 
     SYNTRA_FFI_OK
 }
 
-fn alloc_owned_vec(
-    bytes: Vec<u8>,
-    out_ptr: *mut *mut u8,
-    out_len: *mut usize,
-) -> i32 {
+fn alloc_owned_vec(bytes: Vec<u8>, out_ptr: *mut *mut u8, out_len: *mut usize) -> i32 {
     if out_ptr.is_null() || out_len.is_null() {
         return SYNTRA_FFI_INVALID;
     }
@@ -188,16 +218,44 @@ fn alloc_owned_vec(
 fn effective_timeout_ms(requested: u32, def: u32) -> u64 {
     let base = if requested == 0 { def } else { requested };
     let clamped = base.min(MAX_RPC_TIMEOUT_MS);
-    if clamped == 0 { 1 } else { clamped as u64 }
+    if clamped == 0 {
+        1
+    } else {
+        clamped as u64
+    }
 }
 
-fn generate_connection_id() -> String {
-    let seq = CONNECTION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("c-{seq:x}-{nanos:x}")
+fn generate_connection_id() -> Result<String, i32> {
+    connection_id_with_rng(getrandom::fill)
+}
+
+fn connection_id_with_rng<E>(fill: impl FnOnce(&mut [u8]) -> Result<(), E>) -> Result<String, i32> {
+    let mut random = [0u8; 16];
+    fill(&mut random).map_err(|_| SYNTRA_FFI_INTERNAL)?;
+    let mut id = String::with_capacity(32);
+    for byte in random {
+        use std::fmt::Write;
+        write!(&mut id, "{byte:02x}").map_err(|_| SYNTRA_FFI_INTERNAL)?;
+    }
+    Ok(id)
+}
+
+fn deadline_result(version: u32, request_id: u64) -> Vec<u8> {
+    Frame {
+        version,
+        request_id,
+        body: Some(syntra_core::proto::frame::Body::Result(
+            syntra_core::proto::RpcResult {
+                outcome: Some(syntra_core::proto::rpc_result::Outcome::Error(
+                    syntra_core::proto::RpcError {
+                        code: syntra_core::ErrorCode::DeadlineExceeded.as_i32(),
+                        message: "deadline exceeded".to_string(),
+                    },
+                )),
+            },
+        )),
+    }
+    .encode_to_vec()
 }
 
 fn decode_frame(bytes: &[u8], ctx: ValidationContext) -> Result<Frame, i32> {
@@ -214,9 +272,7 @@ fn client_lock<'a>(
     handle.inner.lock().map_err(|_| SYNTRA_FFI_INTERNAL)
 }
 
-fn host_lock<'a>(
-    h: *mut syntra_ffi_host_t,
-) -> Result<std::sync::MutexGuard<'a, HostInner>, i32> {
+fn host_lock<'a>(h: *mut syntra_ffi_host_t) -> Result<std::sync::MutexGuard<'a, HostInner>, i32> {
     if h.is_null() {
         return Err(SYNTRA_FFI_INVALID);
     }
@@ -294,6 +350,7 @@ pub extern "C" fn syntra_ffi_client_open(
                 min_version,
                 max_version,
                 credential: cred,
+                hello_sent: false,
                 default_timeout_ms: def,
                 max_pending,
                 negotiated: 0,
@@ -312,7 +369,7 @@ pub extern "C" fn syntra_ffi_client_open(
     r.unwrap_or(SYNTRA_FFI_INTERNAL)
 }
 
-/// Builds the hello frame for transport transmission.
+/// Builds the hello frame once for transport transmission, then drops the stored credential.
 #[no_mangle]
 pub extern "C" fn syntra_ffi_client_hello_frame(
     c: *mut syntra_ffi_client_t,
@@ -320,14 +377,20 @@ pub extern "C" fn syntra_ffi_client_hello_frame(
     out_len: *mut usize,
 ) -> i32 {
     let r = catch_unwind(AssertUnwindSafe(|| {
-        let inner = match client_lock(c) {
+        if let Err(code) = init_output(out, out_len) {
+            return code;
+        }
+        let mut inner = match client_lock(c) {
             Ok(g) => g,
             Err(code) => return code,
         };
         if inner.closed {
             return SYNTRA_FFI_CLOSED;
         }
-        if validate_hello_range(inner.min_version, inner.max_version).is_err() {
+        if inner.hello_sent
+            || inner.active
+            || validate_hello_range(inner.min_version, inner.max_version).is_err()
+        {
             return SYNTRA_FFI_INVALID;
         }
         let hello = syntra_core::proto::ClientHello {
@@ -344,7 +407,12 @@ pub extern "C" fn syntra_ffi_client_hello_frame(
         if bytes.len() > MAX_FRAME_BYTES {
             return SYNTRA_FFI_INVALID;
         }
-        alloc_owned(&bytes, out, out_len)
+        let rc = alloc_owned_vec(bytes, out, out_len);
+        if rc == SYNTRA_FFI_OK {
+            inner.hello_sent = true;
+            inner.credential = Vec::new();
+        }
+        rc
     }));
     r.unwrap_or(SYNTRA_FFI_INTERNAL)
 }
@@ -378,14 +446,14 @@ pub extern "C" fn syntra_ffi_client_activate(
         if inner.closed {
             return SYNTRA_FFI_CLOSED;
         }
-        if inner.active {
+        if inner.active || !inner.hello_sent {
             return SYNTRA_FFI_INVALID;
         }
         if frame.request_id != 0 {
             return SYNTRA_FFI_INVALID;
         }
         match frame.body {
-            Some(syntra_core::proto::frame::Body::Ready(_)) => {},
+            Some(syntra_core::proto::frame::Body::Ready(_)) => {}
             _ => return SYNTRA_FFI_INVALID,
         }
         if frame.version < inner.min_version || frame.version > inner.max_version {
@@ -413,7 +481,10 @@ pub extern "C" fn syntra_ffi_client_on_frame(
     notifications: *mut i32,
 ) -> i32 {
     let r = catch_unwind(AssertUnwindSafe(|| {
-        if terminal_n.is_null() || notifications.is_null() {
+        if terminal_n.is_null()
+            || notifications.is_null()
+            || (terminal_ids.is_null() && terminal_cap != 0)
+        {
             return SYNTRA_FFI_INVALID;
         }
         unsafe {
@@ -462,7 +533,7 @@ pub extern "C" fn syntra_ffi_client_on_frame(
                     }
                 }
                 SYNTRA_FFI_OK
-            },
+            }
             Some(syntra_core::proto::frame::Body::Notification(n)) => {
                 if decoded.request_id != 0 {
                     return SYNTRA_FFI_INVALID;
@@ -482,7 +553,7 @@ pub extern "C" fn syntra_ffi_client_on_frame(
                 inner.notifications.push_back(bytes);
                 unsafe { *notifications = 1 };
                 SYNTRA_FFI_OK
-            },
+            }
             _ => SYNTRA_FFI_INVALID,
         }
     }));
@@ -503,6 +574,9 @@ pub extern "C" fn syntra_ffi_client_begin_call(
     out_len: *mut usize,
 ) -> i32 {
     let r = catch_unwind(AssertUnwindSafe(|| {
+        if let Err(code) = init_output(out_req_frame, out_len) {
+            return code;
+        }
         if request_id == 0 {
             return SYNTRA_FFI_INVALID;
         }
@@ -544,10 +618,12 @@ pub extern "C" fn syntra_ffi_client_begin_call(
         if !inner.active || inner.negotiated == 0 {
             return SYNTRA_FFI_INVALID;
         }
-        if inner.pending.contains_key(&request_id) {
+        if inner.pending.contains_key(&request_id) || inner.outcomes.contains_key(&request_id) {
             return SYNTRA_FFI_INVALID;
         }
-        if (inner.pending.len() as u32) >= inner.max_pending {
+        // Unread results retain their admission slots, bounding both their
+        // count and bytes (each result is at most MAX_FRAME_BYTES).
+        if inner.pending.len() + inner.outcomes.len() >= inner.max_pending as usize {
             return SYNTRA_FFI_NOMEM;
         }
         let budget = effective_timeout_ms(timeout_ms, inner.default_timeout_ms);
@@ -565,10 +641,13 @@ pub extern "C" fn syntra_ffi_client_begin_call(
         if bytes.len() > MAX_FRAME_BYTES {
             return SYNTRA_FFI_INVALID;
         }
-        inner.pending.insert(request_id, PendingCall {
-            deadline: Instant::now() + Duration::from_millis(budget),
-            method: method_str,
-        });
+        inner.pending.insert(
+            request_id,
+            PendingCall {
+                deadline: Instant::now() + Duration::from_millis(budget),
+                method: method_str,
+            },
+        );
         alloc_owned(&bytes, out_req_frame, out_len)
     }));
     r.unwrap_or(SYNTRA_FFI_INTERNAL)
@@ -583,6 +662,9 @@ pub extern "C" fn syntra_ffi_client_cancel(
     out_len: *mut usize,
 ) -> i32 {
     let r = catch_unwind(AssertUnwindSafe(|| {
+        if let Err(code) = init_output(out_cancel_frame, out_len) {
+            return code;
+        }
         if request_id == 0 {
             return SYNTRA_FFI_INVALID;
         }
@@ -594,12 +676,6 @@ pub extern "C" fn syntra_ffi_client_cancel(
             return SYNTRA_FFI_CLOSED;
         }
         if !inner.active || !inner.pending.contains_key(&request_id) {
-            if !out_cancel_frame.is_null() {
-                unsafe { *out_cancel_frame = ptr::null_mut() };
-            }
-            if !out_len.is_null() {
-                unsafe { *out_len = 0 };
-            }
             return SYNTRA_FFI_OK;
         }
         let frame = Frame {
@@ -629,8 +705,8 @@ pub extern "C" fn syntra_ffi_client_take_outcome(
             return SYNTRA_FFI_INVALID;
         }
         unsafe { *present = 0 };
-        if out.is_null() || out_len.is_null() {
-            return SYNTRA_FFI_INVALID;
+        if let Err(code) = init_output(out, out_len) {
+            return code;
         }
         let mut inner = match client_lock(c) {
             Ok(g) => g,
@@ -647,7 +723,7 @@ pub extern "C" fn syntra_ffi_client_take_outcome(
                 }
                 unsafe { *present = 1 };
                 SYNTRA_FFI_OK
-            },
+            }
             None => SYNTRA_FFI_OK,
         }
     }));
@@ -667,8 +743,8 @@ pub extern "C" fn syntra_ffi_client_poll_notification(
             return SYNTRA_FFI_INVALID;
         }
         unsafe { *present = 0 };
-        if out.is_null() || out_len.is_null() {
-            return SYNTRA_FFI_INVALID;
+        if let Err(code) = init_output(out, out_len) {
+            return code;
         }
         let mut inner = match client_lock(c) {
             Ok(g) => g,
@@ -685,7 +761,7 @@ pub extern "C" fn syntra_ffi_client_poll_notification(
                 }
                 unsafe { *present = 1 };
                 SYNTRA_FFI_OK
-            },
+            }
             None => SYNTRA_FFI_OK,
         }
     }));
@@ -767,7 +843,7 @@ pub extern "C" fn syntra_ffi_client_reap_expired(
     r.unwrap_or(SYNTRA_FFI_INTERNAL)
 }
 
-/// Closes an initiator core exactly once.
+/// Consumes the initiator handle, including on INTERNAL. No concurrent or subsequent use is valid.
 #[no_mangle]
 pub extern "C" fn syntra_ffi_client_close(c: *mut syntra_ffi_client_t) -> i32 {
     let r = catch_unwind(AssertUnwindSafe(|| {
@@ -786,12 +862,10 @@ pub extern "C" fn syntra_ffi_client_close(c: *mut syntra_ffi_client_t) -> i32 {
                     inner.notifications.clear();
                     SYNTRA_FFI_OK
                 }
-            },
+            }
             Err(_) => SYNTRA_FFI_INTERNAL,
         };
-        // Guard is dropped here; Box frees the allocation on scope exit.
-        // A second close would use-after-free at the C layer; Go guards
-        // double-close before reaching here.
+        // The allocation is freed on scope exit; callers must discard the pointer.
         let _ = &boxed;
         result
     }));
@@ -836,6 +910,7 @@ pub extern "C" fn syntra_ffi_host_open(
                 pending_map: HashMap::new(),
                 cancelled: HashSet::new(),
                 outbound: VecDeque::new(),
+                outbound_bytes: 0,
                 closed: false,
             }),
         });
@@ -925,6 +1000,9 @@ pub extern "C" fn syntra_ffi_host_auth_complete(
     out_len: *mut usize,
 ) -> i32 {
     let r = catch_unwind(AssertUnwindSafe(|| {
+        if let Err(code) = init_output(out_ready_frame, out_len) {
+            return code;
+        }
         if principal_len > 512 {
             return SYNTRA_FFI_INVALID;
         }
@@ -949,7 +1027,10 @@ pub extern "C" fn syntra_ffi_host_auth_complete(
         if inner.active || inner.negotiated == 0 {
             return SYNTRA_FFI_INVALID;
         }
-        let connection_id = generate_connection_id();
+        let connection_id = match generate_connection_id() {
+            Ok(id) => id,
+            Err(code) => return code,
+        };
         let ready = syntra_core::proto::ServerReady {
             connection_id: connection_id.clone(),
         };
@@ -962,10 +1043,14 @@ pub extern "C" fn syntra_ffi_host_auth_complete(
         if bytes.len() > MAX_FRAME_BYTES {
             return SYNTRA_FFI_INTERNAL;
         }
+        let rc = alloc_owned_vec(bytes, out_ready_frame, out_len);
+        if rc != SYNTRA_FFI_OK {
+            return rc;
+        }
         inner.principal = princ;
         inner.connection_id = connection_id;
         inner.active = true;
-        alloc_owned(&bytes, out_ready_frame, out_len)
+        SYNTRA_FFI_OK
     }));
     r.unwrap_or(SYNTRA_FFI_INTERNAL)
 }
@@ -984,18 +1069,16 @@ pub extern "C" fn syntra_ffi_host_on_frame(
     cancel_n: *mut usize,
 ) -> i32 {
     let r = catch_unwind(AssertUnwindSafe(|| {
-        if has_response.is_null() || cancel_n.is_null() {
+        if has_response.is_null() || cancel_n.is_null() || (cancel_ids.is_null() && cancel_cap != 0)
+        {
             return SYNTRA_FFI_INVALID;
+        }
+        if let Err(code) = init_output(out_response, out_len) {
+            return code;
         }
         unsafe {
             *has_response = 0;
             *cancel_n = 0;
-            if !out_response.is_null() {
-                *out_response = ptr::null_mut();
-            }
-            if !out_len.is_null() {
-                *out_len = 0;
-            }
         }
         if len > MAX_FRAME_BYTES {
             return SYNTRA_FFI_INVALID;
@@ -1030,8 +1113,7 @@ pub extern "C" fn syntra_ffi_host_on_frame(
                 }
                 match Frame::decode(bytes.as_slice()) {
                     Ok(fallback)
-                        if fallback.version == inner.negotiated
-                            && fallback.request_id != 0 =>
+                        if fallback.version == inner.negotiated && fallback.request_id != 0 =>
                     {
                         match fallback.body {
                             Some(syntra_core::proto::frame::Body::Request(req))
@@ -1041,31 +1123,31 @@ pub extern "C" fn syntra_ffi_host_on_frame(
                                 let err_frame = Frame {
                                     version: inner.negotiated,
                                     request_id: id,
-                                    body: Some(
-                                        syntra_core::proto::frame::Body::Result(
-                                            syntra_core::proto::RpcResult {
-                                                outcome: Some(
-                                                    syntra_core::proto::rpc_result::Outcome::Error(
-                                                        syntra_core::proto::RpcError {
-                                                            code: syntra_core::ErrorCode::InvalidArgument.as_i32(),
-                                                            message: "invalid method".to_string(),
-                                                        },
-                                                    ),
+                                    body: Some(syntra_core::proto::frame::Body::Result(
+                                        syntra_core::proto::RpcResult {
+                                            outcome: Some(
+                                                syntra_core::proto::rpc_result::Outcome::Error(
+                                                    syntra_core::proto::RpcError {
+                                                        code:
+                                                            syntra_core::ErrorCode::InvalidArgument
+                                                                .as_i32(),
+                                                        message: "invalid method".to_string(),
+                                                    },
                                                 ),
-                                            },
-                                        ),
-                                    ),
+                                            ),
+                                        },
+                                    )),
                                 };
                                 let out = err_frame.encode_to_vec();
                                 unsafe { *has_response = 1 };
                                 return alloc_owned(&out, out_response, out_len);
-                            },
+                            }
                             _ => return SYNTRA_FFI_INVALID,
                         }
-                    },
+                    }
                     _ => return SYNTRA_FFI_INVALID,
                 }
-            },
+            }
         };
         if decoded.version != inner.negotiated {
             return SYNTRA_FFI_INVALID;
@@ -1082,14 +1164,12 @@ pub extern "C" fn syntra_ffi_host_on_frame(
                         request_id: id,
                         body: Some(syntra_core::proto::frame::Body::Result(
                             syntra_core::proto::RpcResult {
-                                outcome: Some(
-                                    syntra_core::proto::rpc_result::Outcome::Error(
-                                        syntra_core::proto::RpcError {
-                                            code: syntra_core::ErrorCode::InvalidArgument.as_i32(),
-                                            message: "invalid method".to_string(),
-                                        },
-                                    ),
-                                ),
+                                outcome: Some(syntra_core::proto::rpc_result::Outcome::Error(
+                                    syntra_core::proto::RpcError {
+                                        code: syntra_core::ErrorCode::InvalidArgument.as_i32(),
+                                        message: "invalid method".to_string(),
+                                    },
+                                )),
                             },
                         )),
                     };
@@ -1103,14 +1183,12 @@ pub extern "C" fn syntra_ffi_host_on_frame(
                         request_id: id,
                         body: Some(syntra_core::proto::frame::Body::Result(
                             syntra_core::proto::RpcResult {
-                                outcome: Some(
-                                    syntra_core::proto::rpc_result::Outcome::Error(
-                                        syntra_core::proto::RpcError {
-                                            code: syntra_core::ErrorCode::FailedPrecondition.as_i32(),
-                                            message: "duplicate request_id".to_string(),
-                                        },
-                                    ),
-                                ),
+                                outcome: Some(syntra_core::proto::rpc_result::Outcome::Error(
+                                    syntra_core::proto::RpcError {
+                                        code: syntra_core::ErrorCode::FailedPrecondition.as_i32(),
+                                        message: "duplicate request_id".to_string(),
+                                    },
+                                )),
                             },
                         )),
                     };
@@ -1124,14 +1202,12 @@ pub extern "C" fn syntra_ffi_host_on_frame(
                         request_id: id,
                         body: Some(syntra_core::proto::frame::Body::Result(
                             syntra_core::proto::RpcResult {
-                                outcome: Some(
-                                    syntra_core::proto::rpc_result::Outcome::Error(
-                                        syntra_core::proto::RpcError {
-                                            code: syntra_core::ErrorCode::ResourceExhausted.as_i32(),
-                                            message: "too many outstanding RPCs".to_string(),
-                                        },
-                                    ),
-                                ),
+                                outcome: Some(syntra_core::proto::rpc_result::Outcome::Error(
+                                    syntra_core::proto::RpcError {
+                                        code: syntra_core::ErrorCode::ResourceExhausted.as_i32(),
+                                        message: "too many outstanding RPCs".to_string(),
+                                    },
+                                )),
                             },
                         )),
                     };
@@ -1139,13 +1215,20 @@ pub extern "C" fn syntra_ffi_host_on_frame(
                     unsafe { *has_response = 1 };
                     return alloc_owned(&out, out_response, out_len);
                 }
-                let timeout = if req.timeout_ms == 0 { 3000 } else { req.timeout_ms.min(MAX_RPC_TIMEOUT_MS) };
-                inner.pending_map.insert(id, HostCall {
-                    deadline: Instant::now() + Duration::from_millis(timeout as u64),
-                });
+                let timeout = if req.timeout_ms == 0 {
+                    3000
+                } else {
+                    req.timeout_ms.min(MAX_RPC_TIMEOUT_MS)
+                };
+                inner.pending_map.insert(
+                    id,
+                    HostCall {
+                        deadline: Instant::now() + Duration::from_millis(timeout as u64),
+                    },
+                );
                 inner.pending_queue.push_back((id, bytes));
                 SYNTRA_FFI_OK
-            },
+            }
             Some(syntra_core::proto::frame::Body::Cancel(_)) => {
                 let id = decoded.request_id;
                 if id == 0 {
@@ -1161,7 +1244,7 @@ pub extern "C" fn syntra_ffi_host_on_frame(
                     }
                 }
                 SYNTRA_FFI_OK
-            },
+            }
             _ => SYNTRA_FFI_INVALID,
         }
     }));
@@ -1178,13 +1261,14 @@ pub extern "C" fn syntra_ffi_host_take_pending(
     present: *mut i32,
 ) -> i32 {
     let r = catch_unwind(AssertUnwindSafe(|| {
-        if present.is_null() {
+        if present.is_null() || request_id_out.is_null() {
             return SYNTRA_FFI_INVALID;
         }
         unsafe { *present = 0 };
-        if out_req_frame.is_null() || out_len.is_null() {
-            return SYNTRA_FFI_INVALID;
+        if let Err(code) = init_output(out_req_frame, out_len) {
+            return code;
         }
+        unsafe { *request_id_out = 0 };
         let mut inner = match host_lock(h) {
             Ok(g) => g,
             Err(code) => return code,
@@ -1200,12 +1284,10 @@ pub extern "C" fn syntra_ffi_host_take_pending(
                 }
                 unsafe {
                     *present = 1;
-                    if !request_id_out.is_null() {
-                        *request_id_out = id;
-                    }
+                    *request_id_out = id;
                 }
                 SYNTRA_FFI_OK
-            },
+            }
             None => SYNTRA_FFI_OK,
         }
     }));
@@ -1241,10 +1323,7 @@ pub extern "C" fn syntra_ffi_host_is_cancelled(
 
 /// Returns the negotiated version.
 #[no_mangle]
-pub extern "C" fn syntra_ffi_host_version(
-    h: *mut syntra_ffi_host_t,
-    version_out: *mut u32,
-) -> i32 {
+pub extern "C" fn syntra_ffi_host_version(h: *mut syntra_ffi_host_t, version_out: *mut u32) -> i32 {
     let r = catch_unwind(AssertUnwindSafe(|| {
         if version_out.is_null() {
             return SYNTRA_FFI_INVALID;
@@ -1262,7 +1341,7 @@ pub extern "C" fn syntra_ffi_host_version(
     r.unwrap_or(SYNTRA_FFI_INTERNAL)
 }
 
-/// Records a result frame. Returns expired=1 when the RPC already expired.
+/// Queues a result frame, or a deadline error if expired. NOMEM leaves the call retryable.
 #[no_mangle]
 pub extern "C" fn syntra_ffi_host_answer(
     h: *mut syntra_ffi_host_t,
@@ -1301,46 +1380,35 @@ pub extern "C" fn syntra_ffi_host_answer(
             return SYNTRA_FFI_INVALID;
         }
         match decoded.body {
-            Some(syntra_core::proto::frame::Body::Result(_)) => {},
+            Some(syntra_core::proto::frame::Body::Result(_)) => {}
             _ => return SYNTRA_FFI_INVALID,
         }
         if decoded.version != inner.negotiated {
             return SYNTRA_FFI_INVALID;
         }
-        match inner.pending_map.remove(&id) {
-            Some(call) => {
-                inner.cancelled.remove(&id);
-                if call.deadline <= Instant::now() {
-                    let version = inner.negotiated;
-                    let frame = Frame {
-                        version,
-                        request_id: id,
-                        body: Some(syntra_core::proto::frame::Body::Result(
-                            syntra_core::proto::RpcResult {
-                                outcome: Some(
-                                    syntra_core::proto::rpc_result::Outcome::Error(
-                                        syntra_core::proto::RpcError {
-                                            code: syntra_core::ErrorCode::DeadlineExceeded.as_i32(),
-                                            message: "deadline exceeded".to_string(),
-                                        },
-                                    ),
-                                ),
-                            },
-                        )),
-                    };
-                    let encoded = frame.encode_to_vec();
-                    if encoded.len() <= MAX_FRAME_BYTES {
-                        inner.outbound.push_back(encoded);
-                    }
-                    unsafe { *expired = 1 };
-                }
-                SYNTRA_FFI_OK
-            },
+        let is_expired = match inner.pending_map.get(&id) {
+            Some(call) => call.deadline <= Instant::now(),
             None => {
                 unsafe { *expired = 1 };
-                SYNTRA_FFI_OK
-            },
+                return SYNTRA_FFI_OK;
+            }
+        };
+        let encoded = if is_expired {
+            deadline_result(inner.negotiated, id)
+        } else {
+            bytes
+        };
+        if let Err(code) = inner.reserve_outbound(1, encoded.len()) {
+            return code;
         }
+        inner.pending_map.remove(&id);
+        inner.cancelled.remove(&id);
+        inner
+            .pending_queue
+            .retain(|(queued_id, _)| *queued_id != id);
+        inner.push_outbound(encoded);
+        unsafe { *expired = i32::from(is_expired) };
+        SYNTRA_FFI_OK
     }));
     r.unwrap_or(SYNTRA_FFI_INTERNAL)
 }
@@ -1374,17 +1442,19 @@ pub extern "C" fn syntra_ffi_host_notify(
             version: inner.negotiated,
             request_id: 0,
             body: Some(syntra_core::proto::frame::Body::Notification(
-                syntra_core::proto::Notification { payload: bytes.into() },
+                syntra_core::proto::Notification {
+                    payload: bytes.into(),
+                },
             )),
         };
         let encoded = frame.encode_to_vec();
         if encoded.len() > MAX_FRAME_BYTES {
             return SYNTRA_FFI_INVALID;
         }
-        if inner.outbound.len() >= 256 {
-            return SYNTRA_FFI_NOMEM;
+        if let Err(code) = inner.reserve_outbound(1, encoded.len()) {
+            return code;
         }
-        inner.outbound.push_back(encoded);
+        inner.push_outbound(encoded);
         SYNTRA_FFI_OK
     }));
     r.unwrap_or(SYNTRA_FFI_INTERNAL)
@@ -1403,8 +1473,8 @@ pub extern "C" fn syntra_ffi_host_next_outbound(
             return SYNTRA_FFI_INVALID;
         }
         unsafe { *present = 0 };
-        if out.is_null() || out_len.is_null() {
-            return SYNTRA_FFI_INVALID;
+        if let Err(code) = init_output(out, out_len) {
+            return code;
         }
         let mut inner = match host_lock(h) {
             Ok(g) => g,
@@ -1415,20 +1485,22 @@ pub extern "C" fn syntra_ffi_host_next_outbound(
         }
         match inner.outbound.pop_front() {
             Some(bytes) => {
+                inner.outbound_bytes -= bytes.len();
                 let rc = alloc_owned_vec(bytes, out, out_len);
                 if rc != SYNTRA_FFI_OK {
                     return rc;
                 }
                 unsafe { *present = 1 };
                 SYNTRA_FFI_OK
-            },
+            }
             None => SYNTRA_FFI_OK,
         }
     }));
     r.unwrap_or(SYNTRA_FFI_INTERNAL)
 }
 
-/// Drains expired host RPC ids.
+/// Drains expired host RPC ids and queues deadline results atomically.
+/// NOMEM leaves all selected calls pending until outbound capacity is drained.
 #[no_mangle]
 pub extern "C" fn syntra_ffi_host_reap_expired(
     h: *mut syntra_ffi_host_t,
@@ -1461,35 +1533,25 @@ pub extern "C" fn syntra_ffi_host_reap_expired(
         expired.sort_unstable();
         let limit = cap.min(MAX_DRAIN_IDS);
         let mut written = 0usize;
-        let to_reap: Vec<u64> = expired.into_iter().take(limit).collect();
+        let to_reap: Vec<(u64, Vec<u8>)> = expired
+            .into_iter()
+            .take(limit)
+            .map(|id| (id, deadline_result(inner.negotiated, id)))
+            .collect();
+        let bytes = to_reap.iter().map(|(_, frame)| frame.len()).sum();
+        if let Err(code) = inner.reserve_outbound(to_reap.len(), bytes) {
+            return code;
+        }
         // Remove queue entries for the same IDs so a reaped RPC is never
         // returned later by `host_take_pending`.
         if !to_reap.is_empty() {
-            let reaped: HashSet<u64> = to_reap.iter().copied().collect();
+            let reaped: HashSet<u64> = to_reap.iter().map(|(id, _)| *id).collect();
             inner.pending_queue.retain(|(id, _)| !reaped.contains(id));
         }
-        for id in to_reap {
+        for (id, encoded) in to_reap {
             inner.pending_map.remove(&id);
             inner.cancelled.remove(&id);
-            let version = inner.negotiated;
-            let frame = Frame {
-                version,
-                request_id: id,
-                body: Some(syntra_core::proto::frame::Body::Result(
-                    syntra_core::proto::RpcResult {
-                        outcome: Some(syntra_core::proto::rpc_result::Outcome::Error(
-                            syntra_core::proto::RpcError {
-                                code: syntra_core::ErrorCode::DeadlineExceeded.as_i32(),
-                                message: "deadline exceeded".to_string(),
-                            },
-                        )),
-                    },
-                )),
-            };
-            let encoded = frame.encode_to_vec();
-            if encoded.len() <= MAX_FRAME_BYTES {
-                inner.outbound.push_back(encoded);
-            }
+            inner.push_outbound(encoded);
             unsafe { *ids.add(written) = id };
             written += 1;
         }
@@ -1499,7 +1561,7 @@ pub extern "C" fn syntra_ffi_host_reap_expired(
     r.unwrap_or(SYNTRA_FFI_INTERNAL)
 }
 
-/// Closes a responder core exactly once.
+/// Consumes the responder handle, including on INTERNAL. No concurrent or subsequent use is valid.
 #[no_mangle]
 pub extern "C" fn syntra_ffi_host_close(h: *mut syntra_ffi_host_t) -> i32 {
     let r = catch_unwind(AssertUnwindSafe(|| {
@@ -1519,7 +1581,7 @@ pub extern "C" fn syntra_ffi_host_close(h: *mut syntra_ffi_host_t) -> i32 {
                     inner.outbound.clear();
                     SYNTRA_FFI_OK
                 }
-            },
+            }
             Err(_) => SYNTRA_FFI_INTERNAL,
         };
         let _ = &boxed;
@@ -1531,6 +1593,729 @@ pub extern "C" fn syntra_ffi_host_close(h: *mut syntra_ffi_host_t) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use syntra_core::proto::{frame::Body, rpc_result::Outcome, RpcError, RpcResult};
+
+    fn take_bytes(out: *mut u8, len: usize) -> Vec<u8> {
+        let bytes = if len == 0 {
+            Vec::new()
+        } else {
+            unsafe { slice::from_raw_parts(out, len).to_vec() }
+        };
+        syntra_ffi_free(out, len);
+        bytes
+    }
+
+    fn active_pair() -> (*mut syntra_ffi_client_t, *mut syntra_ffi_host_t) {
+        let c = open_client();
+        let mut h = ptr::null_mut();
+        assert_eq!(syntra_ffi_host_open(1, 1, 16, &mut h), SYNTRA_FFI_OK);
+        let mut out = ptr::null_mut();
+        let mut len = 0;
+        assert_eq!(
+            syntra_ffi_client_hello_frame(c, &mut out, &mut len),
+            SYNTRA_FFI_OK
+        );
+        let hello = take_bytes(out, len);
+        let mut version = 0;
+        assert_eq!(
+            syntra_ffi_host_accept_hello(h, hello.as_ptr(), hello.len(), &mut version),
+            SYNTRA_FFI_OK
+        );
+        assert_eq!(
+            syntra_ffi_host_auth_complete(h, b"svc".as_ptr().cast(), 3, &mut out, &mut len),
+            SYNTRA_FFI_OK
+        );
+        let ready = take_bytes(out, len);
+        assert_eq!(
+            syntra_ffi_client_activate(c, ready.as_ptr(), ready.len()),
+            SYNTRA_FFI_OK
+        );
+        (c, h)
+    }
+
+    fn begin_status(c: *mut syntra_ffi_client_t, id: u64) -> (i32, Vec<u8>) {
+        let mut out = ptr::null_mut();
+        let mut len = 0;
+        let method = b"/example.Echo/Echo";
+        let rc = syntra_ffi_client_begin_call(
+            c,
+            id,
+            method.as_ptr(),
+            method.len(),
+            b"req".as_ptr(),
+            3,
+            30000,
+            &mut out,
+            &mut len,
+        );
+        (rc, take_bytes(out, len))
+    }
+
+    fn result(id: u64, error: bool) -> Vec<u8> {
+        Frame {
+            version: 1,
+            request_id: id,
+            body: Some(Body::Result(RpcResult {
+                outcome: Some(if error {
+                    Outcome::Error(RpcError {
+                        code: 7,
+                        message: "denied".to_string(),
+                    })
+                } else {
+                    Outcome::Payload(b"response\0\xff".to_vec().into())
+                }),
+            })),
+        }
+        .encode_to_vec()
+    }
+
+    fn next_outbound(h: *mut syntra_ffi_host_t) -> Vec<u8> {
+        let mut out = ptr::null_mut();
+        let mut len = 0;
+        let mut present = 0;
+        assert_eq!(
+            syntra_ffi_host_next_outbound(h, &mut out, &mut len, &mut present),
+            SYNTRA_FFI_OK
+        );
+        assert_eq!(present, 1);
+        take_bytes(out, len)
+    }
+
+    fn ingest_result(c: *mut syntra_ffi_client_t, bytes: &[u8], id: u64) {
+        let mut terminal = 0;
+        let mut n = 0;
+        let mut notifications = 0;
+        assert_eq!(
+            syntra_ffi_client_on_frame(
+                c,
+                bytes.as_ptr(),
+                bytes.len(),
+                &mut terminal,
+                1,
+                &mut n,
+                &mut notifications
+            ),
+            SYNTRA_FFI_OK
+        );
+        assert_eq!((terminal, n, notifications), (id, 1, 0));
+    }
+
+    #[test]
+    fn request_dispatch_answer_outbound_client_outcome_round_trip() {
+        let (c, h) = active_pair();
+        for (id, error, expired) in [(1, false, false), (2, true, false), (3, false, true)] {
+            let (rc, request) = begin_status(c, id);
+            assert_eq!(rc, SYNTRA_FFI_OK);
+            assert_eq!(on_frame_status(h, &request), (SYNTRA_FFI_OK, 0));
+            let mut taken_id = 0;
+            let mut out = ptr::null_mut();
+            let mut len = 0;
+            let mut present = 0;
+            assert_eq!(
+                syntra_ffi_host_take_pending(h, &mut taken_id, &mut out, &mut len, &mut present),
+                SYNTRA_FFI_OK
+            );
+            assert_eq!((taken_id, present), (id, 1));
+            assert_eq!(take_bytes(out, len), request);
+            if expired {
+                host_lock(h)
+                    .unwrap()
+                    .pending_map
+                    .get_mut(&id)
+                    .unwrap()
+                    .deadline = Instant::now();
+            }
+            let supplied = result(id, error);
+            let mut was_expired = -1;
+            assert_eq!(
+                syntra_ffi_host_answer(h, supplied.as_ptr(), supplied.len(), &mut was_expired),
+                SYNTRA_FFI_OK
+            );
+            assert_eq!(was_expired, i32::from(expired));
+            let expected = if expired {
+                deadline_result(1, id)
+            } else {
+                supplied
+            };
+            let outbound = next_outbound(h);
+            assert_eq!(outbound, expected);
+            ingest_result(c, &outbound, id);
+            assert_eq!(
+                syntra_ffi_client_take_outcome(c, id, &mut out, &mut len, &mut present),
+                SYNTRA_FFI_OK
+            );
+            assert_eq!(present, 1);
+            assert_eq!(take_bytes(out, len), expected);
+            assert_eq!(
+                syntra_ffi_client_take_outcome(c, id, &mut out, &mut len, &mut present),
+                SYNTRA_FFI_OK
+            );
+            assert_eq!((out.is_null(), len, present), (true, 0, 0));
+        }
+        assert_eq!(host_lock(h).unwrap().outbound_bytes, 0);
+        assert_eq!(syntra_ffi_client_close(c), SYNTRA_FFI_OK);
+        assert_eq!(syntra_ffi_host_close(h), SYNTRA_FFI_OK);
+    }
+
+    #[test]
+    fn outbound_count_backpressure_preserves_answer_and_expiry_batch() {
+        let (c, h) = active_pair();
+        for id in 1..=2 {
+            let (rc, request) = begin_status(c, id);
+            assert_eq!(rc, SYNTRA_FFI_OK);
+            assert_eq!(on_frame_status(h, &request), (SYNTRA_FFI_OK, 0));
+        }
+        {
+            let mut inner = host_lock(h).unwrap();
+            inner.cancelled.insert(1);
+        }
+        for _ in 0..MAX_OUTBOUND_FRAMES {
+            assert_eq!(syntra_ffi_host_notify(h, ptr::null(), 0), SYNTRA_FFI_OK);
+        }
+        assert_eq!(syntra_ffi_host_notify(h, ptr::null(), 0), SYNTRA_FFI_NOMEM);
+        let supplied = result(1, false);
+        let mut expired = -1;
+        assert_eq!(
+            syntra_ffi_host_answer(h, supplied.as_ptr(), supplied.len(), &mut expired),
+            SYNTRA_FFI_NOMEM
+        );
+        assert_eq!(expired, 0);
+        {
+            let mut inner = host_lock(h).unwrap();
+            assert_eq!(inner.pending_map.len(), 2);
+            assert_eq!(inner.pending_queue.len(), 2);
+            assert!(inner.cancelled.contains(&1));
+            for call in inner.pending_map.values_mut() {
+                call.deadline = Instant::now();
+            }
+        }
+        let mut ids = [0; 2];
+        let mut n = 99;
+        assert_eq!(
+            syntra_ffi_host_reap_expired(h, ids.as_mut_ptr(), 2, &mut n),
+            SYNTRA_FFI_NOMEM
+        );
+        assert_eq!((ids, n), ([0, 0], 0));
+        assert_eq!(
+            syntra_ffi_host_answer(h, supplied.as_ptr(), supplied.len(), &mut expired),
+            SYNTRA_FFI_NOMEM
+        );
+        assert_eq!(expired, 0);
+        assert_eq!(host_lock(h).unwrap().pending_queue.len(), 2);
+        next_outbound(h);
+        assert_eq!(
+            syntra_ffi_host_reap_expired(h, ids.as_mut_ptr(), 2, &mut n),
+            SYNTRA_FFI_NOMEM
+        );
+        assert_eq!(host_lock(h).unwrap().pending_map.len(), 2);
+        // An expired answer also needs admission before retiring its call.
+        assert_eq!(
+            syntra_ffi_host_answer(h, supplied.as_ptr(), supplied.len(), &mut expired),
+            SYNTRA_FFI_OK
+        );
+        assert_eq!(expired, 1);
+        assert_eq!(
+            syntra_ffi_host_reap_expired(h, ids.as_mut_ptr(), 2, &mut n),
+            SYNTRA_FFI_NOMEM
+        );
+        next_outbound(h);
+        assert_eq!(
+            syntra_ffi_host_reap_expired(h, ids.as_mut_ptr(), 2, &mut n),
+            SYNTRA_FFI_OK
+        );
+        assert_eq!((ids[0], n), (2, 1));
+        {
+            let inner = host_lock(h).unwrap();
+            assert!(
+                inner.pending_map.is_empty()
+                    && inner.pending_queue.is_empty()
+                    && inner.cancelled.is_empty()
+            );
+            assert_eq!(inner.outbound.len(), MAX_OUTBOUND_FRAMES);
+        }
+        for _ in 0..MAX_OUTBOUND_FRAMES - 2 {
+            next_outbound(h);
+        }
+        assert_eq!(next_outbound(h), deadline_result(1, 1));
+        assert_eq!(next_outbound(h), deadline_result(1, 2));
+        assert_eq!(host_lock(h).unwrap().outbound_bytes, 0);
+        assert_eq!(syntra_ffi_client_close(c), SYNTRA_FFI_OK);
+        assert_eq!(syntra_ffi_host_close(h), SYNTRA_FFI_OK);
+    }
+
+    #[test]
+    fn outbound_byte_backpressure_and_answer_without_dispatch() {
+        let (c, h) = active_pair();
+        let (_, request) = begin_status(c, 1);
+        assert_eq!(on_frame_status(h, &request), (SYNTRA_FFI_OK, 0));
+        let large = vec![0; MAX_FRAME_BYTES - 32];
+        let mut accepted = 0;
+        while syntra_ffi_host_notify(h, large.as_ptr(), large.len()) == SYNTRA_FFI_OK {
+            accepted += 1;
+            assert!(accepted <= MAX_OUTBOUND_FRAMES);
+        }
+        assert!(accepted < MAX_OUTBOUND_FRAMES);
+        let supplied = Frame {
+            version: 1,
+            request_id: 1,
+            body: Some(Body::Result(RpcResult {
+                outcome: Some(Outcome::Payload(large.into())),
+            })),
+        }
+        .encode_to_vec();
+        let mut expired = 0;
+        assert_eq!(
+            syntra_ffi_host_answer(h, supplied.as_ptr(), supplied.len(), &mut expired),
+            SYNTRA_FFI_NOMEM
+        );
+        assert_eq!(host_lock(h).unwrap().pending_queue.len(), 1);
+        next_outbound(h);
+        assert_eq!(
+            syntra_ffi_host_answer(h, supplied.as_ptr(), supplied.len(), &mut expired),
+            SYNTRA_FFI_OK
+        );
+        assert_eq!(expired, 0);
+        assert!(host_lock(h).unwrap().pending_queue.is_empty());
+        for _ in 1..accepted {
+            next_outbound(h);
+        }
+        assert_eq!(next_outbound(h), supplied);
+        assert_eq!(host_lock(h).unwrap().outbound_bytes, 0);
+        assert_eq!(syntra_ffi_client_close(c), SYNTRA_FFI_OK);
+        assert_eq!(syntra_ffi_host_close(h), SYNTRA_FFI_OK);
+    }
+
+    #[test]
+    fn unread_outcomes_retain_admission_and_cannot_be_overwritten() {
+        let (c, h) = active_pair();
+        client_lock(c).unwrap().max_pending = 2;
+        for id in 1..=2 {
+            assert_eq!(begin_status(c, id).0, SYNTRA_FFI_OK);
+            ingest_result(c, &result(id, false), id);
+        }
+        assert_eq!(begin_status(c, 3).0, SYNTRA_FFI_NOMEM);
+        assert_eq!(begin_status(c, 1).0, SYNTRA_FFI_INVALID);
+        let mut out = ptr::null_mut();
+        let mut len = 0;
+        let mut present = 0;
+        assert_eq!(
+            syntra_ffi_client_take_outcome(c, 1, &mut out, &mut len, &mut present),
+            SYNTRA_FFI_OK
+        );
+        assert_eq!(take_bytes(out, len), result(1, false));
+        assert_eq!(begin_status(c, 3).0, SYNTRA_FFI_OK);
+        assert_eq!(begin_status(c, 4).0, SYNTRA_FFI_NOMEM);
+        assert_eq!(syntra_ffi_client_close(c), SYNTRA_FFI_OK);
+        assert_eq!(syntra_ffi_host_close(h), SYNTRA_FFI_OK);
+    }
+
+    #[test]
+    fn hello_is_once_and_ready_requires_hello_and_outputs() {
+        let mut c = ptr::null_mut();
+        let credential = b"private-token";
+        assert_eq!(
+            syntra_ffi_client_open(
+                1,
+                1,
+                credential.as_ptr(),
+                credential.len(),
+                3000,
+                16,
+                &mut c
+            ),
+            SYNTRA_FFI_OK
+        );
+        let ready = Frame {
+            version: 1,
+            request_id: 0,
+            body: Some(Body::Ready(syntra_core::proto::ServerReady {
+                connection_id: "0123456789abcdef0123456789abcdef".to_string(),
+            })),
+        }
+        .encode_to_vec();
+        assert_eq!(
+            syntra_ffi_client_activate(c, ready.as_ptr(), ready.len()),
+            SYNTRA_FFI_INVALID
+        );
+        let mut out = ptr::null_mut();
+        let mut len = 0;
+        assert_eq!(
+            syntra_ffi_client_hello_frame(c, ptr::null_mut(), &mut len),
+            SYNTRA_FFI_INVALID
+        );
+        assert_eq!(
+            syntra_ffi_client_hello_frame(c, &mut out, ptr::null_mut()),
+            SYNTRA_FFI_INVALID
+        );
+        assert_eq!(client_lock(c).unwrap().credential, credential);
+        assert!(!client_lock(c).unwrap().hello_sent);
+        assert_eq!(
+            syntra_ffi_client_hello_frame(c, &mut out, &mut len),
+            SYNTRA_FFI_OK
+        );
+        let hello = take_bytes(out, len);
+        let frame = Frame::decode(hello.as_slice()).unwrap();
+        match frame.body {
+            Some(Body::Hello(hello)) => assert_eq!(&hello.credential[..], credential),
+            _ => panic!("expected hello"),
+        }
+        assert_eq!(client_lock(c).unwrap().credential.capacity(), 0);
+        assert_eq!(
+            syntra_ffi_client_hello_frame(c, &mut out, &mut len),
+            SYNTRA_FFI_INVALID
+        );
+        assert_eq!((out.is_null(), len), (true, 0));
+        assert_eq!(
+            syntra_ffi_client_activate(c, ready.as_ptr(), ready.len()),
+            SYNTRA_FFI_OK
+        );
+        assert_eq!(
+            syntra_ffi_client_hello_frame(c, &mut out, &mut len),
+            SYNTRA_FFI_INVALID
+        );
+        assert_eq!(
+            syntra_ffi_client_activate(c, ready.as_ptr(), ready.len()),
+            SYNTRA_FFI_INVALID
+        );
+        assert_eq!(syntra_ffi_client_close(c), SYNTRA_FFI_OK);
+    }
+
+    #[test]
+    fn connection_ids_use_128_random_bits_and_fail_closed() {
+        let id = connection_id_with_rng(|bytes| {
+            assert_eq!(bytes.len(), 16);
+            for (i, byte) in bytes.iter_mut().enumerate() {
+                *byte = i as u8;
+            }
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(id, "000102030405060708090a0b0c0d0e0f");
+        assert_eq!(
+            connection_id_with_rng(|_| Err(())),
+            Err(SYNTRA_FFI_INTERNAL)
+        );
+        let first = generate_connection_id().unwrap();
+        let second = generate_connection_id().unwrap();
+        assert_eq!(first.len(), 32);
+        assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn invalid_read_outputs_preserve_queued_items_and_empty_reads_clear_buffers() {
+        let (c, h) = active_pair();
+        let (_, request) = begin_status(c, 1);
+        assert_eq!(on_frame_status(h, &request), (SYNTRA_FFI_OK, 0));
+        ingest_result(c, &result(1, false), 1);
+        let notification = Frame {
+            version: 1,
+            request_id: 0,
+            body: Some(Body::Notification(syntra_core::proto::Notification {
+                payload: b"notice".to_vec().into(),
+            })),
+        }
+        .encode_to_vec();
+        let mut n = 0;
+        let mut queued = 0;
+        assert_eq!(
+            syntra_ffi_client_on_frame(
+                c,
+                notification.as_ptr(),
+                notification.len(),
+                ptr::null_mut(),
+                0,
+                &mut n,
+                &mut queued
+            ),
+            SYNTRA_FFI_OK
+        );
+        assert_eq!(
+            syntra_ffi_host_notify(h, b"notice".as_ptr(), 6),
+            SYNTRA_FFI_OK
+        );
+        for missing in 0..3 {
+            let mut out = ptr::null_mut();
+            let mut len = 0;
+            let mut present = 0;
+            let mut id = 0;
+            let out_arg = if missing == 0 {
+                ptr::null_mut()
+            } else {
+                &mut out
+            };
+            let len_arg = if missing == 1 {
+                ptr::null_mut()
+            } else {
+                &mut len
+            };
+            let present_arg = if missing == 2 {
+                ptr::null_mut()
+            } else {
+                &mut present
+            };
+            assert_eq!(
+                syntra_ffi_client_take_outcome(c, 1, out_arg, len_arg, present_arg),
+                SYNTRA_FFI_INVALID
+            );
+            assert_eq!(
+                syntra_ffi_client_poll_notification(c, out_arg, len_arg, present_arg),
+                SYNTRA_FFI_INVALID
+            );
+            assert_eq!(
+                syntra_ffi_host_take_pending(h, &mut id, out_arg, len_arg, present_arg),
+                SYNTRA_FFI_INVALID
+            );
+            assert_eq!(
+                syntra_ffi_host_next_outbound(h, out_arg, len_arg, present_arg),
+                SYNTRA_FFI_INVALID
+            );
+        }
+        let mut out = ptr::null_mut();
+        let mut len = 0;
+        let mut present = 0;
+        assert_eq!(
+            syntra_ffi_host_take_pending(h, ptr::null_mut(), &mut out, &mut len, &mut present),
+            SYNTRA_FFI_INVALID
+        );
+        assert_eq!(client_lock(c).unwrap().outcomes.len(), 1);
+        assert_eq!(client_lock(c).unwrap().notifications.len(), 1);
+        assert_eq!(host_lock(h).unwrap().pending_queue.len(), 1);
+        assert_eq!(host_lock(h).unwrap().outbound.len(), 1);
+        assert_eq!(
+            syntra_ffi_client_take_outcome(c, 1, &mut out, &mut len, &mut present),
+            SYNTRA_FFI_OK
+        );
+        assert_eq!(present, 1);
+        assert_eq!(take_bytes(out, len), result(1, false));
+        assert_eq!(
+            syntra_ffi_client_poll_notification(c, &mut out, &mut len, &mut present),
+            SYNTRA_FFI_OK
+        );
+        assert_eq!(present, 1);
+        assert_eq!(take_bytes(out, len), notification);
+        let mut id = 0;
+        assert_eq!(
+            syntra_ffi_host_take_pending(h, &mut id, &mut out, &mut len, &mut present),
+            SYNTRA_FFI_OK
+        );
+        assert_eq!((id, present), (1, 1));
+        assert_eq!(take_bytes(out, len), request);
+        assert_eq!(next_outbound(h), notification);
+        // Sentinel pointers are never dereferenced; empty reads overwrite them.
+        out = ptr::dangling_mut();
+        len = 99;
+        present = 99;
+        assert_eq!(
+            syntra_ffi_client_take_outcome(c, 1, &mut out, &mut len, &mut present),
+            SYNTRA_FFI_OK
+        );
+        assert_eq!((out.is_null(), len, present), (true, 0, 0));
+        out = ptr::dangling_mut();
+        len = 99;
+        assert_eq!(
+            syntra_ffi_client_poll_notification(c, &mut out, &mut len, &mut present),
+            SYNTRA_FFI_OK
+        );
+        assert_eq!((out.is_null(), len, present), (true, 0, 0));
+        out = ptr::dangling_mut();
+        len = 99;
+        assert_eq!(
+            syntra_ffi_host_take_pending(h, &mut id, &mut out, &mut len, &mut present),
+            SYNTRA_FFI_OK
+        );
+        assert_eq!((id, out.is_null(), len, present), (0, true, 0, 0));
+        out = ptr::dangling_mut();
+        len = 99;
+        assert_eq!(
+            syntra_ffi_host_next_outbound(h, &mut out, &mut len, &mut present),
+            SYNTRA_FFI_OK
+        );
+        assert_eq!((out.is_null(), len, present), (true, 0, 0));
+        assert_eq!(syntra_ffi_client_close(c), SYNTRA_FFI_OK);
+        assert_eq!(syntra_ffi_host_close(h), SYNTRA_FFI_OK);
+    }
+
+    #[test]
+    fn invalid_outputs_do_not_activate_admit_complete_cancel_or_reap() {
+        let c = open_client();
+        let mut h = ptr::null_mut();
+        assert_eq!(syntra_ffi_host_open(1, 1, 16, &mut h), SYNTRA_FFI_OK);
+        let mut out = ptr::null_mut();
+        let mut len = 0;
+        assert_eq!(
+            syntra_ffi_client_hello_frame(c, &mut out, &mut len),
+            SYNTRA_FFI_OK
+        );
+        let hello = take_bytes(out, len);
+        let mut version = 0;
+        assert_eq!(
+            syntra_ffi_host_accept_hello(h, hello.as_ptr(), hello.len(), &mut version),
+            SYNTRA_FFI_OK
+        );
+        for missing in 0..2 {
+            let out_arg = if missing == 0 {
+                ptr::null_mut()
+            } else {
+                &mut out
+            };
+            let len_arg = if missing == 1 {
+                ptr::null_mut()
+            } else {
+                &mut len
+            };
+            assert_eq!(
+                syntra_ffi_host_auth_complete(h, b"svc".as_ptr().cast(), 3, out_arg, len_arg),
+                SYNTRA_FFI_INVALID
+            );
+            let inner = host_lock(h).unwrap();
+            assert!(!inner.active && inner.principal.is_empty() && inner.connection_id.is_empty());
+        }
+        assert_eq!(
+            syntra_ffi_host_auth_complete(h, b"svc".as_ptr().cast(), 3, &mut out, &mut len),
+            SYNTRA_FFI_OK
+        );
+        let ready = take_bytes(out, len);
+        assert_eq!(
+            syntra_ffi_client_activate(c, ready.as_ptr(), ready.len()),
+            SYNTRA_FFI_OK
+        );
+        let method = b"/example.Echo/Echo";
+        for missing in 0..2 {
+            let out_arg = if missing == 0 {
+                ptr::null_mut()
+            } else {
+                &mut out
+            };
+            let len_arg = if missing == 1 {
+                ptr::null_mut()
+            } else {
+                &mut len
+            };
+            assert_eq!(
+                syntra_ffi_client_begin_call(
+                    c,
+                    1,
+                    method.as_ptr(),
+                    method.len(),
+                    ptr::null(),
+                    0,
+                    30000,
+                    out_arg,
+                    len_arg
+                ),
+                SYNTRA_FFI_INVALID
+            );
+            assert!(client_lock(c).unwrap().pending.is_empty());
+            assert_eq!(
+                syntra_ffi_client_cancel(c, 999, out_arg, len_arg),
+                SYNTRA_FFI_INVALID
+            );
+        }
+        let (_, request) = begin_status(c, 1);
+        let mut response = 0;
+        let mut n = 0;
+        for missing in 0..4 {
+            let out_arg = if missing == 0 {
+                ptr::null_mut()
+            } else {
+                &mut out
+            };
+            let len_arg = if missing == 1 {
+                ptr::null_mut()
+            } else {
+                &mut len
+            };
+            let response_arg = if missing == 2 {
+                ptr::null_mut()
+            } else {
+                &mut response
+            };
+            let n_arg = if missing == 3 {
+                ptr::null_mut()
+            } else {
+                &mut n
+            };
+            assert_eq!(
+                syntra_ffi_host_on_frame(
+                    h,
+                    request.as_ptr(),
+                    request.len(),
+                    out_arg,
+                    len_arg,
+                    response_arg,
+                    ptr::null_mut(),
+                    0,
+                    n_arg
+                ),
+                SYNTRA_FFI_INVALID
+            );
+            assert!(host_lock(h).unwrap().pending_map.is_empty());
+        }
+        assert_eq!(on_frame_status(h, &request), (SYNTRA_FFI_OK, 0));
+        let cancel = Frame {
+            version: 1,
+            request_id: 1,
+            body: Some(Body::Cancel(syntra_core::proto::Cancel {})),
+        }
+        .encode_to_vec();
+        assert_eq!(
+            syntra_ffi_host_on_frame(
+                h,
+                cancel.as_ptr(),
+                cancel.len(),
+                &mut out,
+                &mut len,
+                &mut response,
+                ptr::null_mut(),
+                1,
+                &mut n
+            ),
+            SYNTRA_FFI_INVALID
+        );
+        assert!(host_lock(h).unwrap().cancelled.is_empty());
+        let supplied = result(1, false);
+        let mut notifications = 0;
+        assert_eq!(
+            syntra_ffi_client_on_frame(
+                c,
+                supplied.as_ptr(),
+                supplied.len(),
+                ptr::null_mut(),
+                1,
+                &mut n,
+                &mut notifications
+            ),
+            SYNTRA_FFI_INVALID
+        );
+        assert!(client_lock(c).unwrap().pending.contains_key(&1));
+        assert!(client_lock(c).unwrap().outcomes.is_empty());
+        client_lock(c)
+            .unwrap()
+            .pending
+            .get_mut(&1)
+            .unwrap()
+            .deadline = Instant::now();
+        host_lock(h)
+            .unwrap()
+            .pending_map
+            .get_mut(&1)
+            .unwrap()
+            .deadline = Instant::now();
+        assert_eq!(
+            syntra_ffi_client_reap_expired(c, ptr::null_mut(), 1, &mut n),
+            SYNTRA_FFI_INVALID
+        );
+        assert_eq!(
+            syntra_ffi_host_reap_expired(h, ptr::null_mut(), 1, &mut n),
+            SYNTRA_FFI_INVALID
+        );
+        assert_eq!(client_lock(c).unwrap().pending.len(), 1);
+        assert_eq!(host_lock(h).unwrap().pending_map.len(), 1);
+        assert!(host_lock(h).unwrap().outbound.is_empty());
+        assert_eq!(syntra_ffi_client_close(c), SYNTRA_FFI_OK);
+        assert_eq!(syntra_ffi_host_close(h), SYNTRA_FFI_OK);
+    }
 
     fn open_client() -> *mut syntra_ffi_client_t {
         let mut out: *mut syntra_ffi_client_t = ptr::null_mut();
@@ -1550,7 +2335,10 @@ mod tests {
         let c = open_client();
         let mut ptr: *mut u8 = ptr::null_mut();
         let mut len = 0usize;
-        assert_eq!(syntra_ffi_client_hello_frame(c, &mut ptr, &mut len), SYNTRA_FFI_OK);
+        assert_eq!(
+            syntra_ffi_client_hello_frame(c, &mut ptr, &mut len),
+            SYNTRA_FFI_OK
+        );
         assert!(!ptr.is_null() && len > 0);
         let hello = unsafe { slice::from_raw_parts(ptr, len).to_vec() };
         syntra_ffi_free(ptr, len);
@@ -1568,12 +2356,21 @@ mod tests {
         let mut rptr: *mut u8 = ptr::null_mut();
         let mut rlen = 0usize;
         assert_eq!(
-            syntra_ffi_host_auth_complete(h, princ.as_ptr() as *const _, princ.len(), &mut rptr, &mut rlen),
+            syntra_ffi_host_auth_complete(
+                h,
+                princ.as_ptr() as *const _,
+                princ.len(),
+                &mut rptr,
+                &mut rlen
+            ),
             SYNTRA_FFI_OK
         );
         let ready = unsafe { slice::from_raw_parts(rptr, rlen).to_vec() };
         syntra_ffi_free(rptr, rlen);
-        assert_eq!(syntra_ffi_client_activate(c, ready.as_ptr(), ready.len()), SYNTRA_FFI_OK);
+        assert_eq!(
+            syntra_ffi_client_activate(c, ready.as_ptr(), ready.len()),
+            SYNTRA_FFI_OK
+        );
 
         assert_eq!(syntra_ffi_client_close(c), SYNTRA_FFI_OK);
         assert_eq!(syntra_ffi_host_close(h), SYNTRA_FFI_OK);
@@ -1583,7 +2380,10 @@ mod tests {
         let c = open_client();
         let mut ptr: *mut u8 = ptr::null_mut();
         let mut len = 0usize;
-        assert_eq!(syntra_ffi_client_hello_frame(c, &mut ptr, &mut len), SYNTRA_FFI_OK);
+        assert_eq!(
+            syntra_ffi_client_hello_frame(c, &mut ptr, &mut len),
+            SYNTRA_FFI_OK
+        );
         let hello = unsafe { slice::from_raw_parts(ptr, len).to_vec() };
         syntra_ffi_free(ptr, len);
         let mut h: *mut syntra_ffi_host_t = ptr::null_mut();
@@ -1597,7 +2397,13 @@ mod tests {
         let mut rptr: *mut u8 = ptr::null_mut();
         let mut rlen = 0usize;
         assert_eq!(
-            syntra_ffi_host_auth_complete(h, princ.as_ptr() as *const _, princ.len(), &mut rptr, &mut rlen),
+            syntra_ffi_host_auth_complete(
+                h,
+                princ.as_ptr() as *const _,
+                princ.len(),
+                &mut rptr,
+                &mut rlen
+            ),
             SYNTRA_FFI_OK
         );
         syntra_ffi_free(rptr, rlen);
@@ -1605,10 +2411,7 @@ mod tests {
         h
     }
 
-    fn on_frame_status(
-        h: *mut syntra_ffi_host_t,
-        bytes: &[u8],
-    ) -> (i32, i32) {
+    fn on_frame_status(h: *mut syntra_ffi_host_t, bytes: &[u8]) -> (i32, i32) {
         let mut out: *mut u8 = ptr::null_mut();
         let mut out_len = 0usize;
         let mut has_response = 0i32;
@@ -1652,20 +2455,33 @@ mod tests {
         let mut rptr: *mut u8 = ptr::null_mut();
         let mut rlen = 0usize;
         assert_eq!(
-            syntra_ffi_host_auth_complete(h, princ.as_ptr() as *const _, princ.len(), &mut rptr, &mut rlen),
+            syntra_ffi_host_auth_complete(
+                h,
+                princ.as_ptr() as *const _,
+                princ.len(),
+                &mut rptr,
+                &mut rlen
+            ),
             SYNTRA_FFI_OK
         );
         let ready = unsafe { slice::from_raw_parts(rptr, rlen).to_vec() };
         syntra_ffi_free(rptr, rlen);
-        assert_eq!(syntra_ffi_client_activate(c, ready.as_ptr(), ready.len()), SYNTRA_FFI_OK);
-        let notif = |payload: &[u8]| Frame {
-            version: 1,
-            request_id: 0,
-            body: Some(syntra_core::proto::frame::Body::Notification(
-                syntra_core::proto::Notification { payload: payload.to_vec().into() },
-            )),
-        }
-        .encode_to_vec();
+        assert_eq!(
+            syntra_ffi_client_activate(c, ready.as_ptr(), ready.len()),
+            SYNTRA_FFI_OK
+        );
+        let notif = |payload: &[u8]| {
+            Frame {
+                version: 1,
+                request_id: 0,
+                body: Some(syntra_core::proto::frame::Body::Notification(
+                    syntra_core::proto::Notification {
+                        payload: payload.to_vec().into(),
+                    },
+                )),
+            }
+            .encode_to_vec()
+        };
         let mut terminal_n = 0usize;
         let mut was_queued = 0i32;
         for i in 0..256u32 {
@@ -1697,7 +2513,10 @@ mod tests {
             ),
             SYNTRA_FFI_OK
         );
-        assert_eq!(was_queued, 0, "overflow must not report a queued notification");
+        assert_eq!(
+            was_queued, 0,
+            "overflow must not report a queued notification"
+        );
         let mut dropped = 0u64;
         let mut dropped_bytes_out = 0u64;
         assert_eq!(

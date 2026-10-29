@@ -549,7 +549,7 @@ fn nested_unassigned_numbers_tolerated() {
 }
 
 #[test]
-fn closing_only_allows_result_and_cancel_and_closed_allows_nothing() {
+fn closing_only_allows_result_cancel_notification_and_closed_allows_nothing() {
     let bodies = [
         Body::Hello(ClientHello {
             min_version: 1,
@@ -571,7 +571,10 @@ fn closing_only_allows_result_and_cancel_and_closed_allows_nothing() {
         Body::Notification(Notification { payload: vec![] }),
     ];
     for body in bodies {
-        let draining = matches!(body, Body::Result(_) | Body::Cancel(_));
+        let draining = matches!(
+            body,
+            Body::Result(_) | Body::Cancel(_) | Body::Notification(_)
+        );
         let frame = Frame {
             version: 1,
             request_id: if matches!(body, Body::Request(_) | Body::Result(_) | Body::Cancel(_)) {

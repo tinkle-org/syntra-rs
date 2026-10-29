@@ -104,11 +104,19 @@ pub struct HostResult {
 
 impl HostResult {
     pub fn ok(token: CompletionToken, payload: Vec<u8>) -> Self {
-        Self { token, payload: Some(payload), error: None }
+        Self {
+            token,
+            payload: Some(payload),
+            error: None,
+        }
     }
 
     pub fn err(token: CompletionToken, code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { token, payload: None, error: Some((code, message.into())) }
+        Self {
+            token,
+            payload: None,
+            error: Some((code, message.into())),
+        }
     }
 
     /// Token of the admitted slot this result completes.
@@ -177,7 +185,10 @@ mod tests {
 
     impl ReferenceSlots {
         fn new() -> Self {
-            Self { outstanding: HashMap::new(), closed: false }
+            Self {
+                outstanding: HashMap::new(),
+                closed: false,
+            }
         }
 
         fn admit(&mut self, req: &AdmittedRequest) {
@@ -218,25 +229,40 @@ mod tests {
 
         // Matching token before the deadline completes its own slot.
         let ok = HostResult::ok(first.token, b"ok".to_vec());
-        assert_eq!(slots.resolve(&ok, Duration::from_secs(1)), CompletionDisposition::Accepted);
+        assert_eq!(
+            slots.resolve(&ok, Duration::from_secs(1)),
+            CompletionDisposition::Accepted
+        );
         // The slot is consumed: a duplicate completion is unknown.
-        assert_eq!(slots.resolve(&ok, Duration::from_secs(1)), CompletionDisposition::Unknown);
+        assert_eq!(
+            slots.resolve(&ok, Duration::from_secs(1)),
+            CompletionDisposition::Unknown
+        );
         // A token that was never admitted is unknown.
         let stranger = HostResult::ok(CompletionToken::new(99), b"ok".to_vec());
-        assert_eq!(slots.resolve(&stranger, Duration::from_secs(1)), CompletionDisposition::Unknown);
+        assert_eq!(
+            slots.resolve(&stranger, Duration::from_secs(1)),
+            CompletionDisposition::Unknown
+        );
 
         // Past the slot deadline the result expires without transmission.
         let second = admitted(8, 43, 5);
         slots.admit(&second);
         let late = HostResult::ok(second.token, b"ok".to_vec());
-        assert_eq!(slots.resolve(&late, Duration::from_secs(6)), CompletionDisposition::Expired);
+        assert_eq!(
+            slots.resolve(&late, Duration::from_secs(6)),
+            CompletionDisposition::Expired
+        );
 
         // After handle close every result is dropped, even a fresh one.
         let third = admitted(9, 44, 60);
         slots.admit(&third);
         slots.close();
         let after_close = HostResult::ok(third.token, b"ok".to_vec());
-        assert_eq!(slots.resolve(&after_close, Duration::from_secs(1)), CompletionDisposition::Closed);
+        assert_eq!(
+            slots.resolve(&after_close, Duration::from_secs(1)),
+            CompletionDisposition::Closed
+        );
     }
 
     #[test]
@@ -294,11 +320,7 @@ mod tests {
         assert_eq!(late.payload(), Some(b"ok".as_slice()));
         assert!(late.error().is_none());
 
-        let err = HostResult::err(
-            second.token,
-            ErrorCode::PermissionDenied,
-            "denied",
-        );
+        let err = HostResult::err(second.token, ErrorCode::PermissionDenied, "denied");
         assert_eq!(err.token(), second.token);
         assert!(err.payload().is_none());
         let (code, msg) = err.error().expect("typed error");
@@ -322,7 +344,9 @@ mod tests {
 
     #[test]
     fn deny_decisions_carry_typed_codes() {
-        let d = AuthzDecision::Deny { code: ErrorCode::PermissionDenied };
+        let d = AuthzDecision::Deny {
+            code: ErrorCode::PermissionDenied,
+        };
         assert!(matches!(d, AuthzDecision::Deny { .. }));
     }
 }

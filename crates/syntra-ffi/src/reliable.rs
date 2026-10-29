@@ -35,10 +35,7 @@ fn borrow_bytes(ptr: *const u8, len: usize) -> Result<Vec<u8>, i32> {
 /// Validate a 16-byte session identifier (non-zero, opaque, distinct from
 /// `connection_id`). Returns `OK` when valid, `INVALID` otherwise.
 #[no_mangle]
-pub extern "C" fn syntra_ffi_reliable_session_id_valid(
-    id: *const u8,
-    len: usize,
-) -> i32 {
+pub extern "C" fn syntra_ffi_reliable_session_id_valid(id: *const u8, len: usize) -> i32 {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let bytes = match borrow_bytes(id, len) {
             Ok(v) => v,
@@ -55,10 +52,7 @@ pub extern "C" fn syntra_ffi_reliable_session_id_valid(
 /// Validate a 16-byte stable delivery identifier (non-zero, distinct from
 /// `request_id`). Returns `OK` when valid, `INVALID` otherwise.
 #[no_mangle]
-pub extern "C" fn syntra_ffi_reliable_delivery_id_valid(
-    id: *const u8,
-    len: usize,
-) -> i32 {
+pub extern "C" fn syntra_ffi_reliable_delivery_id_valid(id: *const u8, len: usize) -> i32 {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let bytes = match borrow_bytes(id, len) {
             Ok(v) => v,
@@ -74,10 +68,7 @@ pub extern "C" fn syntra_ffi_reliable_delivery_id_valid(
 
 /// Validate an opaque resume handle (16..256 bytes, non-zero).
 #[no_mangle]
-pub extern "C" fn syntra_ffi_reliable_resume_credential_valid(
-    cred: *const u8,
-    len: usize,
-) -> i32 {
+pub extern "C" fn syntra_ffi_reliable_resume_credential_valid(cred: *const u8, len: usize) -> i32 {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let bytes = match borrow_bytes(cred, len) {
             Ok(v) => v,
@@ -93,10 +84,7 @@ pub extern "C" fn syntra_ffi_reliable_resume_credential_valid(
 
 /// Validate monotonic epoch advance (`proposed > current`, both nonzero).
 #[no_mangle]
-pub extern "C" fn syntra_ffi_reliable_epoch_advance_valid(
-    current: u64,
-    proposed: u64,
-) -> i32 {
+pub extern "C" fn syntra_ffi_reliable_epoch_advance_valid(current: u64, proposed: u64) -> i32 {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         match syntra_core::reliable::check_epoch_advance(current, proposed) {
             Ok(_) => SYNTRA_FFI_OK,
@@ -164,10 +152,7 @@ mod tests {
             syntra_ffi_reliable_resume_credential_valid([7u8; 32].as_ptr(), 32),
             SYNTRA_FFI_OK
         );
-        assert_eq!(
-            syntra_ffi_reliable_epoch_advance_valid(3, 4),
-            SYNTRA_FFI_OK
-        );
+        assert_eq!(syntra_ffi_reliable_epoch_advance_valid(3, 4), SYNTRA_FFI_OK);
         assert_eq!(
             syntra_ffi_reliable_epoch_advance_valid(3, 3),
             SYNTRA_FFI_INVALID
