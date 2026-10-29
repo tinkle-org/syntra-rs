@@ -1,7 +1,7 @@
 # SC1 local revision 1
 
 This document describes the implementation in `syntra-secure-channel/` and
-the ordered adapters in `syntra-tcp/` and `syntra-ws/src/sc1.rs`.
+the ordered adapters in `syntra-tcp/` and `syntra-ws-sc1/`.
 **SC1 local revision 1 is an implementation-specific draft. It has not been
 accepted upstream or independently security-audited.** The domain,
 subprotocol and context encoding below identify this draft only.
@@ -128,7 +128,7 @@ messages fail. Ping/Pong/Close are carrier control messages, never channel
 confirmation, application completion or RPC results. Control frames cannot
 extend an absolute receive/establishment deadline.
 
-`syntra_ws::sc1::connect` accepts explicit `ws://` or `wss://` URLs and
+`syntra_ws_sc1::connect` accepts explicit `ws://` or `wss://` URLs and
 requires exactly the endpoint path above, with no userinfo, query or
 fragment. The host requires exactly the subprotocol token and rejects
 `Authorization` and `Cookie` headers; it does not treat `Origin` as
@@ -327,7 +327,7 @@ through its handle lifetime. The application owns its accept loop and
 retains each `HostHandle` for as long as that connection is served; dropping
 a handle aborts its pump. For caller-owned streams, `connect_stream` and
 `accept_stream` take any `AsyncRead + AsyncWrite + Unpin + Send` endpoint
-and run the same pump. `syntra_ws::sc1::{connect, accept, accept_stream}`
+and run the same pump. `syntra_ws_sc1::{connect, accept, accept_stream}`
 wrap the same pump around WebSocket binary messages.
 
 ## Secret lifetime and assurance limits
@@ -361,8 +361,9 @@ record limits, 1 MiB segmentation, all short inner split points and
 coalescing, entropy failure and secret redaction. Native TCP and WS tests
 use real loopback sockets in both modes, principal deny, and multi-record
 RPC round trips without Docker. The Docker suite in
-`crates/syntra-integration` repeats the handshake, echo, concurrency,
-denial and wrong-key coverage for TCP and WS over real container networking.
+`crates/syntra-integration` repeats the handshake and echo over real
+container networking: TCP empty and 1 KiB echoes, one authorization-denial
+call and eight concurrent 2 KiB echoes, plus a single WS 1 KiB echo.
 These are local tests, not upstream registered conformance vectors or
 evidence of an independent implementation's interop. Benchmarks and separate
 tooling are documented in [BENCHMARKS.md](BENCHMARKS.md).

@@ -117,7 +117,11 @@ pub async fn connect(
 }
 
 /// Listener admission bounds cover concurrent SC1 attempts and live handles.
-/// Admission is acquired before accept; callers drive accept futures themselves.
+/// Socket admission is separate from the handshake: `accept_socket` returns
+/// before any handshake bytes are read, so callers must drive each
+/// connection's `accept_stream` handshake in its own task. Driving `accept`
+/// (or `accept_socket` + `accept_stream`) sequentially lets one slow client
+/// block subsequent accepts.
 #[cfg(feature = "sockets")]
 pub struct Listener {
     socket: tokio::net::TcpListener,
@@ -141,14 +145,14 @@ impl Listener {
     pub fn local_addr(&self) -> Result<std::net::SocketAddr, Error> {
         Ok(self.socket.local_addr()?)
     }
-    pub async fn accept(
-        &self,
-        security: &ServerConfig,
-        factory: Arc<dyn AuthenticatorFactory>,
-        handler: Arc<dyn Handler>,
-        runtime: ConnectionConfig,
-        limits: Limits,
-    ) -> Result<HostHandle, Error> {
+    /// Accept one socket, holding one admission permit until the returned
+    /// stream is dropped. Returns before any handshake bytes are read, so a
+    /// slow client cannot block subsequent accepts as long as the caller
+    /// keeps accepting and drives each `accept_stream` handshake
+    /// concurrently. Dropping the stream without completing the handshake
+    /// releases the permit; completing it carries the permit into the
+    /// connection lifetime via the returned handle.
+    pub async fn accept_socket(&self) -> Result<AdmittedStream, Error> {
         let permit = self
             .admission
             .clone()
@@ -157,23 +161,34 @@ impl Listener {
             .map_err(|_| Error::Closed)?;
         let (socket, _) = self.socket.accept().await?;
         socket.set_nodelay(true)?;
-        accept_stream(
-            AdmittedStream {
-                socket,
-                _permit: permit,
-            },
-            security,
-            factory,
-            handler,
-            runtime,
-            limits,
-        )
-        .await
+        Ok(AdmittedStream {
+            socket,
+            _permit: permit,
+        })
+    }
+    /// Accept one connection and run the SC1 handshake inline. Convenience
+    /// wrapper around `accept_socket` + `accept_stream`: drive the returned
+    /// future concurrently (spawn one task per call) so a slow handshake
+    /// cannot block subsequent accepts.
+    pub async fn accept(
+        &self,
+        security: &ServerConfig,
+        factory: Arc<dyn AuthenticatorFactory>,
+        handler: Arc<dyn Handler>,
+        runtime: ConnectionConfig,
+        limits: Limits,
+    ) -> Result<HostHandle, Error> {
+        let stream = self.accept_socket().await?;
+        accept_stream(stream, security, factory, handler, runtime, limits).await
     }
 }
 
+/// A socket accepted by `Listener::accept_socket`. The admission permit is
+/// held until this stream is dropped, covering the handshake and the whole
+/// connection lifetime. Cannot be constructed outside this crate, so the
+/// permit cannot be forged or detached from its socket.
 #[cfg(feature = "sockets")]
-struct AdmittedStream {
+pub struct AdmittedStream {
     socket: tokio::net::TcpStream,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }

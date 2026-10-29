@@ -11,7 +11,7 @@ use syntra_runtime::{
     RejectAll,
 };
 use syntra_secure_channel::*;
-use syntra_ws::sc1::{self, AuthenticatorFactory, Limits};
+use syntra_ws_sc1::{self as sc1, AuthenticatorFactory, Limits};
 
 struct Store;
 impl KeyStore for Store {

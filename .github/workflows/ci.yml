@@ -194,10 +194,14 @@ jobs:
       pull-requests: write
     outputs:
       has_manifests: ${{ steps.base.outputs.has_manifests }}
-    # Tolerate failures only when the base dependency graph is unavailable
-    # (e.g. PR #1 introduces the first Cargo.lock while main has only README).
-    # Once the graph exists, high-severity or denied-license findings fail.
-    # cargo-deny + cargo-audit in the security job remain blocking.
+    # Tolerate failures when the base dependency graph is unavailable: either
+    # the base ref has no manifests (e.g. PR #1 introduces the first
+    # Cargo.lock while main has only README) or the dependency graph itself
+    # is disabled/unsupported for the repository (the review action then
+    # fails with "not supported on this repository" even though manifests
+    # exist). Once the graph exists and is readable, high-severity or
+    # denied-license findings fail. cargo-deny + cargo-audit in the security
+    # job remain blocking regardless.
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -217,6 +221,17 @@ jobs:
             cat /tmp/gh_err.txt >&2
             exit 1
           fi
+      - name: Check dependency graph availability
+        id: graph
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ github.repository }}
+        run: |
+          if gh api "repos/${TARGET_REPO}/dependency-graph/sbom" >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Dependency review
         id: review
         continue-on-error: true
@@ -227,11 +242,11 @@ jobs:
       - name: Enforce review when graph exists
         run: |
           if [ "${{ steps.review.outcome }}" = "failure" ]; then
-            if [ "${{ steps.base.outputs.has_manifests }}" = "true" ]; then
+            if [ "${{ steps.base.outputs.has_manifests }}" = "true" ] && [ "${{ steps.graph.outputs.available }}" = "true" ]; then
               echo "Dependency review failed with graph available; failing workflow."
               exit 1
             else
-              echo "Dependency review unavailable (no base graph); tolerating as informational."
+              echo "Dependency review unavailable (no base graph or graph disabled/unsupported); tolerating as informational. cargo-deny + cargo-audit remain blocking."
             fi
           fi
 

@@ -1,5 +1,11 @@
-//! Native SC1 local revision 1. One binary message per channel record; encrypted
-//! inner framing is shared with TCP. Browser SC1 is not implemented.
+//! `syntra-ws-sc1`: native SC1 local revision 1 over WebSocket. One binary
+//! message per channel record; encrypted inner framing is shared with TCP.
+//! Browser SC1 is not implemented.
+//!
+//! Local-only draft: not an accepted upstream profile and not independently
+//! audited. This crate stays unpublished (`publish = false`) so the
+//! publishable `syntra-ws` crate keeps a registry-resolvable dependency
+//! closure for the `cargo package` gate.
 use futures_util::{
     stream::{SplitSink, SplitStream},
     SinkExt, StreamExt,
@@ -111,10 +117,15 @@ pub async fn connect(
         if roots.is_empty() {
             return Err(Error::Configuration);
         }
-        let config =
-            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                .with_root_certificates(roots)
-                .with_no_client_auth();
+        // Pin the ring provider explicitly instead of relying on the
+        // process-default provider, and keep TLS 1.3-only. A provider that
+        // cannot offer TLS 1.3 is a configuration error, not a panic.
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|_| Error::Configuration)?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
         Some(tokio_tungstenite::Connector::Rustls(Arc::new(config)))
     } else {
         None

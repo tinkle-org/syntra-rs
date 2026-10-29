@@ -123,7 +123,7 @@ pub fn channel(c: &mut Criterion) {
             b.iter(|| {
                 let ct = client.encrypt(&payload).unwrap();
                 let pt = server.decrypt(&ct).unwrap();
-                assert_eq!(pt.len(), size);
+                assert_eq!(pt.as_slice(), payload.as_slice());
             });
         });
     }

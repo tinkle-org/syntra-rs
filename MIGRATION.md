@@ -75,7 +75,7 @@ or SC1 implementation and makes no protocol behavior changes.
 On `feat/sc1-connectivity-and-benchmarks`, the workspace adds local-only
 crates that did not exist in the extraction commit: `syntra-secure-channel`
 (the SC1 Noise channel), `syntra-tcp` (the native TCP adapter and shared
-frame pump), `syntra-ws::sc1` plus `syntra-ws/tests/sc1.rs` (the native
+frame pump), `syntra-ws-sc1` plus `syntra-ws-sc1/tests/sc1.rs` (the native
 WebSocket SC1 binding), `syntra-integration` (the Docker-based connectivity
 suite and echo peer) and Criterion benchmarks under
 `crates/syntra-core/benches`, `crates/syntra-secure-channel/benches` and

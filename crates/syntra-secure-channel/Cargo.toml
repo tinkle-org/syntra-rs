@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# Local-only SC1 draft revision, not an accepted upstream profile and not
+# independently audited. Must stay unpublished until the channel is reviewed
+# and the release plan covers it; keeping it publish=false also keeps the
+# `cargo package` gate green for the five publishable crates.
+publish = false
 description = "Networking-independent local SC1 Noise channel"
 
 [dependencies]

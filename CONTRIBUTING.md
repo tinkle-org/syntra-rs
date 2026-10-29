@@ -20,7 +20,9 @@ reference changes.
 
 ```sh
 export RUSTUP_TOOLCHAIN=1.88.0
-cargo fmt --all -- --check           # must print nothing
+cargo fmt --all -- --check           # informational while the formatting
+                                     # baseline is uncleared; the CI fmt job
+                                     # does not gate
 cargo test --locked --workspace
 cargo clippy --locked --workspace --all-targets -- --no-deps
 cargo test --locked -p syntra-ffi --no-default-features --features production

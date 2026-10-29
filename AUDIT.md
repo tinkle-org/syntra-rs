@@ -15,9 +15,10 @@ The following passed on `feat/sc1-connectivity-and-benchmarks`, using Rust
   `syntra-tcp` and `syntra-integration` members: `cargo test --locked
   --workspace` passed with no failures and one ignored test (the Docker
   container suite, which runs in the integration job).
-- Actual Docker container integration across TCP and WS in bootstrap mode,
-  including echo, concurrency, denial and wrong-key handling, passed on
-  macOS Docker Desktop in 18 seconds with no skipped container cases.
+- Docker container integration across TCP and WS was not run for this
+  tree: no macOS Docker Desktop platform, revision or outcome is claimed
+  here. The Linux container lane in the integration job is the
+  authoritative gate (the container suite stays ignored in workspace runs).
 - Production and test-fixture FFI suites plus the C build contract, each in a
   separate invocation with no `--all-features`: production (13 tests),
   test-fixture (11 tests) and `build_contract.py` (5 checks, including both C
@@ -40,10 +41,9 @@ No `allow` suppressions were added for new code.
 
 The container suite (`syntra-integration/tests/sc1_containers.rs`) is
 ignored by workspace runs and executes only in the integration job or on
-explicit request. The latest macOS Docker Desktop run completed the image
-build, container start, SC1 handshakes and echo, concurrency, denial and
-wrong-key cases for both TCP and WS with no skipped container cases. The
-Linux container lane remains the authoritative gate; see the remaining
+explicit request. No macOS Docker Desktop run is reported for this tree, so
+no macOS container platform, revision or outcome is presented as validation.
+The Linux container lane remains the authoritative gate; see the remaining
 findings below.
 
 ## Authority and source pins
@@ -78,7 +78,7 @@ evidence. It does not close the broader TODOs listed below.
 | --- | --- | --- |
 | SC1 channel and context boundary | Exact local context bytes, NK/NKpsk0 suite selection, wrong keys/contexts, empty handshake payloads, replayed M1 without fresh confirmation, record ordering/failure/limits and redacted key formatting. | `syntra-secure-channel`, `channel allocation/entropy/handshake/record tests` |
 | Ordered carrier boundary | Prefixes across records, coalesced frames, absolute frame clocks, admission limits, cancellation, lifetime and confirmed-peer rechecks. | `syntra-tcp/src/pump.rs`, pump tests including lifetime/confirmation/batch-backpressure deadlines and close-watch handling |
-| TCP and WS/SC1 binding | TCP short writes, coalescing, partial record deadlines and real sockets; WS binary-message boundaries, fragmentation, origin/subprotocol rejection. | `syntra-tcp/tests/connectivity.rs`, `syntra-ws/tests/sc1.rs`, `syntra-ws/tests/websocket_vectors.rs` |
+| TCP and WS/SC1 binding | TCP short writes, coalescing, partial record deadlines and real sockets; WS binary-message boundaries, fragmentation, origin/subprotocol rejection. | `syntra-tcp/tests/connectivity.rs`, `syntra-ws-sc1/tests/sc1.rs`, `syntra-ws/tests/websocket_vectors.rs` |
 | Runtime correlation and lifecycle | Malformed correlated results settle only their RPC; handshake frames and version mismatches in ACTIVE close immediately; structural faults never become semantic RPC errors. | `crates/syntra-runtime/tests/runtime_defects.rs` |
 | Graceful drain and withdrawal | Draining tolerates queued notifications; withdrawal is resumable across cancellation; graceful close waits for inflight RPCs and pending withdrawal terminals. | `runtime_defects.rs`: drain-tolerates-notifications, cancelled-withdrawal retry, graceful-waits-for-withdrawal regressions |
 | Production FFI correctness | Normal host answers queue success and error results; bounded outbound admission before retiring pending work; stale dispatch entries cleared; output pointers validated before mutation; CSPRNG connection IDs. | `crates/syntra-ffi` production tests and `production_smoke.c` complete request/take/answer/outbound/client round trips |

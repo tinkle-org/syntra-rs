@@ -25,13 +25,12 @@ SYNTRA_INTEGRATION_REQUIRE_DOCKER=1 cargo test -p syntra-integration --test sc1_
 The fixture image builds with the pinned `rust:1.88-bookworm` builder from
 the repository root context (`Dockerfile` is inline in the test via
 `GenericBuildableImage`), then reuses the built peer for TCP and WS groups.
-Each test opens its own connections. Peers, the custom bridge network and
-the built image are cleaned up. Mapped endpoints are rediscovered rather
-than assumed stable.
+Each test opens its own connections. Peers are torn down with the
+container. Mapped endpoints are rediscovered rather than assumed stable.
 
 ## Coverage
 
-Both production adapters (`syntra-tcp` and `syntra-ws::sc1`) are used
+Both production adapters (`syntra-tcp` and `syntra-ws-sc1`) are used
 directly with root `Initiator`/`Host` sessions. There is no dependency on a
 high-level connection wrapper.
 
@@ -40,15 +39,11 @@ For **TCP and WS**, in **bootstrap** mode:
 - Structured listener-bound readiness followed by real SC1 handshake,
   confirmed ClientHello/ServerReady and echo RPC; port readiness alone
   cannot pass.
-- Echo of empty, 1 KiB and 2 KiB payloads, including multi-record coverage
-  in the loopback suite; container RPCs exercise the real mapped-port path.
-- Eight concurrent echo callers with independent payload checks.
-- Explicit per-method authorization denial (`/test.Denied/Denied`) and
-  continued usability.
-- Rejection of an incorrect server static key; bootstrap rejects empty/wrong
-  explicit hello credentials. Rejection is observed as terminal
-  `UNAVAILABLE` because the schema has no pre-ACTIVE typed
-  authentication-error carrier.
+- TCP: empty and 1 KiB echoes, one authorization denial
+  (`/test.Denied/Denied`, observed as `PermissionDenied`), and eight
+  concurrent 2 KiB echo callers with independent payload checks over the
+  same connection.
+- WS: a single 1 KiB echo RPC over the mapped port.
 - Closing the client after the suite; the peer is torn down with the
   container.
 

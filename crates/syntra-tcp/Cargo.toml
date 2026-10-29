@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# Local-only SC1 adapter (depends on the unpublished secure-channel crate),
+# so it must stay unpublished too; otherwise `cargo package -p syntra-ws`
+# style gates fail resolving the path dependency from crates.io.
+publish = false
 description = "Native SC1 ordered stream adapter and shared frame pump"
 
 [features]

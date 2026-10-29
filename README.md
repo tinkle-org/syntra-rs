@@ -4,6 +4,10 @@ Rust implementation of Syntra v1 with generated Protobuf types, bounded
 codecs, client/host runtimes, reliable-session and recovery helpers, and
 experimental SC1 local-revision-1 channels over TCP and native WebSocket.
 
+Extracted from [`tinkle-org/syntra`](https://github.com/tinkle-org/syntra) at
+[`2a91da7fdb96f3e75badf07614c14e4f85c9ba1c`](https://github.com/tinkle-org/syntra/commit/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c).
+See [MIGRATION.md](MIGRATION.md) for provenance and the path mapping.
+
 **SC1 local revision 1 is an implementation-specific draft, not an accepted
 upstream profile or an independently audited secure channel.** Read
 [SC1.md](SC1.md) for the exact wire format and runnable examples, and
@@ -47,7 +51,8 @@ cargo test --locked --workspace
 | `syntra-runtime` | Transport-independent `Initiator`/`Host`, sessions, RPC correlation, notifications, recovery drivers |
 | `syntra-secure-channel` | Socket-free SC1: `Context`, `ClientHandshake`, `respond`, `Channel`, `Secret32`, `KeyStore` |
 | `syntra-tcp` | SC1 TCP `connect`/`Listener`/`connect_stream`/`accept_stream` and the shared bounded frame pump |
-| `syntra-ws` | Native WS/WSS adapters plus `sc1::{connect, accept, accept_stream}` |
+| `syntra-ws` | Native WS/WSS adapters (binary-only, one message per `Frame`) |
+| `syntra-ws-sc1` | Native WebSocket SC1 binding: `connect`/`accept`/`accept_stream` (local-only draft, not published) |
 | `syntra-web` | Browser-facing WASM client; native fixtures for tests |
 | `syntra-ffi` | Native C ABI with explicit production and test-fixture modes |
 | `syntra-integration` | Docker-based SC1 TCP/WebSocket connectivity tests (not published) |
@@ -85,7 +90,7 @@ client.close().await;
 The complete [SC1 runnable sketch](SC1.md#api-sketch) shows provisioning
 fixtures, an explicit factory capturing the sealed channel identity, and
 `accept_stream` for caller-owned streams. Native WS uses
-`syntra_ws::sc1::{connect, accept, accept_stream}` with the
+`syntra_ws_sc1::{connect, accept, accept_stream}` with the
 `syntra.sc1.local1.ws` subprotocol.
 
 Dialing has a **15-second total connection attempt budget**, including

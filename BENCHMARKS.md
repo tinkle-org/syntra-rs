@@ -77,11 +77,16 @@ cargo bench --workspace -- --test
 
 ## Benchmark workflow
 
-`.github/workflows/benchmarks.yml` uses Rust 1.88.0 and runs the full
-in-memory benchmark suite:
+`.github/workflows/benchmarks.yml` uses Rust 1.88.0 and runs the three
+Criterion benchmark targets with short report-only settings (the compile
+step still covers every bench target with the harness-neutral `--test`
+selector, since Criterion timing flags are rejected by the default libtest
+harness):
 
 ```sh
-cargo bench --workspace -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
+cargo bench -p syntra-core --bench frame_codec -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
+cargo bench -p syntra-secure-channel --bench channel -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
+cargo bench -p syntra-tcp --bench pipe -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
 ```
 
 The artifact records raw samples, source revision and toolchain. Timing is

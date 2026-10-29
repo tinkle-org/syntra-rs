@@ -2413,6 +2413,7 @@ dependencies = [
  "syntra-secure-channel",
  "syntra-tcp",
  "syntra-ws",
+ "syntra-ws-sc1",
  "testcontainers",
  "tokio",
  "tracing",
@@ -2493,8 +2494,6 @@ dependencies = [
  "rustls-native-certs",
  "syntra-core",
  "syntra-runtime",
- "syntra-secure-channel",
- "syntra-tcp",
  "thiserror",
  "tokio",
  "tokio-tungstenite",
@@ -2504,6 +2503,27 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "ws_stream_wasm",
+]
+
+[[package]]
+name = "syntra-ws-sc1"
+version = "1.0.0-rc.1"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "prost 0.13.5",
+ "rustls",
+ "rustls-native-certs",
+ "syntra-core",
+ "syntra-runtime",
+ "syntra-secure-channel",
+ "syntra-tcp",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tungstenite",
+ "url",
 ]
 
 [[package]]

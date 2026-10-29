@@ -206,7 +206,7 @@ ENTRYPOINT ["/usr/local/bin/peer"]
         authorization_key: None,
     };
     let ws_url = format!("ws://{host}:{ws_port}/syntra/local/sc1/1/ws");
-    let ws_client = syntra_ws::sc1::connect(
+    let ws_client = syntra_ws_sc1::connect(
         &ws_url,
         ws_client_cfg,
         b"test-credential".to_vec(),

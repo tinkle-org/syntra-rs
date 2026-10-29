@@ -5,6 +5,7 @@ members = [
     "crates/syntra-secure-channel",
     "crates/syntra-tcp",
     "crates/syntra-ws",
+    "crates/syntra-ws-sc1",
     "crates/syntra-ffi",
     "crates/syntra-web",
     "crates/syntra-integration",

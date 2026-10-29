@@ -76,22 +76,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let tcp_config = ServerConfig {
+    let tcp_config = Arc::new(ServerConfig {
         mode,
         carrier: Carrier::Tcp,
         server_key_id: 1,
         scope: scope.as_bytes().to_vec(),
         private_key: Secret32::new(*private_key.expose()),
         store: store.clone(),
-    };
-    let ws_config = ServerConfig {
+    });
+    let ws_config = Arc::new(ServerConfig {
         mode,
         carrier: Carrier::WebSocket,
         server_key_id: 1,
         scope: scope.as_bytes().to_vec(),
         private_key: Secret32::new(*private_key.expose()),
         store,
-    };
+    });
 
     let handler = Arc::new(FnHandler(
         |method: String, payload: Vec<u8>, _| async move {
@@ -130,29 +130,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("peer ws ready on {ws_addr}");
 
     let tcp_task = tokio::spawn(async move {
-        let mut handles: Vec<syntra_tcp::HostHandle> = Vec::new();
+        let handles: Arc<tokio::sync::Mutex<Vec<syntra_tcp::HostHandle>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
         loop {
-            let host = tcp_listener
-                .accept(
+            // Admit the socket first and shake each hand in its own task:
+            // a slow client must not block subsequent accepts.
+            let stream = match tcp_listener.accept_socket().await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("tcp accept failed: {e:?}");
+                    continue;
+                }
+            };
+            let (factory, handler, handles, tcp_config) = (
+                factory.clone(),
+                handler.clone(),
+                handles.clone(),
+                tcp_config.clone(),
+            );
+            tokio::spawn(async move {
+                match syntra_tcp::accept_stream(
+                    stream,
                     &tcp_config,
-                    factory.clone(),
-                    handler.clone(),
+                    factory,
+                    handler,
                     ConnectionConfig::default(),
                     Limits::default(),
                 )
-                .await;
-            match host {
-                Ok(h) => {
-                    eprintln!("peer tcp accepted");
-                    handles.push(h);
-                    if handles.len() > 4096 {
-                        handles.remove(0);
+                .await
+                {
+                    Ok(h) => {
+                        eprintln!("peer tcp accepted");
+                        let mut handles = handles.lock().await;
+                        handles.push(h);
+                        if handles.len() > 4096 {
+                            handles.remove(0);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("tcp handshake failed: {e:?}");
                     }
                 }
-                Err(e) => {
-                    eprintln!("tcp accept failed: {e:?}");
-                }
-            }
+            });
         }
     });
 
@@ -181,29 +200,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     ));
     let ws_task = tokio::spawn(async move {
-        let mut handles: Vec<syntra_tcp::HostHandle> = Vec::new();
+        let handles: Arc<tokio::sync::Mutex<Vec<syntra_tcp::HostHandle>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
         loop {
-            let res = syntra_ws::sc1::accept(
-                &ws_listener,
-                &ws_config,
-                ws_factory.clone(),
-                ws_handler.clone(),
-                ConnectionConfig::default(),
-                syntra_tcp::Limits::default(),
-            )
-            .await;
-            match res {
-                Ok(h) => {
-                    eprintln!("peer ws accepted");
-                    handles.push(h);
-                    if handles.len() > 4096 {
-                        handles.remove(0);
-                    }
-                }
+            // Same split as TCP: admit first, shake each hand concurrently
+            // so a slow client cannot block subsequent accepts.
+            let (socket, _) = match ws_listener.accept().await {
+                Ok(s) => s,
                 Err(e) => {
                     eprintln!("ws accept failed: {e:?}");
+                    continue;
                 }
+            };
+            if let Err(e) = socket.set_nodelay(true) {
+                eprintln!("ws nodelay failed: {e:?}");
+                continue;
             }
+            let (ws_factory, ws_handler, handles, ws_config) = (
+                ws_factory.clone(),
+                ws_handler.clone(),
+                handles.clone(),
+                ws_config.clone(),
+            );
+            tokio::spawn(async move {
+                let res = syntra_ws_sc1::accept_stream(
+                    socket,
+                    &ws_config,
+                    ws_factory,
+                    ws_handler,
+                    ConnectionConfig::default(),
+                    syntra_tcp::Limits::default(),
+                )
+                .await;
+                match res {
+                    Ok(h) => {
+                        eprintln!("peer ws accepted");
+                        let mut handles = handles.lock().await;
+                        handles.push(h);
+                        if handles.len() > 4096 {
+                            handles.remove(0);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("ws handshake failed: {e:?}");
+                    }
+                }
+            });
         }
     });
 

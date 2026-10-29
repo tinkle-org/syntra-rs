@@ -25,10 +25,6 @@ pub mod error;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod native;
 
-/// Explicit native SC1 local-revision WebSocket client and host entrypoints.
-#[cfg(not(target_arch = "wasm32"))]
-pub mod sc1;
-
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 

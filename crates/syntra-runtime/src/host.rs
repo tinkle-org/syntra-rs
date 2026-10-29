@@ -187,8 +187,12 @@ pub struct Host {
     /// dropped `withdraw_principal` future can be retried to completion.
     /// `withdraw_ids` are terminal `UNAUTHENTICATED` results still to queue;
     /// `withdraw_workers` are fenced workers still to join.
+    /// `withdraw_send_mutex` serializes the terminal-result send loop so
+    /// concurrent withdraw callers cannot pop the same ID and queue
+    /// duplicate terminal results.
     withdraw_ids: Mutex<Vec<u64>>,
     withdraw_workers: Mutex<Vec<InflightEntry>>,
+    withdraw_send_mutex: tokio::sync::Mutex<()>,
 }
 
 impl Host {
@@ -231,6 +235,7 @@ impl Host {
             handshake_done: handshake_done.clone(),
             withdraw_ids: Mutex::new(Vec::new()),
             withdraw_workers: Mutex::new(Vec::new()),
+            withdraw_send_mutex: tokio::sync::Mutex::new(()),
         });
         // Handshake timer (SNTR-HS-002/011): ACTIVE or explicit close.
         // The `handshake_done` signal lets a successful handshake stop the
@@ -984,29 +989,43 @@ impl Host {
         // The shared one-second budget bounds a full writer; expiry leaves
         // the remainder queued for retry rather than silently dropping it.
         // `send_result` internally funnels through the bounded writer.
-        loop {
-            let next = {
+        //
+        // The send loop holds `withdraw_send_mutex` so concurrent withdraw
+        // callers cannot pop the same ID and send duplicate terminal
+        // results. Acquisition shares the shutdown deadline with sending;
+        // expiry (or a dropped future) releases the lock with the remainder
+        // still queued, so a later retry continues where this attempt
+        // stopped.
+        let _send_guard = tokio::select! {
+            biased;
+            _ = sleep_until(deadline) => None,
+            guard = self.withdraw_send_mutex.lock() => Some(guard),
+        };
+        if let Some(_send_guard) = _send_guard {
+            loop {
+                let next = {
+                    self.withdraw_ids
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .first()
+                        .copied()
+                };
+                let Some(id) = next else { break };
+                let sent = tokio::select! {
+                    biased;
+                    _ = sleep_until(deadline) => false,
+                    _ = self.send_result(id, outcome_error(ErrorCode::Unauthenticated, "credential not accepted")) => true,
+                };
+                if !sent {
+                    break;
+                }
                 self.withdraw_ids
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .first()
-                    .copied()
-            };
-            let Some(id) = next else { break };
-            let sent = tokio::select! {
-                biased;
-                _ = sleep_until(deadline) => false,
-                _ = self.send_result(id, outcome_error(ErrorCode::Unauthenticated, "credential not accepted")) => true,
-            };
-            if !sent {
-                break;
-            }
-            self.withdraw_ids
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .retain(|kept| *kept != id);
-            if Instant::now() >= deadline {
-                break;
+                    .retain(|kept| *kept != id);
+                if Instant::now() >= deadline {
+                    break;
+                }
             }
         }
         // Close even when the writer stayed full: the connection must not

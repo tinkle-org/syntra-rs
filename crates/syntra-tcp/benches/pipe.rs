@@ -118,7 +118,7 @@ pub fn pipe(c: &mut Criterion) {
                     .call("/bench.Echo/Echo", payload.clone(), 5000)
                     .await
                     .unwrap();
-                assert_eq!(out.len(), size);
+                assert_eq!(out, payload);
                 client.close().await;
                 let host = server.await.unwrap();
                 host.close().await;
