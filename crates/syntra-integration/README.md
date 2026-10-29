@@ -1,5 +1,45 @@
 # SC1 container integration tests
 
+## Current migration scope and execution boundary
+
+The experimental, unpublished `syntra-sc1-transport` replaces `syntra-tcp` and
+`syntra-ws-sc1`. Default features are empty and expose native WSS; this test
+crate explicitly opts into `development-carriers` for restricted TCP and
+plaintext WS fixtures. The shared `pump` is public and carrier-neutral. Baseline
+`syntra-ws` keeps its framing/endpoints; runtime writers must honor the emission
+gate behavior contract. See [SC1.md](../../SC1.md) for the
+RFC 0007 section 11 proposal at review pin
+`94404d7378136d8b6c88ece28bf945c88d1653ba`, the canonical endpoint
+`/syntra/v1/sc1/ws` and exact subprotocol `syntra.sc1.v1`.
+
+The peer and tests now use `syntra_sc1_transport::{tcp, websocket}` and the
+canonical endpoint via `websocket::ENDPOINT_PATH`. The container test dials mapped
+ports on `127.0.0.1` to meet the plaintext WS loopback restriction; raw accepted
+stream fixtures remain explicitly development-only.
+
+The latest local Rust 1.88.0, darwin/arm64 run records
+`cargo test --locked --workspace --quiet`: **372 passed, 0 failed, 2 ignored**
+(Docker/browser). It compiled the migrated fixture but did not execute the
+container suite: **`docker info` failed because the daemon was missing**.
+Browser execution was also ignored. Post-documentation checks passed;
+see [AUDIT.md](../../AUDIT.md#current-recorded-verification). Record a new peer
+revision and actual carrier/mode results when Docker becomes available.
+
+Root `default-members` excludes this integration crate. Explicit `--workspace`
+includes it and intentionally enables `development-carriers` through its dependency.
+CI's isolated `syntra-sc1-transport --no-default-features` tests separately check
+WSS-only defaults. TCP/WS fixture results cannot establish WSS/TLS coverage.
+
+The prior successful run below is historical local-revision-1 evidence, not
+proof of the canonical context, WSS feature split or runtime emission gate.
+The exact public context/prologue fixtures are encoding examples only, not
+independent cryptographic vectors. Release gates remain upstream activation, independent
+pure-Go/Rust interoperability in both roles and modes, recovery and mobile
+validation, and independent review. Browser SC1 is not added, and production
+FFI remains a separate state machine rather than automatically an SC1 SDK.
+
+## Running the fixture suite
+
 This is a separate test crate with a **running Docker daemon** requirement.
 The root library retains its own toolchain and has no Testcontainers/Docker
 dependency. The fixture peer builds from the current worktree, including
@@ -28,13 +68,18 @@ the repository root context (`Dockerfile` is inline in the test via
 Each test opens its own connections. Peers are torn down with the
 container. Mapped endpoints are rediscovered rather than assumed stable.
 
-## Coverage
+## Current fixture targets (container execution outstanding)
 
-Both production adapters (`syntra-tcp` and `syntra-ws-sc1`) are used
-directly with root `Initiator`/`Host` sessions. There is no dependency on a
-high-level connection wrapper.
+The consolidated development adapters are `syntra_sc1_transport::tcp` and
+`syntra_sc1_transport::websocket`, using the shared root handles and runtime
+`Initiator`/`Host` sessions. The opt-in reconnecting client's lifecycle contract
+is documented [separately](../../SC1.md#reconnecting-client). This container
+fixture does not exercise that wrapper. WSS uses
+`websocket::connect`/`connect_with_roots`, `TlsServerSettings::new` and
+`accept_tls_stream`; see the [source-backed API sketch](../../SC1.md#api-sketch).
 
-For **TCP and WS**, in **bootstrap** mode:
+The migrated source targets the following **TCP and WS bootstrap** cases.
+These are compiled test intentions, not a recorded current Docker execution:
 
 - Structured listener-bound readiness followed by real SC1 handshake,
   confirmed ClientHello/ServerReady and echo RPC; port readiness alone
@@ -70,10 +115,11 @@ gate merging.
 Criterion smoke/reporting settings; timing is report-only and no container
 or baseline comparison gate is used.
 
-## Local verification status
+## Historical local verification (pre-consolidation)
 
-Latest run: 2026-10-29, Docker Desktop on darwin/arm64, Rust 1.88.0 host
-toolchain, current worktree.
+Recorded before this migration on 2026-10-29: Docker Desktop on darwin/arm64,
+Rust 1.88.0 host toolchain, the then-current worktree (no immutable revision
+recorded here). This is not a run against the current consolidated crate.
 
 ```text
 cargo test -p syntra-integration --test sc1_containers -- --ignored --nocapture
@@ -81,9 +127,9 @@ test sc1_tcp_and_ws_over_containers ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.29s
 ```
 
-The container builds, starts, prints both readiness lines, completes SC1
-handshakes and echo (including concurrent callers), denial, wrong-key and
-WebSocket cases with no skips. An earlier macOS failure — handshake
+That run built the container, started it, printed both readiness lines, and
+completed SC1 handshakes and echo (including concurrent callers), denial,
+wrong-key and WebSocket cases with no skips. An earlier macOS failure — handshake
 completed, then transport loss on the first RPC — was a fixture bug: the
 peer spawned a detached waiter touching only `h.host`, so disjoint
 async-block capture moved just the `Arc<Host>` and dropped the rest of the

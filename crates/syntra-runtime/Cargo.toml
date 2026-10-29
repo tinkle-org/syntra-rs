@@ -33,4 +33,4 @@ js-sys = "0.3"
 [dev-dependencies]
 syntra-core = { path = "../syntra-core", version = "1.0.0-rc.1" }
 prost.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

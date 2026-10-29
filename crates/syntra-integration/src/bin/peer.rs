@@ -3,8 +3,8 @@
 use std::sync::Arc;
 use syntra_core::ErrorCode;
 use syntra_runtime::{ConnectionConfig, FnHandler, HandlerOutcome, StaticToken};
+use syntra_sc1_transport::{tcp, websocket, HostHandle, Limits};
 use syntra_secure_channel::{Carrier, Mode, Secret32, ServerConfig};
-use syntra_tcp::Limits;
 
 fn hex_to_32(s: &str) -> [u8; 32] {
     let s = s.trim();
@@ -124,13 +124,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     };
 
-    let tcp_listener = syntra_tcp::Listener::bind(tcp_addr.clone(), 64).await?;
+    let tcp_listener = tcp::Listener::bind(tcp_addr.clone(), 64).await?;
     println!("peer tcp ready on {tcp_addr}");
     let ws_listener = tokio::net::TcpListener::bind(ws_addr.clone()).await?;
     println!("peer ws ready on {ws_addr}");
 
     let tcp_task = tokio::spawn(async move {
-        let handles: Arc<tokio::sync::Mutex<Vec<syntra_tcp::HostHandle>>> =
+        let handles: Arc<tokio::sync::Mutex<Vec<HostHandle>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         loop {
             // Admit the socket first and shake each hand in its own task:
@@ -149,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tcp_config.clone(),
             );
             tokio::spawn(async move {
-                match syntra_tcp::accept_stream(
+                match tcp::accept_stream(
                     stream,
                     &tcp_config,
                     factory,
@@ -200,7 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     ));
     let ws_task = tokio::spawn(async move {
-        let handles: Arc<tokio::sync::Mutex<Vec<syntra_tcp::HostHandle>>> =
+        let handles: Arc<tokio::sync::Mutex<Vec<HostHandle>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         loop {
             // Same split as TCP: admit first, shake each hand concurrently
@@ -223,13 +223,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ws_config.clone(),
             );
             tokio::spawn(async move {
-                let res = syntra_ws_sc1::accept_stream(
+                let res = websocket::accept_stream(
                     socket,
                     &ws_config,
                     ws_factory,
                     ws_handler,
                     ConnectionConfig::default(),
-                    syntra_tcp::Limits::default(),
+                    Limits::default(),
                 )
                 .await;
                 match res {

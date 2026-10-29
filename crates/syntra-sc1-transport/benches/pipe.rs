@@ -2,10 +2,13 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use std::sync::Arc;
 use syntra_runtime::{AuthError, Authenticator, StaticToken};
 use syntra_runtime::{ConnectionConfig, FnHandler, HandlerOutcome};
+use syntra_sc1_transport::{
+    tcp::{accept_stream, connect_stream},
+    AuthenticatorFactory, Limits,
+};
 use syntra_secure_channel::{
     generate_server_key, Carrier, ClientConfig, Context, KeyStore, Mode, Secret32, ServerConfig,
 };
-use syntra_tcp::{accept_stream, connect_stream, pump::AuthenticatorFactory, Limits};
 
 struct Store;
 impl KeyStore for Store {

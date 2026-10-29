@@ -135,6 +135,204 @@ fn anonymous() -> Arc<dyn AuthenticatorFactory> {
     )
 }
 
+#[tokio::test(start_paused = true)]
+async fn cancelled_post_sc1_dial_releases_carrier_before_replacement() {
+    // Poll establishment ourselves: no owner task gets a chance to clean up
+    // between cancellation and starting the next dial.
+    for _ in 0..8 {
+        let (client, server) = configs(Mode::Returning);
+        let (client_tx, mut server_rx) = mpsc::channel(8);
+        let (server_tx, client_rx) = mpsc::channel(8);
+        let gate = Arc::new(Gate::default());
+        let mut dial = Box::pin(connect_records(
+            reader(client_rx),
+            QueueWriter {
+                records: client_tx,
+                gate: gate.clone(),
+            },
+            client,
+            vec![],
+            ConnectionConfig::default(),
+            Limits::default(),
+        ));
+        assert!(futures_util::poll!(&mut dial).is_pending());
+        let first = server_rx.try_recv().unwrap();
+        let (mut channel, second) = respond(&server, &first).unwrap();
+        server_tx.send(second).await.unwrap();
+        assert!(futures_util::poll!(&mut dial).is_pending());
+        let hello = server_rx.try_recv().unwrap();
+        assert!(channel.decrypt(&hello).is_ok());
+        assert!(!gate.dropped.load(Ordering::SeqCst));
+        drop(dial);
+        assert!(gate.dropped.load(Ordering::SeqCst));
+        assert!(server_rx.is_closed());
+        assert!(server_tx.is_closed());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn core_handshake_loss_and_deadline_remain_retryable() {
+    for close in [false, true] {
+        let (client, server) = configs(Mode::Bootstrap);
+        let (client_tx, mut server_rx) = mpsc::channel(8);
+        let (server_tx, client_rx) = mpsc::channel(8);
+        let gate = Arc::new(Gate::default());
+        let runtime = ConnectionConfig {
+            handshake_timeout: Duration::from_millis(5),
+            ..ConnectionConfig::default()
+        };
+        let mut dial = Box::pin(connect_records(
+            reader(client_rx),
+            QueueWriter {
+                records: client_tx,
+                gate: gate.clone(),
+            },
+            client,
+            vec![],
+            runtime,
+            Limits::default(),
+        ));
+        assert!(futures_util::poll!(&mut dial).is_pending());
+        let (_, second) = respond(&server, &server_rx.try_recv().unwrap()).unwrap();
+        server_tx.send(second).await.unwrap();
+        assert!(futures_util::poll!(&mut dial).is_pending());
+        assert!(server_rx.try_recv().is_ok()); // encrypted hello, no ready
+        if close {
+            drop(server_tx);
+            assert!(matches!(dial.await, Err(Error::Closed)));
+        } else {
+            tokio::time::advance(Duration::from_millis(6)).await;
+            assert!(matches!(dial.await, Err(Error::Timeout)));
+        }
+        assert!(gate.dropped.load(Ordering::SeqCst));
+    }
+}
+
+fn ready_bytes() -> Vec<u8> {
+    syntra_core::Frame {
+        version: 1,
+        request_id: 0,
+        body: Some(syntra_core::proto::frame::Body::Ready(
+            syntra_core::ServerReady {
+                connection_id: "0123456789abcdef0123456789abcdef".into(),
+            },
+        )),
+    }
+    .encode_to_vec()
+}
+
+#[tokio::test(start_paused = true)]
+async fn ready_with_coalesced_notifications_accounts_for_the_entire_batch() {
+    let (client, server) = configs(Mode::Bootstrap);
+    let (client_tx, mut server_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (server_tx, client_rx) = mpsc::channel(8);
+    let server_task = tokio::spawn(async move {
+        let (mut channel, second) = respond(&server, &server_rx.recv().await.unwrap()).unwrap();
+        server_tx.send(second).await.unwrap();
+        channel.decrypt(&server_rx.recv().await.unwrap()).unwrap();
+        let mut stream = frame_plaintext(&ready_bytes()).unwrap().to_vec();
+        for n in 0..500u32 {
+            let frame = syntra_core::Frame {
+                version: 1,
+                request_id: 0,
+                body: Some(syntra_core::proto::frame::Body::Notification(
+                    syntra_core::Notification {
+                        payload: n.to_be_bytes().to_vec(),
+                    },
+                )),
+            }
+            .encode_to_vec();
+            stream.extend_from_slice(&frame_plaintext(&frame).unwrap());
+        }
+        server_tx
+            .send(channel.encrypt(&stream).unwrap())
+            .await
+            .unwrap();
+        (server_tx, server_rx)
+    });
+    let runtime = ConnectionConfig {
+        notification_capacity: 1024,
+        ..ConnectionConfig::default()
+    };
+    let client = connect_records(
+        reader(client_rx),
+        QueueWriter {
+            records: client_tx,
+            gate: Arc::new(Gate::default()),
+        },
+        client,
+        vec![],
+        runtime,
+        Limits::default(),
+    )
+    .await
+    .unwrap();
+    let _peer = server_task.await.unwrap();
+    for n in 0..500u32 {
+        assert_eq!(
+            client.conn.next_notification().await,
+            Some(n.to_be_bytes().to_vec())
+        );
+    }
+    assert_eq!(client.conn.notification_loss(), (0, 0));
+    client.close().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn partial_frame_deadline_survives_ready_and_background_handoff() {
+    for ready_first in [false, true] {
+        let (client, server) = configs(Mode::Bootstrap);
+        let (client_tx, mut server_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (server_tx, client_rx) = mpsc::channel(8);
+        let server_task = tokio::spawn(async move {
+            let (mut channel, second) = respond(&server, &server_rx.recv().await.unwrap()).unwrap();
+            server_tx.send(second).await.unwrap();
+            channel.decrypt(&server_rx.recv().await.unwrap()).unwrap();
+            let mut first = if ready_first {
+                frame_plaintext(&ready_bytes()).unwrap().to_vec()
+            } else {
+                vec![]
+            };
+            first.push(0); // first byte of a new inner length prefix
+            server_tx
+                .send(channel.encrypt(&first).unwrap())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let rest = frame_plaintext(&ready_bytes()).unwrap();
+            let _ = server_tx.send(channel.encrypt(&rest[1..]).unwrap()).await;
+        });
+        let limits = Limits {
+            frame_timeout: Duration::from_millis(10),
+            record_timeout: Duration::from_millis(100),
+            ..Limits::default()
+        };
+        let start = Instant::now();
+        let result = connect_records(
+            reader(client_rx),
+            QueueWriter {
+                records: client_tx,
+                gate: Arc::new(Gate::default()),
+            },
+            client,
+            vec![],
+            ConnectionConfig::default(),
+            limits,
+        )
+        .await;
+        if ready_first {
+            let client = result.unwrap();
+            wait_closed(&mut client.conn.subscribe_close()).await;
+            client.close().await;
+        } else {
+            assert!(matches!(result, Err(Error::Timeout)));
+        }
+        assert!(Instant::now() - start < Duration::from_millis(30));
+        server_task.abort();
+        let _ = server_task.await;
+    }
+}
+
 async fn connected(
     handler: Arc<dyn Handler>,
 ) -> (ClientHandle, HostHandle, Arc<Gate>, mpsc::Sender<Vec<u8>>) {
@@ -261,7 +459,7 @@ async fn partial_frame_deadline_includes_every_backpressured_delivery_in_the_bat
         let result = read_frames(
             input,
             Arc::new(Mutex::new(server)),
-            FrameDecoder::default(),
+            FrameDecoder::default().into(),
             now + Duration::from_secs(2),
             limits,
             move |_| {
@@ -295,7 +493,7 @@ async fn delayed_owner_poll_does_not_renew_lifetime() {
             gate: Arc::new(Gate::default()),
         },
         client,
-        FrameDecoder::default(),
+        FrameDecoder::default().into(),
         Peer::Client(conn.clone()),
         outbound,
         Limits::default(),
@@ -335,7 +533,7 @@ async fn close_watch_observes_close_before_and_after_subscription() {
             gate: Arc::new(Gate::default()),
         },
         client,
-        FrameDecoder::default(),
+        FrameDecoder::default().into(),
         Peer::Client(conn.clone()),
         outbound,
         Limits::default(),

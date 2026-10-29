@@ -15,9 +15,8 @@ path = "src/bin/peer.rs"
 syntra-core = { path = "../syntra-core", version = "1.0.0-rc.1" }
 syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.1" }
 syntra-secure-channel = { path = "../syntra-secure-channel", version = "1.0.0-rc.1" }
-syntra-tcp = { path = "../syntra-tcp", version = "1.0.0-rc.1" }
+syntra-sc1-transport = { path = "../syntra-sc1-transport", version = "1.0.0-rc.1", features = ["development-carriers"] }
 syntra-ws = { path = "../syntra-ws", version = "1.0.0-rc.1" }
-syntra-ws-sc1 = { path = "../syntra-ws-sc1", version = "1.0.0-rc.1" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

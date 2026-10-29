@@ -1,7 +1,5 @@
-//! Native local SC1 TCP adapter. Generic accepted streams need no socket feature.
-#![forbid(unsafe_code)]
-
-pub mod pump;
+//! Restricted-development SC1 TCP carrier. Never selected as WSS fallback.
+use crate::pump;
 
 pub use pump::{AuthenticatorFactory, ClientHandle, Error, HostHandle, Limits};
 use std::{sync::Arc, time::Duration};
@@ -9,7 +7,7 @@ use syntra_runtime::{ConnectionConfig, Handler};
 use syntra_secure_channel::{Carrier, ClientConfig, ServerConfig, MAX_CIPHERTEXT};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const BINDING: &str = "syntra.sc1.local1.tcp";
+pub const BINDING: &str = "syntra.sc1.v1";
 
 pub struct StreamReader<R>(pub R);
 pub struct StreamWriter<W>(pub W);
@@ -97,7 +95,6 @@ where
     .await
 }
 
-#[cfg(feature = "sockets")]
 pub async fn connect(
     address: impl tokio::net::ToSocketAddrs,
     security: ClientConfig,
@@ -122,13 +119,11 @@ pub async fn connect(
 /// connection's `accept_stream` handshake in its own task. Driving `accept`
 /// (or `accept_socket` + `accept_stream`) sequentially lets one slow client
 /// block subsequent accepts.
-#[cfg(feature = "sockets")]
 pub struct Listener {
     socket: tokio::net::TcpListener,
     admission: Arc<tokio::sync::Semaphore>,
 }
 
-#[cfg(feature = "sockets")]
 impl Listener {
     pub async fn bind(
         address: impl tokio::net::ToSocketAddrs,
@@ -187,12 +182,10 @@ impl Listener {
 /// held until this stream is dropped, covering the handshake and the whole
 /// connection lifetime. Cannot be constructed outside this crate, so the
 /// permit cannot be forged or detached from its socket.
-#[cfg(feature = "sockets")]
 pub struct AdmittedStream {
     socket: tokio::net::TcpStream,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
-#[cfg(feature = "sockets")]
 impl AsyncRead for AdmittedStream {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
@@ -202,7 +195,6 @@ impl AsyncRead for AdmittedStream {
         std::pin::Pin::new(&mut self.socket).poll_read(cx, buf)
     }
 }
-#[cfg(feature = "sockets")]
 impl AsyncWrite for AdmittedStream {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,

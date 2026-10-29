@@ -1,4 +1,5 @@
-//! Networking-independent SC1 local revision 1. See `SC1.md` for the wire contract.
+//! Networking-independent experimental SC1 channel using the canonical context
+//! proposal in RFC 0007 section 11. This is not an accepted production profile.
 #![forbid(unsafe_code)]
 
 use std::fmt;
@@ -9,11 +10,10 @@ mod resolver;
 pub const MAX_CIPHERTEXT: usize = 65_535;
 pub const MAX_PLAINTEXT: usize = MAX_CIPHERTEXT - 16;
 pub const MAX_FRAME: usize = 1_048_576;
-pub const MAX_WRAPPER: usize = 337;
+pub const MAX_WRAPPER: usize = 340;
 pub const MAX_RECORDS: u64 = 1 << 32;
 pub const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(86_400);
-const MAGIC: &[u8; 8] = b"SNTRSC1L";
-const DOMAIN: &[u8] = b"syntra-rs/sc1/local/1\0";
+const DOMAIN: &[u8; 13] = b"syntra.sc1.v1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -86,8 +86,8 @@ pub enum Mode {
 impl Mode {
     fn code(self) -> u8 {
         match self {
-            Self::Bootstrap => 0,
-            Self::Returning => 1,
+            Self::Bootstrap => 1,
+            Self::Returning => 2,
         }
     }
     fn pattern(self) -> &'static str {
@@ -101,18 +101,23 @@ impl Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Carrier {
     Tcp,
+    /// Plain WebSocket (WS), context carrier code 2.
     WebSocket,
+    /// Secure WebSocket (WSS), context carrier code 3.
+    SecureWebSocket,
 }
 impl Carrier {
     fn code(self) -> u8 {
         match self {
             Self::Tcp => 1,
             Self::WebSocket => 2,
+            Self::SecureWebSocket => 3,
         }
     }
 }
 
 /// Public routing context. A parsed context and handle lookup are never proof.
+/// Scope is valid UTF-8 of 1..=255 bytes, preserved without normalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Context {
     pub mode: Mode,
@@ -127,62 +132,58 @@ impl Context {
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
         if self.scope.is_empty()
             || self.scope.len() > 255
+            || std::str::from_utf8(&self.scope).is_err()
             || (self.mode == Mode::Bootstrap && (self.handle != [0; 8] || self.epoch != 0))
+            || (self.mode == Mode::Returning && (self.handle == [0; 8] || self.epoch == 0))
         {
             return Err(Error::Invalid);
         }
-        let mut out = Vec::with_capacity(34 + self.scope.len());
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&1u16.to_be_bytes());
+        let mut out = Vec::with_capacity(37 + self.scope.len());
+        out.extend_from_slice(DOMAIN);
         out.push(self.mode.code());
         out.push(self.carrier.code());
         out.extend_from_slice(&self.server_key_id.to_be_bytes());
+        out.extend_from_slice(&self.epoch.to_be_bytes());
+        out.extend_from_slice(&self.handle);
         out.extend_from_slice(&(self.scope.len() as u16).to_be_bytes());
         out.extend_from_slice(&self.scope);
-        out.extend_from_slice(&self.handle);
-        out.extend_from_slice(&self.epoch.to_be_bytes());
         Ok(out)
     }
 
     /// Parse exactly one first-flight wrapper, including its 48-byte Noise message.
     pub fn parse_first(input: &[u8]) -> Result<(Self, &[u8]), Error> {
-        if input.len() < 83
-            || input.len() > MAX_WRAPPER
-            || &input[..8] != MAGIC
-            || input[8..10] != [0, 1]
-        {
+        if input.len() < 86 || input.len() > MAX_WRAPPER || &input[..13] != DOMAIN {
             return Err(Error::Invalid);
         }
-        let mode = match input[10] {
-            0 => Mode::Bootstrap,
-            1 => Mode::Returning,
+        let mode = match input[13] {
+            1 => Mode::Bootstrap,
+            2 => Mode::Returning,
             _ => return Err(Error::Invalid),
         };
-        let carrier = match input[11] {
+        let carrier = match input[14] {
             1 => Carrier::Tcp,
             2 => Carrier::WebSocket,
+            3 => Carrier::SecureWebSocket,
             _ => return Err(Error::Invalid),
         };
-        let n = u16::from_be_bytes(input[16..18].try_into().unwrap()) as usize;
-        if !(1..=255).contains(&n) || input.len() != 34 + n + 48 {
+        let n = u16::from_be_bytes(input[35..37].try_into().unwrap()) as usize;
+        if !(1..=255).contains(&n) || input.len() != 37 + n + 48 {
             return Err(Error::Invalid);
         }
         let context = Self {
             mode,
             carrier,
-            server_key_id: u32::from_be_bytes(input[12..16].try_into().unwrap()),
-            scope: input[18..18 + n].to_vec(),
-            handle: input[18 + n..26 + n].try_into().unwrap(),
-            epoch: u64::from_be_bytes(input[26 + n..34 + n].try_into().unwrap()),
+            server_key_id: u32::from_be_bytes(input[15..19].try_into().unwrap()),
+            epoch: u64::from_be_bytes(input[19..27].try_into().unwrap()),
+            handle: input[27..35].try_into().unwrap(),
+            scope: input[37..37 + n].to_vec(),
         };
         context.encode()?;
-        Ok((context, &input[34 + n..]))
+        Ok((context, &input[37 + n..]))
     }
 
     fn prologue(&self) -> Result<Vec<u8>, Error> {
-        let mut out = DOMAIN.to_vec();
-        out.extend_from_slice(&self.encode()?);
-        Ok(out)
+        self.encode()
     }
 }
 
@@ -511,6 +512,9 @@ pub fn frame_plaintext(frame: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
     out.extend_from_slice(frame);
     Ok(out)
 }
+
+#[cfg(test)]
+mod context_tests;
 
 #[cfg(test)]
 mod tests {

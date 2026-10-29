@@ -1,4 +1,4 @@
-//! Shared bounded frame pump for ordered SC1 carriers. Socket ownership stays in adapters.
+//! Carrier-neutral bounded SC1 pump. Socket ownership stays in carrier modules.
 use std::{
     future::Future,
     sync::{Arc, Mutex},
@@ -296,10 +296,25 @@ enum Direction {
 type TerminalTask = Option<Result<(Direction, Result<(), Error>), tokio::task::JoinError>>;
 type PumpTasks = JoinSet<(Direction, Result<(), Error>)>;
 
+#[derive(Default)]
+struct ReceiveState {
+    decoder: FrameDecoder,
+    frame_deadline: Option<Instant>,
+}
+
+impl From<FrameDecoder> for ReceiveState {
+    fn from(decoder: FrameDecoder) -> Self {
+        Self {
+            decoder,
+            frame_deadline: None,
+        }
+    }
+}
+
 async fn read_frames<R, F, Fut>(
     mut reader: R,
     channel: Arc<Mutex<Channel>>,
-    mut decoder: FrameDecoder,
+    receive: ReceiveState,
     end: Instant,
     limits: Limits,
     mut ingest: F,
@@ -309,9 +324,15 @@ where
     F: FnMut(Zeroizing<Vec<u8>>) -> Fut,
     Fut: Future<Output = Result<(), Error>>,
 {
-    let mut frame_deadline = decoder
-        .is_partial()
-        .then(|| Instant::now() + limits.frame_timeout);
+    let ReceiveState {
+        mut decoder,
+        frame_deadline,
+    } = receive;
+    let mut frame_deadline = frame_deadline.or_else(|| {
+        decoder
+            .is_partial()
+            .then(|| Instant::now() + limits.frame_timeout)
+    });
     loop {
         let deadline = (Instant::now() + limits.record_timeout)
             .min(frame_deadline.unwrap_or(end))
@@ -403,7 +424,7 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
     reader: R,
     mut writer: W,
     channel: Channel,
-    decoder: FrameDecoder,
+    receive: ReceiveState,
     peer: Peer,
     mut outbound: mpsc::Receiver<Vec<u8>>,
     limits: Limits,
@@ -428,7 +449,7 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
             let result = read_frames(
                 reader,
                 read_channel,
-                decoder,
+                receive,
                 end,
                 read_limits,
                 move |frame| {
@@ -447,6 +468,7 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
             (Direction::Read, result)
         });
         let write_channel = channel.clone();
+        let write_peer = peer.clone();
         tasks.spawn(async move {
             let result = async {
                 let mut drain_deadline = None;
@@ -459,6 +481,16 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
                         biased;
                         _ = draining.changed(), if drain_deadline.is_none() => continue,
                         frame = outbound.recv() => match frame { Some(frame) => frame, None => break },
+                    };
+                    // Gate exactly once before framing/encryption. A selected
+                    // frame's record sequence must finish in order or abort;
+                    // never re-gate/rewrite after a nonce has been consumed.
+                    let frame = match &write_peer {
+                        Peer::Client(client) => match client.prepare_outbound(frame) {
+                            Some(frame) => frame,
+                            None => continue,
+                        },
+                        Peer::Host(_) => frame,
                     };
                     let frame = Zeroizing::new(frame);
                     let deadline = (Instant::now() + limits.write_timeout).min(end).min(drain_deadline.unwrap_or(end));
@@ -555,34 +587,89 @@ pub async fn connect_records<R: RecordReader, W: RecordWriter>(
     if Instant::now() >= channel_deadline {
         return Err(Error::Timeout);
     }
-    let (conn, outbound) = Initiator::new(runtime);
+    let core_deadline = attempt
+        .min(end)
+        .min(Instant::now() + runtime.handshake_timeout);
+    let (conn, mut outbound) = Initiator::new(runtime);
+    let mut channel = channel;
+    let mut receive = ReceiveState::default();
+    // Establishment I/O stays in the caller's future. In particular, do not
+    // spawn an owner before ready: cancelling a partial dial must synchronously
+    // release both carrier halves before a lifecycle replacement can begin.
+    let id = timeout_at(core_deadline, async {
+        let handshake = conn.handshake(credential);
+        tokio::pin!(handshake);
+        let mut hello_sent = false;
+        loop {
+            let deadline = core_deadline
+                .min(Instant::now() + limits.record_timeout)
+                .min(receive.frame_deadline.unwrap_or(core_deadline));
+            tokio::select! {
+                biased;
+                result = &mut handshake => break result.map_err(runtime_error),
+                hello = outbound.recv(), if !hello_sent => {
+                    let hello = Zeroizing::new(hello.ok_or(Error::Closed)?);
+                    let plaintext = frame_plaintext(&hello)?;
+                    let write_deadline = core_deadline.min(Instant::now() + limits.write_timeout);
+                    for chunk in plaintext.chunks(MAX_PLAINTEXT) {
+                        let encrypted = channel.encrypt(chunk)?;
+                        timeout_at(write_deadline, writer.write_record(&encrypted))
+                            .await.map_err(|_| Error::Timeout)??;
+                    }
+                    hello_sent = true;
+                }
+                record = timeout_at(deadline, reader.read_record(MAX_CIPHERTEXT)), if hello_sent => {
+                    let record = record.map_err(|_| Error::Timeout)??;
+                    if Instant::now() >= deadline { return Err(Error::Timeout); }
+                    let plaintext = channel.decrypt(&record)?;
+                    let frames = receive.decoder.push(&plaintext)?;
+                    if !receive.decoder.is_partial() {
+                        receive.frame_deadline = None;
+                    } else if receive.frame_deadline.is_none() || !frames.is_empty() {
+                        receive.frame_deadline = Some(Instant::now() + limits.frame_timeout);
+                    }
+                    // This body is outside the select futures: ready cannot
+                    // cancel delivery midway through a decoded batch. Yielding
+                    // in ingest preserves the iterator until its whole batch
+                    // has been accounted for (unless establishment itself fails).
+                    for frame in frames {
+                        conn.ingest(&Zeroizing::new(frame)).await;
+                    }
+                }
+            }
+        }
+    }).await.map_err(|_| Error::Timeout)??;
+    if Instant::now() >= core_deadline {
+        return Err(Error::Timeout);
+    }
+    let version = conn.negotiated_version().await.ok_or(Error::Runtime)?;
     let pump = spawn_pump(
         reader,
         writer,
         channel,
-        FrameDecoder::default(),
+        receive,
         Peer::Client(conn.clone()),
         outbound,
         limits,
         end,
     );
-    let id = timeout_at(attempt.min(end), conn.handshake(credential))
-        .await
-        .map_err(|_| Error::Timeout)?
-        .map_err(|error| {
-            warn!(error = ?error, "sc1 runtime handshake failed");
-            Error::Runtime
-        })?;
-    if Instant::now() >= attempt.min(end) {
-        return Err(Error::Timeout);
-    }
-    let version = conn.negotiated_version().await.ok_or(Error::Runtime)?;
     Ok(ClientHandle {
         conn,
         connection_id: id,
         version,
         pump: Some(pump),
     })
+}
+
+fn runtime_error(error: SyntraError) -> Error {
+    match error.code() {
+        syntra_core::ErrorCode::DeadlineExceeded => Error::Timeout,
+        syntra_core::ErrorCode::Unavailable => Error::Closed,
+        syntra_core::ErrorCode::Unauthenticated | syntra_core::ErrorCode::PermissionDenied => {
+            Error::Authentication
+        }
+        _ => Error::Runtime,
+    }
 }
 
 pub async fn accept_records<R: RecordReader, W: RecordWriter>(
@@ -650,26 +737,41 @@ pub async fn accept_records<R: RecordReader, W: RecordWriter>(
     if Instant::now() >= attempt.min(end) {
         return Err(Error::Timeout);
     }
-    let (host, outbound) = Host::new(runtime, auth, handler);
+    let (host, mut outbound) = Host::new(runtime, auth, handler);
+    timeout_at(attempt.min(end), host.ingest(&first_frame))
+        .await
+        .map_err(|_| Error::Timeout)?;
+    if host.is_closed() {
+        return Err(Error::Authentication);
+    }
+    // Flush ready before transferring the carrier to background tasks. A
+    // cancelled accept owns/drops its partial carrier just like a cancelled dial.
+    let ready = timeout_at(attempt.min(end), outbound.recv())
+        .await
+        .map_err(|_| Error::Timeout)?
+        .ok_or(Error::Closed)?;
+    let plaintext = frame_plaintext(&Zeroizing::new(ready))?;
+    let mut channel = channel;
+    let deadline = attempt.min(end).min(Instant::now() + limits.write_timeout);
+    for chunk in plaintext.chunks(MAX_PLAINTEXT) {
+        let encrypted = channel.encrypt(chunk)?;
+        timeout_at(deadline, writer.write_record(&encrypted))
+            .await
+            .map_err(|_| Error::Timeout)??;
+    }
+    if Instant::now() >= deadline {
+        return Err(Error::Timeout);
+    }
     let pump = spawn_pump(
         reader,
         writer,
         channel,
-        std::mem::take(&mut decoder),
+        std::mem::take(&mut decoder).into(),
         Peer::Host(host.clone()),
         outbound,
         limits,
         end,
     );
-    timeout_at(attempt.min(end), host.ingest(&first_frame))
-        .await
-        .map_err(|_| Error::Timeout)?;
-    if Instant::now() >= attempt.min(end) {
-        return Err(Error::Timeout);
-    }
-    if host.is_closed() {
-        return Err(Error::Authentication);
-    }
     Ok(HostHandle {
         host,
         identity,

@@ -267,9 +267,11 @@ async fn initiator_graceful_close_drains_results_and_rejects_new_calls() {
     let (client, mut writer) = client().await;
     let mut call = Box::pin(client.call(METHOD, vec![], 5000));
     assert!(futures_util::poll!(&mut call).is_pending());
-    let id = Frame::decode(writer.recv().await.unwrap().as_slice())
-        .unwrap()
-        .request_id;
+    // Model actual emission before exercising advisory cancellation/drain.
+    let bytes = client
+        .prepare_outbound(writer.recv().await.unwrap())
+        .unwrap();
+    let id = Frame::decode(bytes.as_slice()).unwrap().request_id;
     let mut closing = Box::pin(client.close_gracefully(Duration::from_secs(1)));
     assert!(futures_util::poll!(&mut closing).is_pending());
     assert_eq!(client.state().await, ConnectionState::Closing);

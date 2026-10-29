@@ -331,6 +331,11 @@ pub async fn connect(
                                 tracing::warn!("outgoing frame exceeds bound; dropping");
                                 continue;
                             }
+                            let Some(bytes) = write_conn.prepare_outbound(bytes) else {
+                                continue;
+                            };
+                            // Runtime handoff precedes carrier send. Once selected,
+                            // finish this message or close; never rewrite/retry it.
                             let send = ws_write.send(Message::Binary(bytes.into()));
                             match tokio::time::timeout(write_grace, send).await {
                                 Ok(Ok(())) => {}

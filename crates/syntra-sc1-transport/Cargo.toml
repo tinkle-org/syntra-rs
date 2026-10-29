@@ -1,0 +1,45 @@
+[package]
+name = "syntra-sc1-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Experimental proposal implementation; no accepted SC1 conformance claim.
+publish = false
+description = "Experimental SC1/WSS transport, shared bounded pump and restricted stream fixtures"
+
+[features]
+default = []
+# Explicit restricted-development TCP and plaintext WS fixtures, never fallback.
+development-carriers = []
+
+[dependencies]
+syntra-secure-channel = { path = "../syntra-secure-channel", version = "1.0.0-rc.1" }
+syntra-core = { path = "../syntra-core", version = "1.0.0-rc.1" }
+syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.1" }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "io-util", "net"] }
+tracing.workspace = true
+thiserror.workspace = true
+prost.workspace = true
+zeroize = { version = "1", features = ["alloc"] }
+futures-util.workspace = true
+url.workspace = true
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+httparse = "=1.10.1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-native-certs = "0.8"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+futures-util = "0.3"
+# Locally generated test certificates only; no SC1 cryptographic vector claims.
+rcgen = { version = "=0.13.2", default-features = false, features = ["crypto", "ring"] }
+# TLS 1.2 exists only to construct deliberately incompatible test peers.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+[[bench]]
+name = "pipe"
+harness = false
+required-features = ["development-carriers"]

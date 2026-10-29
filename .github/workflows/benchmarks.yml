@@ -39,7 +39,7 @@ jobs:
           restore-keys: |
             cargo-registry-${{ runner.os }}-1.88.0-
       - name: Compile benchmarks
-        run: cargo bench --workspace -- --test
+        run: cargo bench --workspace --features syntra-sc1-transport/development-carriers -- --test
       - name: Run benchmarks (short, report-only)
         # Target only the three Criterion harnesses: passing Criterion timing
         # flags to the default libtest harness fails the run
@@ -48,7 +48,7 @@ jobs:
         run: |
           cargo bench -p syntra-core --bench frame_codec -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
           cargo bench -p syntra-secure-channel --bench channel -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
-          cargo bench -p syntra-tcp --bench pipe -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
+          cargo bench -p syntra-sc1-transport --features development-carriers --bench pipe -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
       - name: Record revision and toolchain
         run: |
           mkdir -p bench-meta

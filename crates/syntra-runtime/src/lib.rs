@@ -21,6 +21,7 @@
 //! [session open questions]: https://github.com/tinkle-org/syntra/blob/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/SESSION-OPEN-QUESTIONS.md
 
 pub mod connection;
+mod emission;
 pub mod host;
 pub mod initiator;
 pub mod policy;
@@ -115,7 +116,11 @@ fn bridge_pumps(
                 _ = host_closed_a.changed() => break,
                 msg = init_rx.recv() => {
                     match msg {
-                        Some(bytes) => pump_host.ingest(&bytes).await,
+                        Some(bytes) => {
+                            if let Some(bytes) = pump_init.prepare_outbound(bytes) {
+                                pump_host.ingest(&bytes).await;
+                            }
+                        }
                         None => break,
                     }
                 }
@@ -127,7 +132,9 @@ fn bridge_pumps(
         pump_init.fence_writer().await;
         init_rx.close();
         while let Some(bytes) = init_rx.recv().await {
-            pump_host.ingest(&bytes).await;
+            if let Some(bytes) = pump_init.prepare_outbound(bytes) {
+                pump_host.ingest(&bytes).await;
+            }
         }
         pump_host.on_transport_lost().await;
         if teardown_a.wait().await.is_leader() {

@@ -79,6 +79,7 @@ pub struct CancelToken {
 struct CancelInner {
     notify: Notify,
     flag: AtomicBool,
+    gate: StdMutex<()>,
 }
 
 impl CancelToken {
@@ -87,17 +88,23 @@ impl CancelToken {
             inner: Arc::new(CancelInner {
                 notify: Notify::new(),
                 flag: AtomicBool::new(false),
+                gate: StdMutex::new(()),
             }),
         }
     }
 
     pub fn cancel(&self) {
+        let _gate = self.lock();
         self.inner.flag.store(true, Ordering::SeqCst);
         self.inner.notify.notify_waiters();
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.inner.flag.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.inner.gate.lock().unwrap()
     }
 
     pub async fn cancelled(&self) {
@@ -455,26 +462,6 @@ pub(crate) fn fill_random(buf: &mut [u8]) -> Result<(), String> {
     }
 }
 
-/// Remove a pending entry unless the RPC already completed. Guards every
-/// path after queue admission: validation failure, send failure,
-/// timeout, cancellation, and dropped futures (SNTR-REL-007).
-pub(crate) struct PendingGuard<'a> {
-    table: &'a PendingTable,
-    id: u64,
-}
-
-impl<'a> PendingGuard<'a> {
-    pub(crate) fn new(table: &'a PendingTable, id: u64) -> Self {
-        Self { table, id }
-    }
-}
-
-impl Drop for PendingGuard<'_> {
-    fn drop(&mut self) {
-        self.table.abandon(self.id);
-    }
-}
-
 /// Successful handshake output observed by the waiter.
 #[derive(Debug, Clone)]
 pub(crate) struct HandshakeDone {
@@ -488,6 +475,8 @@ pub(crate) struct Shared {
     pub proposed_min: u32,
     pub proposed_max: u32,
     pub pending: PendingTable,
+    /// Serializes RPC handoff with terminal selection and pending cleanup.
+    pub(crate) emissions: StdMutex<crate::emission::Emissions>,
     pub ids: RequestIdAllocator,
     pub writer: mpsc::Sender<Vec<u8>>,
     pub notif_tx: mpsc::Sender<Bytes>,
@@ -540,6 +529,7 @@ impl Shared {
             proposed_min,
             proposed_max,
             pending: PendingTable::new(config.max_outstanding),
+            emissions: StdMutex::new(crate::emission::Emissions::new()),
             ids: RequestIdAllocator::new(),
             writer,
             notif_tx,
@@ -823,8 +813,12 @@ impl Connection {
         if next == ConnectionState::Closing {
             *state = ConnectionState::Closed;
         }
-        self.shared.closed.store(true, Ordering::Release);
-        self.shared.pending.drain_transport_lost();
+        {
+            let mut emissions = self.shared.emissions.lock().unwrap();
+            self.shared.closed.store(true, Ordering::Release);
+            self.shared.pending.drain_transport_lost();
+            emissions.clear();
+        }
         if let Some(tx) = waiter.take() {
             let _ = tx.send(Err(failure));
         }

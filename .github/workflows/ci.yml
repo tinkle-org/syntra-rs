@@ -99,6 +99,10 @@ jobs:
             cargo-registry-${{ runner.os }}-1.88.0-
       - name: Locked workspace tests (default features)
         run: cargo test --locked --workspace
+      - name: Isolated SC1 WSS-only defaults (no development feature unification)
+        run: cargo test --locked -p syntra-sc1-transport --no-default-features
+      - name: Explicit SC1 development-carrier regressions
+        run: cargo test --locked -p syntra-sc1-transport --features development-carriers
       - name: Default FFI exposes no ABI (explicit, no --all-features)
         run: cargo test --locked -p syntra-ffi --no-default-features
       - name: Production FFI tests

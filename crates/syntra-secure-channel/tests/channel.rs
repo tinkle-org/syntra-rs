@@ -51,15 +51,80 @@ fn pair(mode: Mode) -> (Channel, Channel) {
 #[test]
 fn both_modes_bidirectional_and_fresh_confirmation() {
     for mode in [Mode::Bootstrap, Mode::Returning] {
-        let (mut client, mut server) = pair(mode);
-        let first = client.encrypt(b"hello").unwrap();
-        assert_eq!(&**server.decrypt(&first).unwrap(), b"hello");
-        assert_eq!(server.verified_identity().unwrap().context().mode, mode);
-        assert_eq!(
-            &**client.decrypt(&server.encrypt(b"ready").unwrap()).unwrap(),
-            b"ready"
-        );
+        for (carrier, code) in [
+            (Carrier::Tcp, 1),
+            (Carrier::WebSocket, 2),
+            (Carrier::SecureWebSocket, 3),
+        ] {
+            let (mut client_config, mut server_config) = configs(mode);
+            client_config.context.carrier = carrier;
+            server_config.carrier = carrier;
+            let (client, first) = ClientHandshake::start(client_config).unwrap();
+            assert_eq!(first[14], code);
+            let (mut server, second) = respond(&server_config, &first).unwrap();
+            assert!(server.verified_identity().is_none());
+            let mut client = client.finish(&second).unwrap();
+            let first = client.encrypt(b"hello").unwrap();
+            assert_eq!(&**server.decrypt(&first).unwrap(), b"hello");
+            assert_eq!(server.verified_identity().unwrap().context().mode, mode);
+            assert_eq!(
+                server.verified_identity().unwrap().context().carrier,
+                carrier
+            );
+            assert_eq!(
+                &**client.decrypt(&server.encrypt(b"ready").unwrap()).unwrap(),
+                b"ready"
+            );
+        }
     }
+}
+
+#[test]
+fn carrier_context_cannot_be_reinterpreted() {
+    let carriers = [Carrier::Tcp, Carrier::WebSocket, Carrier::SecureWebSocket];
+    for mode in [Mode::Bootstrap, Mode::Returning] {
+        for carrier in carriers {
+            let (mut client, mut server) = configs(mode);
+            client.context.carrier = carrier;
+            let (_, first) = ClientHandshake::start(client).unwrap();
+            for other in carriers.into_iter().filter(|other| *other != carrier) {
+                server.carrier = other;
+                // Even valid context for a different configured carrier fails.
+                assert!(matches!(
+                    respond(&server, &first),
+                    Err(Error::Authentication)
+                ));
+                let mut tampered = first.clone();
+                tampered[14] = match other {
+                    Carrier::Tcp => 1,
+                    Carrier::WebSocket => 2,
+                    Carrier::SecureWebSocket => 3,
+                };
+                // Matching the public carrier to server policy cannot change
+                // the prologue authenticated by the original Noise M1.
+                assert!(matches!(
+                    respond(&server, &tampered),
+                    Err(Error::Authentication)
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn mode_requires_exact_authorization_key_presence() {
+    let (mut bootstrap, _) = configs(Mode::Bootstrap);
+    bootstrap.authorization_key = Some(Secret32::generate().unwrap());
+    assert!(matches!(
+        ClientHandshake::start(bootstrap),
+        Err(Error::Invalid)
+    ));
+    let (mut returning, _) = configs(Mode::Returning);
+    returning.authorization_key = None;
+    assert!(matches!(
+        ClientHandshake::start(returning),
+        Err(Error::Invalid)
+    ));
 }
 
 #[test]
@@ -85,7 +150,7 @@ fn wrong_keys_and_prologue_fail_without_fallback() {
     client.authorization_key = Some(Secret32::new([10; 32]));
     let (_, first) = ClientHandshake::start(client).unwrap();
     assert!(respond(&server, &first).is_err());
-    for offset in [8, 10, 11, 12, 18, 18 + 20, 18 + 20 + 8] {
+    for offset in [0, 12, 13, 14, 15, 19, 27, 35, 37] {
         let (client, server) = configs(Mode::Returning);
         let (_, mut first) = ClientHandshake::start(client).unwrap();
         first[offset] ^= 1;
@@ -185,10 +250,11 @@ fn wrapper_is_canonical_and_bounded() {
     let (parsed, message) = Context::parse_first(&first).unwrap();
     assert_eq!(parsed, context);
     assert_eq!(message.len(), 48);
-    assert_eq!(
-        &first[..18],
-        &[83, 78, 84, 82, 83, 67, 49, 76, 0, 1, 1, 1, 0, 0, 0, 42, 0, 20]
-    );
+    assert_eq!(&first[..19], b"syntra.sc1.v1\x02\x01\x00\x00\x00\x2a");
+    assert_eq!(&first[19..27], &3u64.to_be_bytes());
+    assert_eq!(&first[27..35], &[7; 8]);
+    assert_eq!(&first[35..37], &20u16.to_be_bytes());
+    assert_eq!(&first[37..57], b"service.example/chat");
     for n in 0..first.len() {
         assert!(Context::parse_first(&first[..n]).is_err());
     }
