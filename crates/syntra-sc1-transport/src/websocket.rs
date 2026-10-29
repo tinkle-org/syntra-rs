@@ -331,7 +331,15 @@ async fn connect_inner(
     let connector = if parsed.scheme() == "wss" {
         let roots = match roots {
             Some(roots) => roots,
-            None => native_roots().await?,
+            None => {
+                // Bound the cold platform load by the same absolute deadline.
+                // Timeout cancels only this dial's wait; a cached store (when
+                // set) remains for other callers and in-flight blocking loads
+                // are per-dial so they are unaffected.
+                tokio::time::timeout_at(deadline, native_roots())
+                    .await
+                    .map_err(|_| Error::Timeout)??
+            }
         };
         if roots.is_empty() {
             return Err(Error::Configuration);
