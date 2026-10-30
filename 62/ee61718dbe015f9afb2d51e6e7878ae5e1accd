@@ -1,0 +1,14 @@
+.gitignore
+  h_f99191657c0a7f 6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "62ee61718dbe015f9afb2d51e6e7878ae5e1accd",
+  "prompts": {},
+  "humans": {
+    "h_f99191657c0a7f": {
+      "author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}
