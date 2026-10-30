@@ -11,10 +11,15 @@ and plaintext loopback WS. Baseline `syntra-ws` retains its framing/endpoints;
 runtime writers gain the emission-gate behavior contract described below.
 
 This migration intentionally permits prerelease source/API/wire breaks. The
-canonical context follows the RFC 0007 section 11 proposal reviewed at
-`94404d7378136d8b6c88ece28bf945c88d1653ba`. That is a proposal review pin,
-not the extraction/schema pin below. The `syntra.sc1.v1` context is the entire
-Noise prologue, with modes 1/2, carriers TCP 1 / WS 2 / WSS 3 and M1 length
+canonical context targets the accepted RFC 0007 SC1 v1 contract pinned at
+`0e8b0f8a4a789cb3d6d00b993e281867d2325e06` (upstream PR #18, profile
+`SNTR-SC1-WSS-V1`, 24 cases `CONF-SCW-001…024` in
+`conformance/manifest/sc1-wss.yaml`). The earlier proposal review pin
+`94404d7378136d8b6c88ece28bf945c88d1653ba` is retained as history only.
+The extraction/schema pin below remains unchanged. Formal conformance has not
+been executed; the registered cases do not establish implementation conformance.
+The `syntra.sc1.v1` context is the entire Noise prologue, with modes 1/2,
+carriers TCP 1 / WS 2 / WSS 3 and M1 length
 86–340 bytes. The endpoint is `/syntra/v1/sc1/ws` and the subprotocol is
 `syntra.sc1.v1`; old local-revision formats, endpoints and tokens have no aliases
 or fallback. [SC1.md](SC1.md) gives the exact field order and API signatures.
@@ -39,9 +44,36 @@ It does not replay mutations or establish recovery readiness. Browser SC1 is not
 added, and the production FFI remains a separate state machine rather than
 automatically becoming an SC1 SDK.
 
-Public context/prologue fixture bytes come from `conformance/plans/sc1-context-v1.json`
-at the proposal review pin and are transcribed in
-`crates/syntra-secure-channel/tests/fixtures/sc1_context_v1.rs`. They are public
+### Acceptance alignment changes
+
+The uncommitted changes on `feature/sc1-v1-acceptance-alignment`, based on
+`1d1916a`, change `ConnectionConfig::default().max_outstanding` from 64 to 32.
+This shared default affects all runtime users that rely on it, including
+non-SC1 transports. Explicit overrides remain available; writer and notification
+capacities still default to 256 each. SC1 `Limits::validate` retains its
+`1..=1024` validation for these three capacities; the runtime does not enforce
+that range universally. The new runtime test asserts the default value only;
+it does not add a 33rd-call admission boundary test.
+
+Returning-mode clients reject an all-zero authorization key with `Error::Invalid`
+before Noise construction or RNG use. The responder rejects an all-zero key
+returned by `KeyStore::lookup` with `Error::Authentication`, after lookup and
+before Noise construction. `Secret32::new` remains unchanged and still accepts
+any 32-byte input. Secure provisioning, random key and independent handle
+generation, collision checks, current enrollment validation and application
+same-principal binding remain host obligations.
+
+Two new WSS tests exercise fragmented handshakes in both bootstrap and returning
+modes: M1 from a raw client to the real server through an active session, and M2
+from a raw server to the real client through ready and an echo RPC. Each
+handshake message is split into two fragments. These tests do not exhaust
+fragmentation patterns or probe interleaved Ping handling.
+
+Public context/prologue fixtures were transcribed from
+`conformance/plans/sc1-context-v1.json` at the proposal review pin into
+`crates/syntra-secure-channel/tests/fixtures/sc1_context_v1.rs`. Their bytes
+are unchanged and match upstream `conformance/test-vectors/sc1/context-vectors.yaml`
+at the accepted contract pin; upstream retains the plans JSON. They are public
 encoding examples only, not independent Noise cryptographic vectors or executed
 interoperability evidence. No MTProto implementation code was copied. Repository
 implementation licensing remains Apache-2.0; references to external design
@@ -52,11 +84,20 @@ endpoint. Root `default-members` excludes integration; `--workspace` intentional
 unifies its development-carrier dependency. Isolated WSS-only default tests run
 separately in CI. Latest executed local results are recorded in
 [AUDIT.md](AUDIT.md#current-recorded-verification); Docker and browser execution
-remain outstanding. Post-documentation checks passed. The records below
-describe extraction and pre-consolidation work only. Release gates remain upstream
-activation, pure-Go/Rust interoperability in both roles and modes, recovery and mobile
-validation, and independent human review. The remaining Rust implementation
+remain outstanding. The latest alignment run is separate from the earlier broader
+FFI/WASM, security, generation and benchmark checks. The records below describe
+extraction and pre-consolidation work only. Formal conformance, independent
+pure-Go/Rust interoperability in both roles and modes, recovery and mobile
+validation, and independent human review remain release requirements. Upstream
+acceptance is complete. The remaining Rust implementation
 backlog is tracked in [implementation status](docs/implementation-status.md).
+
+The current `scripts/check-upstream-pin.py` reads only `README.md`, `MIGRATION.md`,
+`SC1.md`, `buf.gen.yaml`, `buf.yaml`, `proto/syntra/v1/envelope.proto` and the SC1
+fixture file. It checks required pin references, extraction-file pin exclusivity,
+known upstream pin URLs, selected snapshot links and local snapshot directory
+presence within that scope. It does not scan the repository, enforce comment
+syntax or compare snapshot contents with upstream.
 
 ## Provenance
 

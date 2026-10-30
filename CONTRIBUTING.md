@@ -8,15 +8,16 @@ a security-patched toolchain. Current pins are `prost =0.13.5`,
 0.26 and `rustls 0.23`. Keep dependency versions and checksums consistent
 unless updating them is part of the change.
 
-Read [SC1.md](SC1.md) for the RFC 0007 section 11 canonical-context proposal
-contract and [AUDIT.md](AUDIT.md) for historical local reviews and current gaps.
-The proposal review pin is `94404d7378136d8b6c88ece28bf945c88d1653ba`;
-identify a new reviewed pin when that reference changes. Keep it distinct from
-the extraction/schema pin in [MIGRATION.md](MIGRATION.md), which is checked by
-`scripts/check-upstream-pin.py`. This channel is neither activated upstream nor
-independently audited. Latest local results are recorded in
+Read [SC1.md](SC1.md) for the current accepted upstream `SNTR-SC1-WSS-V1`
+contract at `0e8b0f8a4a789cb3d6d00b993e281867d2325e06` (accepted 2026-10-29)
+and [AUDIT.md](AUDIT.md) for local reviews and current gaps.
+[MIGRATION.md](MIGRATION.md) records the historical proposal-review and separate
+extraction/schema pins, along with the scope of `scripts/check-upstream-pin.py`.
+The implementation remains experimental and unpublished; formal conformance has
+not been executed and independent security review remains outstanding.
+Latest local results are recorded in
 [AUDIT.md](AUDIT.md#current-recorded-verification); historical runs remain
-separate. Post-documentation checks passed.
+separate.
 
 `syntra-sc1-transport` is experimental and unpublished, replacing the prerelease
 `syntra-tcp` and `syntra-ws-sc1` crates with an intentional source/API/wire break.
@@ -85,10 +86,11 @@ integration tests and true independent Rust wire interop are separate
 evidence; name the level actually exercised.
 
 The exact context/prologue fixture tests cover **public encoding only**, not
-independent Noise cryptographic vectors. Release gates remain upstream activation,
-independent pure-Go/Rust interoperability in both roles and modes, recovery and
-mobile validation, and independent security review. Do not infer completion from
-same-library round trips or public fixture matches.
+independent Noise cryptographic vectors. Upstream acceptance is complete.
+Remaining release requirements include formal conformance, independent pure-Go/Rust
+interoperability in both roles and modes, recovery and mobile validation, and
+independent security review. Do not infer completion from same-library round trips
+or public fixture matches.
 
 Workflows (all actions SHA-pinned, `contents: read`, timeouts, concurrency
 cancel for PRs):
@@ -140,7 +142,7 @@ establishment, complete ready-batch ingestion and existing partial-frame deadlin
 Status snapshots must stay owned, not borrowed watch guards; generation-fenced
 calls must never migrate/replay into a successor. Exercise explicit controls,
 elapsed outage budgets through pauses, terminal blocking and retained cleanup
-ownership on close timeout. Passing source reviews by code agents does not replace
+ownership on close timeout. Automated source reviews do not replace
 independent human review. Track protocol/host-policy, durable recovery and FFI/mobile
 work in [implementation status](docs/implementation-status.md).
 

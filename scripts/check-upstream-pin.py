@@ -1,14 +1,20 @@
-"""Verify pin-reference consistency for the pinned upstream Syntra revision
+"""Verify pin-reference consistency for the two scoped upstream Syntra pins
 and presence of local snapshot directories.
 
-Ensures reproducible builds do not silently follow a floating upstream main:
-- README.md, MIGRATION.md and buf.gen.yaml must reference the same pinned
-  upstream commit.
-- The snapshot-comment files must use pinned upstream URLs, not
-  repository-relative paths that resolve to absent local files.
+Scopes (no floating upstream main):
+- Extraction/schema pin ``2a91da7fdb96f3e75badf07614c14e4f85c9ba1c``:
+  buf.gen.yaml, buf.yaml, proto/syntra/v1/envelope.proto, plus the
+  pre-existing README.md/MIGRATION.md provenance links. Extraction files
+  must contain only the extraction pin.
+- SC1 contract pin ``0e8b0f8a4a789cb3d6d00b993e281867d2325e06`` (upstream
+  PR #18, profile SNTR-SC1-WSS-V1): permitted ONLY in README.md,
+  MIGRATION.md, SC1.md and SC1 fixture comments.
+- Proposal-review pin ``94404d7378136d8b6c88ece28bf945c88d1653ba``: history
+  only, permitted ONLY in README.md, MIGRATION.md, SC1.md and SC1 fixture
+  comments; never in extraction files.
 
 This checks reference consistency and directory presence only; it does not
-compare snapshot file contents against the upstream commit.
+compare snapshot file contents against either upstream commit.
 
 Run: python3 scripts/check-upstream-pin.py
 Requires Python 3 (stdlib only). No network access.
@@ -19,10 +25,21 @@ import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-PINNED = "2a91da7fdb96f3e75badf07614c14e4f85c9ba1c"
-PINNED_URL = f"https://github.com/tinkle-org/syntra/blob/{PINNED}"
-PINNED_TREE = f"https://github.com/tinkle-org/syntra/tree/{PINNED}"
-PINNED_COMMIT = f"https://github.com/tinkle-org/syntra/commit/{PINNED}"
+EXTRACTION_PIN = "2a91da7fdb96f3e75badf07614c14e4f85c9ba1c"
+SC1_PIN = "0e8b0f8a4a789cb3d6d00b993e281867d2325e06"
+PROPOSAL_PIN = "94404d7378136d8b6c88ece28bf945c88d1653ba"
+PINNED_URL = f"https://github.com/tinkle-org/syntra/blob/{EXTRACTION_PIN}"
+PINNED_TREE = f"https://github.com/tinkle-org/syntra/tree/{EXTRACTION_PIN}"
+PINNED_COMMIT = f"https://github.com/tinkle-org/syntra/commit/{EXTRACTION_PIN}"
+
+PIN_RE = re.compile(
+    r"https://github\.com/tinkle-org/syntra/(?:blob|tree|commit)/([0-9a-f]{40})"
+)
+BARE_RE = re.compile(r"\b[0-9a-f]{40}\b")
+
+DOC_FILES = ("README.md", "MIGRATION.md", "SC1.md")
+EXTRACTION_FILES = ("buf.gen.yaml", "buf.yaml", "proto/syntra/v1/envelope.proto")
+FIXTURE = "crates/syntra-secure-channel/tests/fixtures/sc1_context_v1.rs"
 
 
 def fail(message: str) -> int:
@@ -31,19 +48,22 @@ def fail(message: str) -> int:
 
 
 def main() -> int:
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    migration = (ROOT / "MIGRATION.md").read_text(encoding="utf-8")
-    buf_gen = (ROOT / "buf.gen.yaml").read_text(encoding="utf-8")
-    buf_yaml = (ROOT / "buf.yaml").read_text(encoding="utf-8")
-    envelope = (ROOT / "proto/syntra/v1/envelope.proto").read_text(encoding="utf-8")
+    texts = {}
+    for name in list(DOC_FILES) + list(EXTRACTION_FILES) + [FIXTURE]:
+        texts[name] = (ROOT / name).read_text(encoding="utf-8")
+    readme, migration = texts["README.md"], texts["MIGRATION.md"]
+    buf_gen = texts["buf.gen.yaml"]
+    buf_yaml = texts["buf.yaml"]
+    envelope = texts["proto/syntra/v1/envelope.proto"]
 
-    for name, text in [
-        ("README.md", readme),
-        ("MIGRATION.md", migration),
-        ("buf.gen.yaml", buf_gen),
-    ]:
-        if PINNED not in text:
-            return fail(f"{name} does not reference pinned upstream {PINNED}")
+    for name in ("README.md", "MIGRATION.md", "buf.gen.yaml"):
+        if EXTRACTION_PIN not in texts[name]:
+            return fail(f"{name} does not reference extraction pin {EXTRACTION_PIN}")
+
+    # Current SC1 contract pin must be recorded in the owned docs.
+    for name in ("README.md", "MIGRATION.md", "SC1.md"):
+        if SC1_PIN not in texts[name]:
+            return fail(f"{name} does not reference SC1 contract pin {SC1_PIN}")
 
     # Snapshot comments must use pinned URLs, not absent local paths.
     # A bare `docs/...` or `compatibility/...` is unpinned; the same text
@@ -61,14 +81,28 @@ def main() -> int:
     if "specifications/schema/reference.md" in envelope_stripped:
         return fail("envelope.proto still uses a relative specification reference")
 
-    # The three pin-link styles must all resolve to the same commit.
-    urls = set(re.findall(r"https://github\.com/tinkle-org/syntra/(?:blob|tree|commit)/([0-9a-f]{40})", readme + migration + buf_gen + buf_yaml + envelope))
-    if urls and urls != {PINNED}:
-        return fail(f"mixed upstream pins found: {sorted(urls)} (expected only {PINNED})")
+    # Scoped exclusivity: extraction files must contain only the extraction
+    # pin; the SC1 contract and proposal-history pins live in docs/fixture
+    # comments only.
+    for name in EXTRACTION_FILES:
+        pins = set(PIN_RE.findall(texts[name])) | set(BARE_RE.findall(texts[name]))
+        if SC1_PIN in texts[name] or PROPOSAL_PIN in texts[name]:
+            return fail(f"{name} must contain only the extraction pin")
+        if pins - {EXTRACTION_PIN}:
+            return fail(
+                f"{name} references out-of-scope pins: {sorted(pins - {EXTRACTION_PIN})}"
+            )
+
+    # Every pin URL anywhere in scope must be one of the three known pins.
+    urls = set(PIN_RE.findall("".join(texts.values())))
+    if urls - {EXTRACTION_PIN, SC1_PIN, PROPOSAL_PIN}:
+        return fail(
+            f"unknown upstream pins found: {sorted(urls - {EXTRACTION_PIN, SC1_PIN, PROPOSAL_PIN})}"
+        )
 
     # Local snapshot directories must exist; upstream authority stays remote.
     # This checks pin-reference consistency and directory presence only, not
-    # snapshot contents against the pinned commit.
+    # snapshot contents against either pinned commit.
     for path in [ROOT / "proto", ROOT / "conformance/test-vectors"]:
         if not path.is_dir():
             return fail(f"missing local snapshot {path.relative_to(ROOT)}")
@@ -79,7 +113,7 @@ def main() -> int:
         if PINNED_COMMIT not in (readme + migration):
             return fail("pinned upstream links missing")
 
-    print(f"Upstream snapshot pin matches {PINNED}.")
+    print(f"Extraction pin {EXTRACTION_PIN}; SC1 contract pin {SC1_PIN}.")
     return 0
 
 

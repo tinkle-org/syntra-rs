@@ -1,6 +1,9 @@
 // Public context/prologue fixtures transcribed without changing their bytes from:
 // https://github.com/tinkle-org/syntra/blob/94404d7378136d8b6c88ece28bf945c88d1653ba/conformance/plans/sc1-context-v1.json
-// Proposal: RFC 0007 section 11; upstream status: proposal-only.
+// Accepted upstream profile SNTR-SC1-WSS-V1 (accepted 2026-10-29; merged upstream
+// as 0e8b0f8a4a789cb3d6d00b993e281867d2325e06); registered at
+// conformance/test-vectors/sc1/context-vectors.yaml. Pin 94404d7 above is
+// proposal-review history (RFC 0007 section 11). Registration is not execution.
 // These are encoding examples, not Noise ciphertext or cryptographic vectors,
 // conformance registration, or evidence of executed interoperability.
 

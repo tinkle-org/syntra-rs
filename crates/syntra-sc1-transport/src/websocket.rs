@@ -4,7 +4,9 @@
 //!
 //! WSS requires verified TLS 1.3 and the SecureWebSocket SC1 carrier binding.
 //! Plaintext WS is a loopback-only dial option under `development-carriers`.
-//! Experimental and unpublished: no accepted upstream profile or audit claim.
+//! Experimental and unpublished implementation of the accepted upstream profile
+//! `SNTR-SC1-WSS-V1` (accepted 2026-10-29): registration is not execution,
+//! and no `CONF` verdict is claimed here.
 use crate::pump::{self, RecordReader, RecordWriter};
 pub use crate::{AuthenticatorFactory, ClientHandle, Error, HostHandle, Limits};
 use futures_util::{

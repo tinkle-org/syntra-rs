@@ -52,13 +52,23 @@ pub struct ConnectionConfig {
 impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
-            max_outstanding: 64,
+            max_outstanding: 32,
             default_timeout: Duration::from_secs(30),
             max_rpc_timeout: Duration::from_secs(120),
             handshake_timeout: syntra_core::HANDSHAKE_TIMEOUT_DEFAULT,
             notification_capacity: 256,
             writer_capacity: 256,
         }
+    }
+}
+
+#[cfg(test)]
+mod connection_config_tests {
+    use super::ConnectionConfig;
+
+    #[test]
+    fn default_max_outstanding_is_32_per_sntr_scw_012() {
+        assert_eq!(ConnectionConfig::default().max_outstanding, 32);
     }
 }
 

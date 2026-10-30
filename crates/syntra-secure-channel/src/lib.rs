@@ -1,5 +1,6 @@
-//! Networking-independent experimental SC1 channel using the canonical context
-//! proposal in RFC 0007 section 11. This is not an accepted production profile.
+//! Networking-independent experimental SC1 channel using the accepted upstream
+//! profile `SNTR-SC1-WSS-V1` (RFC 0007 section 11; accepted 2026-10-29).
+//! Experimental and unpublished: registration is not execution, and no `CONF` verdict is claimed here.
 #![forbid(unsafe_code)]
 
 use std::fmt;
@@ -187,7 +188,8 @@ impl Context {
     }
 }
 
-/// Caller-owned lookup policy. Must validate epoch, expiry, revocation and scope.
+/// Caller-owned lookup policy. Must validate epoch, expiry, revocation and scope,
+/// and only return a nonzero 32-byte AK (an all-zero AK is rejected as unauthenticated).
 /// Called before proof of possession; must not grant a principal or cause effects.
 pub trait KeyStore: Send + Sync {
     fn lookup(&self, context: &Context) -> Result<Secret32, Error>;
@@ -223,6 +225,13 @@ impl ClientHandshake {
         config: ClientConfig,
         resolver: snow::resolvers::BoxedCryptoResolver,
     ) -> Result<(Self, Vec<u8>), Error> {
+        // Returning mode requires a nonzero 32-byte AK; reject a zero AK before
+        // building any snow Builder or consuming RNG so no handshake state exists.
+        if config.context.mode == Mode::Returning
+            && matches!(config.authorization_key.as_ref(), Some(key) if key.expose().iter().fold(0u8, |acc, byte| acc | byte) == 0)
+        {
+            return Err(Error::Invalid);
+        }
         let prologue = config.context.prologue()?;
         let mut builder = snow::Builder::with_resolver(
             config.context.mode.pattern().parse().map_err(noise_error)?,
@@ -293,6 +302,14 @@ pub fn respond(config: &ServerConfig, first: &[u8]) -> Result<(Channel, Vec<u8>)
                 .lookup(&context)?,
         ),
     };
+    // A zero AK from the store is never usable as a PSK; reject with generic
+    // authentication failure before prologue/Noise construction, without logging
+    // or otherwise exposing key material.
+    if let Some(key) = key.as_ref() {
+        if key.expose().iter().fold(0u8, |acc, byte| acc | byte) == 0 {
+            return Err(Error::Authentication);
+        }
+    }
     let prologue = context.prologue()?;
     let mut builder = snow::Builder::with_resolver(
         context.mode.pattern().parse().map_err(noise_error)?,
@@ -541,6 +558,85 @@ mod tests {
             ),
             Err(Error::Entropy)
         ));
+    }
+
+    #[test]
+    fn returning_zero_ak_client_rejects_before_noise_rng() {
+        let context = Context {
+            mode: Mode::Returning,
+            carrier: Carrier::Tcp,
+            server_key_id: 1,
+            scope: b"test".to_vec(),
+            handle: [7; 8],
+            epoch: 1,
+        };
+        let err = match ClientHandshake::start(ClientConfig {
+            context: context.clone(),
+            server_public_key: [5; 32],
+            authorization_key: Some(Secret32::new([0; 32])),
+        }) {
+            Err(err) => err,
+            Ok(_) => panic!("zero AK must reject"),
+        };
+        assert!(matches!(err, Error::Invalid));
+        assert_eq!(format!("{err}"), "SC1 context or message rejected");
+        // A failing RNG must not change the outcome: rejection happens before
+        // any snow Builder is built or entropy is consumed.
+        let err = match ClientHandshake::start_with_resolver(
+            ClientConfig {
+                context,
+                server_public_key: [5; 32],
+                authorization_key: Some(Secret32::new([0; 32])),
+            },
+            Box::new(resolver::Resolver { fail_rng: true }),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("zero AK must reject before RNG"),
+        };
+        assert!(matches!(err, Error::Invalid));
+        assert_eq!(format!("{err}"), "SC1 context or message rejected");
+    }
+
+    struct ZeroAkStore;
+    impl KeyStore for ZeroAkStore {
+        fn lookup(&self, _: &Context) -> Result<Secret32, Error> {
+            Ok(Secret32::new([0; 32]))
+        }
+    }
+
+    #[test]
+    fn returning_zero_ak_store_rejects_before_noise() {
+        let (private_key, server_public_key) = generate_server_key().unwrap();
+        let context = Context {
+            mode: Mode::Returning,
+            carrier: Carrier::Tcp,
+            server_key_id: 1,
+            scope: b"test".to_vec(),
+            handle: [7; 8],
+            epoch: 1,
+        };
+        let (_, first) = ClientHandshake::start(ClientConfig {
+            context: context.clone(),
+            server_public_key,
+            authorization_key: Some(Secret32::new([1; 32])),
+        })
+        .unwrap();
+        let err = match respond(
+            &ServerConfig {
+                mode: context.mode,
+                carrier: context.carrier,
+                server_key_id: 1,
+                scope: context.scope,
+                private_key,
+                store: Some(std::sync::Arc::new(ZeroAkStore)),
+            },
+            &first,
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("zero AK from store must reject"),
+        };
+        assert!(matches!(err, Error::Authentication));
+        assert_eq!(format!("{err}"), "SC1 authentication failed");
     }
 
     #[test]
