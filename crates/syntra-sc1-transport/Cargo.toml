@@ -14,9 +14,9 @@ default = []
 development-carriers = []
 
 [dependencies]
-syntra-secure-channel = { path = "../syntra-secure-channel", version = "1.0.0-rc.1" }
-syntra-core = { path = "../syntra-core", version = "1.0.0-rc.1" }
-syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.1" }
+syntra-secure-channel = { path = "../syntra-secure-channel", version = "1.0.0-rc.2" }
+syntra-core = { path = "../syntra-core", version = "1.0.0-rc.2" }
+syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.2" }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "io-util", "net"] }
 tracing.workspace = true
 thiserror.workspace = true

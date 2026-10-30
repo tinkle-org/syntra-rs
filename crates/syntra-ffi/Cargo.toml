@@ -26,6 +26,6 @@ prost = { workspace = true, optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 getrandom = { version = "0.3", optional = true }
-syntra-core = { path = "../syntra-core", version = "1.0.0-rc.1", optional = true }
-syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.1", optional = true }
+syntra-core = { path = "../syntra-core", version = "1.0.0-rc.2", optional = true }
+syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.2", optional = true }
 tokio = { version = "1", default-features = false, features = ["sync", "time", "rt-multi-thread", "macros"], optional = true }

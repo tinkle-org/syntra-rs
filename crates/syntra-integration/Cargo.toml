@@ -12,11 +12,11 @@ name = "peer"
 path = "src/bin/peer.rs"
 
 [dependencies]
-syntra-core = { path = "../syntra-core", version = "1.0.0-rc.1" }
-syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.1" }
-syntra-secure-channel = { path = "../syntra-secure-channel", version = "1.0.0-rc.1" }
-syntra-sc1-transport = { path = "../syntra-sc1-transport", version = "1.0.0-rc.1", features = ["development-carriers"] }
-syntra-ws = { path = "../syntra-ws", version = "1.0.0-rc.1" }
+syntra-core = { path = "../syntra-core", version = "1.0.0-rc.2" }
+syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.2" }
+syntra-secure-channel = { path = "../syntra-secure-channel", version = "1.0.0-rc.2" }
+syntra-sc1-transport = { path = "../syntra-sc1-transport", version = "1.0.0-rc.2", features = ["development-carriers"] }
+syntra-ws = { path = "../syntra-ws", version = "1.0.0-rc.2" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

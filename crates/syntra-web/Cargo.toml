@@ -13,9 +13,9 @@ description = "Browser client for Syntra v1 (connect/call/notify/close JS-facing
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-syntra-core = { path = "../syntra-core", version = "1.0.0-rc.1" }
-syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.1" }
-syntra-ws = { path = "../syntra-ws", version = "1.0.0-rc.1" }
+syntra-core = { path = "../syntra-core", version = "1.0.0-rc.2" }
+syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.2" }
+syntra-ws = { path = "../syntra-ws", version = "1.0.0-rc.2" }
 tokio.workspace = true
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

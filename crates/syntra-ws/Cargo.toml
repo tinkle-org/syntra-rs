@@ -10,8 +10,8 @@ documentation.workspace = true
 description = "Syntra WSS/WS transport adapters (native tokio + browser wasm). Binary-only, one message per Frame."
 
 [dependencies]
-syntra-core = { path = "../syntra-core", version = "1.0.0-rc.1" }
-syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.1" }
+syntra-core = { path = "../syntra-core", version = "1.0.0-rc.2" }
+syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.2" }
 prost.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
@@ -39,6 +39,6 @@ js-sys = "0.3"
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
-syntra-core = { path = "../syntra-core", version = "1.0.0-rc.1" }
-syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.1" }
+syntra-core = { path = "../syntra-core", version = "1.0.0-rc.2" }
+syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.2" }
 futures-util = "0.3"
