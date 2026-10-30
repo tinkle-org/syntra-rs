@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.2](https://github.com/tinkle-org/syntra-rs/compare/syntra-runtime-v1.0.0-rc.1...syntra-runtime-v1.0.0-rc.2) - 2026-10-30
+
+### Added
+
+- align SC1 v1 with accepted RFC 0007 profile ([#15](https://github.com/tinkle-org/syntra-rs/pull/15))
+- canonical SC1 WSS lifecycle with emission gate ([#11](https://github.com/tinkle-org/syntra-rs/pull/11))
+- add SC1 connectivity and benchmarks ([#10](https://github.com/tinkle-org/syntra-rs/pull/10))
+
+### Other
+
+- extract existing Rust implementation from syntra ([#1](https://github.com/tinkle-org/syntra-rs/pull/1))
+
 ### Changed
 
 * Change `ConnectionConfig::default().max_outstanding` from 64 to 32 to align

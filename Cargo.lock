@@ -2393,7 +2393,7 @@ dependencies = [
 
 [[package]]
 name = "syntra-core"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "bytes",
  "criterion",
@@ -2406,7 +2406,7 @@ dependencies = [
 
 [[package]]
 name = "syntra-ffi"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "getrandom 0.3.4",
  "prost 0.13.5",
@@ -2417,7 +2417,7 @@ dependencies = [
 
 [[package]]
 name = "syntra-integration"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "futures-util",
  "syntra-core",
@@ -2433,7 +2433,7 @@ dependencies = [
 
 [[package]]
 name = "syntra-runtime"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "bytes",
  "futures-util",
@@ -2454,7 +2454,7 @@ dependencies = [
 
 [[package]]
 name = "syntra-sc1-transport"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "criterion",
  "futures-util",
@@ -2477,7 +2477,7 @@ dependencies = [
 
 [[package]]
 name = "syntra-secure-channel"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "criterion",
  "getrandom 0.3.4",
@@ -2488,7 +2488,7 @@ dependencies = [
 
 [[package]]
 name = "syntra-web"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "js-sys",
  "syntra-core",
@@ -2502,7 +2502,7 @@ dependencies = [
 
 [[package]]
 name = "syntra-ws"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "bytes",
  "futures-util",
