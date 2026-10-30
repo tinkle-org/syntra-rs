@@ -96,7 +96,15 @@ Rust 1.88.0, committed `Cargo.lock`, `rust-toolchain.toml` unchanged.
 - Release (`release-plz.yml` on `main`): `validate-release` runs full
   validation plus release-profile FFI symbol and packaging checks, then
   `release-pr` opens a reviewed Release PR and `release` publishes with
-  trusted publishing. No manual tag workflow remains.
+  trusted publishing. No manual tag workflow remains. `release-pr` and
+  `release` run their tooling on **stable** rustc, not the 1.88.0 pin: the
+  release-plz action bundles its own `cargo-semver-checks` (hard-pinned
+  inside the action with no override input), and every semver-checks release
+  requires the then-current stable rustc — 0.51.0 declares minimum rustc
+  1.93.0, so the pinned lane failed with "rustc version is not high enough"
+  on every main push. The job-level `RUSTUP_TOOLCHAIN: stable` env overrides
+  the workflow default; the 1.88.0 pin remains for `validate-release` and PR
+  CI builds/tests.
 
 ## 4. Dependency security
 
