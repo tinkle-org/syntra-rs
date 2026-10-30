@@ -1,17 +1,19 @@
-# Experimental SC1 canonical-context proposal
+# SC1 implementation and verification
 
-This document describes `crates/syntra-secure-channel/` and the consolidated,
-unpublished native adapter `crates/syntra-sc1-transport/`. **This is an
-experimental implementation of the RFC 0007 section 11 proposal, not an
-activated upstream profile or an independently audited secure channel.**
+This document describes `crates/syntra-secure-channel/` and the unpublished
+native adapter `crates/syntra-sc1-transport/`. They target the accepted upstream
+profile `SNTR-SC1-WSS-V1`. The implementation remains experimental; host-policy
+and verification gaps are documented below. No formal conformance verdict or
+independent security audit is claimed.
 
-The upstream design reference is [RFC 0007 at specification commit
-`94404d7378136d8b6c88ece28bf945c88d1653ba`](https://github.com/tinkle-org/syntra/tree/94404d7378136d8b6c88ece28bf945c88d1653ba),
-section 11. Proposal review and extraction/schema provenance are distinct;
-see [MIGRATION.md](MIGRATION.md). Latest main-agent execution results are recorded
-in [AUDIT.md](AUDIT.md#current-recorded-verification), including the final
-post-documentation checks.
-[AUDIT.md](AUDIT.md) preserves earlier local-revision-1 evidence as historical.
+The contract is [RFC 0007 §11.4](https://github.com/tinkle-org/syntra/blob/0e8b0f8a4a789cb3d6d00b993e281867d2325e06/rfcs/0007-secure-channel-device-authorization.md)
+and its companion specifications at upstream commit
+`0e8b0f8a4a789cb3d6d00b993e281867d2325e06` (PR #18, accepted 2026-10-29).
+The [SC1/WSS manifest](https://github.com/tinkle-org/syntra/blob/0e8b0f8a4a789cb3d6d00b993e281867d2325e06/conformance/manifest/sc1-wss.yaml)
+registers `CONF-SCW-001` through `CONF-SCW-024`. Registration does not establish
+an executed result. See [MIGRATION.md](MIGRATION.md) for the separate extraction,
+proposal-review and accepted-contract provenance. Current local results and
+earlier verification records are in [AUDIT.md](AUDIT.md#current-recorded-verification).
 
 The prerelease source/API/wire break replaces `syntra-tcp` and `syntra-ws-sc1`
 with `syntra-sc1-transport`. `default = []` exposes WSS as the default carrier;
@@ -43,7 +45,7 @@ There are no releases yet; future releases use repository-root `vX.Y.Z` tags.
 | Mode byte | API constant | Noise name | Client material |
 | --- | --- | --- | --- |
 | 1 | `Mode::Bootstrap` | `Noise_NK_25519_ChaChaPoly_SHA256` | Authenticated, pinned server public key; no authorization key |
-| 2 | `Mode::Returning` | `Noise_NKpsk0_25519_ChaChaPoly_SHA256` | Same server pin plus a provisioned 32-byte authorization key |
+| 2 | `Mode::Returning` | `Noise_NKpsk0_25519_ChaChaPoly_SHA256` | Same server pin plus a provisioned, nonzero 32-byte authorization key |
 
 Both modes use X25519, ChaCha20-Poly1305 and SHA-256 through `snow 0.10.0`
 with its standard providers. `Enrollment::generate` and the Noise handshake
@@ -99,7 +101,10 @@ and subprotocol tokens are also rejected; there is no fallback.
 Exact fixtures in
 `crates/syntra-secure-channel/tests/fixtures/sc1_context_v1.rs` transcribe the
 four public context/prologue examples from `conformance/plans/sc1-context-v1.json`
-at the review pin above. **These are public encoding fixtures only, not
+at proposal-review commit `94404d7378136d8b6c88ece28bf945c88d1653ba`.
+Their bytes also match the [registered context vectors](https://github.com/tinkle-org/syntra/blob/0e8b0f8a4a789cb3d6d00b993e281867d2325e06/conformance/test-vectors/sc1/context-vectors.yaml)
+at the accepted-contract pin; the original plans JSON remains upstream.
+**These are public encoding fixtures only, not
 independent cryptographic vectors.** Parser fixtures use a dummy 48-byte suffix;
 they do not specify Noise ciphertext, fixed ephemeral keys, or independent
 Go/Rust interoperability. The recorded local tests do not establish independent
@@ -208,8 +213,18 @@ carrier/IP overhead and application payload encoding.
 | `close_timeout` | 1s | Positive, at most 24h; owner-task join after close, then abort |
 | `lifetime` | 24h | Positive, at most 24h, configurable downward |
 
-`writer_capacity`, `notification_capacity` and the runtime outstanding RPC
-count must be `1..1024`. The default runtime writer queue holds at most 256
+SC1 `Limits::validate` requires `writer_capacity`, `notification_capacity` and
+`max_outstanding` to be in `1..=1024`. This validation applies at the SC1
+adapter boundary, not to every runtime constructor. The shared runtime default
+`ConnectionConfig::default().max_outstanding` is 32, matching the pending-RPC
+default in `SNTR-SCW-012`. It affects all transports using the runtime defaults;
+callers can set an explicit value. The initiator bounds pending outbound RPCs
+and the host bounds active inbound RPCs using this setting. The new
+`default_max_outstanding_is_32_per_sntr_scw_012` test in
+`crates/syntra-runtime/src/connection.rs` checks the default value only; it does
+not test admission of a 32nd call or refusal of a 33rd.
+
+Writer and notification queue defaults remain 256 each. The writer queue holds at most 256
 frame items; with a 1 MiB frame ceiling this permits up to 256 MiB of
 serialized queued frame bytes per direction. Deployments should use a smaller
 queue appropriate to their memory budget. There is one incomplete receive
@@ -237,8 +252,9 @@ does not select another frame mid-write. RPC-call cancellation does not cancel
 this owned output. Write error/timeout/connection cancellation aborts the
 channel; it never encrypts a replacement under a consumed nonce. A locally
 rejected plaintext length in the socket-free `Channel::encrypt` does not
-consume a nonce. Authentication failure, framing error and every channel
-record error permanently poison channel state. Direct users of
+consume a nonce, but it still permanently poisons the channel. Authentication
+failure, framing error and every channel record error also poison channel
+state. Direct users of
 `Channel::encrypt` must retain its returned ciphertext until successful
 ordered emission, or call `Channel::close` on output error/cancellation.
 There is no resynchronization scan. Incomplete record/frame bytes are
@@ -290,8 +306,10 @@ persists across cancellation, and a retry continues queueing and closing
 rather than leaving a half-closed connection. Graceful close waits for both
 inflight RPCs and pending withdrawal terminals before closing.
 
-SC1 framing, authentication and policy failures terminate the carrier without
-a diagnostic payload or promised WS close code. Normal writer exhaustion
+SC1 establishment, framing, authentication and connection-fatal policy failures
+terminate the carrier without a diagnostic payload or promised WS close code.
+An ordinary post-ready method denial returns `PERMISSION_DENIED` and leaves
+the connection usable. Normal writer exhaustion
 attempts TCP shutdown or WS Close within the close budget. No carrier close
 is an authenticated SC1 close or delivery ack. Unknown RPC outcomes require
 application-level handling; there is no automatic RPC replay, session
@@ -305,6 +323,14 @@ protected store. Records are scoped by the full provisioned routing tuple
 possession is established. It must be nonblocking, bounded and free of
 principal-granting or enrollment side effects. A matching handle/epoch is
 only a routing result.
+
+Returning-mode handshake entry points reject an all-zero AK. The client
+returns `Error::Invalid` before constructing Noise state or consuming handshake
+randomness. The responder returns `Error::Authentication` after lookup returns
+the zero key and before Noise construction. These errors contain no key
+material. `Secret32::new` remains an unrestricted 32-byte container; the
+handshake checks do not establish that a provisioned nonzero key was generated
+securely or that its enrollment is still authorized.
 
 After M2 the responder still has **no verified client identity** and cannot
 encrypt application records. A first successfully authenticated client
@@ -347,7 +373,7 @@ those remain implementation work, not completed features of the factory hook.
 **Only explicit authenticated out-of-band provisioning is supported.**
 `Enrollment::generate(epoch)` samples the 32-byte authorization key and an
 independent random eight-byte handle. The host must allocate a nonzero returning
-epoch, reject/resample an all-zero handle, and check handle collisions in its
+epoch, reject/resample an all-zero AK or handle, and check handle collisions in its
 scoped store before provisioning. A handle must not be a key prefix, hash of a
 key, principal-derived value or counter.
 
@@ -630,23 +656,86 @@ throughout the complete composition.
 
 ## Local verification status
 
-The latest local run on Rust 1.88.0, darwin/arm64 records 372 workspace
-tests passed, 0 failed, 2 ignored; 50 isolated no-default-feature transport tests;
-58 explicit development-carrier tests; FFI suites/build contract, WASM compilation,
-formatting, clippy, generation/pin, workflow-lint and security checks; and all
-three Criterion smoke targets. Exact counts and qualifications are in
-[AUDIT.md](AUDIT.md#current-recorded-verification). Post-documentation checks
-passed. Docker was unavailable, so the container suite was **not executed**;
-browser execution was ignored. Earlier local-revision-1 tests and Docker outcomes
-remain historical. [BENCHMARKS.md](BENCHMARKS.md) preserves historical timing captures
+The recorded acceptance-alignment run passed 377 workspace tests with no
+failures and two ignored tests (Docker and browser). Separate SC1 transport
+runs passed 52 tests with `--no-default-features` and 60 tests with
+`--features development-carriers`. Formatting and pin validation passed;
+workspace Clippy exited successfully with 43 unique warnings. These are
+working-tree results, not revision-pinned release evidence.
+
+The earlier emission-gate run also checked the explicit FFI variants, C build
+contract, WASM compilation, generation drift, workflows, security tools and
+Criterion smoke targets. Those checks were not rerun for acceptance alignment.
+See [AUDIT.md](AUDIT.md#current-recorded-verification) for commands, feature
+configurations and separate run records. Docker and browser execution remain
+unverified. [BENCHMARKS.md](BENCHMARKS.md) preserves historical timing captures
 without a new performance claim.
 
-Release gates remain upstream activation, independent pure-Go/Rust
-interoperability for both initiator/responder roles and bootstrap/returning
-modes, recovery validation, mobile validation, and independent security review.
+Outstanding release evidence includes formal conformance execution,
+independent pure-Go/Rust interoperability for both initiator/responder roles
+and bootstrap/returning modes, recovery and mobile validation, and independent
+security review. Upstream profile acceptance is complete.
 Public encoding fixtures alone close none of these gates. No MTProto
 implementation code was copied; the repository implementation remains licensed
 under Apache-2.0, as recorded in the root manifest and `LICENSE`.
 The remaining host-policy, activated protocol/execution-accounting, durable wire
 recovery, FFI/mobile and independent-evidence work is tracked in
 [implementation status](docs/implementation-status.md).
+
+### Conformance case cross-reference
+
+The case IDs and requirement references below follow the pinned upstream
+[SC1/WSS manifest](https://github.com/tinkle-org/syntra/blob/0e8b0f8a4a789cb3d6d00b993e281867d2325e06/conformance/manifest/sc1-wss.yaml).
+This table maps local tests and implementation checks to the registered cases;
+it does not report formal case verdicts. `Local probe` identifies a direct test
+for the described behavior, `Partial` identifies narrower or adjacent evidence,
+and `Not demonstrated` means the distinguishing probe is absent. None of these
+labels is an upstream `PASS`, `FAIL` or other execution verdict.
+
+Source keys keep the test references readable:
+
+| Key | Source |
+| --- | --- |
+| C | [Secure-channel integration tests](crates/syntra-secure-channel/tests/channel.rs) |
+| X | [Context fixture and negative-recipe tests](crates/syntra-secure-channel/src/context_tests.rs) |
+| L | [Channel implementation and unit tests](crates/syntra-secure-channel/src/lib.rs) |
+| W | [WSS transport tests](crates/syntra-sc1-transport/tests/wss.rs) |
+| P | [Carrier-neutral pump tests](crates/syntra-sc1-transport/src/pump/tests.rs) |
+| R | [Reconnecting-client tests](crates/syntra-sc1-transport/src/client.rs) |
+| D | [Development TCP tests](crates/syntra-sc1-transport/tests/connectivity.rs) |
+| V | [Development WS tests](crates/syntra-sc1-transport/tests/websocket.rs) |
+| H | [Runtime host tests](crates/syntra-runtime/src/host.rs) |
+
+| Case and behavior | Upstream requirements | Local evidence | Coverage limits |
+| --- | --- | --- | --- |
+| CONF-SCW-001: endpoint, subprotocol and Upgrade selection | `SNTR-SCW-001`, `SNTR-SC-013` | W: `verified_wss_real_socket_rpc_both_modes`, `legacy_endpoint_subprotocol_and_header_credentials_are_rejected_over_tls`, `invalid_upgrade_subprotocol_never_sends_sc1` | Partial. Positive WSS and legacy path/token rejection are tested; there is no explicit `syntra.sc1.draft1` Upgrade-token probe. Context-domain rejection belongs to 013. |
+| CONF-SCW-002: exact WSS context and prologue | `SNTR-SCW-002`, `SNTR-SC-003` | X: `four_pinned_upstream_context_and_prologue_fixtures`; [fixtures 02 and 04](crates/syntra-secure-channel/tests/fixtures/sc1_context_v1.rs) | Partial. Exact encoding, prologue and real M1 prefix are checked, including UTF-8 scope. These exact fixtures are not exercised through responder acceptance and readiness. |
+| CONF-SCW-003: Noise modes, empty payloads, sizes and fresh ephemerals | `SNTR-SCW-003`, `SNTR-SC-001`, `SNTR-SC-004`, `SNTR-SC-005` | C: `both_modes_bidirectional_and_fresh_confirmation`, `wrong_keys_and_prologue_fail_without_fallback`, `tampered_second_flight_and_early_payload_lengths_are_rejected`, `wrapper_is_canonical_and_bounded`; X: `scope_byte_bounds_utf8_and_no_normalization`; L: `snow_entropy_error_is_returned_without_first_flight` | Partial. Boundary parser fixtures use dummy Noise suffixes; full boundary handshakes, wrong-suite peers and valid nonempty-payload peers are not demonstrated. |
+| CONF-SCW-004: independent TLS-identity and Noise-pin failures | `SNTR-SCW-004`, `SNTR-TSEC-003`, `SNTR-TSEC-004` | W: `untrusted_certificate_and_wrong_hostname_fail_before_sc1`, `wrong_noise_pin_is_rejected_before_authentication` | Local probe. Trust/hostname and Noise-pin failures independently reject before the factory runs. This is not the full manifest error-code and hygiene matrix. |
+| CONF-SCW-005: active-session binary and fragmented records | `SNTR-SCW-005`, `SNTR-SC-007` | W: `verified_wss_real_socket_rpc_both_modes` | Partial. Protected binary RPCs are tested; deliberately fragmented active-session records and control-frame noncompletion are not. Handshake fragmentation is tested separately under 021. |
+| CONF-SCW-006: reject Upgrade credentials with HTTP 400 | `SNTR-SCW-006`, `SNTR-SC-013` | W: `legacy_endpoint_subprotocol_and_header_credentials_are_rejected_over_tls`; [Upgrade callback](crates/syntra-sc1-transport/src/websocket.rs) | Partial. Authorization and Cookie rejection is tested, but the test does not assert HTTP 400 or rejection-response hygiene. The callback supplies the 400 status. |
+| CONF-SCW-007: direct TLS and refusal of proxy carrier claims | `SNTR-SCW-007`, `SNTR-TSEC-008` | W: `secure_server_rejects_plaintext_and_proxy_tls_claims`; V: `development_ws_rejects_non_loopback_and_secure_carrier` | Local probe for plaintext forwarding-header claims and development-API restrictions. No deployed proxy-topology test is established. |
+| CONF-SCW-008: development carriers disabled by default | `SNTR-SCW-008`, `SNTR-SC-013` | W: `default_build_rejects_even_loopback_plaintext_ws`; V: `development_ws_rejects_non_loopback_and_secure_carrier`; [feature declarations](crates/syntra-sc1-transport/Cargo.toml) | Partial. WS default rejection is directly tested in the isolated lane. TCP default absence is a feature-gating check, not a compile-fail probe. |
+| CONF-SCW-009: boundary record sizes with empty AD | `SNTR-SCW-009`, `SNTR-SC-007` | C: `record_and_frame_limits_and_segmentation`; L: `Channel::encrypt` and `Channel::decrypt` | Partial. Maximum plaintext chunks round-trip, but the exact minimum and maximum ciphertext sizes are not asserted as a both-role/mode boundary matrix. Empty AD is structural. |
+| CONF-SCW-010: inner framing, splits, coalescing and frame bounds | `SNTR-SCW-010`, `SNTR-SC-008` | C: `every_inner_split_point_and_coalescing`, `record_and_frame_limits_and_segmentation`; P: `partial_frame_deadline_includes_every_backpressured_delivery_in_the_batch` | Partial. Parser and channel tests cover small-frame splits, a segmented 1 MiB frame and invalid lengths. They do not establish the complete WSS dispatch matrix. |
+| CONF-SCW-011: first hello may span records, with no trailing envelope | `SNTR-SCW-011`, `SNTR-SC-006`, `SNTR-DAUTH-010` | W: `verified_wss_real_socket_rpc_both_modes`; [pump implementation](crates/syntra-sc1-transport/src/pump.rs), `accept_records` | Partial. Ordinary hello/ready is tested. Record-spanning hello and extra complete/partial envelope rejection are implemented but lack dedicated probes. |
+| CONF-SCW-012: lifetime, counters, stalled output and fresh reconnect | `SNTR-SCW-012`, `SNTR-SC-009`, `SNTR-SC-011`, `SNTR-SC-012`, `SNTR-SC-014`, `SNTR-DAUTH-009` | L: `record_budget_is_terminal_in_each_direction`, `age_ceiling_is_terminal_without_adapter_timers`; P: `confirmation_cannot_outlive_noise_lifetime_in_either_mode`, `graceful_close_deadline_aborts_a_stalled_carrier`; D: `nonce_consumed_output_error_closes_runtime_and_does_not_dispatch`; R: `replacement_fences_pending_calls_and_never_replays_mutations`; W: `reconnecting_client_replaces_real_wss_with_fresh_generation_both_modes` | Partial. Counter/age tests inject limits; stall and no-replay evidence includes generic/development carriers. WSS reconnect checks connection generations and effects, not distinct traffic keys. The runtime default-value test is supplementary. |
+| CONF-SCW-013: malformed contexts rejected before Noise and lookup | `SNTR-SCW-002`, `SNTR-SC-003`, `SNTR-SC-010` | X: `upstream_negative_recipes_reject_before_lookup_and_noise`, `malformed_fields_and_every_truncation_reject_without_lookup`, `invalid_contexts_reject_before_initiator_noise_rng` | Local probe for all 12 negative recipes and lookup avoidance, with a positive lookup control. Full WSS teardown and hygiene assertions remain separate. |
+| CONF-SCW-014: replayed M1, missing/corrupt M2 and pre-ready requests | `SNTR-SC-004`, `SNTR-SC-006`, `SNTR-SC-010`, `SNTR-DAUTH-008` | C: `replay_m1_does_not_confirm_and_old_transport_record_fails`; D: `replayed_first_flight_never_calls_factory`; W: `unconfirmed_m2_never_releases_hello_or_credential`; H: `pre_active_request_fails` | Partial. The WSS M2 probe is returning-mode only; replay/factory evidence is development TCP. No complete WSS matrix covers every input and protected effect. |
+| CONF-SCW-015: AK, handle, epoch and collision validation | `SNTR-DAUTH-001`, `SNTR-DAUTH-003` | L: `returning_zero_ak_client_rejects_before_noise_rng`, `returning_zero_ak_store_rejects_before_noise`; C: `mode_requires_exact_authorization_key_presence`, `secrets_are_redacted_and_enrollments_are_independent`; X: `malformed_fields_and_every_truncation_reject_without_lookup` | Partial. Zero AK, zero returning handle/epoch and key presence are checked. Store collision handling is not supplied. The responder test checks the error; pre-Noise ordering is also verified in source. |
+| CONF-SCW-016: enrollment/application principal mismatch before ready | `SNTR-DAUTH-005`, `SNTR-DAUTH-010` | Adjacent evidence: W, `sc1_authorization_rejection_is_distinct_from_tls_validation` | Not demonstrated. Generic factory denial does not compare trusted enrollment principal A with independently verified application principal B. This remains host implementation work. |
+| CONF-SCW-017: carrier-2 context rejected under WSS before lookup | `SNTR-SCW-002`, `SNTR-SC-003`, `SNTR-SC-010` | C: `carrier_context_cannot_be_reinterpreted`; L: `respond`, carrier comparison before lookup | Partial. Carrier mismatch is tested, but there is no exact `SC1-CONTEXT-03` to carrier-3 responder probe with lookup counting. Client URL/config rejection does not establish this case. |
+| CONF-SCW-018: post-ready method denial without effects or connection loss | `SNTR-DAUTH-005`, `SNTR-DAUTH-010` | H: `handlers_without_authorization_fail_closed`, `allow_all_wrapper_restores_explicit_permissive_behavior`, `authorization_uses_bound_principal_and_method_on_every_call` | Partial. Runtime tests check denial, no handler effects and an active host. A dedicated SC1/WSS probe for one terminal result followed by a successful permitted call is absent. |
+| CONF-SCW-019: active-session text, compressed, empty and truncated messages | `SNTR-SCW-005`, `SNTR-SC-007`, `SNTR-SC-010` | Adjacent evidence: V, `separate_endpoint_and_subprotocol_are_required`; W, `invalid_raw_upgrade_responses_never_receive_m1`; [WS record reader](crates/syntra-sc1-transport/src/websocket.rs) | Not demonstrated for the active-session WSS matrix. Existing text and extension probes run during establishment; they do not establish these post-ready rejection cases. |
+| CONF-SCW-020: oversize plaintext/ciphertext rejection | `SNTR-SCW-009`, `SNTR-SC-007`, `SNTR-SC-010` | C: `record_and_frame_limits_and_segmentation` | Partial. `MAX_PLAINTEXT + 1` encryption fails and poisons the channel. No otherwise-valid 65,536-byte ciphertext receive probe is present. |
+| CONF-SCW-021: fragmented M1/M2 reassembled before Noise | `SNTR-SCW-003`, `SNTR-SCW-005`, `SNTR-SC-002` | W: `fragmented_m1_reassembles_before_noise_server_role_both_modes`, `fragmented_m2_reassembles_before_noise_client_role_both_modes` | Local probe in both modes and receiving roles. Both reach readiness; the M1 test asserts Active and the M2 test completes an echo RPC. Each message uses one midpoint split. |
+| CONF-SCW-022: isolated truncated-tag rejection | `SNTR-SCW-009`, `SNTR-SC-007`, `SNTR-SC-010` | Adjacent evidence: C, `tamper_and_reorder_poison_state`; D, `every_outer_split_point_and_truncated_record` | Not demonstrated. Ciphertext corruption/reordering and truncated record framing do not isolate an otherwise-valid record with a truncated AEAD tag. |
+| CONF-SCW-023: reject a record produced with nonempty AD | `SNTR-SCW-009`, `SNTR-SC-007`, `SNTR-SC-010` | L: `Channel::encrypt` and `Channel::decrypt` use standard transport operations with no AD argument | Not demonstrated. Structural empty-AD use is not an executable foreign nonempty-AD ciphertext rejection probe. |
+| CONF-SCW-024: invalid Upgrade response sends no M1 | `SNTR-SCW-006` | W: `invalid_raw_upgrade_responses_never_receive_m1` | Local probe for wrong, missing and duplicate Accept values, plus other malformed responses; it observes connection closure with no subsequent M1 bytes. |
+
+The raw-frame helpers for 021 are test peers, not production WebSocket
+validators. They use fixture masking keys and a 1 MiB allocation cap; that cap
+does not change the production adapter's 65,535-byte ciphertext-message limit.
+The probes split each handshake message into two fragments and do not insert
+Ping between them. Subsequent hello/ready/RPC messages are whole, so these
+tests do not supply the active-record fragmentation evidence missing from 005.

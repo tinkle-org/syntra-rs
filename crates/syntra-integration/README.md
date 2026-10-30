@@ -7,36 +7,43 @@ The experimental, unpublished `syntra-sc1-transport` replaces `syntra-tcp` and
 crate explicitly opts into `development-carriers` for restricted TCP and
 plaintext WS fixtures. The shared `pump` is public and carrier-neutral. Baseline
 `syntra-ws` keeps its framing/endpoints; runtime writers must honor the emission
-gate behavior contract. See [SC1.md](../../SC1.md) for the
-RFC 0007 section 11 proposal at review pin
-`94404d7378136d8b6c88ece28bf945c88d1653ba`, the canonical endpoint
-`/syntra/v1/sc1/ws` and exact subprotocol `syntra.sc1.v1`.
+gate behavior contract. See [SC1.md](../../SC1.md) for the accepted upstream
+`SNTR-SC1-WSS-V1` contract at `0e8b0f8a4a789cb3d6d00b993e281867d2325e06`
+(accepted 2026-10-29), the canonical endpoint `/syntra/v1/sc1/ws` and exact
+subprotocol `syntra.sc1.v1`. [MIGRATION.md](../../MIGRATION.md) records the
+historical proposal-review and separate extraction/schema pins.
 
 The peer and tests now use `syntra_sc1_transport::{tcp, websocket}` and the
 canonical endpoint via `websocket::ENDPOINT_PATH`. The container test dials mapped
 ports on `127.0.0.1` to meet the plaintext WS loopback restriction; raw accepted
 stream fixtures remain explicitly development-only.
 
-The latest local Rust 1.88.0, darwin/arm64 run records
-`cargo test --locked --workspace --quiet`: **372 passed, 0 failed, 2 ignored**
-(Docker/browser). It compiled the migrated fixture but did not execute the
-container suite: **`docker info` failed because the daemon was missing**.
-Browser execution was also ignored. Post-documentation checks passed;
-see [AUDIT.md](../../AUDIT.md#current-recorded-verification). Record a new peer
-revision and actual carrier/mode results when Docker becomes available.
+The most recent recorded acceptance-alignment run reports
+`cargo test --locked --workspace`: **377 passed, 0 failed, 2 ignored**
+(Docker/browser). It compiled the migrated TCP/WS bootstrap fixture but did not
+execute the container suite or browser tests. That run did not independently
+check `docker info`. The earlier emission-gate run recorded a failed `docker info`
+check because the daemon was unavailable; that is a previous-run observation.
+See [AUDIT.md](../../AUDIT.md#current-recorded-verification) for the separate
+run records. Record a new peer revision and actual carrier/mode results when
+the container suite is executed.
 
 Root `default-members` excludes this integration crate. Explicit `--workspace`
 includes it and intentionally enables `development-carriers` through its dependency.
-CI's isolated `syntra-sc1-transport --no-default-features` tests separately check
-WSS-only defaults. TCP/WS fixture results cannot establish WSS/TLS coverage.
+Isolated `syntra-sc1-transport --no-default-features` tests separately check
+WSS-only defaults, both in CI and in the recorded alignment run. SC1 WSS tests
+in `crates/syntra-sc1-transport/tests/wss.rs` run outside this container suite.
+TCP/WS fixture results cannot establish WSS/TLS coverage.
 
 The prior successful run below is historical local-revision-1 evidence, not
 proof of the canonical context, WSS feature split or runtime emission gate.
 The exact public context/prologue fixtures are encoding examples only, not
-independent cryptographic vectors. Release gates remain upstream activation, independent
-pure-Go/Rust interoperability in both roles and modes, recovery and mobile
-validation, and independent review. Browser SC1 is not added, and production
-FFI remains a separate state machine rather than automatically an SC1 SDK.
+independent cryptographic vectors. Upstream acceptance is complete. Remaining
+release requirements include formal conformance, independent pure-Go/Rust
+interoperability in both roles and modes, recovery and mobile validation, and
+independent security review. Formal conformance has not been executed. Browser
+SC1 is not added, and production FFI remains a separate state machine rather
+than automatically an SC1 SDK.
 
 ## Running the fixture suite
 

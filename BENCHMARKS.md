@@ -13,14 +13,18 @@ Current transport cases live in the experimental, unpublished
 requires `development-carriers` because it uses the restricted TCP stream
 fixture over in-memory duplex I/O. Default features are empty and expose WSS
 as the default carrier; these pipe cases do not measure WSS or TLS. The channel
-now uses the RFC 0007 section 11 canonical-context proposal at
-`94404d7378136d8b6c88ece28bf945c88d1653ba`; see [SC1.md](SC1.md).
-The latest local execution report on Rust 1.88.0, darwin/arm64 records
-passing Criterion smoke runs for all three targets: `frame_codec`, `channel`
-and `pipe` (with `development-carriers`). This is execution evidence, not a new
-timed performance capture or a speed/energy superiority claim. See
-[AUDIT.md](AUDIT.md#current-recorded-verification). Post-documentation checks
-passed. The baseline below remains historical.
+targets the accepted upstream `SNTR-SC1-WSS-V1` contract at
+`0e8b0f8a4a789cb3d6d00b993e281867d2325e06` (accepted 2026-10-29); see
+[SC1.md](SC1.md) for the current contract and [MIGRATION.md](MIGRATION.md) for
+the historical proposal-review and separate extraction/schema pins.
+
+The earlier emission-gate run on Rust 1.88.0, darwin/arm64 recorded passing
+Criterion smoke runs for all three targets: `frame_codec`, `channel` and `pipe`
+(with `development-carriers`). Criterion was not rerun for acceptance alignment,
+and no new timed performance capture was made. The earlier smoke results are
+execution evidence only, with no speed/energy superiority claim. See the separate
+run records in [AUDIT.md](AUDIT.md#current-recorded-verification). The baseline
+below remains historical.
 
 ## Cases and accounting
 

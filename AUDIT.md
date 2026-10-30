@@ -9,10 +9,15 @@ plaintext loopback WS. Its public root `pump` is carrier-neutral with no TCP
 module dependency. Baseline `syntra-ws` retains its framing/endpoints; custom
 runtime writers must honor the added emission-gate behavior contract.
 
-The review target is the RFC 0007 section 11 canonical-context **proposal** at
-`94404d7378136d8b6c88ece28bf945c88d1653ba`, distinct from the historical
-extraction/schema pin. [SC1.md](SC1.md) specifies `syntra.sc1.v1`, modes 1/2,
-TCP/WS/WSS codes 1/2/3, context-only prologue, M1 86–340 bytes, M2 48 bytes,
+The review target is the accepted upstream SC1 v1 contract: profile
+`SNTR-SC1-WSS-V1` (24 cases `CONF-SCW-001…024`), merged as upstream commit
+`0e8b0f8a4a789cb3d6d00b993e281867d2325e06` (PR #18, accepted 2026-10-29).
+The earlier proposal pin `94404d7378136d8b6c88ece28bf945c88d1653ba` is retained
+as proposal-review history, distinct from the unchanged extraction/schema pin
+`2a91da7fdb96f3e75badf07614c14e4f85c9ba1c`. Formal conformance remains
+unexecuted and no conformance verdict is claimed. [SC1.md](SC1.md) specifies
+`syntra.sc1.v1`, modes 1/2, TCP/WS/WSS codes 1/2/3, context-only prologue,
+M1 86–340 bytes, M2 48 bytes,
 and `/syntra/v1/sc1/ws` with exactly the `syntra.sc1.v1` subprotocol. Historical
 local-revision-1 bytes and aliases are rejected rather than supported by fallback.
 The prerelease source/API/wire break is intentional.
@@ -31,13 +36,88 @@ Integration peer/tests now use the consolidated modules and canonical endpoint.
 Root `default-members` excludes integration; `--workspace` intentionally enables
 development carriers through integration. CI tests WSS-only defaults separately.
 
-Release gates remain upstream activation; independent pure-Go/Rust
+Release requirements include formal conformance and independent pure-Go/Rust
 interoperability in both roles and modes; recovery, including issuance/delivery/ack
 and rotation workflows; mobile validation; and independent security review.
+Upstream acceptance is complete.
 No MTProto implementation code was copied. The root manifest and `LICENSE`
 identify the repository implementation as Apache-2.0, not MIT.
 
+### Acceptance alignment changes and test scope
+
+The working tree on `feature/sc1-v1-acceptance-alignment`, based on `1d1916a`,
+contains the following changes:
+
+- `crates/syntra-runtime/src/connection.rs` changes the shared
+  `ConnectionConfig::default().max_outstanding` from 64 to 32. All runtime users
+  relying on this default are affected, including non-SC1 transports. Explicit
+  overrides remain available; writer and notification defaults stay at 256 each.
+  The new `default_max_outstanding_is_32_per_sntr_scw_012` test asserts the
+  configuration value only, not admission behavior at a 33rd call. The
+  `1..=1024` capacity validation remains in SC1 `Limits::validate`; it is not a
+  universal runtime bound.
+- `crates/syntra-secure-channel/src/lib.rs` rejects an all-zero returning-mode
+  authorization key at the client with `Error::Invalid` before Noise construction
+  or RNG use. The responder returns `Error::Authentication` after
+  `KeyStore::lookup` returns a zero key and before Noise construction. The tests
+  `returning_zero_ak_client_rejects_before_noise_rng` and
+  `returning_zero_ak_store_rejects_before_noise` cover these paths.
+  `Secret32::new` still accepts any 32-byte input. Secure provisioning, random
+  key and independent handle generation, collision checks, current enrollment
+  validation and application same-principal binding remain host obligations.
+- `crates/syntra-sc1-transport/tests/wss.rs` adds
+  `fragmented_m1_reassembles_before_noise_server_role_both_modes` and
+  `fragmented_m2_reassembles_before_noise_client_role_both_modes`. Both exercise
+  bootstrap and returning modes. The M1 test sends from a raw client to the real
+  server and reaches an active session; the M2 test sends from a raw server to
+  the real client and reaches ready plus an echo RPC. Each handshake message
+  uses two fragments. These are not exhaustive fragmentation tests and do not
+  probe interleaved Ping handling.
+- Context/prologue fixture bytes are unchanged. Their updated provenance
+  comments identify the accepted upstream registration; they remain public
+  encoding examples rather than independent cryptographic or interoperability
+  evidence. The pin checker has a fixed file scope, described in
+  [MIGRATION.md](MIGRATION.md#acceptance-alignment-changes); it does not scan the
+  repository, validate comment syntax or compare snapshot contents with upstream.
+
 ## Current recorded verification
+
+### Acceptance alignment run
+
+These results were recorded for the uncommitted working tree on
+`feature/sc1-v1-acceptance-alignment`, based on `1d1916a`. They are local
+working-tree evidence, not revision-pinned release evidence. The index is empty.
+
+| Check | Recorded result |
+| --- | --- |
+| `cargo test --locked --workspace` | 377 passed, 0 failed, 2 ignored (Docker and browser) |
+| `cargo test --locked -p syntra-sc1-transport --no-default-features` | 52 passed: library 29, WSS 23 |
+| `cargo test --locked -p syntra-sc1-transport --features development-carriers` | 60 passed: library 29, TCP connectivity 6, WS 3, WSS 22 |
+| `syntra-secure-channel` tests included in the workspace run | 10 unit and 12 integration tests passed; not an additional run |
+| `cargo clippy --workspace --locked --all-targets` | Exit 0 with 43 unique warnings; no warning-free or `-D warnings` result |
+| `cargo fmt --all -- --check` | Passed |
+| `python3 scripts/check-upstream-pin.py` | Passed within the script's fixed file scope |
+| Docker / browser execution | Not executed; both remain ignored in the workspace run |
+
+The transport results are separate feature-configuration runs, not additive
+counts for one run. Workspace feature unification includes development carriers
+and does not replace isolated WSS-only testing. Formal `CONF-SCW-001…024`
+conformance has not been executed.
+
+Explicit production/test-fixture FFI suites and the C build contract, WASM
+compilation, security checks, generation drift, workflow lint and Criterion smoke
+targets were not rerun for alignment. Their earlier results retain the scope
+recorded below. Passing local checks does not close the release requirements in
+[implementation status](docs/implementation-status.md).
+
+The documentation-only follow-up passed `python3 scripts/check-upstream-pin.py`
+and `git diff --check`. Rust tests and other checks above were not rerun during
+that follow-up.
+
+### Earlier emission-gate verification
+
+The following dated record predates the acceptance alignment run. Its counts
+and broader checks describe that earlier working tree.
 
 Executed locally on 2026-10-29 with **Rust 1.88.0, darwin/arm64**, on
 `feat/canonical-sc1-wss-lifecycle` based on `ce4db11`. The changes remain

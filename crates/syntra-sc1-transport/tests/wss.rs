@@ -12,15 +12,16 @@ use std::{
     time::Duration,
 };
 use syntra_runtime::{
-    AuthError, Authenticator, ConnectionConfig, FnHandler, Handler, HandlerOutcome, Principal,
+    AuthError, Authenticator, ConnectionConfig, FnHandler, Handler, HandlerOutcome, Initiator,
+    Principal,
 };
 use syntra_sc1_transport::{
     websocket as ws, AuthenticatorFactory, Error, HostHandle, LifecycleStatus, Limits,
     ReconnectConfig, ReconnectingClient,
 };
 use syntra_secure_channel::{
-    generate_server_key, Carrier, ClientConfig, Context, KeyStore, Mode, Secret32, ServerConfig,
-    VerifiedIdentity,
+    generate_server_key, Carrier, ClientConfig, ClientHandshake, Context, FrameDecoder, KeyStore,
+    Mode, Secret32, ServerConfig, VerifiedIdentity,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -556,10 +557,7 @@ async fn invalid_raw_upgrade_responses_never_receive_m1() {
             // Peer closed before completing headers: socket failure, not validation.
             assert!(matches!(result, Err(Error::Closed)), "{label}");
         } else {
-            assert!(
-                matches!(result, Err(Error::Configuration)),
-                "{label}"
-            );
+            assert!(matches!(result, Err(Error::Configuration)), "{label}");
         }
         task.await.unwrap();
     }
@@ -1054,4 +1052,413 @@ async fn stalled_tls_handshakes_are_bounded_on_both_sides() {
     )
     .await;
     assert!(matches!(result, Err(Error::Timeout)));
+}
+
+// CONF-SCW-021 pre-session fragmented-handshake probes (VEC-WS-004 shape).
+//
+// Test-only RFC 6455 framing: the async WebSocketStream sink has no FIN-split
+// API, so pre-session fragments are hand-crafted bytes. Client frames are
+// masked with a fixed fixture key (vectors.md VEC-WS-005 fixture convention;
+// production clients must use fresh unpredictable keys per RFC 6455). Server
+// frames are never masked. Failure paths use static labels only and never
+// format credential, token, or wire bytes.
+const FRAGMENT_MASK_KEY: [u8; 4] = [0x37, 0xFA, 0x21, 0x3D];
+
+fn encode_raw_ws_frame(payload: &[u8], fin: bool, opcode: u8, mask: bool) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(payload.len() + 14);
+    frame.push((if fin { 0x80 } else { 0x00 }) | (opcode & 0x0F));
+    if payload.len() < 126 {
+        frame.push((if mask { 0x80 } else { 0x00 }) | payload.len() as u8);
+    } else if payload.len() <= u16::MAX as usize {
+        frame.push((if mask { 0x80 } else { 0x00 }) | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push((if mask { 0x80 } else { 0x00 }) | 127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    if mask {
+        frame.extend_from_slice(&FRAGMENT_MASK_KEY);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ FRAGMENT_MASK_KEY[index % 4]),
+        );
+    } else {
+        frame.extend_from_slice(payload);
+    }
+    frame
+}
+
+fn encode_client_fragment(payload: &[u8], fin: bool, opcode: u8) -> Vec<u8> {
+    encode_raw_ws_frame(payload, fin, opcode, true)
+}
+
+fn encode_server_fragment(payload: &[u8], fin: bool, opcode: u8) -> Vec<u8> {
+    encode_raw_ws_frame(payload, fin, opcode, false)
+}
+
+// Reassemble one binary message from raw frames in either direction
+// (masked client or unmasked server), skipping Ping/Pong at the WS layer.
+// Close, text, unexpected opcodes, and accumulation past the 1 MiB envelope
+// cap are I/O errors with static labels; wire bytes never enter the error.
+async fn read_raw_ws_message<S>(stream: &mut S) -> Result<Vec<u8>, std::io::Error>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use std::io::{Error, ErrorKind};
+    let mut message = Vec::new();
+    let mut started = false;
+    loop {
+        let first = stream.read_u8().await?;
+        let second = stream.read_u8().await?;
+        let fin = first & 0x80 != 0;
+        let opcode = first & 0x0F;
+        let masked = second & 0x80 != 0;
+        let mut length = (second & 0x7F) as u64;
+        if length == 126 {
+            let mut extended = [0; 2];
+            stream.read_exact(&mut extended).await?;
+            length = u16::from_be_bytes(extended) as u64;
+        } else if length == 127 {
+            let mut extended = [0; 8];
+            stream.read_exact(&mut extended).await?;
+            length = u64::from_be_bytes(extended);
+        }
+        let key = if masked {
+            let mut key = [0; 4];
+            stream.read_exact(&mut key).await?;
+            Some(key)
+        } else {
+            None
+        };
+        if length > 1_048_576 || message.len() as u64 + length > 1_048_576 {
+            return Err(Error::new(ErrorKind::InvalidData, "ws message over bound"));
+        }
+        let mut payload = vec![0; length as usize];
+        stream.read_exact(&mut payload).await?;
+        if let Some(key) = key {
+            for (index, byte) in payload.iter_mut().enumerate() {
+                *byte ^= key[index % 4];
+            }
+        }
+        match opcode {
+            0x2 => {
+                if started {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "new message mid-fragment",
+                    ));
+                }
+                started = true;
+                message = payload;
+                if fin {
+                    return Ok(message);
+                }
+            }
+            0x0 => {
+                if !started {
+                    return Err(Error::new(ErrorKind::InvalidData, "stray continuation"));
+                }
+                message.extend_from_slice(&payload);
+                if fin {
+                    return Ok(message);
+                }
+            }
+            0x9 | 0xA => {}
+            0x8 => {
+                return Err(Error::new(
+                    ErrorKind::ConnectionReset,
+                    "ws closed mid-message",
+                ));
+            }
+            _ => {
+                return Err(Error::new(ErrorKind::InvalidData, "unexpected ws opcode"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn fragmented_m1_reassembles_before_noise_server_role_both_modes() {
+    for mode in [Mode::Bootstrap, Mode::Returning] {
+        let (listener, url) = listener().await;
+        let (client_config, server_config) = configs(mode);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server = serve(listener, server_config, calls.clone());
+        let port = url::Url::parse(&url).unwrap().port().unwrap();
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("raw fixture connect");
+        let mut tls = tls_client(&rustls::version::TLS13)
+            .connect(ServerName::try_from("127.0.0.1").unwrap(), tcp)
+            .await
+            .expect("raw fixture tls");
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Protocol: {}\r\n\r\n",
+            ws::ENDPOINT_PATH,
+            ws::SUBPROTOCOL
+        );
+        tls.write_all(request.as_bytes())
+            .await
+            .expect("raw upgrade write");
+        tls.flush().await.expect("raw upgrade flush");
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\n") {
+            assert!(response.len() < 16 * 1024, "upgrade response over bound");
+            response.push(
+                tokio::time::timeout(Duration::from_secs(2), tls.read_u8())
+                    .await
+                    .expect("upgrade response deadline")
+                    .expect("upgrade response read"),
+            );
+        }
+        assert!(
+            !response
+                .windows(CREDENTIAL.len())
+                .any(|part| part == CREDENTIAL),
+            "upgrade response carries no credential"
+        );
+        let response_text = String::from_utf8(response).expect("upgrade response utf8");
+        assert!(
+            response_text.starts_with("HTTP/1.1 101"),
+            "expected 101 upgrade"
+        );
+        assert!(
+            response_text.contains(&derive_accept_key(key.as_bytes())),
+            "upgrade accept mismatch"
+        );
+        assert!(
+            response_text.contains(ws::SUBPROTOCOL),
+            "upgrade subprotocol mismatch"
+        );
+        // M1 split into FIN=0 opcode-2 + FIN=1 opcode-0: the real server must
+        // reassemble before Noise processing and answer with a normal M2.
+        let (handshake, first) = ClientHandshake::start(client_config).expect("fixture m1");
+        assert!(first.len() > 48, "m1 carries context plus noise");
+        let split = first.len() / 2;
+        tls.write_all(&encode_client_fragment(&first[..split], false, 0x2))
+            .await
+            .expect("m1 fragment write");
+        tls.write_all(&encode_client_fragment(&first[split..], true, 0x0))
+            .await
+            .expect("m1 fragment write");
+        tls.flush().await.expect("m1 fragment flush");
+        let second = tokio::time::timeout(Duration::from_secs(3), read_raw_ws_message(&mut tls))
+            .await
+            .expect("m2 deadline")
+            .expect("m2 read");
+        assert!(!second
+            .windows(CREDENTIAL.len())
+            .any(|part| part == CREDENTIAL));
+        assert_eq!(second.len(), 48, "server answers fragmented m1 with one m2");
+        let mut channel = handshake.finish(&second).expect("fixture m2 finish");
+        // Complete hello/ready over the same raw channel to reach ready.
+        let (initiator, mut outbound) = Initiator::new(ConnectionConfig::default());
+        let handshake_task = tokio::spawn({
+            let initiator = initiator.clone();
+            async move { initiator.handshake(CREDENTIAL.to_vec()).await }
+        });
+        let hello = tokio::time::timeout(Duration::from_secs(3), outbound.recv())
+            .await
+            .expect("hello deadline")
+            .expect("hello queued");
+        let plaintext = syntra_secure_channel::frame_plaintext(&hello).expect("hello framing");
+        for chunk in plaintext.chunks(syntra_secure_channel::MAX_PLAINTEXT) {
+            let record = channel.encrypt(chunk).expect("hello encrypt");
+            tls.write_all(&encode_client_fragment(&record, true, 0x2))
+                .await
+                .expect("hello record write");
+        }
+        tls.flush().await.expect("hello record flush");
+        let ready_record =
+            tokio::time::timeout(Duration::from_secs(3), read_raw_ws_message(&mut tls))
+                .await
+                .expect("ready deadline")
+                .expect("ready read");
+        let plaintext = channel.decrypt(&ready_record).expect("ready decrypt");
+        let mut decoder = FrameDecoder::default();
+        let frames = decoder.push(&plaintext).expect("ready framing");
+        assert_eq!(frames.len(), 1, "ready arrives as one frame");
+        assert!(!decoder.is_partial(), "ready frame complete");
+        initiator.ingest(&frames[0]).await;
+        let connection_id = tokio::time::timeout(Duration::from_secs(3), handshake_task)
+            .await
+            .expect("ready handshake deadline")
+            .expect("handshake task")
+            .expect("session reaches ready");
+        assert!(!connection_id.is_empty(), "ready carries connection id");
+        assert_eq!(
+            initiator.state().await,
+            syntra_core::ConnectionState::Active,
+            "raw session reaches active"
+        );
+        let host = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server accept deadline")
+            .expect("server task")
+            .expect("server reaches ready");
+        assert_eq!(host.identity.context().mode, mode, "server mode");
+        assert_eq!(
+            host.identity.context().carrier,
+            Carrier::SecureWebSocket,
+            "server carrier"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "hello reached factory once"
+        );
+        let _ = tls
+            .write_all(&encode_client_fragment(&[0x03, 0xE8], true, 0x8))
+            .await;
+        let _ = tls.shutdown().await;
+        host.close().await;
+    }
+}
+
+#[tokio::test]
+async fn fragmented_m2_reassembles_before_noise_client_role_both_modes() {
+    for mode in [Mode::Bootstrap, Mode::Returning] {
+        let (listener, url) = listener().await;
+        let (client_config, server_config) = configs(mode);
+        let connection_id = format!(
+            "frag-m2-{}",
+            match mode {
+                Mode::Bootstrap => "bootstrap",
+                Mode::Returning => "returning",
+            }
+        );
+        let expected_id = connection_id.clone();
+        let peer = tokio::spawn(async move {
+            let (mut tls, accept) = raw_upgrade_peer(listener).await;
+            let response =
+                raw_upgrade_response("Connection: Upgrade").replace("ACCEPT_KEY", &accept);
+            tls.write_all(response.as_bytes()).await.expect("101 write");
+            tls.flush().await.expect("101 flush");
+            // The real client sends M1 whole; answer with M2 split into two
+            // continuation fragments. The client must reassemble before Noise.
+            let first = tokio::time::timeout(Duration::from_secs(3), read_raw_ws_message(&mut tls))
+                .await
+                .expect("m1 deadline")
+                .expect("m1 read");
+            let (mut channel, second) =
+                syntra_secure_channel::respond(&server_config, &first).expect("fixture m2");
+            assert_eq!(second.len(), 48, "m2 shape");
+            let split = second.len() / 2;
+            tls.write_all(&encode_server_fragment(&second[..split], false, 0x2))
+                .await
+                .expect("m2 fragment write");
+            tls.write_all(&encode_server_fragment(&second[split..], true, 0x0))
+                .await
+                .expect("m2 fragment write");
+            tls.flush().await.expect("m2 fragment flush");
+            // The client must continue past M2 with a decrypted hello record.
+            let hello_record =
+                tokio::time::timeout(Duration::from_secs(3), read_raw_ws_message(&mut tls))
+                    .await
+                    .expect("hello deadline")
+                    .expect("hello read");
+            let plaintext = channel.decrypt(&hello_record).expect("hello decrypt");
+            let mut decoder = FrameDecoder::default();
+            let frames = decoder.push(&plaintext).expect("hello framing");
+            assert_eq!(frames.len(), 1, "hello arrives as one frame");
+            let hello = syntra_core::Frame::decode(frames[0].as_slice()).expect("hello decode");
+            match hello.body {
+                Some(syntra_core::proto::frame::Body::Hello(hello)) => {
+                    assert!(hello.credential == CREDENTIAL, "hello credential mismatch");
+                }
+                _ => panic!("expected encrypted hello"),
+            }
+            let identity = channel.verified_identity().expect("identity after hello");
+            assert_eq!(identity.context().mode, mode, "verified mode");
+            assert_eq!(
+                identity.context().carrier,
+                Carrier::SecureWebSocket,
+                "verified carrier"
+            );
+            let ready = syntra_core::Frame {
+                version: 1,
+                request_id: 0,
+                body: Some(syntra_core::proto::frame::Body::Ready(
+                    syntra_core::ServerReady {
+                        connection_id: connection_id.clone(),
+                    },
+                )),
+            }
+            .encode_to_vec();
+            let plaintext = syntra_secure_channel::frame_plaintext(&ready).expect("ready framing");
+            let record = channel.encrypt(&plaintext).expect("ready encrypt");
+            tls.write_all(&encode_server_fragment(&record, true, 0x2))
+                .await
+                .expect("ready write");
+            tls.flush().await.expect("ready flush");
+            // Echo one RPC to prove the session reached ready/active.
+            let mut decoder = FrameDecoder::default();
+            loop {
+                let next =
+                    tokio::time::timeout(Duration::from_secs(5), read_raw_ws_message(&mut tls))
+                        .await;
+                let record = match next {
+                    Ok(Ok(record)) => record,
+                    _ => break,
+                };
+                let plaintext = channel.decrypt(&record).expect("request decrypt");
+                let frames = decoder.push(&plaintext).expect("request framing");
+                for frame in frames {
+                    let request =
+                        syntra_core::Frame::decode(frame.as_slice()).expect("request decode");
+                    match request.body {
+                        Some(syntra_core::proto::frame::Body::Request(call)) => {
+                            let result = syntra_core::Frame {
+                                version: request.version,
+                                request_id: request.request_id,
+                                body: Some(syntra_core::proto::frame::Body::Result(
+                                    syntra_core::proto::RpcResult {
+                                        outcome: Some(
+                                            syntra_core::proto::rpc_result::Outcome::Payload(
+                                                call.payload,
+                                            ),
+                                        ),
+                                    },
+                                )),
+                            }
+                            .encode_to_vec();
+                            let plaintext = syntra_secure_channel::frame_plaintext(&result)
+                                .expect("result framing");
+                            let record = channel.encrypt(&plaintext).expect("result encrypt");
+                            tls.write_all(&encode_server_fragment(&record, true, 0x2))
+                                .await
+                                .expect("result write");
+                            tls.flush().await.expect("result flush");
+                        }
+                        _ => panic!("expected application request"),
+                    }
+                }
+            }
+        });
+        let client = dial(&url, client_config)
+            .await
+            .expect("dial past fragmented m2");
+        assert_eq!(client.connection_id, expected_id, "ready connection id");
+        let payload = b"frag-m2-echo".to_vec();
+        assert_eq!(
+            client
+                .conn
+                .call("/test.Service/Echo", payload.clone(), 5000)
+                .await
+                .expect("echo past fragmented m2"),
+            payload,
+            "session is active"
+        );
+        client
+            .close_gracefully(Duration::from_secs(1))
+            .await
+            .expect("client close");
+        tokio::time::timeout(Duration::from_secs(5), peer)
+            .await
+            .expect("peer shutdown deadline")
+            .expect("peer task");
+    }
 }

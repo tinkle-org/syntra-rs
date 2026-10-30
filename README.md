@@ -8,11 +8,12 @@ Extracted from [`tinkle-org/syntra`](https://github.com/tinkle-org/syntra) at
 [`2a91da7fdb96f3e75badf07614c14e4f85c9ba1c`](https://github.com/tinkle-org/syntra/commit/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c).
 See [MIGRATION.md](MIGRATION.md) for provenance and the path mapping.
 
-**SC1 is an experimental implementation of the RFC 0007 section 11 canonical
-context proposal, not an activated upstream profile or an independently audited
-secure channel.** Its review pin is
-`94404d7378136d8b6c88ece28bf945c88d1653ba`, distinct from the extraction pin
-above. Read [SC1.md](SC1.md) for the wire format and source-backed API sketch,
+SC1 targets the accepted RFC 0007 profile `SNTR-SC1-WSS-V1`, merged upstream at
+[`0e8b0f8a4a789cb3d6d00b993e281867d2325e06`](https://github.com/tinkle-org/syntra/commit/0e8b0f8a4a789cb3d6d00b993e281867d2325e06).
+The implementation remains experimental and unpublished with documented gaps.
+The profile registers 24 cases (`CONF-SCW-001…024`); formal conformance has not
+been executed and no conformance verdict is claimed.
+Read [SC1.md](SC1.md) for the wire format and source-backed API sketch,
 and [AUDIT.md](AUDIT.md) for recorded results and historical evidence.
 The core `Frame` schema and baseline `syntra-ws` framing/endpoints remain
 unchanged; custom runtime writers must adopt the emission-gate contract below.
@@ -68,7 +69,7 @@ feature isolation.
 `Transport` adapters exchange exactly one serialized `Frame` per pump step in
 each direction. The supplied SC1 adapters add encrypted record framing and
 bounded socket I/O. Upstream's production TLS baseline remains in effect;
-this experimental draft does not supersede it.
+this experimental implementation does not supersede it.
 
 `syntra-sc1-transport` replaces the prerelease `syntra-tcp` and
 `syntra-ws-sc1` crates. Its default feature set is empty (`default = []`);
@@ -159,6 +160,10 @@ not a complete subscription/recovery service.
 
 ### Resource and compatibility behavior
 
+- `ConnectionConfig::default().max_outstanding` changes from 64 to 32 for
+  all runtime users that use the default, including non-SC1 transports.
+  Explicit overrides remain available; writer and notification capacities
+  still default to 256 each.
 - A serialized frame is limited to 1 MiB, including envelope overhead. A
   payload at a separate application limit can therefore fail encoding.
   Failed request encoding does not reserve a call slot or start its timer.
@@ -168,8 +173,9 @@ not a complete subscription/recovery service.
   waiters. No matching subscription work is claimed beyond carriage.
 - SC1 limits ciphertext records to 65,535 bytes and plaintext to 65,519
   bytes; the encrypted frame stream may span records. Lifetime is at most 24
-  hours or 2^32 records per direction. Pending transport operations are
-  bounded by writer/notification capacities, each `1..1024`. See
+  hours or 2^32 records per direction. SC1 `Limits::validate` requires runtime
+  outstanding-RPC, writer and notification capacities in `1..=1024`; this is
+  adapter validation, not a universal runtime configuration bound. See
   [SC1.md](SC1.md) for exact clocks, cancellation requirements and
   revocation checks.
 - Unknown fields alongside a known body are tolerated. Unknown top-level
@@ -278,12 +284,17 @@ and coverage. See [CONTRIBUTING.md](CONTRIBUTING.md),
 [crates/syntra-integration/README.md](crates/syntra-integration/README.md)
 and [BENCHMARKS.md](BENCHMARKS.md).
 
-The latest local run records 372 workspace tests passed, 0 failed and
-2 ignored (Docker/browser), separate WSS-only and development-carrier runs,
-FFI/WASM checks, tooling/security checks and all three Criterion smoke targets.
+The latest alignment run on `feature/sc1-v1-acceptance-alignment` records
+377 workspace tests passed, 0 failed and 2 ignored (Docker/browser).
+Isolated transport runs passed 52 tests in the WSS-only configuration and 60
+with development carriers. Clippy exited successfully with 43 unique warnings;
+formatting and upstream-pin checks passed. Earlier explicit FFI/WASM, security, generation
+and benchmark checks were not rerun for alignment.
 See [AUDIT.md](AUDIT.md#current-recorded-verification) for exact results and
 [implementation status](docs/implementation-status.md) for the Rust backlog.
-Docker was not executed because the daemon was unavailable; browser execution
-also remains unverified. Post-documentation checks passed. Release
-gates remain upstream activation, independent pure-Go/Rust interoperability in
-both roles and modes, recovery and mobile validation, and independent human review.
+Docker and the container suite were not executed; no Docker availability
+check was recorded for this run. Browser execution also remains unverified.
+Formal conformance, independent pure-Go/Rust
+interoperability in both roles and modes, recovery and mobile validation, and
+independent human review remain release requirements. Upstream acceptance is
+complete.
