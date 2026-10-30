@@ -1,0 +1,131 @@
+crates/syntra-sc1-transport/tests/wss.rs
+  s_5e697df286639e::t_d379fc74202d5d 15-16
+  s_5e697df286639e::t_0e8a0570887d7e 1148-1151,1170-1173,1308-1312,1338,1367,1391
+  s_5cc3fe1af0f315::t_c94eb94f5ff0c5 560
+  s_5e697df286639e::t_9bfa3c289d3d47 1056-1147,1152-1169,1174-1307,1313-1337,1339-1366,1368-1390,1392-1464
+  s_5e697df286639e::t_629e9e34da3758 23-24
+crates/syntra-secure-channel/src/lib.rs
+  s_5636729b1fb0ad::t_5effc847f4b96f 1-3
+  s_5cc3fe1af0f315::t_bf2bd852ea6399 573,577-580,585,592-595
+  s_5cc3fe1af0f315::t_d3f7510a1079b5 308-311
+  s_5cc3fe1af0f315::t_42e2d78ce7f63a 563-572,574-576,581-584,586-591,596-623,625-633,638-641
+  s_5cc3fe1af0f315::t_d4c2a9294f2b27 228-234
+  s_5cc3fe1af0f315::t_614a1ec24bf0a3 305-307,312
+  s_5cc3fe1af0f315::t_cc0525be5fbe25 624,634-637
+  s_5cc3fe1af0f315::t_67c9b0f115a1ee 191-192
+crates/syntra-sc1-transport/src/websocket.rs
+  s_5636729b1fb0ad::t_4798887783caad 7-9
+crates/syntra-sc1-transport/src/lib.rs
+  s_5636729b1fb0ad::t_cf089270e13bba 1-3
+crates/syntra-runtime/src/connection.rs
+  s_31f15b4b65eed8::t_47017869631743 55
+  s_31f15b4b65eed8::t_82d53c8f2b42e7 65-74
+CONTRIBUTING.md
+  s_41ae356e98b96d::t_bd683b4ade2f66 11-18,20,89-93,145
+AUDIT.md
+  s_493462f91aa96c::t_0c4a9acb889cc3 19-20,112-115
+  s_493462f91aa96c::t_207aecb653b8de 16-18,39,42,46-82,85-111,116-120
+  s_11d37f8a13ce36::t_2f515909aabfef 12-15
+  s_493462f91aa96c::t_80bdeb3fabadd9 121
+crates/syntra-integration/README.md
+  s_41ae356e98b96d::t_bd683b4ade2f66 10-14,21-29,33-36,41-46
+crates/syntra-secure-channel/tests/fixtures/sc1_context_v1.rs
+  s_5636729b1fb0ad::t_b67cb7d8a269e3 3-6
+crates/syntra-runtime/CHANGELOG.md
+  s_493462f91aa96c::t_b1f67c95f94e4a 9,11-17
+  s_31f15b4b65eed8::t_e382422c303418 10
+scripts/check-upstream-pin.py
+  s_11d37f8a13ce36::t_14c388f7df9370 1,4-14,17,28-42,51-66,84-101,105,116
+BENCHMARKS.md
+  s_41ae356e98b96d::t_bd683b4ade2f66 16-27
+docs/implementation-status.md
+  s_d10957da4c1dc4::t_a2c1903fd7dc9c 27-29
+  s_11d37f8a13ce36::t_ced58e1eaa5794 7-8
+  s_493462f91aa96c::t_207aecb653b8de 5-6,9-11,17-26,30-54,75,77,80,103-105,115
+MIGRATION.md
+  s_493462f91aa96c::t_b1f67c95f94e4a 14,19-22,47-76,87-92,95-100
+  s_11d37f8a13ce36::t_026a8d1a6c0935 15-18
+  s_493462f91aa96c::t_651ee7ea24a791 101
+README.md
+  s_493462f91aa96c::t_0c4a9acb889cc3 289
+  s_493462f91aa96c::t_8dbe0794611d10 290-291
+  s_493462f91aa96c::t_b1f67c95f94e4a 11-16,72,163-166,176-178,287-288,292,298-300
+  s_d10957da4c1dc4::t_342d2fca194386 295-297
+SC1.md
+  s_d10957da4c1dc4::t_a67be17d0e14c8 732
+  s_d10957da4c1dc4::t_a9405039a702d5 726
+  s_11d37f8a13ce36::t_5aa265feccc2da 684,686,694,710
+  s_d10957da4c1dc4::t_7f652fd2060fb8 1-16,48,104-107,216-227,255-257,309-312,327-334,376,659-671,674-677,685,687-693,695-709,711-725,727-731,733-741
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "76461e7d3ea854ccc61adc520fe85533d4f28e21",
+  "prompts": {},
+  "sessions": {
+    "s_11d37f8a13ce36": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e75b441a8ffeLC8LLTj90mBQ18",
+        "model": "muse-spark-1.3-contributor"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    },
+    "s_31f15b4b65eed8": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e75b7035fffeXAD4vvipzMvsdG",
+        "model": "muse-spark-1.3-contributor"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    },
+    "s_41ae356e98b96d": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e75a6eeddffee6FXTTbV8tDIZ1",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    },
+    "s_493462f91aa96c": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e75abf82cffe9t8hgLaXjhpIhe",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    },
+    "s_5636729b1fb0ad": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e75b21488ffegWxEO2sR7TixJ0",
+        "model": "muse-spark-1.3-contributor"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    },
+    "s_5cc3fe1af0f315": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e75b7037affeNyMKfy2en92Lvp",
+        "model": "muse-spark-1.3-contributor"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    },
+    "s_5e697df286639e": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e75b70356ffetk4AAMmfzFkAlc",
+        "model": "muse-spark-1.3-contributor"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    },
+    "s_d10957da4c1dc4": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e76054422ffefa1q2HZOfehtuA",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}
