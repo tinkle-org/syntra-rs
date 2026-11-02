@@ -13,9 +13,8 @@
 //! Checkpoints are opaque bytes. The coordinator compares checkpoint bytes
 //! and stream selector bytes by equality only. It never orders, increments,
 //! decrements, or parses checkpoint bytes. One continuity generation is
-//! tracked per stream. Generation changes happen only through snapshot
-//! confirms, which the application treats as its explicit continuity-epoch
-//! decision.
+//! tracked per scoped stream. Only explicit provider loss/rebase advances
+//! it; retention misses, local queue loss, revocation, and snapshots do not.
 //!
 //! Commit sequence: receive, validate, offer, persist, confirm. Observing a
 //! validated batch returns a committable action without advancing committed
@@ -31,9 +30,9 @@
 //! Snapshot gating: once continuation expiry reports a live stream, the
 //! pending gate is set. While set, otherwise-valid validated batches return
 //! a snapshot-required action instead of a committable action, so committed
-//! progress cannot advance via the batch path until a snapshot with a new
-//! generation confirms. New-generation snapshot installation remains
-//! admissible while pending as the snapshot path.
+//! progress cannot advance via the batch path until an offered snapshot in
+//! the CURRENT generation confirms. A provider-trusted snapshot can replace
+//! local state at S0 without chaining from the old committed cursor.
 //!
 //! Commit sequencing is stop-and-wait with a single pending offer. While a
 //! committable checkpoint awaits confirmation, a different committable
@@ -61,7 +60,7 @@ use syntra_core::ErrorCode;
 pub struct ProfileCheckpoint {
     /// Application-defined stream selector, opaque to the coordinator.
     pub stream_selector: Vec<u8>,
-    /// Continuity epoch. Changes when an old checkpoint cannot continue.
+    /// Scoped provider continuity epoch; not changed by replay unavailability.
     pub generation: u64,
     /// State required before applying the next batch.
     pub base_cursor: Vec<u8>,
@@ -104,7 +103,15 @@ pub enum ProfileInput {
         stream_selector: Vec<u8>,
         committed: Vec<u8>,
     },
-    /// The application installed a snapshot at the given checkpoint.
+    /// True scoped provider history loss or shared rebase. The next generation
+    /// must be strictly greater than the current one. This is NOT local loss,
+    /// retention expiry, or revocation. Invalidates pending work and gates.
+    ProviderLoss {
+        stream_selector: Vec<u8>,
+        next_generation: u64,
+    },
+    /// The application validated/installed a provider-trusted snapshot at S0.
+    /// This trusted input may jump cursors, but MUST use the current generation.
     SnapshotInstalled { checkpoint: ProfileCheckpoint },
 }
 
@@ -137,31 +144,42 @@ pub type ProfileRecoveryAction = ProfileAction;
 ///
 /// Maps to typed codes without carrying sensitive bytes. Messages set by
 /// the application must not contain credentials or private diagnostics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProviderError {
     /// Unknown stream selector or unknown operation.
+    #[error("unknown recovery stream")]
     UnknownStream,
     /// Unknown profile operation.
+    #[error("unknown recovery operation")]
     UnknownOperation,
     /// Use of an unconfirmed option on a confirmed connection.
+    #[error("recovery profile unconfirmed")]
     Unconfirmed,
     /// Bound principal is not authorized at this hook.
+    #[error("recovery permission denied")]
     Unauthorized,
     /// Bound principal is unknown or not authenticated at this hook.
+    #[error("recovery principal unauthenticated")]
     Unauthenticated,
     /// Stale, forged, malformed, cross-stream, cross-generation, or
     /// cross-principal checkpoint bytes.
+    #[error("invalid recovery checkpoint binding")]
     StaleCheckpoint,
     /// Requested checkpoint is outside retention or otherwise
     /// unrecoverable by replay. Recovery follows the snapshot path.
+    #[error("recovery checkpoint outside replay retention")]
     OutsideRetention,
     /// Bound saturation. The caller backs off with a bounded budget.
+    #[error("recovery resource limit exceeded")]
     Overloaded,
     /// Connection loss with invocations outstanding. Outcome unknown.
+    #[error("recovery transport lost")]
     TransportLost,
     /// Effective deadline expiry for the operation.
+    #[error("recovery deadline exceeded")]
     DeadlineExpired,
     /// Application-internal failure persisting or supplying state.
+    #[error("internal recovery failure")]
     Internal,
 }
 
@@ -269,6 +287,13 @@ pub trait SnapshotProvider {
 /// continuation, catch-up, and confirm. Checkpoint and selector bytes are
 /// never authority by themselves.
 pub trait RecoveryAuthorizer {
+    /// Validate current authorization context and application bounds before
+    /// duplicate suppression or offering either live or recovered batches.
+    /// The compatibility default reuses replay authorization; implementations
+    /// with distinct live policy or additional validation override this hook.
+    fn authorize_validate(&self, checkpoint: &ProfileCheckpoint) -> Result<(), ProviderError> {
+        self.authorize_replay(checkpoint)
+    }
     /// Authorizes establishment for the stream selector.
     fn authorize_subscribe(&self, stream_selector: &[u8]) -> Result<(), ProviderError>;
     /// Authorizes bounded replay from the checkpoint.
@@ -281,27 +306,26 @@ pub trait RecoveryAuthorizer {
 
 /// Coordinator over one stream's committed progress.
 ///
-/// The coordinator tracks the committed cursor only. The application
+/// The coordinator tracks the active cursor and exact pending offer. The application
 /// applies effects, persists checkpoints, and reports inputs.
 ///
 /// Cursor bytes are compared by equality only. Generation is the
 /// continuity epoch and is compared exactly. Generations move forward
 /// only: a confirmation from an older generation never rolls back newer
 /// progress and instead reports the current position for recovery.
-/// Generation changes happen only through snapshot confirms.
+/// Generation changes happen only through explicit provider loss/rebase.
 ///
 /// Snapshot gating: once [`ProfileInput::ContinuationExpired`] reports a
 /// live stream, the pending gate is set. While set, otherwise-valid
 /// [`ProfileInput::BatchValidated`] inputs return
 /// [`ProfileAction::SnapshotRequired`] instead of `CommitCheckpoint`, so
-/// committed progress cannot advance via the batch path until a snapshot
-/// with a new generation confirms via [`Self::confirm_persisted`].
-/// New-generation [`ProfileInput::SnapshotInstalled`] remains admissible
-/// while pending as the snapshot path.
+/// committed progress cannot advance via the batch path until an exact pending
+/// current-generation snapshot confirms via [`Self::confirm_persisted`].
 ///
-/// Duplicate tolerance: a validated batch or snapshot whose result cursor
-/// already equals the committed cursor is tolerated with no actions and
-/// no mutation. A duplicate is never a violation. Duplicate confirmation
+/// Duplicate tolerance: a validated batch whose result cursor already equals
+/// the committed cursor is tolerated when no snapshot gate holds. An exact
+/// pending snapshot retry repeats its offer, including when S0 equals C;
+/// confirmation must still clear the snapshot gate. Duplicate confirmation
 /// is idempotent and leaves progress unchanged. An older duplicate whose
 /// result cursor no longer equals the committed cursor returns a
 /// recovery-needed action; the application holds a bounded recent-result
@@ -319,18 +343,15 @@ pub struct ProfileRecovery {
     committed: Vec<u8>,
     snapshot_pending: bool,
     pending: Option<PendingOffer>,
+    last_confirmed: Option<ProfileCheckpoint>,
 }
+/// Exact committable checkpoint with its explicitly trusted source. Cursor
+/// shape or a generation difference never establishes snapshot authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingOffer {
     checkpoint: ProfileCheckpoint,
     is_snapshot: bool,
 }
-
-/// Committable checkpoint returned by observe with its snapshot source.
-///
-/// Tracks whether the pending checkpoint was offered through the batch
-/// path or the snapshot path. New-generation progress advances only
-/// through the snapshot path.
 
 impl ProfileRecovery {
     /// Starts tracking from the last confirmed position.
@@ -341,15 +362,17 @@ impl ProfileRecovery {
             committed,
             snapshot_pending: false,
             pending: None,
+            last_confirmed: None,
         }
     }
 
-    /// Last confirmed cursor bytes.
+    /// Last confirmed active cursor bytes; empty after explicit provider loss
+    /// until current-generation progress is installed. Not a durable-store read.
     pub fn committed(&self) -> &[u8] {
         &self.committed
     }
 
-    /// Continuity generation of the committed cursor.
+    /// Current scoped provider generation (may have no active cursor after loss).
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -359,7 +382,8 @@ impl ProfileRecovery {
         &self.stream_selector
     }
 
-    /// Last confirmed position as an owned value.
+    /// Active position as an owned value. After provider loss the cursor is
+    /// invalidated; this MUST NOT be treated as an initial live-only choice.
     pub fn position(&self) -> CommittedPosition {
         CommittedPosition {
             stream_selector: self.stream_selector.clone(),
@@ -371,6 +395,30 @@ impl ProfileRecovery {
     /// Whether a snapshot is required before batch commits may resume.
     pub fn snapshot_pending(&self) -> bool {
         self.snapshot_pending
+    }
+
+    /// Explicit scoped provider loss/rebase; never called for local queue loss,
+    /// ordinary retention misses, or revocation. Invalidates the active cursor
+    /// rather than re-labeling old bytes with new G. External durable evidence
+    /// remains untouched; the caller must re-establish the scoped subscription.
+    pub fn provider_loss(&mut self, next_generation: u64) -> Result<(), ProviderError> {
+        if next_generation <= self.generation {
+            return Err(ProviderError::StaleCheckpoint);
+        }
+        self.generation = next_generation;
+        self.committed.clear();
+        self.pending = None;
+        self.snapshot_pending = false;
+        self.last_confirmed = None;
+        Ok(())
+    }
+
+    pub(super) fn pending_checkpoint(&self) -> Option<&ProfileCheckpoint> {
+        self.pending.as_ref().map(|offer| &offer.checkpoint)
+    }
+
+    pub(super) fn pending_is_snapshot(&self) -> bool {
+        self.pending.as_ref().is_some_and(|offer| offer.is_snapshot)
     }
 
     fn recovery_needed(&self) -> Vec<ProfileAction> {
@@ -393,12 +441,9 @@ impl ProfileRecovery {
     /// and its effects are durably persisted.
     ///
     /// Selectors for other streams are ignored with no actions and no
-    /// mutation, like gap reports for other streams. Same-generation
-    /// batches and snapshots must continue exactly from the committed
-    /// cursor. New-generation snapshots may start from a fresh base as
-    /// their proven synchronization cut. Stale generations and
-    /// non-contiguous same-generation checkpoints return a recovery-needed
-    /// action instead of a committable action.
+    /// mutation. Batches must chain from the committed cursor. Only the
+    /// provider-trusted snapshot input may jump to S0 in the current G.
+    /// All other generations are rejected until an explicit provider loss.
     ///
     /// Stop-and-wait: while one committable checkpoint is pending, a
     /// different committable checkpoint returns a recovery-needed action
@@ -416,17 +461,20 @@ impl ProfileRecovery {
                 if checkpoint.generation != self.generation {
                     return self.recovery_needed();
                 }
-                if checkpoint.result_cursor == self.committed {
-                    return vec![];
-                }
                 if self.snapshot_pending {
                     return self.snapshot_required();
+                }
+                if self.pending_is_snapshot() {
+                    return self.recovery_needed();
+                }
+                if checkpoint.result_cursor == self.committed {
+                    return vec![];
                 }
                 if checkpoint.base_cursor != self.committed {
                     return self.recovery_needed();
                 }
                 if let Some(offer) = &self.pending {
-                    if offer.checkpoint != checkpoint {
+                    if offer.checkpoint != checkpoint || offer.is_snapshot {
                         return self.recovery_needed();
                     }
                 }
@@ -478,32 +526,11 @@ impl ProfileRecovery {
                 if checkpoint.stream_selector != self.stream_selector {
                     return vec![];
                 }
-                if checkpoint.generation < self.generation {
+                if checkpoint.generation != self.generation {
                     return self.recovery_needed();
                 }
-                if checkpoint.generation == self.generation {
-                    if checkpoint.result_cursor == self.committed {
-                        return vec![];
-                    }
-                    if self.snapshot_pending {
-                        return self.snapshot_required();
-                    }
-                    if checkpoint.base_cursor != self.committed {
-                        return self.recovery_needed();
-                    }
-                    if let Some(offer) = &self.pending {
-                        if offer.checkpoint != checkpoint {
-                            return self.recovery_needed();
-                        }
-                    }
-                    self.pending = Some(PendingOffer {
-                        checkpoint: checkpoint.clone(),
-                        is_snapshot: true,
-                    });
-                    return vec![ProfileAction::CommitCheckpoint { checkpoint }];
-                }
                 if let Some(offer) = &self.pending {
-                    if offer.checkpoint != checkpoint {
+                    if offer.checkpoint != checkpoint || !offer.is_snapshot {
                         return self.recovery_needed();
                     }
                 }
@@ -511,7 +538,18 @@ impl ProfileRecovery {
                     checkpoint: checkpoint.clone(),
                     is_snapshot: true,
                 });
+                self.snapshot_pending = true;
                 vec![ProfileAction::CommitCheckpoint { checkpoint }]
+            }
+            ProfileInput::ProviderLoss {
+                stream_selector,
+                next_generation,
+            } => {
+                if stream_selector != self.stream_selector {
+                    return vec![];
+                }
+                let _ = self.provider_loss(next_generation);
+                self.recovery_needed()
             }
         }
     }
@@ -526,20 +564,14 @@ impl ProfileRecovery {
     /// progress.
     ///
     /// Selectors for other streams are ignored with no actions and no
-    /// mutation. Duplicate confirmation of the committed cursor is
-    /// idempotent with no actions.
+    /// mutation. An exact retry of the last successful confirmation is
+    /// idempotent, unless a snapshot gate now holds. Cursor equality alone
+    /// never establishes a previously offered confirmation.
     ///
-    /// Snapshot confirms carrying a new generation follow their own
-    /// continuity rules: only the stream selector is validated, so a
-    /// snapshot whose base differs from the pre-snapshot committed cursor
-    /// is accepted as its proven synchronization cut. Same-generation
-    /// checkpoints must continue exactly from the committed cursor.
-    /// Generations move forward only. New-generation progress advances
-    /// only through the snapshot path.
-    ///
-    /// While the pending gate is set, same-generation confirmations are
-    /// blocked with a snapshot-required action instead of advancing, so
-    /// only a new-generation snapshot confirm clears the gate.
+    /// Only an exact pending offer in current G can change state. A snapshot
+    /// offer can jump to S0 and clear the snapshot gate; a batch cannot.
+    /// Confirmation NEVER changes G. Duplicate batch confirms are harmless
+    /// but do not clear gates or consume a different pending offer.
     ///
     /// Stop-and-wait: only the pending committable checkpoint confirms.
     /// A different checkpoint returns a recovery-needed action without
@@ -548,73 +580,45 @@ impl ProfileRecovery {
         if checkpoint.stream_selector != self.stream_selector {
             return vec![];
         }
-        if checkpoint.generation < self.generation {
+        if checkpoint.generation != self.generation {
             return self.recovery_needed();
         }
-        if checkpoint.generation == self.generation {
-            if checkpoint.result_cursor == self.committed {
-                return vec![];
-            }
-            if self.snapshot_pending {
-                return self.snapshot_required();
-            }
-            // Only a checkpoint previously returned as committable advances
-            // committed progress.
-            match &self.pending {
-                Some(offer) if offer.checkpoint == *checkpoint => {}
-                _ => return self.recovery_needed(),
-            }
-            if checkpoint.base_cursor != self.committed {
-                return self.recovery_needed();
-            }
+        if self.can_confirm(checkpoint) {
+            let is_snapshot = self.pending_is_snapshot();
             self.committed = checkpoint.result_cursor.clone();
+            self.last_confirmed = Some(checkpoint.clone());
             self.pending = None;
+            if is_snapshot {
+                self.snapshot_pending = false;
+            }
             return vec![];
         }
-        // New-generation progress advances only through a snapshot
-        // previously returned as committable through the snapshot path.
-        match &self.pending {
-            Some(offer) if offer.checkpoint == *checkpoint && offer.is_snapshot => {}
-            _ => return self.recovery_needed(),
+        if self.snapshot_pending {
+            return self.snapshot_required();
         }
-        self.generation = checkpoint.generation;
-        self.committed = checkpoint.result_cursor.clone();
-        self.snapshot_pending = false;
-        self.pending = None;
-        vec![]
+        if self.last_confirmed.as_ref() == Some(checkpoint) {
+            return vec![];
+        }
+        self.recovery_needed()
     }
 
     /// Read-only pre-validation for [`Self::confirm_persisted`].
     ///
     /// Returns true only when [`Self::confirm_persisted`] would advance
-    /// committed progress (empty result with mutation). Idempotent
+    /// committed progress or clear a pending snapshot gate. Idempotent
     /// duplicates, rejected checkpoints, and untracked selectors return
     /// false. No mutation.
     pub fn can_confirm(&self, checkpoint: &ProfileCheckpoint) -> bool {
-        if checkpoint.stream_selector != self.stream_selector {
+        if checkpoint.stream_selector != self.stream_selector
+            || checkpoint.generation != self.generation
+        {
             return false;
-        }
-        if checkpoint.generation < self.generation {
-            return false;
-        }
-        if checkpoint.generation == self.generation {
-            if checkpoint.result_cursor == self.committed {
-                return false;
-            }
-            if self.snapshot_pending {
-                return false;
-            }
-            match &self.pending {
-                Some(offer) if offer.checkpoint == *checkpoint => {}
-                _ => return false,
-            }
-            if checkpoint.base_cursor != self.committed {
-                return false;
-            }
-            return true;
         }
         match &self.pending {
-            Some(offer) if offer.checkpoint == *checkpoint && offer.is_snapshot => true,
+            Some(offer) if offer.checkpoint == *checkpoint => {
+                offer.is_snapshot
+                    || (!self.snapshot_pending && checkpoint.base_cursor == self.committed)
+            }
             _ => false,
         }
     }
@@ -644,6 +648,88 @@ mod tests {
 
     fn coordinator(committed: &[u8]) -> ProfileRecovery {
         ProfileRecovery::new(selector(), 7, committed.to_vec())
+    }
+
+    #[test]
+    fn snapshot_source_cannot_be_inferred_or_upgraded_from_checkpoint_shape() {
+        let mut r = coordinator(b"C");
+        let cp = checkpoint(b"C", b"S0");
+        r.observe(ProfileInput::BatchValidated {
+            checkpoint: cp.clone(),
+        });
+        let competing = r.observe(ProfileInput::SnapshotInstalled {
+            checkpoint: cp.clone(),
+        });
+        assert!(matches!(competing[0], ProfileAction::RecoveryNeeded { .. }));
+        assert!(!r.pending_is_snapshot());
+        assert!(r.confirm_persisted(&cp).is_empty());
+
+        r.observe(ProfileInput::ContinuationExpired {
+            stream_selector: selector(),
+            committed: b"S0".to_vec(),
+        });
+        let snapshot = checkpoint(b"provider-base", b"S0");
+        assert!(
+            !r.can_confirm(&snapshot),
+            "equal cursor alone is not an offer"
+        );
+        assert!(!r.confirm_persisted(&snapshot).is_empty());
+        assert!(r.snapshot_pending());
+        let offered = r.observe(ProfileInput::SnapshotInstalled {
+            checkpoint: snapshot.clone(),
+        });
+        assert!(matches!(offered[0], ProfileAction::CommitCheckpoint { .. }));
+        assert!(
+            r.can_confirm(&snapshot),
+            "even an equal-cursor snapshot must persist and clear its gate"
+        );
+        let retried = r.observe(ProfileInput::SnapshotInstalled {
+            checkpoint: snapshot.clone(),
+        });
+        assert_eq!(retried, offered);
+        assert!(!r
+            .observe(ProfileInput::BatchValidated {
+                checkpoint: snapshot.clone()
+            })
+            .is_empty());
+        assert!(r.pending_is_snapshot());
+        assert!(r.confirm_persisted(&snapshot).is_empty());
+        assert!(!r.snapshot_pending());
+        assert_eq!(r.generation(), 7);
+        assert!(!r.can_confirm(&snapshot));
+        assert!(r.confirm_persisted(&snapshot).is_empty());
+        assert!(!r
+            .confirm_persisted(&checkpoint(b"unoffered", b"S0"))
+            .is_empty());
+    }
+
+    #[test]
+    fn provider_loss_input_invalidates_pending_without_inventing_cursor_progress() {
+        let mut r = coordinator(b"C");
+        let old = checkpoint(b"C", b"next");
+        r.observe(ProfileInput::BatchValidated {
+            checkpoint: old.clone(),
+        });
+        r.observe(ProfileInput::ProviderLoss {
+            stream_selector: b"foreign".to_vec(),
+            next_generation: 8,
+        });
+        assert!(r.can_confirm(&old));
+        r.observe(ProfileInput::ProviderLoss {
+            stream_selector: selector(),
+            next_generation: 7,
+        });
+        assert!(r.can_confirm(&old));
+        r.observe(ProfileInput::ProviderLoss {
+            stream_selector: selector(),
+            next_generation: 8,
+        });
+        assert!(!r.can_confirm(&old));
+        assert!(r.pending_checkpoint().is_none());
+        assert!(!r.snapshot_pending());
+        assert_eq!(r.generation(), 8);
+        assert!(r.committed().is_empty());
+        assert!(!r.confirm_persisted(&old).is_empty());
     }
 
     #[test]
@@ -705,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_generation_change_only_via_snapshot() {
+    fn profile_generation_change_only_via_explicit_provider_loss() {
         let mut r = coordinator(b"cursor-40");
         // Batch from another generation is never committable via the batch path.
         let next_gen_batch = ProfileCheckpoint {
@@ -732,8 +818,7 @@ mod tests {
             stale_actions[0],
             ProfileAction::RecoveryNeeded { .. }
         ));
-        // Snapshot under a new generation may start from a fresh base and,
-        // once confirmed, moves the continuity epoch forward.
+        // A snapshot cannot manufacture a generation transition.
         let snap = ProfileCheckpoint {
             stream_selector: selector(),
             generation: 8,
@@ -745,10 +830,21 @@ mod tests {
         });
         assert!(matches!(
             snap_actions[0],
+            ProfileAction::RecoveryNeeded { .. }
+        ));
+        assert!(!r.can_confirm(&snap));
+        assert!(!r.confirm_persisted(&snap).is_empty());
+        assert_eq!(r.generation(), 7);
+        r.provider_loss(8).unwrap();
+        let snap_actions = r.observe(ProfileInput::SnapshotInstalled {
+            checkpoint: snap.clone(),
+        });
+        assert!(matches!(
+            snap_actions[0],
             ProfileAction::CommitCheckpoint { .. }
         ));
-        assert_eq!(r.generation(), 7);
-        assert_eq!(r.committed(), b"cursor-40");
+        assert_eq!(r.generation(), 8);
+        assert!(r.committed().is_empty());
         assert!(r.confirm_persisted(&snap).is_empty());
         assert_eq!(r.generation(), 8);
         assert_eq!(r.committed(), b"boundary-100");
@@ -780,8 +876,7 @@ mod tests {
         });
         assert!(matches!(blocked[0], ProfileAction::SnapshotRequired { .. }));
         assert_eq!(r.committed(), b"cursor-40");
-        // Same-generation confirm is blocked as well; only a new-generation
-        // snapshot confirm clears the gate.
+        // An unoffered batch confirm cannot clear the gate.
         let blocked_confirm = r.confirm_persisted(&batch);
         assert!(matches!(
             blocked_confirm[0],
@@ -789,16 +884,10 @@ mod tests {
         ));
         assert_eq!(r.committed(), b"cursor-40");
         assert!(r.snapshot_pending());
-        // Same-generation snapshot is held by the gate.
-        let same_gen = checkpoint(b"cursor-40", b"cursor-43");
-        let held = r.observe(ProfileInput::SnapshotInstalled {
-            checkpoint: same_gen,
-        });
-        assert!(matches!(held[0], ProfileAction::SnapshotRequired { .. }));
-        // New-generation snapshot commits and, once confirmed, clears the gate.
+        // A provider-trusted snapshot jumps to S0 within the SAME generation.
         let snap = ProfileCheckpoint {
             stream_selector: selector(),
-            generation: 8,
+            generation: 7,
             base_cursor: b"boundary-00".to_vec(),
             result_cursor: b"boundary-100".to_vec(),
         };
@@ -811,7 +900,7 @@ mod tests {
         ));
         assert!(r.confirm_persisted(&snap).is_empty());
         assert!(!r.snapshot_pending());
-        assert_eq!(r.generation(), 8);
+        assert_eq!(r.generation(), 7);
         assert_eq!(r.committed(), b"boundary-100");
     }
 
@@ -877,7 +966,7 @@ mod tests {
         let mut r = coordinator(b"cursor-40");
         let snap = ProfileCheckpoint {
             stream_selector: selector(),
-            generation: 8,
+            generation: 7,
             base_cursor: b"boundary-00".to_vec(),
             result_cursor: b"boundary-100".to_vec(),
         };
@@ -899,7 +988,7 @@ mod tests {
         let rejected_while_pending = r.confirm_persisted(&snap);
         assert!(matches!(
             rejected_while_pending[0],
-            ProfileAction::RecoveryNeeded { .. }
+            ProfileAction::SnapshotRequired { .. }
         ));
         assert_eq!(r.generation(), 7);
         assert_eq!(r.committed(), b"cursor-40");
@@ -917,7 +1006,7 @@ mod tests {
         assert!(r.snapshot_pending());
         let snap = ProfileCheckpoint {
             stream_selector: selector(),
-            generation: 8,
+            generation: 7,
             base_cursor: b"boundary-00".to_vec(),
             result_cursor: b"boundary-100".to_vec(),
         };
@@ -927,11 +1016,11 @@ mod tests {
         });
         assert!(matches!(offered[0], ProfileAction::CommitCheckpoint { .. }));
         assert!(r.snapshot_pending());
-        // Confirm advances generation and committed progress and clears
+        // Confirm preserves generation, advances committed progress and clears
         // the pending gate.
         assert!(r.confirm_persisted(&snap).is_empty());
         assert!(!r.snapshot_pending());
-        assert_eq!(r.generation(), 8);
+        assert_eq!(r.generation(), 7);
         assert_eq!(r.committed(), b"boundary-100");
     }
 

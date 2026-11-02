@@ -1,0 +1,22 @@
+# Cross-implementation scenarios (machine-readable companions to matrix.yaml)
+format_version: "1.0"
+scenarios:
+  - id: XIMPL-HELLO-ECHO-EVENT
+    name: "hello, echo, concurrent echo, event, graceful close"
+    steps:
+      - { actor: initiator, action: "send hello (task fixture credential bytes, throwaway)", expect: "ready with fresh connection_id" }
+      - { actor: initiator, action: "send request id 7 /example.Echo/Echo payload hello", expect: "result id 7 payload hello" }
+      - { actor: initiator, action: "send requests id 8 and id 9 concurrently", expect: "results id 8 and id 9 in any order, no cross-delivery" }
+      - { actor: host, action: "emit notification payload event-1 (only where events-v1 claimed; else skip with reason)", expect: "initiator delivers event without completing any RPC" }
+      - { actor: either, action: "initiate graceful close", expect: "CLOSING then CLOSED; no new RPCs; per-connection state discarded" }
+    swap_roles: true
+    logs_required: ["wire trace both legs", "per-ID verdicts", "implementation versions and bounds"]
+
+  - id: XIMPL-NEGATIVE-PAIR
+    name: "unknown method, duplicate ID, oversize prefix"
+    steps:
+      - { actor: initiator, action: "send request id 11 /example.Unknown/Call", expect: "result id 11 error UNIMPLEMENTED; connection usable" }
+      - { actor: initiator, action: "send duplicate request id 7 while 7 outstanding", expect: "FAILED_PRECONDITION for the duplicate; original completes once" }
+      - { actor: initiator, action: "send oversize prefix (MAX+1) with no payload", expect: "rejection on the prefix alone; immediate close (TCP/TLS) or 413/Close-1009 (HTTP/WS bindings)" }
+    swap_roles: false
+    logs_required: ["wire trace", "allocation proof for the oversize row (no payload-sized allocation)"]

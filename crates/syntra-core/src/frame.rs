@@ -10,16 +10,22 @@
 //! - unknown wire fields are tolerated per SNTR-SER-003, EXCEPT reserved
 //!   top-level numbers 16/17, which are rejected. Numbers 16/17 inside
 //!   nested messages are unassigned and tolerated;
-//! - an unset `body` with unknown top-level content is an unknown variant
-//!   (`UNIMPLEMENTED`), while an unset `body` with no unknown content is
-//!   an empty body (`INVALID_ARGUMENT`);
+//! - body space is 10..31: known 10..15, reserved 16/17, future 18..31;
+//!   metadata never supplies a missing body;
 //! - duplicate `body` alternatives on the wire (two `oneof` members, or
 //!   the same member twice — prost would collapse them) are rejected;
 //!   duplicate `version`/`request_id` scalars follow protobuf merge
 //!   semantics (last wins) and are not rejected;
-//! - nesting depth is schema-bounded (known message fields only) with a
+//! - the complete structural walk precedes reserved/multiplicity/future
+//!   classification, including every known field occurrence and unknown groups;
+//! - nesting depth is bounded (known messages and unknown groups) with a
 //!   hard cap of 32, and no single length prefix may exceed the envelope
-//!   bound, before prost decodes anything.
+//!   bound, before prost decodes anything;
+//! - credential/connection-ID/diagnostic byte caps are admission bounds on
+//!   every raw occurrence, checked after structural and raw-choice validation
+//!   but before generated decoding. Even a subsequently overwritten value is
+//!   consumed by prost and must fit its field's allocation budget. In-bound
+//!   ordinary singular duplicates still retain protobuf last-value semantics.
 
 use prost::Message;
 
@@ -31,9 +37,8 @@ use crate::state::ConnectionState;
 /// Default maximum serialized `Frame` bytes (SNTR-WIRE-006).
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 
-/// Hard cap on message nesting depth (SNTR-SER-006). The v1 schema nests
-/// at most 3 deep (`Frame` -> `RpcResult` -> `RpcError`); anything deeper
-/// can only come from corrupt or hostile input.
+/// Hard cap on nesting below the root (SNTR-SER-006), including unknown
+/// protobuf groups. Known v1 messages nest as `Frame` -> `RpcResult` -> `RpcError`.
 pub const MAX_DECODE_DEPTH: u32 = 32;
 
 /// What a validated frame contains.
@@ -76,10 +81,9 @@ pub fn encode_frame(frame: &Frame) -> Vec<u8> {
     frame.encode_to_vec()
 }
 
-/// Shared raw-wire prelude: emptiness, envelope size, then the bounded
-/// top-level pre-scan. Used by both [`decode_frame`] and
-/// [`validate_wire_structure`] so the two entry points cannot drift.
-fn pre_scan(bytes: &[u8]) -> Result<ScanStats, SyntraError> {
+/// Shared bounded structural walk, before any raw-choice classification or
+/// generated decoding. Also used by the narrow missing-outcome correlator.
+fn structural_scan(bytes: &[u8]) -> Result<ScanStats, SyntraError> {
     if bytes.is_empty() {
         return Err(SyntraError::Protocol {
             code: ErrorCode::InvalidArgument,
@@ -92,7 +96,20 @@ fn pre_scan(bytes: &[u8]) -> Result<ScanStats, SyntraError> {
             message: "frame exceeds maximum envelope size".to_string(),
         });
     }
-    scan_top_level(bytes)
+    let mut scan = ScanStats::default();
+    walk(bytes, &mut 0, Schema::Frame, 0, None, &mut scan)?;
+    Ok(scan)
+}
+
+/// Shared strict prelude for decoding and raw-wire validation.
+fn pre_scan(bytes: &[u8]) -> Result<(), SyntraError> {
+    let scan = structural_scan(bytes)?;
+    // No semantic classification may short-circuit the complete structural walk.
+    scan.validate_body()?;
+    if let Some(outcome) = &scan.outcome {
+        outcome.validate("result outcome")?;
+    }
+    scan.validate_field_bounds()
 }
 
 /// Decode + validate a received `Frame`.
@@ -102,29 +119,11 @@ fn pre_scan(bytes: &[u8]) -> Result<ScanStats, SyntraError> {
 /// (5) per-variant semantics. First failure determines the error;
 /// validation completes before dispatch.
 pub fn decode_frame(bytes: &[u8], ctx: ValidationContext) -> Result<Frame, SyntraError> {
-    // Raw pre-scan (SNTR-SER-006/008, SNTR-WIRE-002/004): reserved
-    // numbers, duplicate bodies, unknown-only bodies, and depth/alloc
-    // limits are decided here, before prost allocates anything.
-    let scan = pre_scan(bytes)?;
+    pre_scan(bytes)?;
     let frame = Frame::decode(bytes).map_err(|_| SyntraError::Protocol {
         code: ErrorCode::InvalidArgument,
         message: "malformed protobuf frame".to_string(),
     })?;
-    if frame.body.is_none() {
-        if scan.unknown_present {
-            // Decoded to no known variant but carried unknown top-level
-            // content: a future `oneof` member or unknown masquerading as
-            // body (SNTR-WIRE-004). Never silently dropped, never success.
-            return Err(SyntraError::Protocol {
-                code: ErrorCode::Unimplemented,
-                message: "unknown frame variant".to_string(),
-            });
-        }
-        return Err(SyntraError::Protocol {
-            code: ErrorCode::InvalidArgument,
-            message: "frame body must be set".to_string(),
-        });
-    }
     validate_frame(&frame, ctx)?;
     Ok(frame)
 }
@@ -297,6 +296,9 @@ pub fn validate_frame(frame: &Frame, ctx: ValidationContext) -> Result<FrameKind
                         message: "error code must be nonzero".to_string(),
                     });
                 }
+                if e.message.len() > crate::error::MAX_DIAGNOSTIC_BYTES {
+                    return Err(invalid("error message exceeds diagnostic bound"));
+                }
             }
         }
         Body::Cancel(_) => {}
@@ -308,275 +310,303 @@ pub fn validate_frame(frame: &Frame, ctx: ValidationContext) -> Result<FrameKind
     Ok(kind)
 }
 
-/// Outcome of the raw wire pre-scan.
-struct ScanStats {
-    unknown_present: bool,
-    body_present: bool,
+/// Raw-wire validation, including body/outcome classification and per-occurrence
+/// allocation bounds, without version, state or other field-value semantics.
+/// No generated decoder allocation is needed.
+pub fn validate_wire_structure(bytes: &[u8]) -> Result<(), SyntraError> {
+    pre_scan(bytes)
 }
 
-/// Raw-wire structural validation without semantic checks.
+/// Recover correlation only for an otherwise legal result with zero raw outcomes.
 ///
-/// Runs the same bounded pre-scan as [`decode_frame`] (reserved
-/// top-level fields, duplicate body alternatives, truncation,
-/// allocation and depth bounds) followed by a full prost decode, but
-/// classifies no method, version, or state semantics. The decode matters:
-/// the pre-scan skips most body contents (only `RpcResult` -> `RpcError`
-/// is descended into), so malformed nested protobuf would otherwise read
-/// as structurally sound. Used by embedding boundaries that map some
-/// decode failures to per-RPC errors: structural violations stay fatal
-/// even when the envelope also carries a malformed method.
-pub fn validate_wire_structure(bytes: &[u8]) -> Result<(), SyntraError> {
-    let scan = pre_scan(bytes)?;
-    Frame::decode(bytes).map_err(|_| SyntraError::Protocol {
-        code: ErrorCode::InvalidArgument,
-        message: "malformed protobuf frame".to_string(),
-    })?;
-    if !scan.body_present {
-        if scan.unknown_present {
-            // Unknown-only envelope: same SNTR-WIRE-004 classification as
-            // `decode_frame`, never silently dropped, never success.
+/// This supports local `INVALID_ARGUMENT` completion of an affected pending RPC
+/// (CONF-RPC-010), not accepting the frame or emitting an error response. The
+/// caller still owns pending-ID lookup and terminal selection. `None` means this
+/// specific failure cannot be safely correlated; retain normal decode-error
+/// handling. Malformed structure, reserved/duplicate/future bodies, any outcome
+/// occurrence, and invalid version/ID/state never yield an ID.
+///
+/// Uses the same complete bounded walk as [`decode_frame`] before generated
+/// decoding. Normal decoding and [`validate_wire_structure`] remain strict.
+pub fn missing_result_outcome_id(bytes: &[u8], ctx: ValidationContext) -> Option<u64> {
+    let scan = structural_scan(bytes).ok()?;
+    scan.validate_body().ok()?;
+    if scan.outcome.as_ref()?.count != 0 {
+        return None;
+    }
+    scan.validate_field_bounds().ok()?;
+    let mut frame = Frame::decode(bytes).ok()?;
+    let Some(Body::Result(result)) = frame.body.as_mut() else {
+        return None;
+    };
+    if result.outcome.is_some() {
+        return None;
+    }
+    // Supply an empty success only to reuse all other envelope validation. This
+    // temporary value never escapes; the received frame remains invalid.
+    result.outcome = Some(crate::proto::rpc_result::Outcome::Payload(Vec::new()));
+    validate_frame(&frame, ctx).ok()?;
+    Some(frame.request_id)
+}
+
+#[derive(Default)]
+struct RawChoice {
+    count: u32,
+    future: bool,
+}
+
+impl RawChoice {
+    fn record(&mut self, future: bool) {
+        self.count += 1; // At most MAX_FRAME_BYTES field occurrences.
+        self.future |= future;
+    }
+
+    fn validate(&self, name: &str) -> Result<(), SyntraError> {
+        if self.count != 1 {
+            return Err(invalid(&format!("{name} must have exactly one occurrence")));
+        }
+        if self.future {
             return Err(SyntraError::Protocol {
                 code: ErrorCode::Unimplemented,
-                message: "unknown frame variant".to_string(),
+                message: format!("unknown {name} variant"),
             });
         }
-        return Err(SyntraError::Protocol {
-            code: ErrorCode::InvalidArgument,
-            message: "frame body must be set".to_string(),
-        });
+        Ok(())
     }
-    Ok(())
 }
 
-/// Scan top-level protobuf wire bytes before prost decodes.
-///
-/// Enforces, in one bounded pass:
-/// - reserved top-level numbers 16/17 rejected (SNTR-SER-008; prost drops
-///   unknown fields, so detection must happen on raw bytes). Numbers 16/17
-///   inside nested messages are unassigned, not reserved, and are tolerated
-///   per SNTR-SER-003 (see `check_nested`);
-/// - duplicate `body` alternatives rejected (SNTR-WIRE-002; prost would
-///   collapse two `oneof` members into one, hiding the violation);
-///   duplicate `version`/`request_id` scalars follow protobuf merge
-///   semantics (last wins) and are not rejected here, matching the Go
-///   binding and SNTR-SER-002 non-canonical tolerance;
-/// - unknown-top-level-content flag for unknown-variant handling
-///   (SNTR-WIRE-004);
-/// - allocation bound: no length prefix may exceed `MAX_FRAME_BYTES`
-///   (SNTR-SER-006);
-/// - depth bound: recursion into known message fields only
-///   (`RpcResult` -> `RpcError`), capped at `MAX_DECODE_DEPTH`
-///   (SNTR-SER-006). Unknown and opaque fields (payloads, credentials,
-///   strings) are skipped by length, never descended into, so arbitrary
-///   application bytes can neither false-positive nor blow up the walk.
-fn scan_top_level(bytes: &[u8]) -> Result<ScanStats, SyntraError> {
-    let mut body_count: u32 = 0;
-    let mut unknown_present = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        let (tag, next) = read_varint(bytes, i).ok_or(SyntraError::Protocol {
-            code: ErrorCode::InvalidArgument,
-            message: "malformed protobuf tag".to_string(),
-        })?;
-        i = next;
-        let field = (tag >> 3) as u32;
-        let wire = (tag & 0x07) as u8;
-        reject_reserved(field)?;
-        if (10..=15).contains(&field) {
-            if wire != 2 {
-                return Err(SyntraError::Protocol {
-                    code: ErrorCode::InvalidArgument,
-                    message: "malformed frame body encoding".to_string(),
-                });
-            }
-            body_count += 1;
-            if body_count > 1 {
-                return Err(SyntraError::Protocol {
-                    code: ErrorCode::InvalidArgument,
-                    message: "frame must contain exactly one body".to_string(),
-                });
-            }
-        } else if !matches!(field, 1 | 2) {
-            unknown_present = true;
+#[derive(Default)]
+struct ScanStats {
+    reserved: bool,
+    body: RawChoice,
+    // Only relevant after exactly one known Frame body has been established.
+    // Multiple result bodies are rejected before this last observation is used.
+    outcome: Option<RawChoice>,
+    // Deferred so malformed structure and raw-choice failures always win.
+    field_bound_violation: Option<FieldBoundViolation>,
+}
+
+enum FieldBoundViolation {
+    Credential,
+    ConnectionId,
+    Diagnostic,
+}
+
+impl ScanStats {
+    fn validate_body(&self) -> Result<(), SyntraError> {
+        if self.reserved {
+            return Err(invalid("frame uses reserved field number"));
         }
-        i = skip_top_value(bytes, i, wire, field)?;
+        self.body.validate("frame body")
     }
-    Ok(ScanStats {
-        unknown_present,
-        body_present: body_count == 1,
-    })
-}
 
-fn reject_reserved(field: u32) -> Result<(), SyntraError> {
-    if field == 16 || field == 17 {
-        return Err(SyntraError::Protocol {
-            code: ErrorCode::InvalidArgument,
-            message: "frame uses reserved field number".to_string(),
-        });
-    }
-    Ok(())
-}
-
-/// Skip one top-level wire value. `RpcResult` bodies (field 13) are
-/// descended into with schema awareness so `RpcError` nesting is still
-/// bounded; every other length-delimited field is skipped whole.
-fn skip_top_value(bytes: &[u8], i: usize, wire: u8, field: u32) -> Result<usize, SyntraError> {
-    match wire {
-        0 => skip_varint(bytes, i),
-        1 => skip_fixed(bytes, i, 8, "truncated fixed64"),
-        2 => {
-            let (len, next) = read_varint(bytes, i).ok_or(SyntraError::Protocol {
-                code: ErrorCode::InvalidArgument,
-                message: "truncated length prefix".to_string(),
-            })?;
-            check_alloc(len)?;
-            let len = len as usize;
-            if next + len > bytes.len() {
-                return Err(SyntraError::Protocol {
-                    code: ErrorCode::InvalidArgument,
-                    message: "truncated length-delimited field".to_string(),
-                });
+    fn validate_field_bounds(&self) -> Result<(), SyntraError> {
+        match self.field_bound_violation {
+            Some(FieldBoundViolation::Credential) => {
+                Err(resource("hello credential exceeds bound"))
             }
-            if field == 13 {
-                // RpcResult: validate the nested message with depth
-                // tracking (depth 1); its RpcError (field 2) descends to
-                // depth 2. All other nested content is opaque.
-                check_nested(&bytes[next..next + len], Schema::RpcResult, 1)?;
+            Some(FieldBoundViolation::ConnectionId) => Err(invalid("invalid connection_id length")),
+            Some(FieldBoundViolation::Diagnostic) => {
+                Err(invalid("error message exceeds diagnostic bound"))
             }
-            Ok(next + len)
+            None => Ok(()),
         }
-        5 => skip_fixed(bytes, i, 4, "truncated fixed32"),
-        _ => Err(SyntraError::Protocol {
-            code: ErrorCode::InvalidArgument,
-            message: "illegal wire type".to_string(),
-        }),
     }
 }
 
-/// Which message schema a nested region must satisfy.
 #[derive(Clone, Copy)]
 enum Schema {
+    Frame,
+    Hello,
+    Ready,
+    Request,
     RpcResult,
     RpcError,
+    Cancel,
+    Notification,
+    UnknownGroup,
 }
 
-/// Schema-aware nested check. Only known message-typed fields are
-/// descended into; opaque `bytes`/`string` fields are skipped whole.
-/// Field numbers 16/17 are reserved only at the top-level `Frame`
-/// (SNTR-SER-008); inside nested messages they are unassigned unknown
-/// fields tolerated per SNTR-SER-003, matching the Go binding. Only the
-/// top-level scan rejects them.
-fn check_nested(bytes: &[u8], schema: Schema, depth: u32) -> Result<(), SyntraError> {
-    if depth > MAX_DECODE_DEPTH {
-        return Err(SyntraError::Protocol {
-            code: ErrorCode::ResourceExhausted,
-            message: "frame nesting exceeds depth bound".to_string(),
-        });
-    }
-    let mut i = 0;
-    while i < bytes.len() {
-        let (tag, next) = read_varint(bytes, i).ok_or(SyntraError::Protocol {
-            code: ErrorCode::InvalidArgument,
-            message: "malformed nested tag".to_string(),
-        })?;
-        i = next;
-        let field = (tag >> 3) as u32;
-        let wire = (tag & 0x07) as u8;
-        match wire {
-            0 => i = skip_varint(bytes, i)?,
-            1 => i = skip_fixed(bytes, i, 8, "truncated nested fixed64")?,
-            2 => {
-                let (len, after) = read_varint(bytes, i).ok_or(SyntraError::Protocol {
-                    code: ErrorCode::InvalidArgument,
-                    message: "truncated nested length prefix".to_string(),
-                })?;
-                check_alloc(len)?;
-                let len = len as usize;
-                if after + len > bytes.len() {
-                    return Err(SyntraError::Protocol {
-                        code: ErrorCode::InvalidArgument,
-                        message: "truncated nested field".to_string(),
-                    });
-                }
-                // Descend only into RpcError (field 2 of RpcResult).
-                // RpcError itself has no message-typed fields, so this
-                // terminates after one more level by construction.
-                if matches!(schema, Schema::RpcResult) && field == 2 {
-                    check_nested(&bytes[after..after + len], Schema::RpcError, depth + 1)?;
-                }
-                i = after + len;
-            }
-            5 => i = skip_fixed(bytes, i, 4, "truncated nested fixed32")?,
-            _ => {
-                return Err(SyntraError::Protocol {
-                    code: ErrorCode::InvalidArgument,
-                    message: "illegal nested wire type".to_string(),
-                })
-            }
-        }
-    }
-    Ok(())
+#[derive(Clone, Copy)]
+enum FieldType {
+    Scalar,
+    Bytes,
+    String,
+    Message(Schema),
 }
 
-fn check_alloc(len: u64) -> Result<(), SyntraError> {
-    if len > MAX_FRAME_BYTES as u64 {
-        return Err(SyntraError::Protocol {
-            code: ErrorCode::ResourceExhausted,
-            message: "frame field exceeds allocation bound".to_string(),
-        });
-    }
-    Ok(())
-}
-
-fn skip_varint(bytes: &[u8], i: usize) -> Result<usize, SyntraError> {
-    let mut j = i;
-    loop {
-        let b = *bytes.get(j).ok_or(SyntraError::Protocol {
-            code: ErrorCode::InvalidArgument,
-            message: "truncated varint".to_string(),
-        })?;
-        j += 1;
-        if b & 0x80 == 0 {
-            return Ok(j);
-        }
-        if j - i > 10 {
-            return Err(SyntraError::Protocol {
-                code: ErrorCode::InvalidArgument,
-                message: "overlong varint".to_string(),
-            });
+impl Schema {
+    fn field_type(self, field: u32) -> Option<FieldType> {
+        use FieldType::{Bytes, Message, Scalar, String};
+        match (self, field) {
+            (Self::Frame, 1 | 2) | (Self::Hello, 1 | 2) => Some(Scalar),
+            (Self::Frame, 10) => Some(Message(Self::Hello)),
+            (Self::Frame, 11) => Some(Message(Self::Ready)),
+            (Self::Frame, 12) => Some(Message(Self::Request)),
+            (Self::Frame, 13) => Some(Message(Self::RpcResult)),
+            (Self::Frame, 14) => Some(Message(Self::Cancel)),
+            (Self::Frame, 15) => Some(Message(Self::Notification)),
+            (Self::Frame, 18..=31) | (Self::RpcResult, 3..=15) => Some(Bytes),
+            (Self::Hello, 3)
+            | (Self::Request, 2)
+            | (Self::RpcResult, 1)
+            | (Self::Notification, 1) => Some(Bytes),
+            (Self::Ready, 1) | (Self::Request, 1) | (Self::RpcError, 2) => Some(String),
+            (Self::Request, 3) | (Self::RpcError, 1) => Some(Scalar),
+            (Self::RpcResult, 2) => Some(Message(Self::RpcError)),
+            _ => None,
         }
     }
 }
 
-fn skip_fixed(
+/// Allocation-free structural walk. Unknown LEN values and opaque bytes are
+/// skipped, not interpreted; lawful unknown groups have matching end tags and
+/// consume the same depth budget as embedded known messages. Root depth is zero.
+fn walk(
     bytes: &[u8],
-    i: usize,
-    width: usize,
-    what: &'static str,
-) -> Result<usize, SyntraError> {
-    if i + width > bytes.len() {
-        return Err(SyntraError::Protocol {
-            code: ErrorCode::InvalidArgument,
-            message: what.to_string(),
-        });
+    i: &mut usize,
+    schema: Schema,
+    depth: u32,
+    end_group: Option<u32>,
+    scan: &mut ScanStats,
+) -> Result<(), SyntraError> {
+    if depth > MAX_DECODE_DEPTH {
+        return Err(resource("frame nesting exceeds depth bound"));
     }
-    Ok(i + width)
+    let mut outcome = RawChoice::default();
+    while *i < bytes.len() {
+        let tag = read_varint(bytes, i)?;
+        let number = tag >> 3;
+        if number == 0 || number > 0x1fff_ffff {
+            return Err(invalid("invalid protobuf field number"));
+        }
+        let field = number as u32;
+        let wire = (tag & 7) as u8;
+        let field_type = schema.field_type(field);
+        if let Some(ty) = field_type {
+            let expected = if matches!(ty, FieldType::Scalar) {
+                0
+            } else {
+                2
+            };
+            if wire != expected {
+                return Err(invalid("wrong wire type for core field"));
+            }
+        }
+        if wire == 4 {
+            return if end_group == Some(field) {
+                Ok(())
+            } else {
+                Err(invalid("unexpected protobuf end group"))
+            };
+        }
+        match schema {
+            Schema::Frame => {
+                if matches!(field, 16 | 17) {
+                    scan.reserved = true;
+                }
+                if (10..=31).contains(&field) {
+                    scan.body.record(field >= 18);
+                }
+            }
+            Schema::RpcResult if field <= 15 => outcome.record(field >= 3),
+            _ => {}
+        }
+        match wire {
+            0 => {
+                read_varint(bytes, i)?;
+            }
+            1 => advance(bytes, i, 8)?,
+            2 => {
+                let len = read_varint(bytes, i)?;
+                if len > MAX_FRAME_BYTES as u64 {
+                    return Err(resource("frame field exceeds allocation bound"));
+                }
+                let start = *i;
+                advance(bytes, i, len as usize)?;
+                let value = &bytes[start..*i];
+                match field_type {
+                    Some(FieldType::Message(nested)) => {
+                        walk(value, &mut 0, nested, depth + 1, None, scan)?;
+                    }
+                    Some(FieldType::String) => {
+                        std::str::from_utf8(value)
+                            .map_err(|_| invalid("invalid UTF-8 in core string"))?;
+                    }
+                    _ => {}
+                }
+                // Do not reject early: later structural failures (including
+                // invalid UTF-8 in any occurrence) precede field admission.
+                // Unknown/opaque content is never interpreted as a submessage.
+                let violation = match (schema, field) {
+                    (Schema::Hello, 3) if len > crate::handshake::MAX_CREDENTIAL_BYTES as u64 => {
+                        Some(FieldBoundViolation::Credential)
+                    }
+                    (Schema::Ready, 1)
+                        if len > crate::handshake::MAX_CONNECTION_ID_BYTES as u64 =>
+                    {
+                        Some(FieldBoundViolation::ConnectionId)
+                    }
+                    (Schema::RpcError, 2) if len > crate::error::MAX_DIAGNOSTIC_BYTES as u64 => {
+                        Some(FieldBoundViolation::Diagnostic)
+                    }
+                    _ => None,
+                };
+                if scan.field_bound_violation.is_none() {
+                    scan.field_bound_violation = violation;
+                }
+            }
+            3 => walk(bytes, i, Schema::UnknownGroup, depth + 1, Some(field), scan)?,
+            5 => advance(bytes, i, 4)?,
+            _ => return Err(invalid("illegal protobuf wire type")),
+        }
+    }
+    if end_group.is_some() {
+        return Err(invalid("unterminated protobuf group"));
+    }
+    if matches!(schema, Schema::RpcResult) {
+        scan.outcome = Some(outcome);
+    }
+    Ok(())
 }
 
-fn read_varint(bytes: &[u8], mut i: usize) -> Option<(u64, usize)> {
-    let mut value: u64 = 0;
-    let mut shift = 0;
-    loop {
-        let b = *bytes.get(i)?;
-        i += 1;
-        value |= ((b & 0x7F) as u64) << shift;
-        shift += 7;
+fn advance(bytes: &[u8], i: &mut usize, width: usize) -> Result<(), SyntraError> {
+    if width > bytes.len() - *i {
+        return Err(invalid("truncated protobuf field"));
+    }
+    *i += width;
+    Ok(())
+}
+
+fn read_varint(bytes: &[u8], i: &mut usize) -> Result<u64, SyntraError> {
+    let mut value = 0u64;
+    for n in 0..10 {
+        let b = *bytes.get(*i).ok_or_else(|| invalid("truncated varint"))?;
+        *i += 1;
+        // At most one payload bit in byte ten. This also rejects continuation
+        // there, but permits valid non-minimal encodings within ten bytes.
+        if n == 9 && b > 1 {
+            return Err(invalid("overflowing protobuf varint"));
+        }
+        value |= u64::from(b & 0x7f) << (7 * n);
         if b & 0x80 == 0 {
-            return Some((value, i));
+            return Ok(value);
         }
-        if shift > 64 {
-            return None;
-        }
+    }
+    Err(invalid("overlong protobuf varint"))
+}
+
+fn invalid(message: &str) -> SyntraError {
+    SyntraError::Protocol {
+        code: ErrorCode::InvalidArgument,
+        message: message.into(),
+    }
+}
+
+fn resource(message: &str) -> SyntraError {
+    SyntraError::Protocol {
+        code: ErrorCode::ResourceExhausted,
+        message: message.into(),
     }
 }
 
@@ -610,8 +640,7 @@ mod tests {
     #[test]
     fn wire_structure_rejects_malformed_nested_body_like_decode() {
         // version=1 plus a request body (field 12) whose nested bytes are
-        // protobuf garbage: the pre-scan skips body contents by length, so
-        // only the full decode rejects it.
+        // protobuf garbage: the bounded structural walk rejects it.
         let mut raw = vec![0x08u8, 0x01, 0x62, 0x0A];
         raw.extend([0xFFu8; 10]);
         assert!(validate_wire_structure(&raw).is_err());
@@ -619,15 +648,14 @@ mod tests {
     }
 
     #[test]
-    fn wire_structure_matches_decode_on_unknown_only_envelope() {
-        // version=1 plus unknown top-level field 90: SNTR-WIRE-004
-        // classifies this UNIMPLEMENTED, never INVALID_ARGUMENT.
+    fn wire_structure_matches_decode_on_metadata_only_envelope() {
+        // Field 90 is metadata, not a future body: body remains absent.
         let raw = [0x08u8, 0x01, 0xD0, 0x05, 0x01];
         let wire_err = validate_wire_structure(&raw).expect_err("unknown-only must fail");
         assert!(matches!(
             wire_err,
             SyntraError::Protocol {
-                code: crate::error::ErrorCode::Unimplemented,
+                code: crate::error::ErrorCode::InvalidArgument,
                 ..
             }
         ));
@@ -635,7 +663,7 @@ mod tests {
         assert!(matches!(
             decode_err,
             SyntraError::Protocol {
-                code: crate::error::ErrorCode::Unimplemented,
+                code: crate::error::ErrorCode::InvalidArgument,
                 ..
             }
         ));

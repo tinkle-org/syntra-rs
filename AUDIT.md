@@ -1,6 +1,63 @@
 # Implementation audit notes
 
-## Current migration scope
+## Accepted SDD alignment phase 3
+
+The uncommitted branch now includes the negotiated update/recovery runtime in
+[docs/phase3-update-recovery.md](docs/phase3-update-recovery.md): all nine RPCs,
+wrapped notifications, immutable per-connection profile binding, per-H fixed
+rounds, same-G snapshot installation, explicit scoped loss, bounded data/control
+queues and typed client orchestration. Host/Initiator routing and the opt-in
+SC1 factory adapter are attached, including actual direct-WSS tests in both modes.
+
+The native full-state persistence reference adds only `fs2 = "=0.4.3"` to the
+native runtime dependency surface. File synchronization, atomic replacement,
+exclusive process locking, CAS, uncertain-commit fencing and actual subprocess
+crash/reopen probes cover the declared local full-record storage contract.
+Applications still own provider-side durable issued bindings/history and effects
+outside the opaque state blob. This is not an encrypted enrollment store.
+
+Automated review found publication-path authentication withdrawal and ignored
+continuation expiry during snapshot staging/install. Both were fixed and
+regression-tested. Earlier integration probes also caught retired-inbox fallback
+and prompted post-writer-wait authority/generation revalidation. These automated
+reviews do not satisfy independent human security review. Pinned fixtures remain
+byte-identical; their known replay-completion wrapper discrepancy is documented,
+not hidden behind a permissive decoder. Phase 4 RFC 0010 work has not begun.
+
+## Accepted SDD alignment phase 2
+
+The current uncommitted branch also implements the Core/RPC checkpoint described
+in [docs/phase2-core-rpc.md](docs/phase2-core-rpc.md). This includes raw parser and
+preallocation bounds, permanent ordered IDs, host high-water admission,
+deadline-first terminal gates, receipt-time budgeting, validated configuration,
+independent execution leases and bounded selected output. SC1 default factories
+now share a process-wide 1024-execution cap; custom quotas must be reused across
+connections. A retained withdrawal owner survives handler/caller cancellation.
+
+Automated implementation review found and prompted fixes for an exhaustion
+read-to-write lock upgrade, an unshared SC1 execution budget, cancellation of a
+self-withdrawal close continuation, and receive-field allocation before bounds.
+Regression tests cover these paths. This review is not independent human security
+review, and the working-tree tests are not a formal conformance declaration.
+At that checkpoint Phase 3 recovery had not begun; its subsequent results below
+are separate from the Phase 2 run. Other later-phase gates remain open.
+
+## Accepted SDD alignment phase 1
+
+Branch `feat/accepted-sdd-v1-alignment`, starting Rust revision
+`73f9775043ba2625a823f5cca3fbe92cdf345293`, targets accepted upstream
+`8ede3810b29fbba4d0e6ae6751a0025ceedda140` (PR #20). The work is uncommitted.
+The new scope is schema/suite snapshot provenance and implementation tracking,
+not Core/RPC, recovery or host-lifecycle behavior. The active suite registers
+`CONF-SCW-001…042` and `CONF-URP-001…017`; no formal verdict is claimed.
+See [the SDD matrix](docs/sdd-alignment.md) and
+[snapshot procedure](MIGRATION.md#accepted-sdd-snapshot-and-alignment-target).
+
+Phase-one verification is recorded under [current recorded verification](#current-recorded-verification).
+Older scope descriptions and test counts below retain their original meaning;
+they are not evidence that the PR #20 contracts have been implemented.
+
+## Historical pre-wave migration scope
 
 The current prerelease migration consolidates `syntra-tcp` and `syntra-ws-sc1`
 into the experimental, unpublished `syntra-sc1-transport`. The empty default
@@ -82,7 +139,129 @@ contains the following changes:
 
 ## Current recorded verification
 
-### Acceptance alignment run
+### Accepted SDD phase-three run
+
+Executed on darwin/arm64 with Rust 1.88.0 on the uncommitted
+`feat/accepted-sdd-v1-alignment` tree based on
+`73f9775043ba2625a823f5cca3fbe92cdf345293`, targeting
+`syntra@8ede3810b29fbba4d0e6ae6751a0025ceedda140`. These are working-tree,
+same-implementation checks, not revision-pinned release or formal `CONF-*` verdicts.
+
+| Command | Result / scope |
+| --- | --- |
+| `cargo test --locked --workspace --quiet` | 606 passed, 0 failed, 2 ignored (Docker/browser). Includes 275 runtime unit tests, 28 recovery-driver tests, 12 source-inclusion persistence tests, 24 actual Core-bridge recovery tests and 3 actual direct-SC1/WSS recovery tests |
+| `cargo test --locked -p syntra-sc1-transport --no-default-features --quiet` | 63 passed: 37 library + 3 recovery WSS + 23 WSS; isolated production/default feature boundary |
+| `cargo test --locked -p syntra-sc1-transport --features development-carriers --quiet` | 71 passed: 37 library + 6 connectivity + 3 WS + 3 recovery WSS + 22 WSS |
+| `cargo test --locked -p syntra-ffi --no-default-features --features production --quiet` | 13 passed; existing ABI v1 scope, not recovery/SC1 ABI v2 integration |
+| `cargo test --locked -p syntra-ffi --no-default-features --features test-fixture --quiet` | 11 passed |
+| `python3 crates/syntra-ffi/tests/build_contract.py` | 5 passed: C smoke/export isolation/header checks and expected FFI WASM rejection |
+| `cargo check --locked -p syntra-core -p syntra-runtime -p syntra-ws -p syntra-web --target wasm32-unknown-unknown` | Passed compilation; no browser execution, persistence or real suspend claim |
+| `cargo clippy --locked --workspace --all-targets -- --no-deps` | Exit 0 with existing warnings; no warning-clean workspace result |
+| `cargo deny --locked check advisories licenses sources` | Passed with cargo-deny 0.20.2 |
+| `cargo audit --deny warnings` | Passed with cargo-audit 0.22.2; scanned the current 335-dependency lockfile using the fetched RustSec database |
+| `python3 scripts/check-upstream-pin.py --upstream ../syntra` | Passed: all 69 managed schema/suite inputs match the locked committed source blobs |
+| `python3 scripts/check-generated.py` | Passed: generated Rust matches the pinned Buf output |
+| `python3 -m unittest discover -s scripts/tests -p 'test_*.py' -q` | 54 passed; snapshot-checker scope |
+| `buf format --diff --exit-code`; `buf lint`; `buf build`; `buf breaking --against '.git#ref=73f9775043ba2625a823f5cca3fbe92cdf345293'` | Passed; original FILE compatibility policy retained |
+| `cargo fmt --all -- --check`; `git diff --check`; `actionlint -color` | Passed; local actionlint 1.7.12, not CI-pinned 1.7.7 |
+| `cargo doc --locked -p syntra-runtime -p syntra-sc1-transport --no-deps` | Completed; existing compiler warnings remain, redundant driver doc-link warnings were corrected |
+
+The local acceptance probes exercise negotiation isolation, initial live-only
+baseline, durable resume and no-op C==B replay, exact reply/completion retries,
+fixed-boundary replay/CatchUp, all nine methods, retention fallback, S0 differing
+from B, unchanged-G installation, supersede fencing, provider loss, targeted
+overflow, cross-scope rejection, lost acknowledgement with retained disk state,
+and root withdrawal while another RPC is pending. Separate controlled-peer tests
+cover expiry during a blocking successful install commit: no stale SnapshotConfirm,
+while durable full-state evidence survives. Writer-barrier tests change policy/G
+after pop but before writer capacity, proving stale protected output is discarded.
+
+Native persistence tests include actual child-process termination at ten write
+cuts across initial/replacement records and process-lock crash release. This is
+evidence under the documented local-filesystem/flush/cooperating-writer assumptions,
+not a proof for arbitrary business transactions, hostile storage or source backends.
+No memory fixture is relabeled as durable storage. Existing warning classes such
+as `baseline`, `issued_at_ms` and older style warnings remain.
+
+Formal manifest execution, independent Rust/Go/crypto evidence, real devices,
+operational budgets/soaks, independent human review and the future upstream freeze
+remain open. Automatic recovered-service reconnect, mixed-notification routing,
+browser/mobile storage and ABI v2 remain later integration phases. RFC 0010
+enrollment/revocation/rotation/pin lifecycle remains Phase 4.
+
+### Accepted SDD phase-two run
+
+Executed on darwin/arm64 using Rust 1.88.0 on the uncommitted
+`feat/accepted-sdd-v1-alignment` working tree, based on
+`73f9775043ba2625a823f5cca3fbe92cdf345293`. Specification and schema/suite remain
+pinned to `8ede3810b29fbba4d0e6ae6751a0025ceedda140`. The 69 managed inputs remain
+byte-identical to that revision. No commits or release artifacts were created.
+
+| Command | Result / scope |
+| --- | --- |
+| `cargo test --locked --workspace --quiet` | 450 passed, 0 failed, 2 ignored (Docker and browser). Includes 68 Core tests, 166 runtime unit tests and local integration regressions; not a manifest-driven run |
+| `cargo test --locked -p syntra-sc1-transport --no-default-features --quiet` | 60 passed: 37 library + 23 WSS; isolated default feature boundary |
+| `cargo test --locked -p syntra-sc1-transport --features development-carriers --quiet` | 68 passed: 37 library + 6 connectivity + 3 WS + 22 WSS |
+| `cargo test --locked -p syntra-ffi --no-default-features --features production --quiet` | 13 passed; existing ABI v1 regression scope, not ABI v2 alignment |
+| `cargo test --locked -p syntra-ffi --no-default-features --features test-fixture --quiet` | 11 passed; test-fixture-only ABI |
+| `python3 crates/syntra-ffi/tests/build_contract.py` | 5 passed: export isolation, C smoke, header checks and expected FFI WASM rejection |
+| `cargo check --locked -p syntra-core -p syntra-runtime -p syntra-ws -p syntra-web --target wasm32-unknown-unknown` | Passed compilation; no real browser/mobile execution or suspend-time evidence |
+| `cargo clippy --locked --workspace --all-targets -- --no-deps` | Exit 0 with warnings; no warning-clean result claimed |
+| `python3 scripts/check-upstream-pin.py --upstream ../syntra` | Passed: all 69 inputs match the locked committed Git blobs |
+| `python3 scripts/check-generated.py` | Passed: generated output matches the existing pinned Buf plugin |
+| `python3 -m unittest discover -s scripts/tests -p 'test_*.py' -q` | 54 passed; snapshot-checker regressions unchanged |
+| `buf format --diff --exit-code`; `buf lint`; `buf build`; `buf breaking --against '.git#ref=73f9775043ba2625a823f5cca3fbe92cdf345293'` | Passed; existing FILE compatibility policy retained |
+| `cargo fmt --all -- --check`; `git diff --check`; `actionlint -color` | Passed; local actionlint 1.7.12, not CI-pinned 1.7.7 |
+
+Allocation-observer regressions reject 8,193-byte credentials, 129-byte
+connection IDs and 4,097-byte diagnostics with zero allocations at or above the
+oversized field lengths, including both duplicate orders. Exact-bound positive
+controls demonstrate observation is active. Structural errors retain precedence;
+in-bound singular duplicates retain last-value semantics. Explicit barriers and
+paused clocks cover terminal ordering, receipt delay, actual 16-way admission and
+reverse correlation; near-maximum IDs exercise prompt exhaustion/close.
+
+Existing Clippy warnings remain, including `baseline`/`issued_at_ms` and older
+style warnings. No dependency versions changed. Dependency security, Criterion,
+Docker, real browser, physical devices, independent Go/crypto vectors and
+independent human review were not executed for this checkpoint. Full conformance,
+control/event queue integration, suspend-aware clocks, complete shutdown D5
+reporting, recovery, RFC 0010 and FFI v2 remain later-phase/release gates.
+
+### Accepted SDD phase-one run
+
+Executed on darwin/arm64 with Rust 1.88.0, Python 3.14.7 and Buf 1.59.0,
+against the uncommitted `feat/accepted-sdd-v1-alignment` working tree based on
+`73f9775043ba2625a823f5cca3fbe92cdf345293`. These are working-tree checks, not a
+revision-pinned release or full manifest-driven conformance run.
+
+| Command | Result / scope |
+| --- | --- |
+| `python3 scripts/upstream_snapshot.py --sync --upstream ../syntra` | Generated 69 snapshot inputs plus the digest lock from committed upstream blobs at `8ede3810b29fbba4d0e6ae6751a0025ceedda140`; local source worktree content was not copied |
+| `python3 scripts/check-upstream-pin.py` | Passed: all 69 inventory entries and digests match offline |
+| `python3 scripts/check-upstream-pin.py --upstream ../syntra` | Passed: all inventory entries also match the exact committed upstream Git blobs |
+| `python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v` | 54 passed, 0 failed, 0 skipped; synthetic offline/mocked-Git fixtures test read-only checks, drift, invalid locks/paths, symlinks, sync preflight and no-op reproduction. Two initially failing sync-safety probes were fixed; automated review prompted lock-symlink and jointly-edited-file/lock protections with additional regressions |
+| `buf generate --template buf.gen.yaml` | Succeeded with the existing pinned `neoeinstein-prost:v0.4.0` revision 1; generated changes are comments, not Rust type/field changes |
+| `python3 scripts/check-generated.py` | Passed: regenerated filenames and bytes match committed-path working-tree output |
+| `buf format --diff --exit-code`; `buf lint`; `buf build` | All passed |
+| `buf breaking --against '.git#ref=73f9775043ba2625a823f5cca3fbe92cdf345293'` | Passed the existing FILE configuration against the starting Rust schema; no Go option migration or field/tag/type changes |
+| `cargo test --locked --workspace` | 377 passed, 0 failed, 2 ignored (Docker and browser). No production-FFI feature was enabled by this command |
+| `cargo test --locked -p syntra-sc1-transport --no-default-features` | 52 passed, 0 failed: 29 library + 23 WSS; isolated WSS-only defaults |
+| `cargo test --locked -p syntra-sc1-transport --features development-carriers` | 60 passed, 0 failed: 29 library + 6 connectivity + 3 WS + 22 WSS |
+| `cargo check --locked -p syntra-core -p syntra-runtime -p syntra-ws -p syntra-web --target wasm32-unknown-unknown` | Passed compilation only; no browser execution or browser SC1 claim |
+| `cargo fmt --all -- --check`; `git diff --check` | Passed |
+| `actionlint -color` | Passed with locally installed 1.7.12, not the CI-pinned 1.7.7 |
+
+Rust runs emitted the existing unused `baseline` assignment and `issued_at_ms`
+warnings. No warning-free result is claimed. Production/test-fixture FFI,
+C build-contract, dependency security, Criterion, Docker, browser, real-device,
+independent Go, and independent security-review runs were not executed in this
+phase. No formal `CONF-*` case verdict follows from the workspace test names:
+some tests explicitly preserve older ID/race/snapshot behavior pending Phase 2/3.
+The full P0–P2 implementation and external evidence gates remain open in
+[the SDD matrix](docs/sdd-alignment.md).
+
+### Historical RFC 0007 acceptance alignment run
 
 These results were recorded for the uncommitted working tree on
 `feature/sc1-v1-acceptance-alignment`, based on `1d1916a`. They are local

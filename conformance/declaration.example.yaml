@@ -1,0 +1,42 @@
+# Implementation declaration template (Section O)
+# Copy this file into the IMPLEMENTATION repository (not into syntra),
+# fill it in, and link per-case logs. Runners validate it against
+# conformance/manifest/schema.yaml (kind: declaration).
+format_version: "1.0"
+implementation:
+  name: "example-syntra-impl"
+  version: "0.1.0"
+  repository: "https://example.com/org/example-syntra-impl"
+  languages: ["ExampleLang"]
+  endpoints_tested: ["client", "server"]
+syntra_core: v1
+profiles:
+  - SNTR-WSS-H1-V1
+  - SNTR-HTTPS-H2-V1
+capabilities: []  # e.g. [events-v1]; empty = mandatory-only (conformant)
+capability_rfcs: {}  # e.g. { events-v1: "RFC-000X" }; required when capabilities non-empty
+bounds:
+  max_frame_bytes: 1048576
+  max_concurrent_rpcs: 16
+  handshake_timeout_ms: 5000
+  rpc_default_timeout_ms: 1000
+  max_method_length: 256
+  event_buffer_per_subscription: 0  # 0 = no event support (mandatory-only)
+secure_transport_policy: "production endpoints use only claimed secure profiles; plaintext profiles loopback-only with explicit insecure-mode warning"
+results:
+  - test_id: CONF-CORE-001
+    verdict: PASS
+    log_ref: "logs/conf-core-001.txt"
+  - test_id: CONF-EVT-001
+    verdict: SKIP
+    reason: "capability events-v1 unclaimed"
+    log_ref: "logs/conf-evt-001.txt"
+verdict_summary:
+  PASS: 120
+  FAIL: 0
+  SKIP: 9
+  UNSUPPORTED: 4
+  NOT_EXECUTED: 0
+notes:
+  - "PASS reported only for executed cases with retained logs."
+  - "SKIP/UNSUPPORTED excluded from pass-rate denominator per conformance/README.md §6."

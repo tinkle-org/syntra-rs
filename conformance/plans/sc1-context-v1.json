@@ -1,0 +1,50 @@
+{
+  "status": "proposal-only",
+  "proposal": "RFC 0007 section 11",
+  "domain_ascii": "syntra.sc1.v1",
+  "note": "Public context/prologue fixtures only. No keys, Noise ciphertext, conformance registration or executed interoperability verdict.",
+  "contexts": [
+    {
+      "id": "SC1-CONTEXT-01", "mode": 1, "carrier": 1, "server_key_id": 0,
+      "epoch": 0, "handle_hex": "0000000000000000", "scope": "a",
+      "context_hex": "73796e7472612e7363312e763101010000000000000000000000000000000000000000000161",
+      "prologue_hex": "73796e7472612e7363312e763101010000000000000000000000000000000000000000000161",
+      "context_bytes": 38, "m1_bytes": 86
+    },
+    {
+      "id": "SC1-CONTEXT-02", "mode": 1, "carrier": 3, "server_key_id": 16909060,
+      "epoch": 0, "handle_hex": "0000000000000000", "scope": "example.service",
+      "context_hex": "73796e7472612e7363312e763101030102030400000000000000000000000000000000000f6578616d706c652e73657276696365",
+      "prologue_hex": "73796e7472612e7363312e763101030102030400000000000000000000000000000000000f6578616d706c652e73657276696365",
+      "context_bytes": 52, "m1_bytes": 100
+    },
+    {
+      "id": "SC1-CONTEXT-03", "mode": 2, "carrier": 2, "server_key_id": 16909060,
+      "epoch": 1, "handle_hex": "0102030405060708", "scope": "example.service",
+      "context_hex": "73796e7472612e7363312e763102020102030400000000000000010102030405060708000f6578616d706c652e73657276696365",
+      "prologue_hex": "73796e7472612e7363312e763102020102030400000000000000010102030405060708000f6578616d706c652e73657276696365",
+      "context_bytes": 52, "m1_bytes": 100
+    },
+    {
+      "id": "SC1-CONTEXT-04", "mode": 2, "carrier": 3, "server_key_id": 4294967295,
+      "epoch": 18446744073709551615, "handle_hex": "0807060504030201", "scope": "é",
+      "context_hex": "73796e7472612e7363312e76310203ffffffffffffffffffffffff08070605040302010002c3a9",
+      "prologue_hex": "73796e7472612e7363312e76310203ffffffffffffffffffffffff08070605040302010002c3a9",
+      "context_bytes": 39, "m1_bytes": 87
+    }
+  ],
+  "negative_recipes": [
+    {"id":"SC1-N01","base":"SC1-CONTEXT-01","mutation":"legacy-go-domain","detail":"Replace the domain with syntra.sc1.draft1; recompute lengths.","expected":"reject-before-noise"},
+    {"id":"SC1-N02","base":"SC1-CONTEXT-01","mutation":"legacy-rust-magic","detail":"Present the complete Rust SNTRSC1L local-revision context instead.","expected":"reject-before-noise"},
+    {"id":"SC1-N03","base":"SC1-CONTEXT-01","mutation":"zero-mode","detail":"Set byte 13 to 0.","expected":"reject-before-noise"},
+    {"id":"SC1-N04","base":"SC1-CONTEXT-01","mutation":"unknown-carrier","detail":"Set byte 14 to 4.","expected":"reject-before-noise"},
+    {"id":"SC1-N05","base":"SC1-CONTEXT-01","mutation":"bootstrap-epoch","detail":"Set u64BE epoch at bytes 19..26 to 1.","expected":"reject-before-noise"},
+    {"id":"SC1-N06","base":"SC1-CONTEXT-03","mutation":"returning-handle","detail":"Set bytes 27..34 to zero.","expected":"reject-before-noise"},
+    {"id":"SC1-N07","base":"SC1-CONTEXT-01","mutation":"empty-scope","detail":"Set scope length to 0 and remove scope bytes.","expected":"reject-before-noise"},
+    {"id":"SC1-N08","base":"SC1-CONTEXT-01","mutation":"oversize-scope","detail":"Set scope length to 256 and supply exactly 256 ASCII bytes.","expected":"reject-before-noise"},
+    {"id":"SC1-N09","base":"SC1-CONTEXT-01","mutation":"truncated","detail":"Remove the final scope byte, leaving its length unchanged.","expected":"reject-before-noise"},
+    {"id":"SC1-N10","base":"SC1-CONTEXT-01","mutation":"trailing","detail":"Append 00 after an otherwise exact context; not part of the 48-byte Noise suffix.","expected":"reject-before-noise"},
+    {"id":"SC1-N11","base":"SC1-CONTEXT-01","mutation":"invalid-utf8","detail":"Replace the single scope byte with ff.","expected":"reject-before-noise"},
+    {"id":"SC1-N12","base":"SC1-CONTEXT-04","mutation":"scope-byte-length","detail":"Set scope length to 1 while retaining c3a9; lengths count bytes, not characters.","expected":"reject-before-noise"}
+  ]
+}

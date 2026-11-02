@@ -9,13 +9,9 @@
 //!   `RecoverySubscribeResponse.catchup_boundary` is recorded via
 //!   [`ProfileEngine::set_subscribed_boundary`]; when set, every replay
 //!   page and every catch-up completion boundary must equal it before held
-//!   live batches are released (SYN-URP-023). Replay pages retain a
-//!   backwards-compatible fallback where the first observed page records
-//!   its boundary when no subscribed boundary was recorded; spec-compliant
-//!   callers must still record the subscribed boundary first. Completion
-//!   has no such fallback and returns recovery-needed until the subscribed
-//!   boundary is recorded, so an unvalidated completion can never become
-//!   the trusted boundary. A different or empty boundary returns a
+//!   live batches are released (SYN-URP-023). Neither replay nor completion
+//!   may establish B; a nonempty subscribed B must be recorded first.
+//!   A different or empty boundary returns a
 //!   recovery-needed action and leaves the recorded boundary unchanged. The
 //!   caller clears the boundary when recovery completes. Initial
 //!   subscriptions (empty `start_checkpoint`) skip replay and validate
@@ -35,7 +31,8 @@
 use std::collections::HashMap;
 
 use super::profile::{
-    CommittedPosition, ProfileAction, ProfileCheckpoint, ProfileInput, ProfileRecovery, ReplayPage,
+    CommittedPosition, ProfileAction, ProfileCheckpoint, ProfileInput, ProfileRecovery,
+    ProviderError, ReplayPage,
 };
 
 /// Per-stream orchestration state.
@@ -44,7 +41,6 @@ struct StreamState {
     recovery: ProfileRecovery,
     catchup_boundary: Option<Vec<u8>>,
     last_loss: u64,
-    pending: Option<ProfileCheckpoint>,
 }
 
 /// Transport-agnostic orchestration over per-stream coordinators.
@@ -74,7 +70,6 @@ impl ProfileEngine {
                 recovery: ProfileRecovery::new(stream_selector, generation, committed),
                 catchup_boundary: None,
                 last_loss: 0,
-                pending: None,
             },
         );
     }
@@ -128,7 +123,32 @@ impl ProfileEngine {
     pub fn pending(&self, stream_selector: &[u8]) -> Option<&ProfileCheckpoint> {
         self.streams
             .get(stream_selector)
-            .and_then(|s| s.pending.as_ref())
+            .and_then(|s| s.recovery.pending_checkpoint())
+    }
+
+    pub(super) fn pending_is_snapshot(&self, stream_selector: &[u8]) -> bool {
+        self.streams
+            .get(stream_selector)
+            .is_some_and(|s| s.recovery.pending_is_snapshot())
+    }
+
+    /// True scoped provider loss/rebase. Clears pending work, snapshot gate,
+    /// and B, invalidating the active cursor without rewriting external durable
+    /// evidence. Invalid/stale updates
+    /// leave everything untouched. Local overflow/retention/revocation are NOT
+    /// provider loss; the wire adapter separately retires affected handles.
+    pub fn provider_loss(
+        &mut self,
+        stream_selector: &[u8],
+        next_generation: u64,
+    ) -> Result<(), ProviderError> {
+        let state = self
+            .streams
+            .get_mut(stream_selector)
+            .ok_or(ProviderError::UnknownStream)?;
+        state.recovery.provider_loss(next_generation)?;
+        state.catchup_boundary = None;
+        Ok(())
     }
 
     /// Whether the stream requires a snapshot before batch commits resume.
@@ -172,6 +192,9 @@ impl ProfileEngine {
             }
             | ProfileInput::ContinuationExpired {
                 stream_selector, ..
+            }
+            | ProfileInput::ProviderLoss {
+                stream_selector, ..
             } => stream_selector,
         }
     }
@@ -180,9 +203,9 @@ impl ProfileEngine {
     ///
     /// Untracked selectors return no actions with no mutation. Otherwise
     /// delegates to the stream coordinator without changing its semantics
-    /// and mirrors stop-and-wait tracking: a commit action records the
-    /// pending offer; gap, continuity-loss, and matched continuation-expiry
-    /// reports clear it.
+    /// and exposes the coordinator's stop-and-wait offer directly. Gap,
+    /// continuity-loss, matched continuation-expiry and provider-loss inputs
+    /// invalidate old round state. Snapshot fallback forgets the old B.
     pub fn observe(&mut self, input: ProfileInput) -> Vec<ProfileAction> {
         let key = Self::selector_of(&input).to_vec();
         let state = match self.streams.get_mut(&key) {
@@ -195,11 +218,19 @@ impl ProfileEngine {
                 | ProfileInput::ContinuityLost { .. }
                 | ProfileInput::ContinuationExpired { .. }
         );
+        let before = state.recovery.generation();
         let actions = state.recovery.observe(input);
-        if let Some(ProfileAction::CommitCheckpoint { checkpoint }) = actions.first() {
-            state.pending = Some(checkpoint.clone());
-        } else if is_gap_like && !actions.is_empty() {
-            state.pending = None;
+        if (is_gap_like && !actions.is_empty())
+            || before != state.recovery.generation()
+            || (state.recovery.pending_is_snapshot()
+                && matches!(
+                    actions.first(),
+                    Some(ProfileAction::CommitCheckpoint { .. })
+                ))
+        {
+            // A new round requires a fresh subscribed B. Snapshot fallback
+            // exits the old replay gate; it never completes at that old B.
+            state.catchup_boundary = None;
         }
         actions
     }
@@ -207,36 +238,22 @@ impl ProfileEngine {
     /// Confirms durable persistence of a previously offered checkpoint.
     ///
     /// Untracked selectors return no actions with no mutation. Otherwise
-    /// delegates to the stream coordinator. An empty result (advance or
-    /// idempotent duplicate) clears the mirrored pending offer only when
-    /// the confirmed checkpoint matches it, preserving a different pending
-    /// offer after an older duplicate confirmation; a recovery-needed or
-    /// snapshot-required result leaves it unchanged.
-    /// A generation advance also forgets the recorded catch-up boundary,
-    /// since the new generation carries its own synchronization cut.
+    /// delegates to the stream coordinator, the sole owner of pending state.
+    /// Confirmation never changes G or establishes a catch-up boundary.
     pub fn confirm_persisted(&mut self, checkpoint: &ProfileCheckpoint) -> Vec<ProfileAction> {
         let state = match self.streams.get_mut(&checkpoint.stream_selector) {
             Some(state) => state,
             None => return vec![],
         };
-        let before = state.recovery.generation();
-        let actions = state.recovery.confirm_persisted(checkpoint);
-        if actions.is_empty() {
-            if state.pending.as_ref() == Some(checkpoint) {
-                state.pending = None;
-            }
-            if state.recovery.generation() != before {
-                state.catchup_boundary = None;
-            }
-        }
-        actions
+        state.recovery.confirm_persisted(checkpoint)
     }
 
     /// Read-only pre-validation for [`Self::confirm_persisted`].
     ///
     /// Returns true only when [`Self::confirm_persisted`] would advance
-    /// committed progress. False for untracked selectors, idempotent
-    /// duplicates, snapshot-gated or rejected checkpoints. No mutation.
+    /// committed progress or clear the snapshot gate for an exact pending
+    /// snapshot. False for untracked selectors, idempotent duplicates and
+    /// rejected checkpoints. No mutation.
     pub fn can_confirm(&self, checkpoint: &ProfileCheckpoint) -> bool {
         match self.streams.get(&checkpoint.stream_selector) {
             Some(state) => state.recovery.can_confirm(checkpoint),
@@ -294,9 +311,9 @@ impl ProfileEngine {
     /// Records the subscribed catch-up boundary from the subscribe response.
     ///
     /// The boundary is fixed at subscribe accept (SYN-URP-023) and MUST be
-    /// non-empty; an empty boundary returns a recovery-needed action and
+    /// non-empty and at most 4096 bytes; an invalid boundary returns a recovery-needed action and
     /// leaves state unchanged. When a boundary was already recorded from an
-    /// earlier page, a different subscribed boundary returns recovery-needed
+    /// earlier subscribe, a different subscribed boundary returns recovery-needed
     /// without replacing it. Untracked selectors return no actions.
     pub fn set_subscribed_boundary(
         &mut self,
@@ -307,7 +324,13 @@ impl ProfileEngine {
             Some(state) => state,
             None => return vec![],
         };
-        if boundary.is_empty() {
+        if state.recovery.snapshot_pending() {
+            return vec![ProfileAction::SnapshotRequired {
+                stream_selector: state.recovery.stream_selector().to_vec(),
+                committed: state.recovery.committed().to_vec(),
+            }];
+        }
+        if boundary.is_empty() || boundary.len() > 4096 {
             return vec![ProfileAction::RecoveryNeeded {
                 stream_selector: state.recovery.stream_selector().to_vec(),
                 committed: state.recovery.committed().to_vec(),
@@ -328,9 +351,8 @@ impl ProfileEngine {
 
     /// Tracks the fixed catch-up boundary across replay pages.
     ///
-    /// The first page records its boundary and returns no actions when no
-    /// subscribed boundary was recorded. Later pages with the same boundary
-    /// return no actions. An empty or different boundary returns a
+    /// Only pages matching a previously recorded nonempty subscribed B
+    /// return no actions. A missing, empty or different boundary returns a
     /// recovery-needed action and leaves the recorded boundary unchanged.
     /// Untracked selectors return no actions.
     /// The caller clears the boundary with
@@ -344,6 +366,12 @@ impl ProfileEngine {
             Some(state) => state,
             None => return vec![],
         };
+        if state.recovery.snapshot_pending() {
+            return vec![ProfileAction::SnapshotRequired {
+                stream_selector: state.recovery.stream_selector().to_vec(),
+                committed: state.recovery.committed().to_vec(),
+            }];
+        }
         if page.catchup_boundary.is_empty() {
             return vec![ProfileAction::RecoveryNeeded {
                 stream_selector: state.recovery.stream_selector().to_vec(),
@@ -351,12 +379,8 @@ impl ProfileEngine {
             }];
         }
         match &state.catchup_boundary {
-            None => {
-                state.catchup_boundary = Some(page.catchup_boundary.clone());
-                vec![]
-            }
             Some(boundary) if *boundary == page.catchup_boundary => vec![],
-            Some(_) => vec![ProfileAction::RecoveryNeeded {
+            _ => vec![ProfileAction::RecoveryNeeded {
                 stream_selector: state.recovery.stream_selector().to_vec(),
                 committed: state.recovery.committed().to_vec(),
             }],
@@ -385,6 +409,12 @@ impl ProfileEngine {
             Some(state) => state,
             None => return vec![],
         };
+        if state.recovery.snapshot_pending() {
+            return vec![ProfileAction::SnapshotRequired {
+                stream_selector: state.recovery.stream_selector().to_vec(),
+                committed: state.recovery.committed().to_vec(),
+            }];
+        }
         if completion_boundary.is_empty() {
             return vec![ProfileAction::RecoveryNeeded {
                 stream_selector: state.recovery.stream_selector().to_vec(),
@@ -434,11 +464,47 @@ mod tests {
     }
 
     #[test]
+    fn provider_loss_input_clears_boundary_and_pending_but_local_loss_preserves_g() {
+        let mut engine = ProfileEngine::new();
+        engine.insert_stream(selector(), 7, b"C".to_vec());
+        let old = batch(b"C", b"next");
+        engine.observe(ProfileInput::BatchValidated {
+            checkpoint: old.clone(),
+        });
+        engine.set_subscribed_boundary(&selector(), b"B".to_vec());
+        assert_eq!(
+            engine.provider_loss(&selector(), 7),
+            Err(ProviderError::StaleCheckpoint)
+        );
+        assert_eq!(engine.pending(&selector()), Some(&old));
+        assert_eq!(engine.catchup_boundary(&selector()), Some(b"B".as_slice()));
+        engine.observe(ProfileInput::ProviderLoss {
+            stream_selector: selector(),
+            next_generation: 8,
+        });
+        assert_eq!(engine.generation(&selector()), Some(8));
+        assert_eq!(engine.catchup_boundary(&selector()), None);
+        assert_eq!(engine.pending(&selector()), None);
+        assert!(!engine.confirm_persisted(&old).is_empty());
+        engine.set_subscribed_boundary(&selector(), b"new-B".to_vec());
+        engine.poll_loss(&selector(), 1);
+        assert_eq!(engine.generation(&selector()), Some(8));
+        assert_eq!(engine.catchup_boundary(&selector()), None);
+        assert_eq!(engine.committed(&selector()), Some(b"".as_slice()));
+    }
+
+    #[test]
     fn boundary_fixed_across_pages() {
         let mut engine = ProfileEngine::new();
         engine.insert_stream(selector(), 7, b"cursor-40".to_vec());
 
         let first = page_with_boundary(b"boundary-100");
+        let missing = engine.observe_replay_page(&selector(), &first);
+        assert!(matches!(missing[0], ProfileAction::RecoveryNeeded { .. }));
+        assert_eq!(engine.catchup_boundary(&selector()), None);
+        assert!(engine
+            .set_subscribed_boundary(&selector(), b"boundary-100".to_vec())
+            .is_empty());
         assert!(engine.observe_replay_page(&selector(), &first).is_empty());
         assert_eq!(
             engine.catchup_boundary(&selector()),
@@ -464,11 +530,36 @@ mod tests {
 
         engine.clear_catchup_boundary(&selector());
         assert_eq!(engine.catchup_boundary(&selector()), None);
+        assert!(!engine.observe_replay_page(&selector(), &moved).is_empty());
+        assert!(engine
+            .set_subscribed_boundary(&selector(), b"boundary-101".to_vec())
+            .is_empty());
         assert!(engine.observe_replay_page(&selector(), &moved).is_empty());
         assert_eq!(
             engine.catchup_boundary(&selector()),
             Some(b"boundary-101".as_slice())
         );
+    }
+
+    #[test]
+    fn snapshot_fallback_cannot_reopen_the_old_replay_gate() {
+        let mut engine = ProfileEngine::new();
+        engine.insert_stream(selector(), 7, b"C".to_vec());
+        engine.set_subscribed_boundary(&selector(), b"B".to_vec());
+        engine.observe(ProfileInput::ContinuationExpired {
+            stream_selector: selector(),
+            committed: b"C".to_vec(),
+        });
+        assert_eq!(engine.catchup_boundary(&selector()), None);
+        let actions = [
+            engine.set_subscribed_boundary(&selector(), b"B".to_vec()),
+            engine.observe_replay_page(&selector(), &page_with_boundary(b"B")),
+            engine.observe_completion_boundary(&selector(), b"B"),
+        ];
+        for action in actions {
+            assert!(matches!(action[0], ProfileAction::SnapshotRequired { .. }));
+        }
+        assert_eq!(engine.catchup_boundary(&selector()), None);
     }
 
     #[test]
@@ -619,7 +710,7 @@ mod tests {
 
         let snap = ProfileCheckpoint {
             stream_selector: selector(),
-            generation: 8,
+            generation: 7,
             base_cursor: b"boundary-00".to_vec(),
             result_cursor: b"boundary-100".to_vec(),
         };
@@ -634,7 +725,7 @@ mod tests {
         assert!(engine.confirm_persisted(&snap).is_empty());
         assert_eq!(engine.pending(&selector()), None);
         assert!(!engine.snapshot_pending(&selector()));
-        assert_eq!(engine.generation(&selector()), Some(8));
+        assert_eq!(engine.generation(&selector()), Some(7));
         assert_eq!(
             engine.committed(&selector()),
             Some(b"boundary-100".as_slice())

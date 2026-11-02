@@ -1,0 +1,65 @@
+# SC1 v1 canonical context and prologue vectors.
+# Public encoding examples only. These are not Noise ciphertext vectors,
+# fixed ephemeral keys, or independent interoperability evidence.
+format_version: "1.0"
+profile: SNTR-SC1-WSS-V1
+status: accepted
+source: RFC 0007 §11.4 and specifications/transports/noise-bindings.md §2
+vectors:
+  - id: SC1-CONTEXT-01
+    mode: 1
+    carrier: 1
+    server_key_id: 0
+    epoch: 0
+    handle_hex: "0000000000000000"
+    scope: "a"
+    context_hex: "73796e7472612e7363312e763101010000000000000000000000000000000000000000000161"
+    prologue_hex: "73796e7472612e7363312e763101010000000000000000000000000000000000000000000161"
+    context_bytes: 38
+    m1_bytes: 86
+  - id: SC1-CONTEXT-02
+    mode: 1
+    carrier: 3
+    server_key_id: 16909060
+    epoch: 0
+    handle_hex: "0000000000000000"
+    scope: "example.service"
+    context_hex: "73796e7472612e7363312e763101030102030400000000000000000000000000000000000f6578616d706c652e73657276696365"
+    prologue_hex: "73796e7472612e7363312e763101030102030400000000000000000000000000000000000f6578616d706c652e73657276696365"
+    context_bytes: 52
+    m1_bytes: 100
+  - id: SC1-CONTEXT-03
+    mode: 2
+    carrier: 2
+    server_key_id: 16909060
+    epoch: 1
+    handle_hex: "0102030405060708"
+    scope: "example.service"
+    context_hex: "73796e7472612e7363312e763102020102030400000000000000010102030405060708000f6578616d706c652e73657276696365"
+    prologue_hex: "73796e7472612e7363312e763102020102030400000000000000010102030405060708000f6578616d706c652e73657276696365"
+    context_bytes: 52
+    m1_bytes: 100
+  - id: SC1-CONTEXT-04
+    mode: 2
+    carrier: 3
+    server_key_id: 4294967295
+    epoch: 18446744073709551615
+    handle_hex: "0807060504030201"
+    scope: "é"
+    context_hex: "73796e7472612e7363312e76310203ffffffffffffffffffffffff08070605040302010002c3a9"
+    prologue_hex: "73796e7472612e7363312e76310203ffffffffffffffffffffffff08070605040302010002c3a9"
+    context_bytes: 39
+    m1_bytes: 87
+negative_recipes:
+  - { id: SC1-N01, base: SC1-CONTEXT-01, mutation: legacy-go-domain, expected: reject-before-noise }
+  - { id: SC1-N02, base: SC1-CONTEXT-01, mutation: legacy-rust-magic, expected: reject-before-noise }
+  - { id: SC1-N03, base: SC1-CONTEXT-01, mutation: zero-mode, expected: reject-before-noise }
+  - { id: SC1-N04, base: SC1-CONTEXT-01, mutation: unknown-carrier, expected: reject-before-noise }
+  - { id: SC1-N05, base: SC1-CONTEXT-01, mutation: bootstrap-epoch, expected: reject-before-noise }
+  - { id: SC1-N06, base: SC1-CONTEXT-03, mutation: returning-handle, expected: reject-before-noise }
+  - { id: SC1-N07, base: SC1-CONTEXT-01, mutation: empty-scope, expected: reject-before-noise }
+  - { id: SC1-N08, base: SC1-CONTEXT-01, mutation: oversize-scope, expected: reject-before-noise }
+  - { id: SC1-N09, base: SC1-CONTEXT-01, mutation: truncated, expected: reject-before-noise }
+  - { id: SC1-N10, base: SC1-CONTEXT-01, mutation: trailing, expected: reject-before-noise }
+  - { id: SC1-N11, base: SC1-CONTEXT-01, mutation: invalid-utf8, expected: reject-before-noise }
+  - { id: SC1-N12, base: SC1-CONTEXT-04, mutation: scope-byte-length, expected: reject-before-noise }

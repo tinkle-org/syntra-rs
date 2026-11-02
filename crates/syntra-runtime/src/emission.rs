@@ -35,7 +35,7 @@ pub(crate) struct QueuedRpc {
     // The original Vec allocation is an opaque, connection-local queue ticket.
     // It stays alive in the byte channel (or pump) until prepare_outbound takes
     // ownership. No dereference is performed. A stale live allocation cannot
-    // alias a newer queue item even if its wire request ID has been reused.
+    // alias a different queue item. Wire IDs are never reused.
     phase: EmissionPhase,
     failed: oneshot::Sender<SyntraError>,
 }
@@ -48,8 +48,8 @@ enum EmissionPhase {
 
 pub(crate) type Emissions = HashMap<u64, QueuedRpc>;
 
-/// Owns both pending and emission registration. Identity checks prevent an old
-/// waiter dropping after result delivery from abandoning a newer use of its ID.
+/// Owns both pending and emission registration. Identity checks also protect
+/// internal callers from an unrelated/stale guard removing a registration.
 pub(crate) struct PendingGuard<'a> {
     shared: &'a Shared,
     id: u64,
@@ -67,13 +67,12 @@ impl PendingGuard<'_> {
         }
     }
 
-    /// Select a local terminal outcome atomically against handoff/results.
-    /// False means another terminal outcome has already selected its channel.
+    /// Abandon a dropped future atomically against handoff/results.
     pub(crate) fn terminate(&self) -> bool {
-        self.terminate_with(|| {})
+        self.fail(SyntraError::Cancelled("RPC future dropped".into()))
     }
 
-    pub(crate) fn terminate_with(&self, selected: impl FnOnce()) -> bool {
+    pub(crate) fn fail(&self, candidate: SyntraError) -> bool {
         let mut entries = self.shared.emissions.lock().unwrap();
         if !entries
             .get(&self.id)
@@ -81,9 +80,8 @@ impl PendingGuard<'_> {
         {
             return false;
         }
-        selected();
-        entries.remove(&self.id);
-        self.shared.pending.abandon(self.id);
+        let entry = entries.remove(&self.id).unwrap();
+        self.shared.fail_entry(self.id, entry, candidate);
         true
     }
 }
@@ -137,26 +135,49 @@ impl Shared {
 
     pub(crate) fn complete_rpc(&self, id: u64, result: RpcResult) {
         let mut entries = self.emissions.lock().unwrap();
-        self.pending.complete(id, result);
-        entries.remove(&id);
+        if let Some(entry) = entries.remove(&id) {
+            if now() >= entry.state.deadline {
+                self.fail_entry(
+                    id,
+                    entry,
+                    SyntraError::DeadlineExceeded("RPC expired".into()),
+                );
+            } else {
+                self.pending.complete(id, result);
+            }
+        }
     }
 
-    // Explicit cancellation before handoff ends locally. The caller still
-    // emits its best-effort control frame; emitting RPCs remain advisory.
-    pub(crate) fn cancel_queued_rpc(&self, id: u64) -> bool {
+    fn fail_entry(&self, id: u64, entry: QueuedRpc, candidate: SyntraError) {
+        let selected = if now() >= entry.state.deadline {
+            SyntraError::DeadlineExceeded("RPC expired".into())
+        } else {
+            candidate
+        };
+        let _ = entry.failed.send(selected);
+        self.pending.abandon(id);
+    }
+
+    pub(crate) fn fail_rpc(&self, id: u64, candidate: SyntraError) -> bool {
         let mut entries = self.emissions.lock().unwrap();
-        if entries
-            .get(&id)
-            .is_some_and(|entry| !matches!(entry.phase, EmissionPhase::Emitting))
-        {
-            let entry = entries.remove(&id).unwrap();
-            let _ = entry
-                .failed
-                .send(SyntraError::Cancelled("queued RPC cancelled".into()));
-            self.pending.abandon(id);
+        if let Some(entry) = entries.remove(&id) {
+            self.fail_entry(id, entry, candidate);
             return true;
         }
         false
+    }
+
+    pub(crate) fn fail_all_rpcs(&self) {
+        let mut entries = self.emissions.lock().unwrap();
+        for (id, entry) in entries.drain() {
+            self.fail_entry(
+                id,
+                entry,
+                SyntraError::Unavailable("connection lost (outcome unknown)".into()),
+            );
+        }
+        // Defensive cleanup for internal raw PendingTable users.
+        self.pending.drain_transport_lost();
     }
 
     pub(crate) fn prepare_outbound(&self, bytes: Vec<u8>) -> Option<Vec<u8>> {
@@ -179,18 +200,17 @@ impl Shared {
             .deadline
             .saturating_duration_since(now())
             .as_millis();
-        let failure = if entry.state.cancel.is_cancelled() {
-            Some(SyntraError::Cancelled("queued RPC cancelled".into()))
-        } else if remaining == 0 {
+        let failure = if remaining == 0 {
             Some(SyntraError::DeadlineExceeded("queued RPC expired".into()))
+        } else if entry.state.cancel.is_cancelled() {
+            Some(SyntraError::Cancelled("queued RPC cancelled".into()))
         } else {
             None
         };
         if let Some(failure) = failure {
             drop(_cancel);
             let entry = entries.remove(&frame.request_id).unwrap();
-            let _ = entry.failed.send(failure);
-            self.pending.abandon(frame.request_id);
+            self.fail_entry(frame.request_id, entry, failure);
             return None;
         }
         request.timeout_ms = remaining.min(u32::MAX as u128) as u32;
@@ -198,10 +218,13 @@ impl Shared {
         if prepared.len() > syntra_core::MAX_FRAME_BYTES {
             drop(_cancel);
             let entry = entries.remove(&frame.request_id).unwrap();
-            let _ = entry.failed.send(SyntraError::ResourceExhausted(
-                "request exceeds maximum envelope size at handoff".into(),
-            ));
-            self.pending.abandon(frame.request_id);
+            self.fail_entry(
+                frame.request_id,
+                entry,
+                SyntraError::ResourceExhausted(
+                    "request exceeds maximum envelope size at handoff".into(),
+                ),
+            );
             return None;
         }
         // This is the linearization point, still under both gates. Bytes are

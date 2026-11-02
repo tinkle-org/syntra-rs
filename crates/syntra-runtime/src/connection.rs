@@ -9,9 +9,8 @@
 //! - every effective deadline is computed as an absolute `Instant`
 //!   BEFORE queue admission, so queueing can never silently consume the
 //!   caller's budget;
-//! - completion wins races: all `select!` sites are `biased` with the
-//!   completion branch first (cancel-vs-deadline ties prefer `CANCELLED`;
-//!   open tie-break B10 is recorded, not invented);
+//! - terminal selection is serialized and checks the absolute deadline before
+//!   every newly observed candidate; already-selected outcomes are immutable;
 //! - handshake timeout explicitly closes the core
 //!   (`fail_handshake_and_close`);
 //! - pending entries are removed on validation failure, send failure,
@@ -60,6 +59,43 @@ impl Default for ConnectionConfig {
             writer_capacity: 256,
         }
     }
+}
+
+impl ConnectionConfig {
+    /// Persistent-profile capacity and finite timer bounds. Reduced capacities
+    /// below the protocol's 16-way floor are not a supported production mode.
+    pub fn validate(&self) -> Result<(), SyntraError> {
+        if !(16..=1024).contains(&self.max_outstanding)
+            || !(1..=1024).contains(&self.writer_capacity)
+            || !(1..=1024).contains(&self.notification_capacity)
+            || [
+                self.default_timeout,
+                self.max_rpc_timeout,
+                self.handshake_timeout,
+            ]
+            .iter()
+            .any(|value| value.is_zero() || *value > Duration::from_secs(86_400))
+        {
+            return Err(SyntraError::Protocol {
+                code: syntra_core::ErrorCode::InvalidArgument,
+                message: "invalid connection limits (RPC capacity 16..1024, queues 1..1024, positive timers at most 24h)".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+pub const DEFAULT_CLOSE_GRACE: Duration = Duration::from_secs(5);
+pub const MAX_CLOSE_GRACE: Duration = Duration::from_secs(30);
+
+pub fn validate_close_grace(grace: Duration) -> Result<(), SyntraError> {
+    if grace > MAX_CLOSE_GRACE {
+        return Err(SyntraError::Protocol {
+            code: syntra_core::ErrorCode::InvalidArgument,
+            message: "close grace must be 0..30 seconds".into(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -487,9 +523,14 @@ pub(crate) struct Shared {
     pub pending: PendingTable,
     /// Serializes RPC handoff with terminal selection and pending cleanup.
     pub(crate) emissions: StdMutex<crate::emission::Emissions>,
+    /// Allocation through FIFO enqueue is one ordered admission operation.
+    pub(crate) rpc_admission: AsyncMutex<()>,
     pub ids: RequestIdAllocator,
     pub writer: mpsc::Sender<Vec<u8>>,
     pub notif_tx: mpsc::Sender<Bytes>,
+    /// One immutable connection-owned recovery notification route. A closed
+    /// attachment is never replaced by another generation on this connection.
+    pub(crate) recovery_inbox: StdMutex<Option<Arc<crate::recovery::wire_client::RecoveryInbox>>>,
     pub handshake_tx: AsyncMutex<Option<oneshot::Sender<Result<HandshakeDone, SyntraError>>>>,
     pub config: ConnectionConfig,
     pub closed: AtomicBool,
@@ -540,9 +581,11 @@ impl Shared {
             proposed_max,
             pending: PendingTable::new(config.max_outstanding),
             emissions: StdMutex::new(crate::emission::Emissions::new()),
+            rpc_admission: AsyncMutex::new(()),
             ids: RequestIdAllocator::new(),
             writer,
             notif_tx,
+            recovery_inbox: StdMutex::new(None),
             handshake_tx: AsyncMutex::new(None),
             config,
             closed: AtomicBool::new(false),
@@ -751,33 +794,15 @@ impl Connection {
             if drained() && self.shared.writer.capacity() == self.shared.writer.max_capacity() {
                 return;
             }
-            if Instant::now() >= deadline {
+            if crate::emission::now() >= deadline {
                 return;
             }
             tokio::select! {
                 biased;
                 _ = closed.changed() => return,
-                _ = sleep_until(deadline.min(Instant::now() + Duration::from_millis(1))) => {},
+                _ = crate::emission::sleep_until(deadline.min(crate::emission::now() + Duration::from_millis(1))) => {},
             }
         }
-    }
-
-    pub(crate) async fn send_worker_result(
-        &self,
-        bytes: Vec<u8>,
-        complete: impl FnOnce(),
-    ) -> Result<(), SyntraError> {
-        let permit = self.reserve_writer().await?;
-        let _state = self.shared.state.read().await;
-        if self.is_closed()
-            || self.writer_is_fenced()
-            || self.shared.principal_withdrawn.load(Ordering::Acquire)
-        {
-            return Err(SyntraError::Closed("connection closed".to_string()));
-        }
-        permit.send(bytes);
-        complete();
-        Ok(())
     }
 
     async fn finish_close(&self, failure: SyntraError, abrupt: bool, handshake_only: bool) {
@@ -823,11 +848,10 @@ impl Connection {
         if next == ConnectionState::Closing {
             *state = ConnectionState::Closed;
         }
-        {
-            let mut emissions = self.shared.emissions.lock().unwrap();
-            self.shared.closed.store(true, Ordering::Release);
-            self.shared.pending.drain_transport_lost();
-            emissions.clear();
+        self.shared.closed.store(true, Ordering::Release);
+        self.shared.fail_all_rpcs();
+        if let Some(inbox) = self.shared.recovery_inbox.lock().unwrap().as_ref() {
+            inbox.close();
         }
         if let Some(tx) = waiter.take() {
             let _ = tx.send(Err(failure));

@@ -187,9 +187,8 @@ fn duplicate_oneof_rejected() {
 
 #[test]
 fn unknown_body_only_is_unimplemented() {
-    // Version only + unknown field 90 (length-delimited "x"): no known
-    // body, but unknown content -> UNIMPLEMENTED (not empty-body).
-    let bytes = vec![0x08, 0x01, 0xD2, 0x05, 0x01, b'x'];
+    // Version only + future body field 18 (length-delimited "x").
+    let bytes = vec![0x08, 0x01, 0x92, 0x01, 0x01, b'x'];
     let err = decode_frame(&bytes, connected()).unwrap_err();
     assert_eq!(err.code(), ErrorCode::Unimplemented);
 }
@@ -379,12 +378,6 @@ fn exact_envelope_boundary_round_trips_for_application_bodies() {
             outcome: Some(syntra_core::proto::rpc_result::Outcome::Payload(vec![
                 0; MAX_FRAME_BYTES
             ])),
-        }),
-        Body::Result(RpcResult {
-            outcome: Some(syntra_core::proto::rpc_result::Outcome::Error(RpcError {
-                code: ErrorCode::Internal.as_i32(),
-                message: "x".repeat(MAX_FRAME_BYTES),
-            })),
         }),
         Body::Notification(Notification {
             payload: vec![0; MAX_FRAME_BYTES],

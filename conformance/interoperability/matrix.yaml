@@ -1,0 +1,38 @@
+# Interop pairs (machine-readable). Execute applicable rows with logs; a Core
+# claim may name a single transport. The two-transport row is a separate proof
+# goal, not a requirement to implement an unclaimed profile. Profiles reference
+# conformance/profiles.yaml; vectors reference conformance/test-vectors/.
+format_version: "1.0"
+pairs:
+  - id: INTEROP-CORE-2T
+    name: "shared logical RPC outcomes, two transports, one implementation"
+    requirement: [SNTR-WIRE-901]
+    required_for: "two-transport independence proof, not a single-transport Core claim"
+    legs:
+      - { transport: SNTR-TLS-TCP-V1, vectors: ["tcp/V1", "tcp/V10", "tcp/V11"] }
+      - { transport: SNTR-WSS-H1-V1, vectors: ["websocket/VEC-WS-001", "websocket/VEC-WS-003"] }
+    asserts: ["equal decoded RPC requests and outcomes across legs, opaque bytes preserved", "only adapter changes; handshake and events follow each transport binding", "WS leg rejects the concrete malformed prefixed inputs (VEC-WS-009)"]
+
+  - id: INTEROP-CORE-2I
+    name: "two independent implementations, one secure transport"
+    requirement: [SNTR-TCP-901, SNTR-TLS-901, SNTR-WS-901, SNTR-HTTPS-901, SNTR-WSS-901]
+    notes: "WSS pairing shown; for a different claimed secure profile, use its own vectors, handshake/event assertions, and applicable requirement IDs in both role assignments. A Core claim need not implement WSS in addition to its selected secure profile."
+    legs:
+      - { role_assignment: "A initiates, B hosts", transport: SNTR-WSS-H1-V1, vectors: ["websocket/VEC-WS-001", "websocket/VEC-WS-002", "websocket/VEC-WS-003", "websocket/VEC-WS-007"] }
+      - { role_assignment: "B initiates, A hosts", transport: SNTR-WSS-H1-V1, vectors: ["websocket/VEC-WS-001", "websocket/VEC-WS-002", "websocket/VEC-WS-003", "websocket/VEC-WS-007"] }
+    asserts: ["independent codebases; TLS validation before Upgrade and Syntra bytes", "Upgrade then hello/ready in binary messages with no TCP prefix, both role assignments", "second hello in a separate binary message closes with 1002 (VEC-WS-007), both role assignments", "echo round-trips both role assignments (VEC-WS-003)"]
+
+  - id: INTEROP-HTTP-H1-H2
+    name: "identical logical envelopes over HTTPS/H1 and HTTPS/H2"
+    requirement: [SNTR-HTTP-901, SNTR-HTTPS-901]
+    legs:
+      - { transport: SNTR-HTTPS-H1-V1, vectors: ["http/V-HTTP-REQ-01", "http/V-HTTP-RES-OK-01"] }
+      - { transport: SNTR-HTTPS-H2-V1, vectors: ["http/V-HTTP-REQ-01", "http/V-HTTP-RES-OK-01"] }
+    asserts: ["equal decoded RPC requests and outcomes, not byte-identical protobuf encoding", "per-exchange header negotiation/authentication; no hello/ready/Notification frames", "correlation by request_id on both; no cross-stream completion order assumed"]
+
+  - id: INTEROP-EVENT-ABSENT
+    name: "mandatory-only host against full peer"
+    requirement: [SNTR-CAP-003]
+    legs:
+      - { mandatory_only_host: true, full_peer: true, transport: SNTR-WSS-H1-V1 }
+    asserts: ["subscription refused with UNIMPLEMENTED (UNSUPPORTED verdict)", "mandatory RPC interop unaffected"]

@@ -4,7 +4,9 @@
 //! duplicate whose result no longer equals the committed cursor is
 //! indistinguishable from a gap and returns `RecoveryNeeded`. The
 //! application holds a bounded recent-result cache keyed by checkpoint
-//! bytes to answer such duplicates without re-applying effects: a hit
+//! bytes to answer such duplicates without re-applying effects. The driver
+//! MUST first validate the current selector/scope, G, authorization and bounds,
+//! and MUST NOT bypass a snapshot gate. The cache is not authority: a hit
 //! returns the cached result without touching persistence or the
 //! coordinator, a miss goes through the normal validate/offer/persist/
 //! confirm path. The cache is strictly bounded: insertion beyond capacity

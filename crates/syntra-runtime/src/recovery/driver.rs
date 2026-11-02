@@ -1,14 +1,15 @@
-//! Recovery drivers: bind [`ProfileEngine`](super::engine::ProfileEngine) to live sessions.
+//! Non-wire recovery helpers around [`ProfileEngine`].
 //!
 //! The coordinator is transport-agnostic and never performs calls, never
 //! persists, and never delivers. Drivers close that gap without widening
-//! it: they carry the connection/principal context for every hook, enforce
-//! the [`RecoveryAuthorizer`](super::profile::RecoveryAuthorizer) at
-//! subscribe/replay/snapshot/confirm, persist through a
-//! [`DurableStore`](super::store::DurableStore) with durable
+//! it: they carry the connection/principal context, check configured
+//! [`RecoveryAuthorizer`] hooks for
+//! initiator batch validation/confirm and host subscribe/replay/delivery,
+//! persist through a
+//! [`DurableStore`] with durable
 //! position/effects atomicity, suppress duplicate re-application through a
-//! bounded [`DuplicateCache`](super::cache::DuplicateCache), stage snapshots
-//! through [`StagedSnapshot`](super::snapshot::StagedSnapshot), and route
+//! bounded [`DuplicateCache`], stage snapshots
+//! through [`StagedSnapshot`], and route
 //! batches to exactly one subscription handle (directed delivery). There is
 //! no broadcast path: a batch for handle A is never visible to handle B.
 //!
@@ -22,6 +23,12 @@
 //! Persistence failure is reported by not confirming: the store error is
 //! returned to the caller and the engine is untouched, so committed
 //! progress never advances on a failed write.
+//!
+//! These helpers do not negotiate, fence wire rounds, or track peer acks. The
+//! wire adapter owns fresh H/B per round, termination, and validated responses.
+//! `confirm` below records LOCAL durable progress, not peer acknowledgement.
+//! Snapshot provider authorization and binding validation remain caller-owned;
+//! staging accepts already provider-trusted descriptors, never raw peer authority.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,17 +47,29 @@ use crate::session::Principal;
 ///
 /// `Store` preserves the underlying [`StoreError`] without carrying
 /// checkpoint bytes; `Unauthorized` carries the denying [`ProviderError`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InitiatorError {
     /// Durable store failure; retry from the last persisted position.
+    #[error("durable recovery store failure: {0:?}")]
     Store(StoreError),
     /// Application authorizer denied the hook.
+    #[error("recovery validation denied: {0}")]
     Unauthorized(ProviderError),
 }
 
 impl From<StoreError> for InitiatorError {
     fn from(e: StoreError) -> Self {
         Self::Store(e)
+    }
+}
+
+impl InitiatorError {
+    /// Typed API-boundary status without exposing checkpoint/effects bytes.
+    pub fn code(&self) -> syntra_core::ErrorCode {
+        match self {
+            Self::Store(e) => e.code(),
+            Self::Unauthorized(e) => e.code(),
+        }
     }
 }
 
@@ -157,7 +176,7 @@ impl<S: DurableStore> InitiatorDriver<S> {
         }
     }
 
-    /// Install an application authorizer checked at confirm time.
+    /// Install an application authorizer checked before cache/offer and confirm.
     pub fn with_authorizer(mut self, authorizer: Arc<dyn RecoveryAuthorizer>) -> Self {
         self.authorizer = Some(authorizer);
         self
@@ -199,21 +218,61 @@ impl<S: DurableStore> InitiatorDriver<S> {
             );
         } else {
             self.engine
-                .insert_stream(stream_selector, generation, committed);
+                .insert_stream(stream_selector.clone(), generation, committed);
         }
+        // Re-establishment is a new local scope/round, never inherited cache
+        // authority or inherited snapshot pages.
+        self.cache.clear();
+        self.staged.remove(&stream_selector);
         Ok(())
     }
 
-    /// Observe a validated batch. Duplicates answered from the bounded
-    /// cache return no actions without re-applying effects or touching the
-    /// coordinator; all other inputs delegate to the engine.
+    /// Compatibility helper. Denial emits recovery-needed and cannot hit the
+    /// cache. Use [`Self::try_on_batch_validated`] to retain the typed denial.
     pub fn on_batch_validated(&mut self, checkpoint: ProfileCheckpoint) -> Vec<ProfileAction> {
+        match self.try_on_batch_validated(checkpoint.clone()) {
+            Ok(actions) => actions,
+            Err(_) => vec![ProfileAction::RecoveryNeeded {
+                stream_selector: checkpoint.stream_selector.clone(),
+                committed: self
+                    .engine
+                    .committed(&checkpoint.stream_selector)
+                    .unwrap_or_default()
+                    .to_vec(),
+            }],
+        }
+    }
+
+    /// Validate selector/current G and the configured authorization/validation
+    /// hook BEFORE duplicate lookup. Cache hits suppress only reapplication,
+    /// never a snapshot gate or pending snapshot source classification.
+    pub fn try_on_batch_validated(
+        &mut self,
+        checkpoint: ProfileCheckpoint,
+    ) -> Result<Vec<ProfileAction>, InitiatorError> {
+        if self.engine.generation(&checkpoint.stream_selector) != Some(checkpoint.generation) {
+            return Ok(self
+                .engine
+                .observe(ProfileInput::BatchValidated { checkpoint }));
+        }
+        if let Some(auth) = &self.authorizer {
+            auth.authorize_validate(&checkpoint)
+                .map_err(InitiatorError::Unauthorized)?;
+        }
+        if self.engine.snapshot_pending(&checkpoint.stream_selector)
+            || self.engine.pending_is_snapshot(&checkpoint.stream_selector)
+        {
+            return Ok(self
+                .engine
+                .observe(ProfileInput::BatchValidated { checkpoint }));
+        }
         let key = cache_key(&checkpoint);
         if self.cache.contains(&key) {
-            return vec![];
+            return Ok(vec![]);
         }
-        self.engine
-            .observe(ProfileInput::BatchValidated { checkpoint })
+        Ok(self
+            .engine
+            .observe(ProfileInput::BatchValidated { checkpoint }))
     }
 
     /// Confirm durable persistence of a previously offered checkpoint.
@@ -244,17 +303,53 @@ impl<S: DurableStore> InitiatorDriver<S> {
             generation: checkpoint.generation,
             committed: checkpoint.result_cursor.clone(),
         };
+        let is_snapshot = self.engine.pending_is_snapshot(&checkpoint.stream_selector);
         self.store.store_atomic(position, effects_digest)?;
         let actions = self.engine.confirm_persisted(checkpoint);
         if actions.is_empty() {
-            self.cache.insert(cache_key(checkpoint));
+            if is_snapshot {
+                self.staged.remove(&checkpoint.stream_selector);
+                self.cache.clear();
+            } else {
+                self.cache.insert(cache_key(checkpoint));
+            }
         }
         Ok(actions)
     }
 
     /// Poll a caller-supplied cumulative loss count for the stream.
     pub fn poll_loss(&mut self, stream_selector: &[u8], loss_count: u64) -> Vec<ProfileAction> {
-        self.engine.poll_loss(stream_selector, loss_count)
+        let actions = self.engine.poll_loss(stream_selector, loss_count);
+        if !actions.is_empty() {
+            self.staged.remove(stream_selector);
+            self.cache.clear();
+        }
+        actions
+    }
+
+    /// Explicit scoped provider history loss/rebase; never local overflow,
+    /// ordinary retention expiry, or revocation. The caller retires old H.
+    pub fn provider_loss(
+        &mut self,
+        stream_selector: &[u8],
+        next_generation: u64,
+    ) -> Result<(), ProviderError> {
+        self.engine
+            .provider_loss(stream_selector, next_generation)?;
+        self.staged.remove(stream_selector);
+        self.cache.clear();
+        Ok(())
+    }
+
+    /// Ordinary retention miss: require a snapshot without changing G.
+    pub fn continuation_expired(&mut self, stream_selector: &[u8]) -> Vec<ProfileAction> {
+        let Some(committed) = self.engine.committed(stream_selector) else {
+            return vec![];
+        };
+        self.engine.observe(ProfileInput::ContinuationExpired {
+            stream_selector: stream_selector.to_vec(),
+            committed: committed.to_vec(),
+        })
     }
 
     /// Record the subscribed catch-up boundary from the subscribe response.
@@ -286,7 +381,10 @@ impl<S: DurableStore> InitiatorDriver<S> {
             .observe_completion_boundary(stream_selector, completion_boundary)
     }
 
-    /// Begin staging a snapshot under a provider-proven boundary.
+    /// Begin staging a provider-trusted snapshot. Exact descriptor retries
+    /// preserve pages. A different descriptor cannot overwrite active state;
+    /// supersession requires retiring H in the wire adapter, then explicitly
+    /// discarding staging. This helper does not authorize a same-H second offer.
     pub fn stage_snapshot(
         &mut self,
         stream_selector: Vec<u8>,
@@ -301,8 +399,30 @@ impl<S: DurableStore> InitiatorDriver<S> {
             total_pages,
             page_bytes_max,
         )?;
+        if !self.engine.contains_stream(&stream_selector) {
+            return Err(SnapshotError::CoordinatorRejected);
+        }
+        if let Some(active) = self.staged.get(&stream_selector) {
+            if active.snapshot_handle() == staged.snapshot_handle()
+                && active.boundary_checkpoint() == staged.boundary_checkpoint()
+                && active.total_pages() == staged.total_pages()
+                && active.page_bytes_max() == staged.page_bytes_max()
+            {
+                return Ok(());
+            }
+            return Err(SnapshotError::ActiveStage);
+        }
+        if self.engine.pending(&stream_selector).is_some() {
+            return Err(SnapshotError::CoordinatorRejected);
+        }
         self.staged.insert(stream_selector, staged);
         Ok(())
+    }
+
+    /// Discard pages only after the owning round is retired. Handle retirement
+    /// and fresh Subscribe are the wire adapter's responsibility.
+    pub fn discard_snapshot(&mut self, stream_selector: &[u8]) {
+        self.staged.remove(stream_selector);
     }
 
     /// Stage one snapshot page for the stream.
@@ -323,21 +443,18 @@ impl<S: DurableStore> InitiatorDriver<S> {
     }
 
     /// Install the staged snapshot and offer it to the coordinator as a
-    /// new-generation checkpoint. Returns the checkpoint plus the assembled
-    /// bytes. The staged entry is removed only after the coordinator offers
-    /// it as committable; otherwise the entry is retained and
-    /// `CoordinatorRejected` is returned. Generations not greater than the
-    /// engine's current generation are rejected. The caller confirms the
-    /// returned checkpoint via [`Self::confirm`] to advance the generation.
+    /// CURRENT-generation checkpoint. Returns the checkpoint and assembled
+    /// bytes; retains staging for exact retries until local durable confirm.
+    /// A different generation is rejected until explicit provider loss/rebase.
+    /// The caller atomically installs effects plus S0 via [`Self::confirm`].
+    /// Peer SnapshotInstalled validation/live release is owned by the wire adapter.
     pub fn install_snapshot(
         &mut self,
         stream_selector: &[u8],
         generation: u64,
     ) -> Result<(ProfileCheckpoint, Vec<u8>), SnapshotError> {
-        if let Some(cur) = self.engine.generation(stream_selector) {
-            if generation <= cur {
-                return Err(SnapshotError::StaleGeneration);
-            }
+        if self.engine.generation(stream_selector) != Some(generation) {
+            return Err(SnapshotError::StaleGeneration);
         }
         let staged = self
             .staged
@@ -359,7 +476,6 @@ impl<S: DurableStore> InitiatorDriver<S> {
             _ => false,
         });
         if offered {
-            self.staged.remove(stream_selector);
             Ok((checkpoint, bytes))
         } else {
             Err(SnapshotError::CoordinatorRejected)
@@ -369,9 +485,18 @@ impl<S: DurableStore> InitiatorDriver<S> {
 
 /// Host-side recovery driver.
 ///
-/// Authorizes every hook with the bound principal, serves bounded replay
+/// Authorizes subscribe/replay/delivery with the bound principal, serves bounded replay
 /// pages from stored batches, and emits [`TargetedEnvelope`]s addressed to
 /// exactly one subscription handle. No broadcast path exists.
+///
+/// Non-wire, per-connection test/embed helper, not a protocol host. Limits:
+/// 64 routes, 64 stored selectors, 4096 total historical batches, 16 MiB total
+/// history bytes (selector/cursors/payload), 64 batches / 256 KiB per page.
+/// History is never silently evicted (indices fence replay); saturation returns
+/// `Overloaded`. Drop/rebuild the helper to release history. Each route retains
+/// only its last request/page until unsubscribe/drop; there is no guaranteed
+/// retry lifetime. Production adapters own principal-wide limits, deadlines,
+/// authorization freshness, round retirement and retained-response expiry.
 pub struct HostDriver {
     ctx: ConnectionContext,
     authorizer: Option<Arc<dyn RecoveryAuthorizer>>,
@@ -383,6 +508,8 @@ pub struct HostDriver {
     next_handle: u64,
     max_batches_per_page: u32,
     max_bytes_per_page: u32,
+    history_count: usize,
+    history_bytes: usize,
 }
 
 /// Per-subscription route: fixed catch-up boundary and generation captured
@@ -437,6 +564,8 @@ impl HostDriver {
             next_handle: 1,
             max_batches_per_page: 64,
             max_bytes_per_page: 262_144,
+            history_count: 0,
+            history_bytes: 0,
         }
     }
 
@@ -451,9 +580,41 @@ impl HostDriver {
         &self.ctx
     }
 
-    /// Append a stored batch for the stream (host application supply).
-    pub fn append_batch(&mut self, stream_selector: Vec<u8>, batch: StoredBatch) {
+    /// Append application-supplied history within the documented helper bounds.
+    /// Rejection leaves history and replay indices untouched.
+    pub fn append_batch(
+        &mut self,
+        stream_selector: Vec<u8>,
+        batch: StoredBatch,
+    ) -> Result<(), ProviderError> {
+        if stream_selector.is_empty()
+            || stream_selector.len() > 1024
+            || batch.predecessor.is_empty()
+            || batch.predecessor.len() > 4096
+            || batch.result.is_empty()
+            || batch.result.len() > 4096
+        {
+            return Err(ProviderError::StaleCheckpoint);
+        }
+        if batch.payload.len() > 262_144
+            || self.history_count >= 4096
+            || (!self.batches.contains_key(&stream_selector) && self.batches.len() >= 64)
+        {
+            return Err(ProviderError::Overloaded);
+        }
+        let added = stream_selector.len()
+            + batch.predecessor.len()
+            + batch.result.len()
+            + batch.payload.len();
+        let total = self
+            .history_bytes
+            .checked_add(added)
+            .filter(|n| *n <= 16 * 1024 * 1024)
+            .ok_or(ProviderError::Overloaded)?;
         self.batches.entry(stream_selector).or_default().push(batch);
+        self.history_count += 1;
+        self.history_bytes = total;
+        Ok(())
     }
 
     /// Subscribe a stream selector. Authorizes with the bound principal,
@@ -470,6 +631,15 @@ impl HostDriver {
         if let Some(auth) = &self.authorizer {
             auth.authorize_subscribe(&stream_selector)?;
         }
+        if stream_selector.is_empty()
+            || stream_selector.len() > 1024
+            || start_checkpoint.len() > 4096
+        {
+            return Err(ProviderError::StaleCheckpoint);
+        }
+        if self.routes.len() >= 64 {
+            return Err(ProviderError::Overloaded);
+        }
         let (replay_end, boundary) = self
             .batches
             .get(&stream_selector)
@@ -484,8 +654,14 @@ impl HostDriver {
         if boundary.is_empty() {
             return Err(ProviderError::StaleCheckpoint);
         }
-        let handle = format!("sub-{}-{}", self.ctx.connection_id, self.next_handle).into_bytes();
-        self.next_handle += 1;
+        // Connection-scoped, non-wire identifier; never wraps or reuses a
+        // retired value. Do not include unbounded diagnostic connection IDs.
+        let next = self
+            .next_handle
+            .checked_add(1)
+            .ok_or(ProviderError::Overloaded)?;
+        let handle = format!("sub-{}", self.next_handle).into_bytes();
+        self.next_handle = next;
         self.routes.insert(
             handle.clone(),
             Route {
@@ -550,6 +726,12 @@ impl HostDriver {
         max_bytes: u32,
         continuation_marker: &[u8],
     ) -> Result<ReplayPage, ProviderError> {
+        if from_checkpoint.is_empty()
+            || from_checkpoint.len() > 4096
+            || continuation_marker.len() > 4096
+        {
+            return Err(ProviderError::StaleCheckpoint);
+        }
         let route = self
             .routes
             .get(subscription_handle)
@@ -673,8 +855,15 @@ impl HostDriver {
         subscription_handle: &[u8],
         payload: Vec<u8>,
     ) -> Result<TargetedEnvelope, ProviderError> {
-        if !self.routes.contains_key(subscription_handle) {
-            return Err(ProviderError::UnknownStream);
+        let route = self
+            .routes
+            .get(subscription_handle)
+            .ok_or(ProviderError::UnknownStream)?;
+        if let Some(auth) = &self.authorizer {
+            auth.authorize_subscribe(&route.selector)?;
+        }
+        if payload.len() > 262_144 {
+            return Err(ProviderError::Overloaded);
         }
         Ok(TargetedEnvelope {
             subscription_handle: subscription_handle.to_vec(),
@@ -694,5 +883,62 @@ impl HostDriver {
     /// Handles currently routed.
     pub fn routed_handles(&self) -> Vec<Vec<u8>> {
         self.routes.keys().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host() -> HostDriver {
+        HostDriver::new(ConnectionContext::new(
+            "c".into(),
+            Principal::new("test"),
+            1,
+        ))
+    }
+
+    #[test]
+    fn handle_counter_exhaustion_never_wraps_or_inserts_a_route() {
+        let mut h = host();
+        h.next_handle = u64::MAX - 1;
+        let (last, _) = h.subscribe(b"s".to_vec(), b"C".to_vec(), 7).unwrap();
+        h.unsubscribe(&last).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                h.subscribe(b"s".to_vec(), b"C".to_vec(), 7),
+                Err(ProviderError::Overloaded)
+            );
+            assert_eq!(h.next_handle, u64::MAX);
+            assert!(h.routes.is_empty());
+        }
+    }
+
+    #[test]
+    fn history_byte_and_selector_limits_reject_without_partial_append() {
+        let mut h = host();
+        let batch = StoredBatch {
+            predecessor: b"C".to_vec(),
+            result: b"D".to_vec(),
+            payload: vec![1],
+            generation: 7,
+        };
+        for i in 0..64u8 {
+            h.append_batch(vec![i], batch.clone()).unwrap();
+        }
+        assert_eq!(
+            h.append_batch(b"new".to_vec(), batch.clone()),
+            Err(ProviderError::Overloaded)
+        );
+        h.history_bytes = 16 * 1024 * 1024 - 4;
+        h.append_batch(vec![0], batch.clone()).unwrap();
+        let count = h.history_count;
+        assert_eq!(
+            h.append_batch(vec![0], batch),
+            Err(ProviderError::Overloaded)
+        );
+        assert_eq!(h.history_count, count);
+        assert_eq!(h.history_bytes, 16 * 1024 * 1024);
+        assert_eq!(h.batches[&vec![0]].len(), 2);
     }
 }

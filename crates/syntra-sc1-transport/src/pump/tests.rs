@@ -1,7 +1,9 @@
 use super::*;
 use prost::Message;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use syntra_runtime::{AllowAnonymous, FnHandler, HandlerOutcome};
+use syntra_runtime::{
+    AllowAll, AllowAnonymous, CancelToken, ExecutionLease, FnHandler, HandlerFut, HandlerOutcome,
+};
 use syntra_secure_channel::{generate_server_key, Carrier, Context, KeyStore, Mode, Secret32};
 use tokio::sync::Semaphore;
 
@@ -133,6 +135,256 @@ fn anonymous() -> Arc<dyn AuthenticatorFactory> {
             Ok(Arc::new(AllowAnonymous))
         },
     )
+}
+
+#[test]
+fn runtime_limits_and_carrier_close_budget_are_validated_separately() {
+    let mut runtime = ConnectionConfig::default();
+    for capacity in [0, 1, 15, 1025, usize::MAX] {
+        runtime.max_outstanding = capacity;
+        assert!(matches!(
+            Limits::default().validate(&runtime),
+            Err(Error::Configuration)
+        ));
+    }
+    for capacity in [16, 1024] {
+        runtime.max_outstanding = capacity;
+        let mut limits = Limits::default();
+        assert_eq!(limits.close_timeout, Duration::from_secs(1));
+        limits.close_timeout = Duration::from_secs(86_400);
+        assert!(limits.validate(&runtime).is_ok());
+        limits.close_timeout += Duration::from_nanos(1);
+        assert!(matches!(
+            limits.validate(&runtime),
+            Err(Error::Configuration)
+        ));
+        limits.close_timeout = Duration::ZERO;
+        assert!(matches!(
+            limits.validate(&runtime),
+            Err(Error::Configuration)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn invalid_runtime_config_rejects_both_record_entries_before_io() {
+    for runtime in [
+        ConnectionConfig {
+            max_outstanding: 15,
+            ..ConnectionConfig::default()
+        },
+        ConnectionConfig {
+            writer_capacity: 0,
+            ..ConnectionConfig::default()
+        },
+        ConnectionConfig {
+            notification_capacity: 0,
+            ..ConnectionConfig::default()
+        },
+        ConnectionConfig {
+            handshake_timeout: Duration::MAX,
+            ..ConnectionConfig::default()
+        },
+    ] {
+        let (client, server) = configs(Mode::Bootstrap);
+        let (_input, incoming) = mpsc::channel(1);
+        let input = reader(incoming);
+        let reads = input.reads.clone();
+        let (output, mut outgoing) = mpsc::channel(1);
+        assert!(matches!(
+            connect_records(
+                input,
+                QueueWriter {
+                    records: output,
+                    gate: Arc::new(Gate::default())
+                },
+                client,
+                vec![],
+                runtime.clone(),
+                Limits::default()
+            )
+            .await,
+            Err(Error::Configuration)
+        ));
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert!(outgoing.try_recv().is_err());
+
+        let (_input, incoming) = mpsc::channel(1);
+        let input = reader(incoming);
+        let reads = input.reads.clone();
+        let (output, mut outgoing) = mpsc::channel(1);
+        assert!(matches!(
+            accept_records(
+                input,
+                QueueWriter {
+                    records: output,
+                    gate: Arc::new(Gate::default())
+                },
+                &server,
+                anonymous(),
+                Arc::new(FnHandler(|_, bytes, _| async move {
+                    HandlerOutcome::Payload(bytes)
+                })),
+                runtime,
+                Limits::default()
+            )
+            .await,
+            Err(Error::Configuration)
+        ));
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert!(outgoing.try_recv().is_err());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn receipt_timestamps_precede_every_delivery_in_a_reconstructed_batch() {
+    for fragmented in [false, true] {
+        let (mut client, server) = channels();
+        let mut plaintext = frame_plaintext(&[1]).unwrap().to_vec();
+        plaintext.extend_from_slice(&frame_plaintext(&[2]).unwrap());
+        let (tx, rx) = mpsc::channel(2);
+        if fragmented {
+            tx.send(client.encrypt(&plaintext[..4]).unwrap())
+                .await
+                .unwrap();
+            tx.send(client.encrypt(&plaintext[4..]).unwrap())
+                .await
+                .unwrap();
+        } else {
+            tx.send(client.encrypt(&plaintext).unwrap()).await.unwrap();
+        }
+        let mut input = reader(rx);
+        input.later_record_delay = Some(Duration::from_millis(10));
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        let observed = deliveries.clone();
+        let start = Instant::now();
+        let result = read_frames(
+            input,
+            Arc::new(Mutex::new(server)),
+            ReceiveState::default(),
+            start + Duration::from_secs(1),
+            Limits::default(),
+            move |frame, received_at| {
+                let observed = observed.clone();
+                async move {
+                    observed.lock().unwrap().push((
+                        frame[0],
+                        received_at,
+                        Instant::now().into_std(),
+                    ));
+                    if frame[0] == 2 {
+                        return Err(Error::Closed);
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Closed)));
+        let deliveries = deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 2);
+        let first_receipt = start.into_std()
+            + if fragmented {
+                Duration::from_millis(10)
+            } else {
+                Duration::ZERO
+            };
+        assert_eq!(deliveries[0], (1, first_receipt, first_receipt));
+        assert_eq!(
+            deliveries[1],
+            (2, first_receipt, first_receipt + Duration::from_millis(20))
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn host_peer_uses_receipt_time_not_later_delivery_time() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let effects = calls.clone();
+    let (host, mut outbound) = Host::new(
+        ConnectionConfig::default(),
+        Arc::new(AllowAnonymous),
+        Arc::new(FnHandler(move |_, bytes, _| {
+            effects.fetch_add(1, Ordering::SeqCst);
+            async move { HandlerOutcome::Payload(bytes) }
+        })),
+    );
+    let peer = Peer::Host(host.clone());
+    let hello = syntra_core::Frame {
+        version: 1,
+        request_id: 0,
+        body: Some(Body::Hello(syntra_core::ClientHello {
+            min_version: 1,
+            max_version: 1,
+            credential: vec![],
+        })),
+    }
+    .encode_to_vec();
+    peer.ingest_received_at(&hello, Instant::now().into_std())
+        .await;
+    assert!(outbound.recv().await.is_some());
+    let request = syntra_core::Frame {
+        version: 1,
+        request_id: 1,
+        body: Some(Body::Request(syntra_core::RpcRequest {
+            method: "/test.Service/Echo".into(),
+            payload: vec![],
+            timeout_ms: 10,
+        })),
+    }
+    .encode_to_vec();
+    let received_at = Instant::now().into_std();
+    tokio::time::advance(Duration::from_millis(20)).await;
+    peer.ingest_received_at(&request, received_at).await;
+    let frame = syntra_core::Frame::decode(outbound.recv().await.unwrap().as_slice()).unwrap();
+    assert_eq!(frame.request_id, 1);
+    assert!(
+        matches!(frame.body, Some(Body::Result(syntra_core::RpcResult {
+        outcome: Some(syntra_core::proto::rpc_result::Outcome::Error(error)),
+    })) if error.code == syntra_core::ErrorCode::DeadlineExceeded.as_i32())
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    host.close().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn graceful_close_zero_aborts_without_spending_a_drain_budget() {
+    let handler = Arc::new(FnHandler(|_, bytes, _| async move {
+        HandlerOutcome::Payload(bytes)
+    }));
+    let (client, host, gate, _) = connected(handler).await;
+    let runtime = host.host.clone();
+    gate.armed.store(true, Ordering::SeqCst);
+    host.host.notify(vec![6; 200_000]).await.unwrap();
+    gate.entered.acquire().await.unwrap().forget();
+    let now = Instant::now();
+    host.close_gracefully(Duration::ZERO).await.unwrap();
+    assert_eq!(Instant::now(), now);
+    assert!(runtime.is_closed());
+    assert!(gate.dropped.load(Ordering::SeqCst));
+    client.close().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn application_close_grace_accepts_30_seconds_but_not_more() {
+    for grace in [
+        Duration::from_secs(30),
+        Duration::from_secs(30) + Duration::from_nanos(1),
+        Duration::MAX,
+    ] {
+        let handler = Arc::new(FnHandler(|_, bytes, _| async move {
+            HandlerOutcome::Payload(bytes)
+        }));
+        let (client, host, _, _) = connected(handler).await;
+        let result = host.close_gracefully(grace).await;
+        if grace == Duration::from_secs(30) {
+            result.unwrap();
+        } else {
+            assert!(matches!(result, Err(Error::Configuration)));
+        }
+        client.close().await;
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -336,6 +588,13 @@ async fn partial_frame_deadline_survives_ready_and_background_handoff() {
 async fn connected(
     handler: Arc<dyn Handler>,
 ) -> (ClientHandle, HostHandle, Arc<Gate>, mpsc::Sender<Vec<u8>>) {
+    connected_with_factory(anonymous(), handler).await
+}
+
+async fn connected_with_factory(
+    factory: Arc<dyn AuthenticatorFactory>,
+    handler: Arc<dyn Handler>,
+) -> (ClientHandle, HostHandle, Arc<Gate>, mpsc::Sender<Vec<u8>>) {
     let (client, server) = configs(Mode::Bootstrap);
     let (client_tx, server_rx) = mpsc::channel(8);
     let (server_tx, client_rx) = mpsc::channel(8);
@@ -349,7 +608,7 @@ async fn connected(
                 gate: server_gate,
             },
             &server,
-            anonymous(),
+            factory,
             handler,
             ConnectionConfig::default(),
             Limits::default(),
@@ -371,6 +630,150 @@ async fn connected(
     .await
     .unwrap();
     (client, server_task.await.unwrap(), gate, client_tx)
+}
+
+struct BudgetFactory(ExecutionBudget);
+
+impl AuthenticatorFactory for BudgetFactory {
+    fn create(&self, _: &VerifiedIdentity) -> Result<Arc<dyn Authenticator>, AuthError> {
+        Ok(Arc::new(AllowAnonymous))
+    }
+
+    fn execution_budget(&self) -> ExecutionBudget {
+        self.0.clone()
+    }
+}
+
+struct ExternalLeaseHandler {
+    leases: mpsc::Sender<ExecutionLease>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl Handler for ExternalLeaseHandler {
+    fn handle(&self, _: String, _: Vec<u8>, _: CancelToken) -> HandlerFut {
+        panic!("execution hook must be used")
+    }
+
+    fn handle_with_execution(
+        &self,
+        _: String,
+        payload: Vec<u8>,
+        _: CancelToken,
+        lease: ExecutionLease,
+    ) -> HandlerFut {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.leases
+            .try_send(lease)
+            .unwrap_or_else(|_| panic!("test must retain every external execution lease"));
+        // Reporting success does not mean external work has stopped. The test
+        // owns the lease until it explicitly releases that work's accounting.
+        Box::pin(async move { HandlerOutcome::Payload(payload) })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn replacement_accept_records_keeps_external_execution_charged_to_factory_budget() {
+    let budget = ExecutionBudget::new(1);
+    let factory: Arc<dyn AuthenticatorFactory> = Arc::new(BudgetFactory(budget.clone()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (leases, mut transferred) = mpsc::channel(2);
+    let handler: Arc<dyn Handler> = Arc::new(AllowAll(ExternalLeaseHandler {
+        leases,
+        calls: calls.clone(),
+    }));
+    // Keep the supported core capacity (default 32), with a separate quota of 1.
+    let (first, first_host, _, _) = connected_with_factory(factory.clone(), handler.clone()).await;
+    assert_eq!(
+        first
+            .conn
+            .call("/test.Service/Echo", vec![1], 1000)
+            .await
+            .unwrap(),
+        vec![1]
+    );
+    let external = transferred.recv().await.unwrap();
+    assert_eq!(budget.in_use(), 1);
+    first_host.close().await;
+    first.close().await;
+    assert_eq!(
+        budget.in_use(),
+        1,
+        "transport close must not release external work"
+    );
+
+    // A new accept/handshake using the same factory must not reset the quota.
+    let (replacement, replacement_host, _, _) =
+        connected_with_factory(factory.clone(), handler).await;
+    let error = replacement
+        .conn
+        .call("/test.Service/Echo", vec![2], 1000)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), syntra_core::ErrorCode::ResourceExhausted);
+    assert!(!replacement.is_closed());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(transferred.try_recv().is_err());
+    assert_eq!(budget.in_use(), 1);
+
+    drop(external);
+    assert_eq!(budget.in_use(), 0);
+    assert_eq!(
+        replacement
+            .conn
+            .call("/test.Service/Echo", vec![3], 1000)
+            .await
+            .unwrap(),
+        vec![3]
+    );
+    let external = transferred.recv().await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(budget.in_use(), 1);
+    replacement_host.close().await;
+    replacement.close().await;
+    assert_eq!(budget.in_use(), 1);
+    drop(external);
+    assert_eq!(budget.in_use(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn default_factory_budget_is_process_shared_across_accepted_connections() {
+    struct DefaultFactory;
+    impl AuthenticatorFactory for DefaultFactory {
+        fn create(&self, _: &VerifiedIdentity) -> Result<Arc<dyn Authenticator>, AuthError> {
+            Ok(Arc::new(AllowAnonymous))
+        }
+    }
+
+    assert_eq!(DEFAULT_AGGREGATE_EXECUTION_LIMIT, 1024);
+    // Cover both the blanket closure implementation and an ordinary factory
+    // using the default hook, with distinct accepted connections.
+    let factories: [Arc<dyn AuthenticatorFactory>; 2] = [anonymous(), Arc::new(DefaultFactory)];
+    let (leases, mut transferred) = mpsc::channel(2);
+    let handler: Arc<dyn Handler> = Arc::new(AllowAll(ExternalLeaseHandler {
+        leases,
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+    let mut external = Vec::new();
+    for factory in &factories {
+        let (client, host, _, _) = connected_with_factory(factory.clone(), handler.clone()).await;
+        assert_eq!(
+            client
+                .conn
+                .call("/test.Service/Echo", vec![1], 1000)
+                .await
+                .unwrap(),
+            vec![1]
+        );
+        external.push(transferred.recv().await.unwrap());
+        host.close().await;
+        client.close().await;
+    }
+    for factory in &factories {
+        // Both retained leases must be visible from every default factory,
+        // even after carrier teardown. Other parallel tests may also be charged.
+        assert!(factory.execution_budget().in_use() >= external.len());
+    }
+    drop(external);
 }
 
 #[tokio::test(start_paused = true)]
@@ -462,7 +865,7 @@ async fn partial_frame_deadline_includes_every_backpressured_delivery_in_the_bat
             FrameDecoder::default().into(),
             now + Duration::from_secs(2),
             limits,
-            move |_| {
+            move |_, _| {
                 let count = count.clone();
                 async move {
                     tokio::time::sleep(Duration::from_millis(20)).await;

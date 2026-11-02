@@ -52,6 +52,7 @@ pub async fn connect_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    limits.validate(&runtime)?;
     if security.context.carrier != Carrier::Tcp {
         return Err(Error::Framing);
     }
@@ -79,6 +80,7 @@ pub async fn accept_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    limits.validate(&runtime)?;
     if security.carrier != Carrier::Tcp {
         return Err(Error::Framing);
     }
@@ -173,6 +175,7 @@ impl Listener {
         runtime: ConnectionConfig,
         limits: Limits,
     ) -> Result<HostHandle, Error> {
+        limits.validate(&runtime)?;
         let stream = self.accept_socket().await?;
         accept_stream(stream, security, factory, handler, runtime, limits).await
     }

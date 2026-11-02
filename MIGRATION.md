@@ -1,6 +1,113 @@
 # Rust repository extraction
 
-## Current SC1 migration scope
+## Accepted SDD snapshot and alignment target
+
+The active specification/schema/suite target is upstream PR #20 at
+`8ede3810b29fbba4d0e6ae6751a0025ceedda140`. The Rust branch
+`feat/accepted-sdd-v1-alignment` starts from
+`73f9775043ba2625a823f5cca3fbe92cdf345293`. The target is the accepted SDD wave,
+not an upstream specification-freeze or release decision. Phase 1 updates
+inputs, generated comments and tracking only; it does not fix runtime contracts.
+See [the implementation matrix](docs/sdd-alignment.md) for subsequent phases.
+
+`proto/` and `conformance/` now contain all 69 regular input files from that
+upstream commit, byte-for-byte. `upstream.lock.json` records the source identity
+and each file's SHA-256. Copied prose and fixture notes retain historical/stale
+wording and relative links. Resolve links to owner documents in the
+[pinned upstream tree](https://github.com/tinkle-org/syntra/tree/8ede3810b29fbba4d0e6ae6751a0025ceedda140),
+not in an assumed Rust-local specification tree. Snapshotting a manifest is not
+executing it. Local implementation reports belong outside the managed snapshot
+roots (for example in `docs/` or `evidence/`).
+
+The active suite registers 42 SC1 cases and 17 recovery cases. Historical
+24-case SC1 results below are not relabeled as evidence for the new cases.
+The original extraction pin `2a91da7fdb96f3e75badf07614c14e4f85c9ba1c`, proposal
+review pin `94404d7378136d8b6c88ece28bf945c88d1653ba`, and previous accepted SC1
+pin `0e8b0f8a4a789cb3d6d00b993e281867d2325e06` remain provenance, not the active
+schema or suite source.
+
+To check without writing or needing a sibling checkout:
+
+```sh
+python3 scripts/check-upstream-pin.py
+python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+```
+
+To verify source provenance or deliberately reproduce the snapshot, use a local
+authoritative Git checkout containing the exact pinned commit:
+
+```sh
+python3 scripts/check-upstream-pin.py --upstream ../syntra
+python3 scripts/upstream_snapshot.py --sync --upstream ../syntra
+buf generate --template buf.gen.yaml
+python3 scripts/check-generated.py
+```
+
+The checker never fetches or follows `main`; `--upstream` reads committed blobs,
+not the source worktree. Offline checking compares the exact file inventory and
+digests against the reviewed lock; only the Git comparison establishes that the
+inventory matches the pinned source. Neither check establishes conformance or
+acceptance. Sync refuses dirty snapshots, untracked conflicts and deletions
+requiring review. Source revisions, digest inventory, copied inputs and generated
+output must be reviewed together; changing an upstream pin is not a label-only
+update. `buf.gen.yaml` retains the extracted plugin/version, not an obligation
+to preserve obsolete generated comments. No schema field/tag/type allocation or
+deferred Go import-path migration is authorized by this refresh.
+
+## Core/RPC phase-two migration
+
+[Phase 2](docs/phase2-core-rpc.md) documents the behavioral/source changes now in
+this branch: permanent increasing request IDs, ordered host high-water admission,
+deadline-first terminal selection, preallocation/raw-wire/diagnostic bounds,
+validated configuration, receipt timestamps and separate execution/output
+accounting. `RequestIdAllocator::next_candidate` is fallible and has no reset.
+Use runtime `try_new*` constructors for fallible configuration and transfer an
+`ExecutionLease` into any job that can outlive its handler future. Custom host
+adapters must supply complete-frame receipt time and preserve receive order.
+Custom initiator writers retain the original-`Vec`, single ordered handoff rule.
+
+The production ABI v1 still has its own state machine: its shared Core field
+bounds change, but the full RPC/order/lifecycle migration requires ABI v2 in the
+later phase. This refresh does not claim v1 is now aligned. At the Phase 2
+checkpoint, recovery snapshot reconciliation was still pending (now covered by
+Phase 3 below); RFC 0010 lifecycle remains pending. Existing peers expecting ID
+reuse or completion-over-expiry races are not compatible; these mandatory
+baseline rules are not remotely toggleable profile options.
+
+## Update/recovery phase-three migration
+
+The [Phase 3 runtime](docs/phase3-update-recovery.md) replaces the former
+new-generation-snapshot behavior with same-generation installation. Explicit
+provider-loss/shared-rebase methods alone advance scoped generation. Replay
+helpers require a previously subscribed boundary rather than inferring it from
+the first page; `HostDriver::append_batch` is now fallible and bounded.
+
+Host configuration before hello enables the nine profile RPCs; the SC1 factory
+adapter supplies the same configuration on actual WSS accepts. The typed client
+owns one immutable recovery inbox per connection and must negotiate afresh.
+No profile state moves to another connection, and a retired attachment never
+reverts to generic notification delivery. The earlier manual helpers remain
+local coordinator APIs, not an alternative accepted wire binding.
+
+The new `RecoveryPersistence` contract commits full opaque application state and
+P/S/G/C together, not merely an effects digest. Native `FileRecoveryStore` adds
+`fs2 = "=0.4.3"` for exclusive process locking; this is a local reference store
+with documented filesystem/flush assumptions, not encrypted AK storage or a
+durable provider-history implementation. Unknown commit outcomes fence further
+work pending reconciliation. Old checkpoint-only/digest persistence cannot be
+silently promoted to durable-effect evidence.
+
+Pinned recovery manifests 011/012 appear to encode a bare inner replay completion
+instead of the required `RecoveryNotification` wrapper. Their bytes are preserved;
+the runtime does not add a permissive fallback. Formal role/profile execution,
+independent peers and the upstream freeze remain later gates.
+
+## Historical pre-wave SC1 migration scope
+
+The following scope and run descriptions predate the PR #20 alignment. They
+explain the implementation at the starting Rust revision, not completion of the
+new accepted contracts. The phase-one snapshot/checker section above supersedes
+their descriptions of the active schema/suite pin and old pin-checker scope.
 
 The experimental, unpublished `syntra-sc1-transport` consolidates the prerelease
 `syntra-tcp` and `syntra-ws-sc1` crates. `websocket` provides native WSS;

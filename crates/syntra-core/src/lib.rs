@@ -14,7 +14,8 @@
 //! Open questions this crate does NOT invent bindings for (see
 //! [session open questions] and [auth/session lifecycle RFC]):
 //! typed pre-`ACTIVE` error carrier (B1), pre-`ACTIVE` notification conflict
-//! (B2), stale `request_id` reuse (B3), payload-vs-envelope size (B8).
+//! (B2). Accepted RFC 0004 D1 forbids connection-local request-ID reuse;
+//! RFC 0005 D2/D3 fixes byte bounds; RFC 0008 D1 fixes raw-wire validation.
 //! Where a conflict exists the enforced rule is documented on the item.
 //!
 //! [schema generation]: https://github.com/tinkle-org/syntra/blob/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/specifications/schema/generation.md
@@ -39,13 +40,15 @@ pub mod rpc;
 pub mod state;
 
 pub use codec::{decode_frame, encode_frame, MAX_FRAME_BYTES};
-pub use error::{ErrorCode, RpcError, SyntraError};
+pub use error::{bounded_diagnostic, ErrorCode, RpcError, SyntraError, MAX_DIAGNOSTIC_BYTES};
 pub use frame::{
-    validate_frame, validate_wire_structure, FrameKind, ValidationContext, MAX_DECODE_DEPTH,
+    missing_result_outcome_id, validate_frame, validate_wire_structure, FrameKind,
+    ValidationContext, MAX_DECODE_DEPTH,
 };
 pub use handshake::{
     build_hello, negotiate_version, validate_connection_id, validate_hello_range,
-    HANDSHAKE_TIMEOUT_DEFAULT, MAX_CREDENTIAL_BYTES, MAX_VERSION, MIN_VERSION,
+    HANDSHAKE_TIMEOUT_DEFAULT, MAX_CONNECTION_ID_BYTES, MAX_CREDENTIAL_BYTES, MAX_VERSION,
+    MIN_VERSION,
 };
 pub use proto::{Cancel, ClientHello, Frame, Notification, RpcRequest, RpcResult, ServerReady};
 pub use rpc::{validate_method, PendingOutcome, PendingTable, RequestIdAllocator};

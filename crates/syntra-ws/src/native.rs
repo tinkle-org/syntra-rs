@@ -59,6 +59,11 @@ struct PumpTasks(Vec<tokio::task::JoinHandle<()>>);
 
 impl PumpTasks {
     async fn join(&mut self, grace: Duration) {
+        if grace.is_zero() {
+            for task in &self.0 {
+                task.abort();
+            }
+        }
         for task in &mut self.0 {
             if tokio::time::timeout(grace, &mut *task).await.is_err() {
                 task.abort();
@@ -185,12 +190,11 @@ pub async fn connect(
     credential: Vec<u8>,
     conn_cfg: ConnectionConfig,
 ) -> Result<WsHandle, TransportError> {
+    conn_cfg
+        .validate()
+        .map_err(|error| TransportError::Protocol(error.to_string()))?;
+    cfg.validate()?;
     let endpoint = Endpoint::parse(&cfg.url, cfg.allow_insecure)?;
-    if cfg.ping_interval.is_zero() {
-        return Err(TransportError::InvalidUrl(
-            "ping interval must be nonzero".into(),
-        ));
-    }
     if !endpoint.is_secure {
         tracing::warn!("insecure WS enabled: restricted-development only, never public traffic");
     }
@@ -298,12 +302,12 @@ pub async fn connect(
                     };
                     match action {
                         ReadExit::Close(code) => bounded_close(&mut ws_write, code, "inbound rejected", close_grace).await,
-                        ReadExit::FlushRemoteClose => {
+                        ReadExit::FlushRemoteClose if !close_grace.is_zero() => {
                             // tungstenite queues the peer's exact Close response
                             // during read; sending a new Close is not equivalent.
                             let _ = tokio::time::timeout(close_grace, ws_write.flush()).await;
                         }
-                        ReadExit::Lost => {}
+                        ReadExit::FlushRemoteClose | ReadExit::Lost => {}
                     }
                     break;
                 }
@@ -357,12 +361,12 @@ pub async fn connect(
         // release. Draining a bounded amount of raw transport bytes avoids
         // resetting TCP with unread oversized input before the peer can see
         // our Close. Do not ask the failed WS parser to assemble that input.
-        if read_to_drain.is_none() {
+        if !close_grace.is_zero() && read_to_drain.is_none() {
             if let Ok(Ok((_, read))) = tokio::time::timeout(close_grace, &mut read_done_rx).await {
                 read_to_drain = Some(read);
             }
         }
-        if let Some(read) = read_to_drain {
+        if let Some(read) = read_to_drain.filter(|_| !close_grace.is_zero()) {
             if let Ok(mut socket) = ws_write.reunite(read) {
                 let _ = tokio::time::timeout(close_grace, async {
                     let mut buffer = [0u8; 8192];
@@ -503,26 +507,28 @@ pub async fn connect(
                 shutdown_tx: Some(close_tx),
                 closed,
                 tasks: Some(tasks),
-                shutdown_grace: cfg
-                    .write_grace
-                    .saturating_add(cfg.close_grace.saturating_mul(3)),
+                shutdown_grace: shutdown_grace(&cfg),
             })
         }
         Err(e) => {
             // Spec-mapped close before teardown; never downgrade/retry.
             let _ = close_tx.send(handshake_close_code(&e)).await;
             // Let the write pump flush the close, then stop the pumps.
-            tasks
-                .join(
-                    cfg.write_grace
-                        .saturating_add(cfg.close_grace.saturating_mul(3)),
-                )
-                .await;
+            tasks.join(shutdown_grace(&cfg)).await;
             conn.on_transport_lost().await;
             Err(TransportError::Connect(format!(
                 "syntra handshake failed: {e}"
             )))
         }
+    }
+}
+
+fn shutdown_grace(cfg: &WsConfig) -> Duration {
+    if cfg.close_grace.is_zero() {
+        Duration::ZERO
+    } else {
+        cfg.write_grace
+            .saturating_add(cfg.close_grace.saturating_mul(3))
     }
 }
 
@@ -553,6 +559,9 @@ where
     S: futures_util::Sink<Message> + Unpin,
     S::Error: std::fmt::Debug,
 {
+    if grace.is_zero() {
+        return;
+    }
     let _ = tokio::time::timeout(grace, send_close(ws, code, reason)).await;
 }
 
@@ -587,6 +596,61 @@ pub fn handshake_close_code(e: &SyntraError) -> CloseCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn invalid_configuration_is_rejected_before_endpoint_or_socket_work() {
+        for runtime in [
+            ConnectionConfig {
+                max_outstanding: 15,
+                ..ConnectionConfig::default()
+            },
+            ConnectionConfig {
+                writer_capacity: 0,
+                ..ConnectionConfig::default()
+            },
+            ConnectionConfig {
+                notification_capacity: 0,
+                ..ConnectionConfig::default()
+            },
+            ConnectionConfig {
+                default_timeout: Duration::MAX,
+                ..ConnectionConfig::default()
+            },
+        ] {
+            let result = connect(WsConfig::secure("not a URL"), vec![], runtime).await;
+            let Err(error) = result else {
+                panic!("invalid configuration accepted");
+            };
+            assert!(matches!(error, TransportError::Protocol(_)));
+            assert_eq!(error.to_syntra_error().code(), ErrorCode::InvalidArgument);
+        }
+        let mut config = WsConfig::secure("not a URL");
+        config.close_grace = Duration::MAX;
+        assert!(matches!(
+            connect(config, vec![], ConnectionConfig::default()).await,
+            Err(TransportError::Protocol(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn zero_close_grace_does_not_poll_a_close_write_or_wait_for_tasks() {
+        let mut config = WsConfig::secure("wss://h/syntra/v1/ws");
+        config.close_grace = Duration::ZERO;
+        assert_eq!(shutdown_grace(&config), Duration::ZERO);
+        let polled = Arc::new(AtomicBool::new(false));
+        let observed = polled.clone();
+        let mut sink = futures_util::sink::unfold((), move |(), _: Message| {
+            observed.store(true, Ordering::SeqCst);
+            std::future::pending::<Result<(), std::io::Error>>()
+        });
+        bounded_close(&mut sink, CloseCode::Normal, "closing", Duration::ZERO).await;
+        assert!(!polled.load(Ordering::SeqCst));
+        let task = tokio::spawn(std::future::pending());
+        let abort = task.abort_handle();
+        let mut tasks = PumpTasks(vec![task]);
+        tasks.join(shutdown_grace(&config)).await;
+        assert!(abort.is_finished());
+    }
 
     #[test]
     fn subprotocol_and_path_constants() {

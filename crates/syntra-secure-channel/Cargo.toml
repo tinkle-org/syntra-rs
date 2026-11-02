@@ -4,8 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-# Local-only SC1 draft revision, not an accepted upstream profile and not
-# independently audited. Must stay unpublished until the channel is reviewed
+# Experimental implementation targeting accepted SNTR-SC1-WSS-V1, not
+# independently audited or fully SDD-aligned. Must stay unpublished until reviewed
 # and the release plan covers it; keeping it publish=false also keeps the
 # `cargo package` gate green for the five publishable crates.
 publish = false

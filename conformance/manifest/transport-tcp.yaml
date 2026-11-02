@@ -1,0 +1,115 @@
+# Portable TCP cases (Section I/TCP). Profile: SNTR-TCP-V1. All Mandatory.
+# Prose companion: conformance/requirements/tcp.md (CONF-TCP-001…008).
+# Development-only profile: passing here never implies production readiness.
+format_version: "1.0"
+profile: SNTR-TCP-V1
+cases:
+  - id: CONF-TCP-001
+    requirement: [SNTR-TCP-002, SNTR-HS-002, SNTR-TCP-007]
+    profile: SNTR-TCP-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport]
+    input:
+      transport: { action: tcp_connect, first_bytes_hex: "000000080801520408011001" }
+    expected: { connection_state: NEGOTIATING, session_state: none }
+    notes: "Connection establishment: first 4 bytes are the hello length prefix; no magic bytes precede it."
+    vector_refs: ["tcp/V1"]
+
+  - id: CONF-TCP-002
+    requirement: [SNTR-TCP-004, SNTR-TCP-006, SNTR-SER-002]
+    profile: SNTR-TCP-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [transport_connected]
+    input:
+      transport: { action: send_wire_hex, wire_hex: "000000085204080110010801" }
+    expected: { connection_state: NEGOTIATING, session_state: none }
+    notes: "Frame boundary + order tolerance: V2 (reordered hello) decodes to the identical logical Frame as V1."
+    vector_refs: ["tcp/V2"]
+
+  - id: CONF-TCP-003
+    requirement: [SNTR-TCP-006]
+    profile: SNTR-TCP-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [transport_connected]
+    input:
+      transport: { action: send_wire_hex_byte_at_a_time, wire_hex: "000000080801520408011001" }
+    expected: { connection_state: NEGOTIATING, session_state: none }
+    notes: "Partial prefix/payload: one-byte-at-a-time delivery (including splits inside the 4-byte prefix) is accepted once complete."
+
+  - id: CONF-TCP-004
+    requirement: [SNTR-TCP-006, SNTR-RPC-002]
+    profile: SNTR-TCP-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input:
+      transport: { action: send_two_units_in_one_write, request_ids: [7, 8] }
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      frames:
+        - { request_id: 7, body: result }
+        - { request_id: 8, body: result }
+    notes: "Multiple frames: concatenated units in one segment each processed once, in any completion order."
+
+  - id: CONF-TCP-005
+    requirement: [SNTR-TCP-005, SNTR-TCP-006, SNTR-WIRE-002]
+    profile: SNTR-TCP-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [transport_connected]
+    input:
+      transport: { action: send_wire_hex, wire_hex: "00000000" }
+    expected: { connection_state: CLOSED, session_state: none }
+    notes: "Invalid length row 1 (zero-length prefix): reject as malformed; close in all states. Row 2 (short length V9) asserted in CONF-TCP-007 note."
+
+  - id: CONF-TCP-006
+    requirement: [SNTR-TCP-005, SNTR-WIRE-006, SNTR-SER-006]
+    profile: SNTR-TCP-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [transport_connected]
+    input:
+      transport: { action: send_wire_hex, wire_hex: "00100001", no_payload_bytes: true, allocation_proof_required: true }
+    expected: { connection_state: CLOSED, session_state: none }
+    notes: "Oversized length: MAX+1 prefix rejected on the prefix alone before allocating the declared payload; immediate close in all states."
+
+  - id: CONF-TCP-007
+    requirement: [SNTR-WIRE-003, SNTR-SER-007, SNTR-SER-008]
+    profile: SNTR-TCP-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input:
+      transport: { action: send_framed_envelope_fixtures, fixtures: [bodyless, request_id_misuse, unknown_variant, reserved_16_17, malformed_method] }
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      error: { code: INVALID_ARGUMENT }
+    notes: "Invalid envelope rows map per the core tables (INVALID_ARGUMENT / FAILED_PRECONDITION / UNIMPLEMENTED / reserved-malformed). Handshake-phase rows close; ACTIVE per-RPC rows keep the connection usable. Truncated prefix/payload rows (V7/V8) close with the partial unit discarded."
+
+  - id: CONF-TCP-008
+    requirement: [SNTR-TCP-009, SNTR-TCP-010, SNTR-HS-006, SNTR-HS-014]
+    profile: SNTR-TCP-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input:
+      transport: { action: graceful_fin_then_rst_rows, in_flight_request_ids: [12] }
+      faults: { abrupt_transport_loss: true }
+    expected:
+      connection_state: CLOSED
+      session_state: terminated_abnormally
+      error: { code: UNAVAILABLE }
+    notes: "Truncated stream + close: graceful FIN processes buffered units then closes; RST/loss maps in-flight RPCs to UNAVAILABLE with unknown outcome; half-close (SHUT_WR) carries no Syntra semantics."

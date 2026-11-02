@@ -152,7 +152,7 @@ async fn selected_success_suppresses_queued_duplicates_and_survives_cancel_close
 }
 
 #[tokio::test(start_paused = true)]
-async fn handoff_is_one_shot_and_emitted_cancel_remains_advisory() {
+async fn handoff_is_one_shot_and_cancel_is_terminal_locally_not_byte_rewrite() {
     let (client, mut writer) = active(ConnectionConfig::default()).await;
     let mut call = Box::pin(client.call(METHOD, vec![], 100));
     assert!(futures_util::poll!(&mut call).is_pending());
@@ -166,7 +166,7 @@ async fn handoff_is_one_shot_and_emitted_cancel_remains_advisory() {
     assert!(client.prepare_outbound(prepared.clone()).is_none());
     client.cancel(id).await.unwrap();
     complete(&client, id).await;
-    assert_eq!(call.await.unwrap(), b"ok");
+    assert!(matches!(call.await, Err(SyntraError::Cancelled(_))));
     assert_eq!(
         request(&prepared).timeout_ms,
         100,
@@ -178,20 +178,25 @@ async fn handoff_is_one_shot_and_emitted_cancel_remains_advisory() {
 #[tokio::test(start_paused = true)]
 async fn admission_and_all_exit_paths_release_emission_registration() {
     let (client, mut writer) = active(ConnectionConfig {
-        max_outstanding: 1,
-        writer_capacity: 1,
+        max_outstanding: 16,
+        writer_capacity: 16,
         ..ConnectionConfig::default()
     })
     .await;
-    let mut first = Box::pin(client.call(METHOD, vec![], 100));
-    assert!(futures_util::poll!(&mut first).is_pending());
+    let mut calls: Vec<_> = (0..16)
+        .map(|_| Box::pin(client.call(METHOD, vec![], 100)))
+        .collect();
+    for call in &mut calls {
+        assert!(futures_util::poll!(call.as_mut()).is_pending());
+    }
     assert!(matches!(
         client.call(METHOD, vec![], 100).await,
         Err(SyntraError::ResourceExhausted(_))
     ));
-    assert_eq!(client.conn.shared.emissions.lock().unwrap().len(), 1);
+    assert_eq!(client.conn.shared.emissions.lock().unwrap().len(), 16);
     let stale = writer.try_recv().unwrap();
-    drop(first);
+    drop(calls);
+    while writer.try_recv().is_ok() {}
     assert_clean(&client);
     // Validation fails after registration (oversized envelope).
     assert!(client

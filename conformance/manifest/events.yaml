@@ -1,0 +1,200 @@
+# Portable event cases (Section H). Profile: SNTR-EVENTS-V1.
+# Prose companion: conformance/events/events.md (CONF-EVT-001…015).
+# Optionality rule: any case whose capabilities are unadvertised MUST yield
+# UNSUPPORTED (correct UNIMPLEMENTED refusal) or SKIP — never FAIL.
+format_version: "1.0"
+profile: SNTR-EVENTS-V1
+cases:
+  - id: CONF-EVT-001
+    requirement: [SNTR-CAP-001, SNTR-CAP-002, SNTR-EVENT-001]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [events-v1]
+    mandatory: false
+    preconditions: [active_session]
+    input: { subscriptions: [{ method: "/example.Events/Subscribe", filter_b64: "ZmlsdGVyLWE=" }] }
+    expected: { connection_state: ACTIVE, session_state: unchanged }
+    notes: "Subscribe: application-defined generic RPC after ACTIVE returns an opaque handle; authorization precedes delivery. SKIP when events-v1 unclaimed."
+
+  - id: CONF-EVT-002
+    requirement: [SNTR-CAP-003, SNTR-EVENT-001, SNTR-EVENT-011]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input: { subscriptions: [{ method: "/example.Events/Subscribe", filter_b64: "ZmlsdGVyLWE=" }] }
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      error: { code: UNIMPLEMENTED }
+    notes: "Capability-absent row (mandatory-only host): subscription attempt yields UNIMPLEMENTED with no events and intact RPC interop. A correct refusal reports UNSUPPORTED, not FAIL."
+
+  - id: CONF-EVT-003
+    requirement: [SNTR-EVENT-002, SNTR-EVENT-005, SNTR-WIRE-003]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [events-v1]
+    mandatory: false
+    preconditions: [active_session, subscription_confirmed]
+    input: { faults: { emit_events: 1 } }
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      frames:
+        - { request_id: 0, body: notification, payload_b64: "ZXZlbnQtMQ==" }
+    notes: "Receive: one notification with request_id 0, payload bit-preserved (incl. empty/non-UTF-8 variants); completes no RPC. SKIP when unadvertised."
+
+  - id: CONF-EVT-004
+    requirement: [SNTR-EVENT-004, SNTR-EVENT-010]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [events-v1]
+    mandatory: false
+    preconditions: [active_session, subscription_confirmed]
+    input: { subscriptions: [{ method: "/example.Events/Unsubscribe" }] }
+    expected: { connection_state: ACTIVE, session_state: unchanged }
+    notes: "Unsubscribe: application-defined RPC terminates the stream; post-cancel events in flight are tolerated without completing any RPC."
+
+  - id: CONF-EVT-005
+    requirement: [SNTR-EVENT-007, SNTR-REL-005]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input: { faults: { emit_duplicate_event: true } }
+    expected: { connection_state: ACTIVE, session_state: unchanged }
+    notes: "Duplicate event tolerance is Mandatory wherever events or replay are evaluated: initiator tolerates the duplicate; no protocol violation, no error storm."
+
+  - id: CONF-EVT-006
+    requirement: [SNTR-EVENT-006]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [events-v1]
+    mandatory: false
+    preconditions: [active_session, subscription_confirmed]
+    input: { faults: { emit_events: 3 } }
+    expected: { connection_state: ACTIVE, session_state: unchanged }
+    notes: "Ordering: on order-preserving transports arrival is 1,2,3; on other bindings order is undefined unless the stream spec adds payload sequence metadata. Global ordering MUST NOT be asserted."
+
+  - id: CONF-EVT-007
+    requirement: [SNTR-EVENT-030, SNTR-REL-007]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [events-v1]
+    mandatory: false
+    preconditions: [active_session, subscription_confirmed]
+    input: { faults: { flood_events: true } }
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      error: { code: RESOURCE_EXHAUSTED }
+    notes: "Queue overflow: documented drop-or-error policy applied (RESOURCE_EXHAUSTED on new work and/or per-policy drops with a documented signal); never unbounded queueing or silent deadlock."
+
+  - id: CONF-EVT-008
+    requirement: [SNTR-EVENT-008, SNTR-EVENT-009]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [events-replay-v1]
+    mandatory: false
+    preconditions: [active_session, subscription_confirmed]
+    input: { replay: { cursor_b64: "Y3Vyc29yLUs=", strategy: subscribe_with_cursor } }
+    expected: { connection_state: ACTIVE, session_state: unchanged }
+    notes: "Replay (Optional, gated on events-replay-v1): re-subscribe with last confirmed cursor; host replays retained events then the replay terminator; boundary duplicates tolerated; initiator continues live with none missed per the documented strategy. SKIP when unadvertised."
+
+  - id: CONF-EVT-009
+    requirement: [SNTR-EVENT-009]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [events-replay-v1]
+    mandatory: false
+    preconditions: [active_session, cursor_expired]
+    input: { replay: { cursor_b64: "ZXhwaXJlZC1jdXJzb3I=", strategy: subscribe_with_cursor } }
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      error: { code: FAILED_PRECONDITION }
+    notes: "Expired cursor: documented FAILED_PRECONDITION or NOT_FOUND; recovery is re-subscribing from the documented point; never silent restart from an unrelated point. SKIP when unadvertised."
+
+  - id: CONF-EVT-010
+    requirement: [SNTR-EVENT-004, SNTR-SESS-004, SNTR-REL-009]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session, subscription_confirmed]
+    input: { faults: { abrupt_transport_loss: true, in_flight_request_ids: [9] } }
+    expected:
+      connection_state: CLOSED
+      session_state: terminated_abnormally
+      error: { code: UNAVAILABLE }
+    notes: "Reconnect prerequisite: loss ends subscriptions; in-flight RPCs get UNAVAILABLE with unknown outcome; no continuity assumed."
+
+  - id: CONF-EVT-011
+    requirement: [SNTR-SESS-008, SNTR-EVENT-020]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [transport_connected]
+    input:
+      frames:
+        - { request_id: 0, body: hello, min_version: 1, max_version: 1 }
+    expected: { connection_state: ACTIVE, session_state: active }
+    notes: "Reconnect requires explicit re-subscribe: no events arrive without it; old handles/cursors are meaningless without a negotiated replay/resumption binding."
+
+  - id: CONF-EVT-012
+    requirement: [SNTR-EVENT-011]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input: { subscriptions: [{ method: "/example.Events/Subscribe", filter_b64: "dW5rbm93bi10b3BpYw==" }] }
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      error: { code: UNIMPLEMENTED }
+    notes: "Invalid subscription (unknown stream): UNIMPLEMENTED; hosts MUST NOT silently ignore or emit unrelated events."
+
+  - id: CONF-EVT-013
+    requirement: [SNTR-EVENT-030, SNTR-ASEC-022]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [events-v1]
+    mandatory: false
+    preconditions: [active_session]
+    input:
+      credentials: "fixture:valid-but-insufficient"
+      subscriptions: [{ method: "/example.Events/Subscribe", filter_b64: "cHJvdGVjdGVk" }]
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      error: { code: PERMISSION_DENIED }
+    notes: "Unauthorized subscription: PERMISSION_DENIED (or UNAUTHENTICATED where the binding is invalid) before any delivery. SKIP when unadvertised."
+
+  - id: CONF-EVT-014
+    requirement: [SNTR-EVENT-005]
+    profile: SNTR-EVENTS-V1
+    roles: [client]
+    capabilities: []
+    mandatory: true
+    preconditions: [handshake_started]
+    input: { faults: { emit_preactive_notification: true } }
+    expected: { connection_state: CLOSED, session_state: none, error: { code: FAILED_PRECONDITION }, hygiene: { absent_from: [queue, subscription_state] } }
+    notes: "Client role only: the observable is the initiator's local outcome — the controlled host sends the pre-ACTIVE notification and the initiator (IUT) records local FAILED_PRECONDITION, discards the notification without application delivery, does not establish any subscription, and proceeds CLOSING then CLOSED (SNTR-EVENT-005, RFC 0003 D2). The peer observes only the transport-native close signal; no error Frame crosses the wire. A host-side variant that makes the controlled initiator emit the notification to observe the server's outcome is not registered. Registered; not yet executed."
+
+  - id: CONF-EVT-015
+    requirement: [SNTR-EVENT-901]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session, subscription_confirmed]
+    input: { faults: { emit_events: 1 } }
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      hygiene: { absent_from: [chat, receipt, presence, typing] }
+    notes: "Generic-proof: all payloads are neutral opaque bytes (e.g. seq/data JSON as bytes). Negative grep for chat/message/receipt/presence/typing terms across fixtures, wire traces, and logs."

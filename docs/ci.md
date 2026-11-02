@@ -21,9 +21,13 @@ P0 — must fix before production use:
   release workflows (trusted publishing, `id-token: write` only on the
   release job) from PR CI, which has only `contents: read` and no secrets.
 - Reproducibility relied on a floating upstream `main`. Fixed by
-  `scripts/check-upstream-pin.py`, which verifies the checked-in snapshot
-  matches pinned upstream `2a91da7fdb96f3e75badf07614c14e4f85c9ba1c` and that
-  `buf.yaml`/proto comments use pinned URLs instead of absent local paths.
+  the accepted-SDD `upstream.lock.json` and `scripts/check-upstream-pin.py`,
+  which verify the complete `proto/` and `conformance/` file inventory and
+  SHA-256 content at `8ede3810b29fbba4d0e6ae6751a0025ceedda140`. CI runs the
+  offline check and its regression tests. An explicit `--upstream ../syntra`
+  comparison additionally checks committed source blobs; the earlier checker
+  only checked pin references/directory presence, not snapshot contents.
+  See [MIGRATION.md](../MIGRATION.md#accepted-sdd-snapshot-and-alignment-target).
 
 P1 — should fix for production quality:
 
@@ -163,17 +167,18 @@ manual with explicit duration caps.
 ## 7. Specification conformance and releases
 
 Normative authority stays in `tinkle-org/syntra`. This repo owns the Rust
-implementation + C headers. `proto/` and `conformance/test-vectors/` are exact
-snapshots of upstream `2a91da7fdb96f3e75badf07614c14e4f85c9ba1c`; sync PRs must
-record upstream commit + paths and update `MIGRATION.md`.
+implementation + C headers. `proto/` and the complete `conformance/` tree are
+exact snapshots of upstream `8ede3810b29fbba4d0e6ae6751a0025ceedda140`, recorded
+in `upstream.lock.json`. The extraction SHA remains historical provenance;
+sync changes must record upstream commit + paths and update `MIGRATION.md`.
 
 - Generation: `prost =0.13.5`, `neoeinstein-prost:v0.4.0` rev 1, Buf 1.59.0.
   `check-generated.py` verifies byte-identical regeneration in a temp dir.
-  `check-upstream-pin.py` verifies the snapshot matches the pinned commit and
-  comments use pinned URLs (no floating `main`, no absent
-  `docs/schema-registry.md` / `compatibility/v1-initial/image.json` relative
-  paths). Proto comment changes are regenerated via `buf generate`, never
-  hand-edited in `generated/`.
+  `check-upstream-pin.py` verifies the exact file inventory and SHA-256 digests
+  offline; `--upstream ../syntra` additionally compares committed source blobs.
+  Snapshot-relative links retain their upstream wording and resolve in the
+  pinned upstream tree. Proto comment changes are regenerated via `buf generate`,
+  never hand-edited in `generated/`.
 - Publishing: crate names frozen (`syntra-core/runtime/ws/web/ffi`),
   versions from workspace `1.0.0-rc.1`, `Cargo.lock` committed, dependency
   order `core → runtime → ws/web → ffi` (resolved topologically by

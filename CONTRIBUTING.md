@@ -9,10 +9,12 @@ a security-patched toolchain. Current pins are `prost =0.13.5`,
 unless updating them is part of the change.
 
 Read [SC1.md](SC1.md) for the current accepted upstream `SNTR-SC1-WSS-V1`
-contract at `0e8b0f8a4a789cb3d6d00b993e281867d2325e06` (accepted 2026-10-29)
+alignment target at `8ede3810b29fbba4d0e6ae6751a0025ceedda140` (PR #20)
 and [AUDIT.md](AUDIT.md) for local reviews and current gaps.
 [MIGRATION.md](MIGRATION.md) records the historical proposal-review and separate
-extraction/schema pins, along with the scope of `scripts/check-upstream-pin.py`.
+extraction and historical contract pins, along with the content-verified
+snapshot procedure. [The SDD matrix](docs/sdd-alignment.md) distinguishes the
+accepted target from the remaining implementation and evidence work.
 The implementation remains experimental and unpublished; formal conformance has
 not been executed and independent security review remains outstanding.
 Latest local results are recorded in
@@ -167,13 +169,18 @@ buf lint
 buf build
 python3 scripts/check-generated.py
 python3 scripts/check-upstream-pin.py
+python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 ```
 
 The drift script uses Python's standard library and only writes to a
 temporary directory. To intentionally regenerate committed Rust output, run
 `buf generate --template buf.gen.yaml`, then inspect the resulting diff.
-Wire compatibility and cross-language conformance remain upstream concerns;
-the local fixture tests and byte-drift checks cover only their stated scope.
+Accepted wire contracts remain upstream-owned; Rust owns its compatibility and
+execution evidence. The local fixture and byte-drift checks cover only their
+stated scope. `proto/` and `conformance/` are exact managed snapshots; do not edit
+them or their digest inventory to make tests pass. Use the explicit sync command
+in MIGRATION.md after reviewing the upstream revision. Copied relative links
+resolve in that pinned source tree. Keep local runner results outside those roots.
 
 ## Reports and releases
 

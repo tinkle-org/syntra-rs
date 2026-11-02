@@ -12,13 +12,10 @@
 //! connections is unavailable in v1 (SNTR-SESS-006; open blocker 2 —
 //! recorded, not invented).
 //!
-//! Open questions this crate does NOT invent bindings for (see
-//! upstream [session open questions]): typed pre-`ACTIVE` error carrier (B1),
-//! pre-`ACTIVE` notification conflict (B2), stale `request_id` reuse
-//! (B3), payload-vs-envelope size (B8), cancel/deadline/`UNAVAILABLE`
-//! races (B10). Enforced choices are documented on the items.
-//!
-//! [session open questions]: https://github.com/tinkle-org/syntra/blob/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/SESSION-OPEN-QUESTIONS.md
+//! Accepted baseline: local pre-ACTIVE failures/native close, permanent
+//! request-ID non-reuse in emission order, received-order host high-water
+//! admission, and deadline-first serialized terminal selection. Recovery and
+//! mobile platform integration have their own implementation/evidence gates.
 
 pub mod connection;
 mod emission;
@@ -29,8 +26,13 @@ pub mod recovery;
 pub mod reliable;
 pub mod session;
 
-pub use connection::{CancelToken, Connection, ConnectionConfig};
-pub use host::{AllowAll, FnHandler, Handler, HandlerFut, HandlerOutcome, Host};
+pub use connection::{
+    validate_close_grace, CancelToken, Connection, ConnectionConfig, DEFAULT_CLOSE_GRACE,
+    MAX_CLOSE_GRACE,
+};
+pub use host::{
+    AllowAll, ExecutionBudget, ExecutionLease, FnHandler, Handler, HandlerFut, HandlerOutcome, Host,
+};
 pub use initiator::Initiator;
 pub use policy::{
     AdmittedRequest, AuthDecision, AuthzDecision, CompletionDisposition, CompletionToken,

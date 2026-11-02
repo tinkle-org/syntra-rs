@@ -1,0 +1,56 @@
+# Portable TLS cases (Section I/TLS). Profile: SNTR-TLS-TCP-V1. All Mandatory for the claim.
+# Prose companion: conformance/requirements/tls-tcp.md (CONF-TLS-001…004).
+# No Syntra byte precedes successful TLS validation. Certificate fixtures are
+# harness-named references (test-pki:*) — never embedded key material.
+format_version: "1.0"
+profile: SNTR-TLS-TCP-V1
+cases:
+  - id: CONF-TLS-001
+    requirement: [SNTR-TLS-001, SNTR-TLS-003, SNTR-TLS-005, SNTR-TLS-009]
+    profile: SNTR-TLS-TCP-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport, valid_chain]
+    input:
+      transport: { action: tls_handshake, version: TLS1_3, pki: test-pki-valid-leaf, then_send: hello }
+      faults: { split_record_across_units: true, coalesce_two_units: true }
+    expected: { connection_state: NEGOTIATING, session_state: none }
+    notes: "Trusted server: TLS 1.3 completes; framing identical to TCP (records are not frames — split/coalesce tolerated); hello evaluated only after TLS."
+
+  - id: CONF-TLS-002
+    requirement: [SNTR-TLS-003, SNTR-TSEC-003, SNTR-TSEC-020]
+    profile: SNTR-TLS-TCP-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport, invalid_chain]
+    input:
+      transport: { action: tls_handshake, version: TLS1_3, pki: test-pki-untrusted }
+    expected: { connection_state: CLOSED, session_state: none }
+    notes: "Untrusted server (self-signed-untrusted / wrong-chain / malformed sub-runs): terminal TLS failure; no hello sent; no credential disclosed; no plaintext fallback."
+
+  - id: CONF-TLS-003
+    requirement: [SNTR-TLS-004, SNTR-TSEC-004, SNTR-TSEC-021]
+    profile: SNTR-TLS-TCP-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport, wrong_hostname]
+    input:
+      transport: { action: tls_handshake, version: TLS1_3, pki: test-pki-wrong-san }
+    expected: { connection_state: CLOSED, session_state: none }
+    notes: "Hostname mismatch: rejected even though the chain validates; no credential or application payload sent to the unverified endpoint."
+
+  - id: CONF-TLS-004
+    requirement: [SNTR-TLS-002, SNTR-TSEC-002, SNTR-TSEC-007]
+    profile: SNTR-TLS-TCP-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport, weak_tls_only]
+    input:
+      transport: { action: tls_handshake, version: TLS1_2_only }
+      faults: { observe_retry_after_failure: true }
+    expected: { connection_state: CLOSED, session_state: none }
+    notes: "TLS version failure + downgrade absence: TLS 1.2-or-lower negotiation fails; automatic plaintext retry after TLS failure is FORBIDDEN; no Syntra bytes exchanged."

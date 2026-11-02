@@ -6,13 +6,16 @@ profile `SNTR-SC1-WSS-V1`. The implementation remains experimental; host-policy
 and verification gaps are documented below. No formal conformance verdict or
 independent security audit is claimed.
 
-The contract is [RFC 0007 §11.4](https://github.com/tinkle-org/syntra/blob/0e8b0f8a4a789cb3d6d00b993e281867d2325e06/rfcs/0007-secure-channel-device-authorization.md)
-and its companion specifications at upstream commit
-`0e8b0f8a4a789cb3d6d00b993e281867d2325e06` (PR #18, accepted 2026-10-29).
-The [SC1/WSS manifest](https://github.com/tinkle-org/syntra/blob/0e8b0f8a4a789cb3d6d00b993e281867d2325e06/conformance/manifest/sc1-wss.yaml)
-registers `CONF-SCW-001` through `CONF-SCW-024`. Registration does not establish
-an executed result. See [MIGRATION.md](MIGRATION.md) for the separate extraction,
-proposal-review and accepted-contract provenance. Current local results and
+The alignment target is [RFC 0007 §11.4](https://github.com/tinkle-org/syntra/blob/8ede3810b29fbba4d0e6ae6751a0025ceedda140/rfcs/0007-secure-channel-device-authorization.md),
+accepted RFC 0010 and their owner specifications at upstream commit
+`8ede3810b29fbba4d0e6ae6751a0025ceedda140` (PR #20).
+The [SC1/WSS manifest](conformance/manifest/sc1-wss.yaml)
+registers `CONF-SCW-001` through `CONF-SCW-042`. Registration does not establish
+an executed result. RFC 0010 enrollment, validity, rotation and pin lifecycle
+are pending implementation; the APIs and behavior below describe the existing
+RFC 0007 implementation, not full SDD compliance. [The matrix](docs/sdd-alignment.md)
+tracks the differences. See [MIGRATION.md](MIGRATION.md) for separate extraction,
+proposal-review and historical contract provenance. Current local results and
 earlier verification records are in [AUDIT.md](AUDIT.md#current-recorded-verification).
 
 The prerelease source/API/wire break replaces `syntra-tcp` and `syntra-ws-sc1`
@@ -201,6 +204,17 @@ carrier/IP overhead and application payload encoding.
 
 ## Limits, cancellation and ownership
 
+Update/recovery is now available through explicit
+`RecoveryAuthenticatorFactory::new(base, service)` configuration. Its optional
+factory hook supplies the immutable service before the accepted host receives
+hello, preserving the original authentication and shared execution budget.
+Clients explicitly construct and negotiate `RecoveryClient` on each fresh
+Initiator; neither SC1 readiness nor reconnect silently confirms recovery.
+The [Phase 3 contract](docs/phase3-update-recovery.md) covers source authority,
+full-state persistence, fixed-boundary and same-generation snapshot gates,
+and actual direct-WSS regression scope. RFC 0010 enrollment/revocation/rotation
+and mobile/FFI lifecycle integration remain separate pending phases.
+
 `syntra_sc1_transport::Limits::default()` applies through the shared pump:
 
 | Option | Default | Accepted nonzero range |
@@ -213,16 +227,30 @@ carrier/IP overhead and application payload encoding.
 | `close_timeout` | 1s | Positive, at most 24h; owner-task join after close, then abort |
 | `lifetime` | 24h | Positive, at most 24h, configurable downward |
 
-SC1 `Limits::validate` requires `writer_capacity`, `notification_capacity` and
-`max_outstanding` to be in `1..=1024`. This validation applies at the SC1
-adapter boundary, not to every runtime constructor. The shared runtime default
+SC1 `Limits::validate` delegates runtime bounds to `ConnectionConfig::validate`:
+`writer_capacity` and `notification_capacity` must be `1..=1024`, while
+`max_outstanding` must be `16..=1024`. Runtime constructors enforce these bounds
+too; use `try_new*` to return errors rather than panic. The shared runtime default
 `ConnectionConfig::default().max_outstanding` is 32, matching the pending-RPC
 default in `SNTR-SCW-012`. It affects all transports using the runtime defaults;
-callers can set an explicit value. The initiator bounds pending outbound RPCs
-and the host bounds active inbound RPCs using this setting. The new
-`default_max_outstanding_is_32_per_sntr_scw_012` test in
-`crates/syntra-runtime/src/connection.rs` checks the default value only; it does
-not test admission of a 32nd call or refusal of a 33rd.
+callers can set an explicit value within the implementation range. Host
+correlation, execution and selected-output resources now have distinct lifetimes.
+The [Phase 2 contract](docs/phase2-core-rpc.md) documents `ExecutionLease`, shared
+factory budgets, receipt timestamps, deadline-first selection, and 16-way
+admission/out-of-order completion regression coverage. These are local tests,
+not formal `CONF-RPC-013` or SC1 case executions.
+
+The default `AuthenticatorFactory::execution_budget` is process-shared with a
+1024-execution ceiling, including work retained after transport loss. Override
+it to clone a retained host/principal quota; do not mint a fresh budget for every
+replacement connection. Handlers that spawn external work must transfer an
+execution lease into it until actual completion. Otherwise the library cannot
+account work that the handler has hidden outside its returned future.
+
+Application graceful-close APIs accept 0..30 seconds (default helper constant
+five seconds); zero skips drain. `Limits::close_timeout` above remains a
+separate owner-task close/join budget, not additional application drain grace.
+Complete D5 shutdown ownership/reporting is still a later-phase gate.
 
 Writer and notification queue defaults remain 256 each. The writer queue holds at most 256
 frame items; with a 1 MiB frame ceiling this permits up to 256 MiB of
@@ -682,15 +710,19 @@ The remaining host-policy, activated protocol/execution-accounting, durable wire
 recovery, FFI/mobile and independent-evidence work is tracked in
 [implementation status](docs/implementation-status.md).
 
-### Conformance case cross-reference
+### Historical RFC 0007 case cross-reference
 
-The case IDs and requirement references below follow the pinned upstream
+The case IDs and requirement references below retain the earlier pinned upstream
 [SC1/WSS manifest](https://github.com/tinkle-org/syntra/blob/0e8b0f8a4a789cb3d6d00b993e281867d2325e06/conformance/manifest/sc1-wss.yaml).
 This table maps local tests and implementation checks to the registered cases;
 it does not report formal case verdicts. `Local probe` identifies a direct test
 for the described behavior, `Partial` identifies narrower or adjacent evidence,
 and `Not demonstrated` means the distinguishing probe is absent. None of these
 labels is an upstream `PASS`, `FAIL` or other execution verdict.
+
+This is the pre-wave 001–024 mapping, not a complete PR #20 mapping. The active
+suite adds `CONF-SCW-025…042` for RFC 0010; those lifecycle cases are not
+demonstrated by the tests below and are tracked in [the SDD matrix](docs/sdd-alignment.md#phase-4--rfc-0010-host-lifecycle--sqlite-reference).
 
 Source keys keep the test references readable:
 

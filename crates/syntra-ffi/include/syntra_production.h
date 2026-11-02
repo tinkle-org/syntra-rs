@@ -51,7 +51,7 @@ uint32_t syntra_ffi_abi_version(void);
  * (NULL,0) is valid and does nothing. Use for every out buffer below. */
 void syntra_ffi_free(uint8_t *ptr, uintptr_t len);
 
-/* Initiator core. credential (may be NULL iff len==0, max 16 KiB) is copied.
+/* Initiator core. credential (may be NULL iff len==0, max 8 KiB) is copied.
  * default_timeout_ms==0 defaults to 3000; max_concurrent==0 defaults to 16.
  * Pending calls plus unread outcomes share max_concurrent admission slots
  * (hard maximum 256), each frame at most 1 MiB. Take outcomes to release slots.

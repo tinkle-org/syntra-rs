@@ -1,0 +1,184 @@
+# Machine-readable schema for conformance manifests and declarations
+# YAML 1.2. Runners validate structure with any YAML parser; semantic rules
+# (ID existence, profile existence, vector existence) are checked by resolving
+# references against profiles.yaml, requirements.yaml, and test-vectors/.
+format_version: "1.0"
+schema:
+  profile_selection:
+    description: "One applicable profile, or a non-empty list of independently applicable profiles; every ID must resolve in profiles.yaml."
+    one_of:
+      - { type: string, pattern: "^SNTR-[A-Z0-9-]+-V1$" }
+      - { type: list, item: { type: string, pattern: "^SNTR-[A-Z0-9-]+-V1$" }, min_items: 1 }
+  profile_manifests:
+    description: "The profiles.yaml profiles[].manifests field."
+    type: list
+    min_items: 1
+    item: { $ref: "#/schema/manifest_reference" }
+  manifest_reference:
+    description: "Each profiles.yaml profiles[].manifests entry is a path or a filtered path. Filters match all listed fields by exact equality; capabilities: [] selects only capability-free cases. A string path loads every case subject to normal capability gating."
+    one_of:
+      - { type: string }
+      - type: map
+        required: [path, select]
+        fields:
+          path: { type: string }
+          select:
+            type: map
+            required: [mandatory, capabilities]
+            fields:
+              mandatory: { type: boolean }
+              capabilities: { type: list, item: { type: string } }
+  manifest_file:
+    type: map
+    required: [format_version, profile, cases]
+    fields:
+      format_version: { type: string, pattern: "^1\\.0$" }
+      profile: { $ref: "#/schema/profile_selection" }
+      cases:
+        type: list
+        item: { $ref: "#/schema/test_case" }
+  expected_map:
+    # Two-observer handshake-failure vocabulary (accepted RFC 0003 D1):
+    # `error.observer` targets the detecting side's local record
+    # (detecting_host | detecting_peer; absent = the initiator's normally
+    # received terminal result in the exchange context), `error.carriage`
+    # declares whether the cause crosses the wire (wire | local_only;
+    # absent = wire). `carriage: local_only` is executable: together with
+    # `frames: []` (an empty frames list asserts that no Syntra Frame
+    # envelopes are emitted in response to the stimulus; the stimulus
+    # Frame itself is never a member) it forbids every invented error
+    # carrier.
+    # `transport.peer_observation` asserts the peer's transport-native
+    # signal per transport family (tcp_tls | ws_wss | http_1_1 |
+    # https_h2), each entry optionally asserting `signal`
+    # (transport_close | ws_close | http_status | connection_loss),
+    # `close_code` (RFC 6455 application code), `status` (integer HTTP
+    # status) and `local_report` (a known ErrorCode or the documented
+    # generic marks generic_protocol_rejection | generic_policy_rejection
+    # when the signal cannot distinguish causes). `transport.result_envelope`
+    # (absent | present) is the HTTP binding's no-invented-envelope
+    # assertion. Unknown transport-family keys or unknown local_report
+    # values fail validation.
+    type: map
+    optional: [connection_state, session_state, frames, error, transport, hygiene, retry]
+    fields:
+      connection_state: { type: string, enum: [CONNECTED, NEGOTIATING, AUTHENTICATING, ACTIVE, CLOSING, CLOSED] }
+      session_state: { type: string, enum: [none, active, unchanged, terminated_normally, terminated_abnormally, withdrawn] }
+      frames: { type: list, item: { type: map } }
+      error: { type: map, optional: [code, message_pattern, message_absent, observer, carriage] }
+      transport: { type: map }
+      hygiene: { type: map, optional: [absent_from] }
+      retry: { type: string }
+  test_case:
+    type: map
+    required: [id, requirement, profile, roles, capabilities, mandatory, preconditions, input, expected]
+    optional: [notes, vector_refs, control_connection, applicable_transports]
+    fields:
+      id: { type: string, pattern: "^CONF-[A-Z]+-[0-9]+$" }
+      # Requirement refs admit the SNTR-* core families and the RFC 0006
+      # recovery family SYN-URP-nnn except the reserved unassigned IDs
+      # SYN-URP-008 and SYN-URP-009, which the pattern rejects outright
+      # (they MUST NOT appear as case refs or registrations).
+      requirement: { type: list, item: { type: string, pattern: "^(SNTR-[A-Z]+-[0-9]+|SYN-ARCH-[0-9]+|SYN-URP-(?:[1-9][0-9]{2,}|0(?:0[1-7]|[1-9][0-9])))$" }, min_items: 1 }
+      profile: { $ref: "#/schema/profile_selection" }
+      roles: { type: list, item: { enum: [client, server] }, min_items: 1 }
+      capabilities: { type: list, item: { type: string } }
+      mandatory: { type: boolean }
+      preconditions: { type: list, item: { type: string }, min_items: 1 }
+      # Transport applicability (machine-readable, e.g. RFC 0004 D3
+      # persistent-carrier exemptions): when present, the case executes
+      # exactly over the listed transport families and a claim whose
+      # transports intersect none of them reports SKIP for the case citing
+      # this key (absent = applies to any claimed transport — the default
+      # for every pre-existing case).
+      applicable_transports: { type: list, item: { type: string, enum: [tcp_tls, ws_wss, http_1_1, https_h2] }, min_items: 1 }
+      input:
+        # `faults` maps are free-form per case (loss/delay/tamper), but
+        # race-sensitive coordination MUST use the documented structured
+        # barrier faults (see conformance/manifest/README.md): e.g.
+        # `duplicate_while_pending: {barrier: first_terminal_result,
+        # release_after: violation_and_closure}` — required, validated, on
+        # CONF-RPC-004 — and `reverse_completion_order: {barrier:
+        # all_admitted}`. Sleeps and prose-only coordination are not
+        # executable specifications.
+        type: map
+        optional: [frames, transport, faults, credentials, subscriptions, replay]
+        fields:
+          frames: { type: list, item: { type: map } }
+          transport: { type: map }
+          faults: { type: map }
+          credentials: { type: string }
+          subscriptions: { type: list, item: { type: map } }
+          replay: { type: map }
+      expected: { $ref: "#/schema/expected_map" }
+      # Optional paired-control scenario for cases whose outcome depends on
+      # per-connection negotiation isolation (e.g., confirming on one
+      # connection must not enable the profile on another). When present, the
+      # runner executes this stimulus on a fresh connection with the same
+      # host, bound principal, authorization scope, and identifier/selector
+      # basis as the case-level scenario, and asserts these outcomes in
+      # addition to the case-level outcomes. Prose-only controls are not
+      # executable specifications.
+      control_connection:
+        type: map
+        required: [preconditions, expected]
+        optional: [frames, subscriptions, replay, transport, faults, credentials, notes]
+        fields:
+          preconditions: { type: list, item: { type: string }, min_items: 1 }
+          frames: { type: list, item: { type: map } }
+          subscriptions: { type: list, item: { type: map } }
+          replay: { type: map }
+          transport: { type: map }
+          faults: { type: map }
+          credentials: { type: string }
+          expected: { $ref: "#/schema/expected_map" }
+          notes: { type: string }
+      notes: { type: string }
+      vector_refs: { type: list, item: { type: string } }
+  requirements_file:
+    type: map
+    required: [format_version, requirements]
+    fields:
+      format_version: { type: string, pattern: "^1\\.0$" }
+      requirements:
+        type: list
+        item: { $ref: "#/schema/requirement_entry" }
+  requirement_entry:
+    type: map
+    required: [requirement_id, specification, section, test_ids, automation_status]
+    optional: [notes]
+    fields:
+      # Requirement IDs admit the SNTR-* core families, the SYN-ARCH-*
+      # charter family, and the RFC 0006 recovery family SYN-URP-nnn except
+      # the reserved unassigned IDs SYN-URP-008 and SYN-URP-009, which the
+      # pattern rejects outright (they MUST NOT be registered as requirement
+      # rows).
+      requirement_id: { type: string, pattern: "^(SNTR-[A-Z]+-[0-9]+|SYN-ARCH-[0-9]+|SYN-URP-(?:[1-9][0-9]{2,}|0(?:0[1-7]|[1-9][0-9])))$" }
+      specification: { type: string }
+      section: { type: string }
+      test_ids: { type: list, item: { type: string, pattern: "^CONF-[A-Z]+-[0-9]+$" } }
+      automation_status: { type: string, enum: [automated, partially_automated, manual, not_testable] }
+      notes: { type: string }
+  declaration_file:
+    type: map
+    required: [format_version, implementation, syntra_core, profiles, capabilities, bounds, results]
+    fields:
+      format_version: { type: string, pattern: "^1\\.0$" }
+      implementation: { type: map, required: [name, version] }
+      syntra_core: { type: string, pattern: "^v1$" }
+      profiles: { type: list, item: { type: string, pattern: "^SNTR-[A-Z0-9-]+-V1$" }, min_items: 1 }
+      capabilities: { type: list, item: { type: string } }
+      bounds: { type: map }
+      results:
+        type: list
+        item:
+          type: map
+          required: [test_id, verdict]
+          fields:
+            test_id: { type: string, pattern: "^CONF-[A-Z]+-[0-9]+$" }
+            verdict: { type: string, enum: [PASS, FAIL, SKIP, UNSUPPORTED, NOT_EXECUTED] }
+  verdicts: [PASS, FAIL, SKIP, UNSUPPORTED, NOT_EXECUTED]
+  verdict_rules:
+    - "UNSUPPORTED != PASS"
+    - "SKIP != PASS"
+    - "NOT_EXECUTED != PASS"

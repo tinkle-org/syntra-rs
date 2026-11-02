@@ -1,0 +1,327 @@
+# Portable recovery cases. RFC 0006 is accepted; its §11 decision amendment is
+# authoritative. Case reconciliation per conformance/plans/update-recovery.md §4
+# and RFC 0006 §11.8: CONF-URP-001/002/003/007 retain their intent (with scoped
+# identity, fresh-round fencing, and durable-safe resume added); CONF-URP-004/011
+# were corrected to the §11 shapes (replay pages delivered in the correlated
+# RpcResult, fixed-boundary rounds with a fresh handle for the second gap);
+# CONF-URP-005/006 were extended (snapshot transfer shape, no-wire completion,
+# same-G local install, coordinated S0 binding); CONF-URP-009/010 were replaced
+# (true scoped provider loss with next_generation trailer fencing; subscriber-
+# local saturation with terminated=true and ASCII local-queue-exhausted, no
+# next_generation); CONF-URP-012..017 are new §11 coverage. Requirement traces
+# use the accepted SYN-URP-* IDs (SYN-URP-008/009 reserved, unassigned) plus
+# meaningful SNTR-* core IDs.
+# Registration is NOT execution: every case below is a planned, not-executed
+# executable specification. No verdict here is an execution result. Prose
+# companion: ../recovery_profile/recovery.md.
+# Optionality rule: any case whose capabilities are unadvertised MUST yield
+# UNSUPPORTED (correct UNIMPLEMENTED refusal) or SKIP — never FAIL.
+format_version: "1.0"
+profile: SNTR-EVENTS-V1
+cases:
+  - id: CONF-URP-001
+    requirement: [SYN-URP-001, SYN-URP-010, SYN-URP-020, SNTR-CAP-003, SNTR-CAP-010, SNTR-CAP-020, SNTR-EVENT-001, SNTR-EVENT-011]
+    profile: SNTR-EVENTS-V1
+    roles: [server]
+    capabilities: [syntra.update-recovery/1]
+    mandatory: false
+    preconditions: [active_session]
+    input:
+      frames:
+        - {request_id: 3, body: request, method: "/syntra.v1.UpdateRecovery/Subscribe", payload_b64: "CAESDnN1YnNjcmlwdGlvbi1h"}
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      error: {code: UNIMPLEMENTED}
+    control_connection:
+      preconditions: [active_session]
+      frames:
+        - {request_id: 1, body: request, method: "/syntra.v1.UpdateRecovery/Negotiate", payload_b64: "CAEQARgBIhhzeW50cmEudXBkYXRlLXJlY292ZXJ5LzE="}
+        - {request_id: 3, body: request, method: "/syntra.v1.UpdateRecovery/Subscribe", payload_b64: "CAESDnN1YnNjcmlwdGlvbi1h"}
+      expected:
+        connection_state: ACTIVE
+        session_state: unchanged
+        frames:
+          - {request_id: 1, body: result, shape: RecoveryNegotiateResponse, note: "selected_version 1 confirmed with the deployment bounds; the profile is confirmed on this connection only"}
+          - {request_id: 3, body: result, shape: RecoverySubscribeResponse, note: "fresh connection-scoped handle with a newly captured boundary"}
+      notes: "Runner-driven paired control on a fresh connection to the same recovery-capable host, bound principal, authorization scope, and stream selector as the case-level probe connection."
+    notes: "Mandatory-only fallback and per-connection negotiation isolation on one recovery-capable Host: both connections target the same host, bound principal, authorization scope, and stream selector, and the Host's mandatory service continues on the unconfirmed connection. UNCONFIRMED PROBE CONNECTION: no Negotiate is run and the profile is not confirmed; the runner deliberately injects the otherwise valid initial-subscription RecoverySubscribeRequest — profile_version 1, a non-empty stream_selector within bounds, and the valid empty start_checkpoint initial-subscription sentinel (SYN-URP-021: start_checkpoint MAY be empty; empty means initial subscription) — as a negative test, because a conforming initiator MUST NOT send profile operations before confirmation (SYN-URP-001); this injection is therefore runner-driven only. The host replies UNIMPLEMENTED (SYN-URP-010: the operation belongs to a profile not confirmed on this connection, and an unknown operation is likewise UNIMPLEMENTED), so the refusal is attributed to the confirmation gate by the paired control rather than by the error code alone. No handle and no checkpoint are created on the unconfirmed connection, including by the checkpoint_issued_for_handle path, because Subscribe itself requires confirmation. request_id 3 is nonzero and admitted as increasing on its connection (RFC 0004), so the refusal is not a request-ID violation. CONTROL CONNECTION (runner-driven, fresh connection to the same host): Negotiate (request_id 1) returns selected_version 1 with the confirmed deployment bounds, confirming the profile on that connection only, and the exact same valid Subscribe payload (request_id 3) then succeeds with a fresh connection-scoped handle and a newly captured boundary, so the confirmation gate is the sole delta; request IDs are independently valid within each connection. Negotiation and confirmation on the control connection never enable the profile on the unconfirmed one; partial acceptance falls back to mandatory-only plus previously confirmed options (SYN-URP-001). The durable known-safe resumption shape is CONF-URP-015's coverage. RFC 0006 §11.1 release-bundle inclusion does not relax the per-connection gate. SKIP when unclaimed. Registered; not yet executed."
+
+  - id: CONF-URP-002
+    requirement: [SYN-URP-003, SYN-URP-004, SNTR-EVENT-007, SNTR-REL-005]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [syntra.update-recovery/1]
+    mandatory: false
+    preconditions: [active_session, subscription_confirmed]
+    input: {faults: {emit_duplicate_event: true}}
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      hygiene: {absent_from: [violation, error_storm]}
+    notes: "Duplicate tolerance across the recovered and live boundary: initiator tolerates the duplicate with no violation and no error storm, skipping an already applied result checkpoint only after version, handle/scope, generation, authorization, and bounds validation; equal checkpoint bytes from another connection, handle, generation, or principal context are not a duplicate. SKIP when unclaimed. Registered; not yet executed."
+
+  - id: CONF-URP-003
+    requirement: [SYN-URP-003, SYN-URP-004, SYN-URP-012, SNTR-EVENT-006, SNTR-EVENT-021]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [syntra.update-recovery/1]
+    mandatory: false
+    preconditions: [active_session, subscription_confirmed]
+    input: {faults: {emit_batches: 3, skip_batch: true}}
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      frames:
+        - {request_id: 0, body: notification}
+    notes: "Gap detection by predecessor chaining without arithmetic on checkpoint bytes and without structural parsing of checkpoint or binding binaries; the initiator reports local recovery-needed, does not treat idle as caught-up, and no generation change results. Harness fault injection provides the gap. SKIP when unclaimed. Registered; not yet executed."
+
+  - id: CONF-URP-004
+    requirement: [SYN-URP-004, SYN-URP-014, SYN-URP-022, SYN-URP-023, SNTR-EVENT-008, SNTR-EVENT-009]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [syntra.update-recovery/1]
+    mandatory: false
+    preconditions: [active_session, subscription_confirmed, replay_retained]
+    input: {replay: {checkpoint_b64: "Y3Vyc29yLUs=", strategy: replay_from_start_checkpoint, pages: 3}}
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      frames:
+        - {request_id: 1, body: result, shape: RecoveryReplayPage, note: "one bare RecoveryReplayPage per correlated RpcResult"}
+        - {request_id: 2, body: result, shape: RecoveryReplayPage}
+        - {request_id: 3, body: result, shape: RecoveryReplayPage}
+      hygiene: {absent_from: [unbounded_burst, page_notification]}
+    notes: "Replay paging correct shape: oversized history returns bounded replay pages — exactly one RecoveryReplayPage payload per correlated RpcResult, each page stating its continuation marker and the round's fixed catch-up boundary; pages are never delivered as page Notifications (recoverable Notification payloads carry batch/replay_complete/trailer outcomes only). Initiator echoes markers verbatim and stops at the boundary; held live batches are not released before a validated completion matching connection+handle+generation+version+exact boundary (RFC 0006 §11.3). Hygiene forbids burst beyond bounds and any page-as-Notification outcome. SKIP when unclaimed. Registered; not yet executed."
+
+  - id: CONF-URP-005
+    requirement: [SYN-URP-012, SYN-URP-015, SNTR-EVENT-009]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [syntra.update-recovery/1]
+    mandatory: false
+    preconditions: [active_session, cursor_expired]
+    input: {replay: {checkpoint_b64: "ZXhwaXJlZC1jdXJzb3I=", strategy: replay_from_start_checkpoint}}
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      error: {code: FAILED_PRECONDITION}
+      frames:
+        - {request_id: 0, body: notification}
+      hygiene: {absent_from: [silent_restart, generation_increment, binding_invalidation]}
+    notes: "Expired continuation with snapshot-required signal: replay from the outside-retention checkpoint yields FAILED_PRECONDITION in the failed replay RpcResult while the snapshot-required signal arrives as the trailer Notification; the checkpoint binding (P, S, G) stays valid and the generation is NOT incremented for a retention-window miss (RFC 0006 §11.2), which is distinct from silent restart and from true provider loss. Recovery follows the snapshot path. SKIP when unclaimed. Registered; not yet executed."
+
+  - id: CONF-URP-006
+    requirement: [SYN-URP-016, SYN-URP-021, SYN-URP-025, SNTR-EVENT-008]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [syntra.update-recovery/1]
+    mandatory: false
+    preconditions: [active_session, subscription_confirmed, snapshot_required]
+    input: {replay: {checkpoint_b64: "Y3Vyc29yLUs=", strategy: snapshot_from_boundary}}
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      frames:
+        - {request_id: 1, body: result}
+      hygiene: {absent_from: [partial_install, cross_boundary_install, provider_rebase]}
+    notes: "Snapshot install gate: the descriptor is bound to (P, S, H, G, S0) with a provider-proven boundary; SnapshotFetch returns exactly one chunk per correlated RpcResult; transfer completion is derived locally from complete index coverage and byte accounting (no wire RecoverySnapshotComplete carrier is used); installation is application-local at the UNCHANGED generation and the initiator opens the snapshot live gate only after a validated RecoverySnapshotInstalled matching handle, generation, and exact S0 with no partial install. SKIP when unclaimed. Registered; not yet executed."
+
+  - id: CONF-URP-007
+    requirement: [SYN-URP-006, SYN-URP-010, SNTR-SESS-008, SNTR-EVENT-020]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [syntra.update-recovery/1]
+    mandatory: false
+    preconditions: [transport_connected]
+    input:
+      frames:
+        - {request_id: 0, body: hello, min_version: 1, max_version: 1}
+        - {request_id: 1, body: request, method: "/syntra.v1.UpdateRecovery/Negotiate", payload_b64: "CAEQARgBIhhzeW50cmEudXBkYXRlLXJlY292ZXJ5LzE="}
+        - {request_id: 3, body: request, method: "/syntra.v1.UpdateRecovery/Subscribe", payload_b64: "CAESDnN1YnNjcmlwdGlvbi1h"}
+      subscriptions:
+        - {method: "/example.Events/Subscribe", filter_b64: "ZmlsdGVyLWE=", handle_b64: "c3RhbGUtaGFuZGxl"}
+    expected:
+      connection_state: ACTIVE
+      session_state: active
+      frames:
+        - {request_id: 1, body: result, shape: RecoveryNegotiateResponse, note: "selected_version 1 confirmed with the deployment bounds on this fresh connection; the fresh profile confirmation does NOT transfer any prior connection's capability state (SNTR-SESS-008)"}
+        - {request_id: 3, body: result, shape: RecoverySubscribeResponse, note: "fresh connection-scoped handle with a newly captured boundary (RFC 0006 §11.6); stale handles carry no continuity"}
+      hygiene: {absent_from: [notification, capability_leak]}
+    notes: "Reconnect re-subscribe: recovery reconnects with a fresh authenticated connection, renegotiates again, and subscribes to a fresh handle with a newly captured boundary; the input explicitly drives the reconnect sequence Negotiate (request_id 1) -> confirmed profile -> recovery Subscribe (request_id 3) on the fresh connection before any other profile operation (SYN-URP-010 client-side negotiation ordering), matching RFC 0006 §11.6. Neither capability state nor pagination or snapshot handles transfer; the new connection carries no batches without explicit re-subscribe; the stale-handle events subscription remains the receive-without-re-subscribe hygiene negative (SNTR-EVENT-020). Expected hygiene forbids notification batches. SKIP when unclaimed. Registered; not yet executed."
+
+  - id: CONF-URP-008
+    requirement: [SYN-URP-007, SYN-URP-018, SNTR-EVENT-030, SNTR-REL-007]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [syntra.update-recovery/1]
+    mandatory: false
+    preconditions: [active_session, flood_ready]
+    input: {faults: {flood_events: true}}
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      error: {code: RESOURCE_EXHAUSTED}
+      hygiene: {absent_from: [unbounded_queue, silent_truncation]}
+    notes: "Reject-new-work before acceptance: saturation of host resources before an affected subscription is accepted yields RESOURCE_EXHAUSTED with documented backoff while existing subscriptions continue (RFC 0006 §11.4: rejecting new work before a saturated subscription is accepted remains valid). Runs only when the host documents the reject-new-work policy (SKIP CONF-URP-008 otherwise). Never unbounded queueing and never silent truncation without the documented signal. SKIP when unclaimed. Registered; not yet executed."
+
+  - id: CONF-URP-009
+    requirement: [SYN-URP-012, SYN-URP-013, SYN-URP-026, SNTR-EVENT-030]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [syntra.update-recovery/1]
+    mandatory: false
+    preconditions: [active_session, subscription_confirmed, two_scopes_stable, provider_loss_barrier]
+    input:
+      faults: {provider_history_loss: true}
+      frames:
+        - {request_id: 1, body: request, method: "/syntra.v1.UpdateRecovery/Replay", payload_b64: "CAESCGhhbmRsZS1BGg1jaGVja3BvaW50LWM3IAEoAQ==", generation: 7}
+        - {request_id: 2, body: request, method: "/syntra.v1.UpdateRecovery/Confirm", payload_b64: "CAESCGhhbmRsZS1BGAciDWNoZWNrcG9pbnQtYzc=", generation: 7}
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      frames:
+        - {request_id: 0, body: notification, payload_b64: "CAEiEAgBEghoYW5kbGUtQRgHKAg="}
+      error: {code: FAILED_PRECONDITION}
+      hygiene: {absent_from: [silent_invalidation, checkpoint_reinterpretation, mixed_generation_work]}
+    notes: "Scoped generation invalidation by true provider history loss: the host changes the scoped generation once and signals explicitly with a versioned RecoveryBatchTrailer whose generation=7 (old G) and next_generation=8 (new G) for the affected (P, S) scope — the expected payload is versioned RecoveryNotification bytes so a normal batch does not pass. Old-generation pages, offers, confirmations, and batches are fenced and fail FAILED_PRECONDITION with no mixed-generation work; subscribers of unaffected scopes keep valid bindings. SELECTED on true provider loss or explicit shared rebase ONLY — an ordinary retention-window miss or local queue saturation never produces this trailer. SKIP when unclaimed. Registered; not yet executed."
+
+  - id: CONF-URP-010
+    requirement: [SYN-URP-007, SYN-URP-017, SYN-URP-018, SYN-URP-026, SNTR-EVENT-030, SNTR-REL-007]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [syntra.update-recovery/1]
+    mandatory: false
+    preconditions: [active_session, subscription_confirmed, two_subscribers_stable, flood_ready]
+    input: {faults: {flood_events: true, slow_subscriber: true}}
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      frames:
+        - {request_id: 0, body: notification, payload_b64: "CAEiJwgBEghoYW5kbGUtQRgHQAFKFWxvY2FsLXF1ZXVlLWV4aGF1c3RlZA=="}
+      retry: "affected subscription is retired and a fresh round begins through new Subscribe; never a fabricated provider next_generation"
+      hygiene: {absent_from: [unbounded_queue, silent_truncation, next_generation_on_local_overflow]}
+    notes: "Subscriber-local saturation isolation: filling the affected subscriber's delivery/holding queue ends ONLY that subscription with terminated=true at the CURRENT generation 7 and non-empty ASCII terminate_reason local-queue-exhausted — no next_generation is selected and shared G is NOT incremented — so the other subscriber on the same (P, S, G) continues with valid checkpoints and the connection stays usable; an affected pending profile invocation may also fail RESOURCE_EXHAUSTED; initiator-local overflow reports local recovery-needed and cannot manufacture a provider next_generation. The expected payload is versioned RecoveryNotification bytes so a normal batch does not pass (RFC 0006 §11.4). SKIP when unclaimed. Registered; not yet executed."
+
+  - id: CONF-URP-011
+    requirement: [SYN-URP-004, SYN-URP-006, SYN-URP-014, SYN-URP-022, SYN-URP-023, SYN-URP-024, SNTR-EVENT-008, SNTR-EVENT-009]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [syntra.update-recovery/1]
+    mandatory: false
+    preconditions: [active_session, durable_checkpoint_c1, subscription_confirmed]
+    input: {replay: {checkpoint_b64: "Y3Vyc29yLUs=", strategy: replay_from_start_checkpoint_then_fresh_round}, faults: {emit_live_during_replay: true, skip_batch_after_progress: true}}
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      frames:
+        - {request_id: 1, body: result, payload_b64: "CAESCGhhbmRsZS1BGghjdXJzb3ItSyIJY3Vyc29yLUsxKgJtMTIBQjosCAESCGhhbmRsZS1BGAciCGN1cnNvci1LKgljdXJzb3ItSzEyB2dlbmVyaWM="}
+        - {request_id: 2, body: result, payload_b64: "CAESCGhhbmRsZS1BGgljdXJzb3ItSzEiAUIqADIBQjolCAESCGhhbmRsZS1BGAciCWN1cnNvci1LMSoBQjIHZ2VuZXJpYw=="}
+        - {request_id: 0, body: notification, payload_b64: "CAESCGhhbmRsZS1BGAciAUI="}
+        - {request_id: 5, body: request, shape: RecoverySubscribeRequest, note: "subscribe with start_checkpoint=c2 after retiring handle-A"}
+      hygiene: {absent_from: [moving_boundary, silent_truncation, same_handle_second_round, obsolete_boundary_replay]}
+    notes: "Fixed-boundary round and fresh-handle second gap: replay from the durable known-safe checkpoint c1 returns pages as one RecoveryReplayPage payload per correlated RpcResult (never a page Notification), held live batches release only after a validated completion matching connection+handle-A+generation 7+version+exact boundary B (`replay_complete` at boundary B for handle-A), and the boundary never moves during the round. After durable progress c2 beyond boundary B, a subsequent gap retires handle-A locally (held queue and cursors cleared) and a fresh Subscribe(start_checkpoint=c2) yields a new handle with a NEWLY captured boundary; recovery runs toward the new boundary, never toward the obsolete one, with no same-handle second round and no marker reset (expected request frame carries a RecoverySubscribeRequest, not a same-handle Replay reset). SKIP when unclaimed. Registered; not yet executed."
+
+  - id: CONF-URP-012
+    requirement: [SYN-URP-014, SYN-URP-022, SYN-URP-024, SNTR-REL-005]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [syntra.update-recovery/1]
+    mandatory: false
+    preconditions: [active_session, subscription_confirmed, replay_retained]
+    input: {faults: {drop_completion: true}}
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      frames:
+        - {request_id: 0, body: notification, payload_b64: "CAESCGhhbmRsZS1BGAciAUI="}
+      retry: "repeat the exact preceding Replay (or same CatchUp) payload with fresh RPC request IDs under documented finite attempts and an absolute deadline; never a same-handle second round or marker reset"
+      hygiene: {absent_from: [idle_as_caught_up, tight_loop, rerun_effects]}
+    notes: "Lost completion and bounded exact retry: while the round stays current, the host returns the retained page/acceptance verbatim without advancing pagination and re-emits the round's completion (same handle, same generation, same boundary — expected payload is the re-emitted RecoveryReplayComplete for handle-A boundary B); duplicate completions are idempotent and do not re-offer data. On retry or deadline budget exhaustion the initiator retires the handle locally (queue, cursors, pending offers cleared) and starts a fresh round through a new Subscribe from the durable known-safe checkpoint — no same-handle second round and no marker reset. SKIP when unclaimed. Registered; not yet executed."
+
+  - id: CONF-URP-013
+    requirement: [SYN-URP-016, SYN-URP-025, SNTR-EVENT-008]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [syntra.update-recovery/1]
+    mandatory: false
+    preconditions: [active_session, subscription_confirmed, snapshot_required]
+    input: {faults: {snapshot_supersede: true}}
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      error: {code: FAILED_PRECONDITION}
+      hygiene: {absent_from: [partial_install, cross_boundary_install, equal_boundary_reuse]}
+    notes: "Superseding an offer retires the handle: gap, continuity-loss, or continuation-expiry reports invalidate any pending offer and the initiator MUST Subscribe again for a fresh handle before a new snapshot handle X is issued — even when the new provider boundary bytes equal the old S0 and the generation is unchanged (RFC 0006 §11.5); in-flight SnapshotFetch under the superseded X or the retired handle fails FAILED_PRECONDITION; staged pages are discarded, never partially installed, never installed across boundaries; old confirmations under a retired handle cannot install; exact duplicate SnapshotOffer under the active handle returns the retained descriptor rather than a second offer. SKIP when unclaimed. Registered; not yet executed."
+
+  - id: CONF-URP-014
+    requirement: [SYN-URP-002, SYN-URP-016, SYN-URP-021, SNTR-EVENT-008]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [syntra.update-recovery/1]
+    mandatory: false
+    preconditions: [active_session, subscription_confirmed, snapshot_required]
+    input: {replay: {checkpoint_b64: "c3RhaWdlLWV4aGF1c3RlZA==", strategy: snapshot_from_boundary, fetch_all_indices: true}}
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      frames:
+        - {request_id: 10, body: result}
+        - {request_id: 11, body: result}
+      hygiene: {absent_from: [wire_complete_signal, partial_install]}
+    notes: "No-wire RecoverySnapshotComplete: each SnapshotFetch returns exactly one RecoverySnapshotChunk in its correlated RpcResult; transfer completion is derived locally from complete index coverage 0..N-1 and bounded byte accounting; there is NO wire transmission for RecoverySnapshotComplete — no request method, no second result slot, and no RecoveryNotification arm or Notification outcome — so the expected frame list contains no completion signal and an invented wire 'complete' carrier is nonconformant (RFC 0006 §11.5). SnapshotConfirm still requires the exact offered boundary and current generation afterward. SKIP when unclaimed. Registered; not yet executed."
+
+  - id: CONF-URP-015
+    requirement: [SYN-URP-005, SYN-URP-006, SYN-URP-013, SNTR-SESS-008]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [syntra.update-recovery/1]
+    mandatory: false
+    preconditions: [transport_connected, restart_from_durable_store, durable_effects_plus_checkpoint, known_safe_checkpoint]
+    input:
+      frames:
+        - {request_id: 0, body: hello, min_version: 1, max_version: 1}
+        - {request_id: 1, body: request, method: "/syntra.v1.UpdateRecovery/Negotiate", payload_b64: "CAEQARgBIhhzeW50cmEudXBkYXRlLXJlY292ZXJ5LzE="}
+        - {request_id: 3, body: request, method: "/syntra.v1.UpdateRecovery/Subscribe", payload_b64: "CAESDnN1YnNjcmlwdGlvbi1hGg1jaGVja3BvaW50LWMx"}
+      faults: {crash_after_durable_persist: true}
+    expected:
+      connection_state: ACTIVE
+      session_state: active
+      frames:
+        - {request_id: 1, body: result, shape: RecoveryNegotiateResponse, note: "selected_version 1 confirmed with the deployment bounds on this fresh connection; the fresh profile confirmation does NOT transfer any prior connection's capability state (SNTR-SESS-008)"}
+        - {request_id: 3, body: result, shape: RecoverySubscribeResponse, note: "fresh connection-scoped handle with a newly captured boundary; the durable known-safe start_checkpoint c1 is validated and accepted without a previous confirmation record (RFC 0006 §11.6)"}
+    notes: "Durable-known-safe checkpoint resume after crash without previous confirmation: effects and checkpoint c1 are durable while the Confirm was never sent (or its response/ack bookkeeping was lost). Test setup establishes the fresh authenticated connection first (hello with a valid credential; the connection reaches ACTIVE before any profile operation), so the case never sends a profile operation on an unconfirmed connection. The reconnect driver then, before any other profile operation (SYN-URP-010 client-side negotiation ordering), runs Negotiate (request_id 1) and asserts its confirmed result — selected_version 1 with the deployment bounds (RFC 0006 §11.6: reconnect always establishes a new authenticated connection, negotiates again, and subscribes with a fresh handle and captured boundary) — and then the recovery Subscribe (request_id 3, increasing though 2 is skipped; RFC 0004) carries a RecoverySubscribeRequest whose start_checkpoint is the durable known-safe checkpoint c1 (opaque checkpoint bytes; may be newer than the last peer-acknowledged checkpoint); the host validates the issued checkpoint binding (P, S, G), current authority, binding, and retention and MAY accept valid c1 without a previous confirmation record (RFC 0006 §11.6). No rollback by guesswork; no invented generation; neither capability state nor pagination or snapshot handles transfer to the fresh connection. SKIP when unclaimed. Registered; not yet executed."
+
+  - id: CONF-URP-016
+    requirement: [SYN-URP-013, SYN-URP-025, SNTR-EVENT-009]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [syntra.update-recovery/1]
+    mandatory: false
+    preconditions: [active_session, subscription_confirmed, fresh_checkpoint_issue]
+    input:
+      frames:
+        - {request_id: 4, body: request, method: "/syntra.v1.UpdateRecovery/Confirm", payload_b64: "CAESCGhhbmRsZS1BGAciDWNoZWNrcG9pbnQtYzc="}
+      faults: {confirm_uncommittable: true}
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      error: {code: FAILED_PRECONDITION}
+      retry: "exact batch Confirm retries with fresh RPC request IDs stay idempotent while eligible; SnapshotConfirm exact retries return the retained installed response at the same generation until supersede/termination/continuity change/cache expiry"
+    notes: "Issued-checkpoint validation distinct from unoffered Confirm: batch Confirm of checkpoint bytes never issued as a committable batch result for handle-A generation 7 fails FAILED_PRECONDITION without advancing or leaking state — the expected request carries a RecoveryConfirmRequest for the unissued bytes; the host provider establishes its recoverable issued binding to (P, S, G) independent of Confirm receipt, and loss of that binding is explicit failure/recovery, never the assumption that a lost acknowledgement proves no local commit (RFC 0006 §11.6). Contrast CONF-URP-015: on resume the same issued checkpoint may be accepted without a confirmation record. Snapshot: exact snapshot Confirm retries use the CURRENT generation only, with no pre-install-generation exception. SKIP when unclaimed. Registered; not yet executed."
+
+  - id: CONF-URP-017
+    requirement: [SYN-URP-012, SYN-URP-016, SYN-URP-025, SNTR-EVENT-008]
+    profile: SNTR-EVENTS-V1
+    roles: [client, server]
+    capabilities: [syntra.update-recovery/1]
+    mandatory: false
+    preconditions: [active_session, two_subscribers_stable, snapshot_durable]
+    input: {replay: {checkpoint_b64: "Ym91bmRhcnktczA=", strategy: snapshot_from_boundary}, faults: {install_snapshot: true}}
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      frames:
+        - {request_id: 12, body: result, payload_b64: "CAESCGhhbmRsZS1BGgtib3VuZGFyeS1zMCAH"}
+      hygiene: {absent_from: [provider_rebase, generation_increment, checkpoint_reinterpretation]}
+    notes: "Install at the same generation without a provider rebase: application-local durable installation under the offered boundary S0 yields a RecoverySnapshotInstalled carrying the UNCHANGED current generation 7 and exact S0 — the expected payload is the bare RpcResult bytes, never carrying a replacement checkpoint field or post-install token — and subsequent batches for that subscription chain from S0 within the same generation; unrelated subscribers continue from their own checkpoints without invalidation; a provider needing a genuine shared rebase performs and signals it before any descriptor in the new generation, and an install confirmation never creates that rebase as a side effect (RFC 0006 §11.5). SKIP when unclaimed. Registered; not yet executed."

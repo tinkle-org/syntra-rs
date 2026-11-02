@@ -267,11 +267,18 @@ async fn initiator_graceful_close_drains_results_and_rejects_new_calls() {
     let (client, mut writer) = client().await;
     let mut call = Box::pin(client.call(METHOD, vec![], 5000));
     assert!(futures_util::poll!(&mut call).is_pending());
-    // Model actual emission before exercising advisory cancellation/drain.
+    // Cancellation is terminal locally after emission, advisory only to peer
+    // execution. A different uncancelled call must still drain during close.
     let bytes = client
         .prepare_outbound(writer.recv().await.unwrap())
         .unwrap();
     let id = Frame::decode(bytes.as_slice()).unwrap().request_id;
+    let mut draining = Box::pin(client.call(METHOD, vec![], 5000));
+    assert!(futures_util::poll!(&mut draining).is_pending());
+    let bytes = client
+        .prepare_outbound(writer.recv().await.unwrap())
+        .unwrap();
+    let draining_id = Frame::decode(bytes.as_slice()).unwrap().request_id;
     let mut closing = Box::pin(client.close_gracefully(Duration::from_secs(1)));
     assert!(futures_util::poll!(&mut closing).is_pending());
     assert_eq!(client.state().await, ConnectionState::Closing);
@@ -299,7 +306,25 @@ async fn initiator_graceful_close_drains_results_and_rejects_new_calls() {
             .encode_to_vec(),
         )
         .await;
-    assert_eq!(call.await.unwrap(), b"drained");
+    assert_eq!(call.await.unwrap_err().code(), ErrorCode::Cancelled);
+    assert_eq!(
+        client.pending_len(),
+        1,
+        "late result cannot settle a different call"
+    );
+    assert!(futures_util::poll!(&mut draining).is_pending());
+    client
+        .ingest(
+            &frame(
+                draining_id,
+                Body::Result(RpcResult {
+                    outcome: Some(Outcome::Payload(b"drained".to_vec())),
+                }),
+            )
+            .encode_to_vec(),
+        )
+        .await;
+    assert_eq!(draining.await.unwrap(), b"drained");
     closing.await;
     assert_eq!(client.state().await, ConnectionState::Closed);
 }
@@ -539,7 +564,10 @@ async fn graceful_deadline_bounds_a_full_writer_and_blocked_result_sender() {
     tokio::task::yield_now().await;
     host.ingest(&request(2)).await;
     tokio::task::yield_now().await;
-    assert_eq!(host.inflight_len(), 1);
+    // Selection retires correlation before writer capacity becomes available.
+    // The blocked output worker remains owned independently of that retirement.
+    assert_eq!(host.inflight_len(), 0);
+    assert!(host.worker_len() >= 1);
     tokio::time::timeout(
         Duration::from_millis(200),
         host.close_gracefully(Duration::from_millis(10)),

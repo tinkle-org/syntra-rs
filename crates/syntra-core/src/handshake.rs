@@ -20,7 +20,9 @@ pub const MAX_VERSION: u32 = 1;
 pub const HANDSHAKE_TIMEOUT_DEFAULT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Maximum credential bytes accepted before policy evaluation.
 /// Bounds unauthenticated input (DoS boundary); deployments document theirs.
-pub const MAX_CREDENTIAL_BYTES: usize = 16 * 1024;
+pub const MAX_CREDENTIAL_BYTES: usize = 8_192;
+/// Maximum UTF-8 encoded bytes in a diagnostic connection identifier (RFC 0005 D2).
+pub const MAX_CONNECTION_ID_BYTES: usize = 128;
 
 /// Validate a `ClientHello` range. Both bounds nonzero, min <= max.
 pub fn validate_hello_range(min_version: u32, max_version: u32) -> Result<(), SyntraError> {
@@ -61,7 +63,7 @@ pub fn negotiate_version(
 /// Validate a received `connection_id`: opaque UTF-8 diagnostic, never an
 /// authenticator or resume token. Must be non-empty and bounded.
 pub fn validate_connection_id(id: &str) -> Result<(), SyntraError> {
-    if id.is_empty() || id.len() > 256 {
+    if id.is_empty() || id.len() > MAX_CONNECTION_ID_BYTES {
         return Err(SyntraError::Protocol {
             code: ErrorCode::InvalidArgument,
             message: "invalid connection_id length".to_string(),

@@ -1,0 +1,264 @@
+# Portable WebSocket cases (Section I/WS). Profile: SNTR-WS-V1. All Mandatory.
+# Prose companion: conformance/requirements/websocket.md (CONF-WS-001…017).
+# Development-only profile. Client frames masked; server frames unmasked (RFC 6455).
+format_version: "1.0"
+profile: SNTR-WS-V1
+cases:
+  - id: CONF-WS-001
+    requirement: [SNTR-WS-001, SNTR-WS-010, SNTR-WS-020, SNTR-WS-040]
+    profile: SNTR-WS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport]
+    input:
+      transport: { action: ws_upgrade, path: "/syntra/v1/ws", protocol: "syntra.v1", key_b64: "dGhlIHNhbXBsZSBub25jZQ==" }
+    expected:
+      connection_state: CONNECTED
+      session_state: none
+      transport: { status: 101, protocol: "syntra.v1" }
+    notes: "Valid WS Upgrade: 101 selects syntra.v1; no Syntra envelope sent before 101."
+    vector_refs: ["websocket/VEC-WS-001", "websocket/VEC-WS-002"]
+
+  - id: CONF-WS-002
+    requirement: [SNTR-WS-020, SNTR-WS-023, SNTR-WS-024]
+    profile: SNTR-WS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport]
+    input:
+      transport: { action: ws_upgrade, path: "/syntra/v1/ws", protocol: "syntra.v1, x-future-proto" }
+    expected:
+      connection_state: CONNECTED
+      session_state: none
+      transport: { status: 101, protocol: "syntra.v1" }
+    notes: "Subprotocol negotiation: 101 selects exactly syntra.v1; core version still negotiates via hello/ready independently."
+
+  - id: CONF-WS-003
+    requirement: [SNTR-WS-021]
+    profile: SNTR-WS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport]
+    input:
+      transport: { action: ws_upgrade, path: "/syntra/v1/ws", protocol: "" }
+    expected: { connection_state: CLOSED, session_state: none }
+    notes: "Missing subprotocol: Upgrade fails (400/426, no 101). A 101 without the header is aborted without Syntra bytes (FAILED_PRECONDITION locally)."
+
+  - id: CONF-WS-004
+    requirement: [SNTR-WS-022]
+    profile: SNTR-WS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport]
+    input:
+      transport: { action: ws_upgrade, path: "/syntra/v1/ws", protocol: "other.proto" }
+    expected: { connection_state: CLOSED, session_state: none }
+    notes: "Unsupported subprotocol: no 101; a 101 selecting anything but syntra.v1 is aborted without Syntra bytes (UNIMPLEMENTED)."
+
+  - id: CONF-WS-005
+    requirement: [SNTR-WS-030, SNTR-WS-031, SNTR-WS-036, SNTR-WIRE-001]
+    profile: SNTR-WS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input:
+      transport: { action: ws_binary_message, opcode: 2, fin: true, body_ref: "protobuf/GOLD-PROT-REQ-01" }
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      frames:
+        - { request_id: 7, body: result }
+    notes: "Binary envelope round-trip: one message = one Frame; no length prefix inside the message (VEC-WS-009 negative proof). Empty/small/non-UTF-8 payload rows repeat."
+    vector_refs: ["websocket/VEC-WS-003", "websocket/VEC-WS-009"]
+
+  - id: CONF-WS-006
+    requirement: [SNTR-WS-031, SNTR-WS-081]
+    profile: SNTR-WS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input:
+      transport: { action: ws_text_message, text: "hello" }
+    expected:
+      connection_state: CLOSED
+      session_state: terminated_abnormally
+      transport: { close_code: 1003 }
+    notes: "Text message rejection: close 1003 (unsupported data); no Syntra result synthesized; no handler dispatch."
+
+  - id: CONF-WS-007
+    requirement: [SNTR-WS-033, SNTR-WS-034]
+    profile: SNTR-WS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input:
+      transport: { action: ws_fragmented_message, fragments: 3, interleave_ping: true }
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      frames:
+        - { request_id: 8, body: result }
+    notes: "Fragmented binary message with interleaved Ping: reassemble all fragments (FIN-gated) then decode exactly one Frame; fragment boundaries have no semantic effect."
+    vector_refs: ["websocket/VEC-WS-004"]
+
+  - id: CONF-WS-008
+    requirement: [SNTR-WS-035, SNTR-WIRE-006]
+    profile: SNTR-WS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input:
+      transport: { action: ws_binary_message, assembled_length: 1048577 }
+    expected:
+      connection_state: CLOSED
+      session_state: terminated_abnormally
+      transport: { close_code: 1009 }
+      error: { code: RESOURCE_EXHAUSTED }
+    notes: "Oversized assembled message (MAX+1, whole or fragmented): stop past the bound, discard, close 1009; no panic, no unbounded allocation. Exactly-MAX accepted."
+    vector_refs: ["websocket/VEC-WS-008"]
+
+  - id: CONF-WS-009
+    requirement: [SNTR-WS-070, SNTR-WS-071, SNTR-WS-072, SNTR-WS-073]
+    profile: SNTR-WS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input:
+      transport: { action: ws_ping_probe, payload: "ping-1" }
+    expected: { connection_state: ACTIVE, session_state: unchanged }
+    notes: "Ping/Pong liveness: each Ping answered with identical-payload Pong; unsolicited Pong accepted and ignored; no Syntra envelope for control frames."
+    vector_refs: ["websocket/VEC-WS-005"]
+
+  - id: CONF-WS-010
+    requirement: [SNTR-WS-080, SNTR-WS-081]
+    profile: SNTR-WS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input:
+      transport: { action: ws_close, code: 1000 }
+    expected: { connection_state: CLOSED, session_state: terminated_normally }
+    notes: "Normal close: clean Close handshake per RFC 6455 §7; state discarded except diagnostics; no error for completed RPCs."
+    vector_refs: ["websocket/VEC-WS-006"]
+
+  - id: CONF-WS-011
+    requirement: [SNTR-WS-081, SNTR-WS-082, SNTR-HS-012, SNTR-WIRE-003]
+    profile: SNTR-WS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input:
+      transport: { action: ws_protocol_error_rows }
+    expected:
+      connection_state: CLOSED
+      session_state: terminated_abnormally
+      transport: { close_code: 1002 }
+      error: { code: FAILED_PRECONDITION }
+    notes: "Protocol-error closes (three runs: second hello / zero-ID request / empty binary message): 1002 with FAILED_PRECONDITION context (empty-message row 1007-or-1002/INVALID_ARGUMENT); no second handshake on the same transport."
+    vector_refs: ["websocket/VEC-WS-007"]
+
+  - id: CONF-WS-012
+    requirement: [SNTR-HS-014, SNTR-REL-009]
+    profile: SNTR-WS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input:
+      faults: { abrupt_transport_loss: true, in_flight_request_ids: [12] }
+    expected:
+      connection_state: CLOSED
+      session_state: terminated_abnormally
+      error: { code: UNAVAILABLE, message_pattern: "NEGATIVE:success" }
+    notes: "Abrupt disconnect: UNAVAILABLE to every in-flight RPC with unknown outcome; never success or proof of non-execution."
+
+  - id: CONF-WS-013
+    requirement: [SNTR-WS-120, SNTR-SESS-003, SNTR-SESS-008, SNTR-SESS-010]
+    profile: SNTR-WS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [transport_connected]
+    input:
+      credentials: "fixture:connection-id-as-credential"
+      transport: { action: ws_upgrade, path: "/syntra/v1/ws", protocol: "syntra.v1" }
+    expected:
+      connection_state: CLOSED
+      session_state: none
+      error: { code: FAILED_PRECONDITION }
+    notes: "Reconnect starts a new session: fresh hello + fresh credential on connection B; connection_id-as-credential rejected; A in-flight RPCs not continued; subscriptions not surviving."
+
+  - id: CONF-WS-014
+    requirement: [SNTR-WS-120, SNTR-SESS-006, SNTR-SESS-020]
+    profile: SNTR-WS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [transport_connected]
+    input:
+      credentials: "fixture:stale-resume-bytes"
+      transport: { action: ws_upgrade, path: "/syntra/v1/ws", protocol: "syntra.v1" }
+    expected:
+      connection_state: CLOSED
+      session_state: none
+      error: { code: UNAUTHENTICATED }
+    notes: "Session resume without capability rejected: any resumption presentation fails; host documents 'no resumption — sessions are connection-bound'."
+
+  - id: CONF-WS-015
+    requirement: [SNTR-RPC-002, SNTR-RPC-008, SNTR-REL-007]
+    profile: SNTR-WS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input:
+      transport: { action: ws_two_binary_messages, request_ids: [7, 8], complete_second_first: true }
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      frames:
+        - { request_id: 8, body: result }
+        - { request_id: 7, body: result }
+    notes: "Concurrent RPCs over one WS connection: two terminal results, 8-before-7 accepted; correlation by ID only."
+
+  - id: CONF-WS-016
+    requirement: [SNTR-HS-005, SNTR-EVENT-005]
+    profile: SNTR-WS-V1
+    roles: [client, server]
+    capabilities: [events-v1]
+    mandatory: false
+    preconditions: [active_session, subscription_confirmed]
+    input: { faults: { emit_events: 1, interleave_with_request_id: 9 } }
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      frames:
+        - { request_id: 0, body: notification }
+        - { request_id: 9, body: result }
+    notes: "Server event over WS (claimed-events row): notification delivered as an event without completing the interleaved RPC. The pre-ACTIVE-notification rejection half is asserted in CONF-EVT-014. SKIP when unadvertised."
+
+  - id: CONF-WS-017
+    requirement: [SNTR-WS-100, SNTR-WS-101, SNTR-REL-007, SNTR-REL-008, SNTR-ASEC-020]
+    profile: SNTR-WS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input:
+      transport: { action: ws_flood_probe }
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      error: { code: RESOURCE_EXHAUSTED }
+    notes: "Slow consumer backpressure: excess RPC rejected with RESOURCE_EXHAUSTED (connection usable); connection-level exhaustion closes (1009/1011) with UNAVAILABLE to affected in-flight RPCs; initiator backs off with jitter; host recovers without restart."

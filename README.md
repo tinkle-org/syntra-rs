@@ -1,23 +1,35 @@
 # Syntra Rust
 
 Rust implementation of Syntra v1 with generated Protobuf types, bounded
-codecs, client/host runtimes, reliable-session and recovery helpers, and
+codecs, client/host runtimes, negotiated update/recovery with full-state
+persistence adapters, local reliable-session helpers, and
 experimental SC1 channels over native WSS, with opt-in development carriers.
 
 Extracted from [`tinkle-org/syntra`](https://github.com/tinkle-org/syntra) at
 [`2a91da7fdb96f3e75badf07614c14e4f85c9ba1c`](https://github.com/tinkle-org/syntra/commit/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c).
 See [MIGRATION.md](MIGRATION.md) for provenance and the path mapping.
 
-SC1 targets the accepted RFC 0007 profile `SNTR-SC1-WSS-V1`, merged upstream at
-[`0e8b0f8a4a789cb3d6d00b993e281867d2325e06`](https://github.com/tinkle-org/syntra/commit/0e8b0f8a4a789cb3d6d00b993e281867d2325e06).
-The implementation remains experimental and unpublished with documented gaps.
-The profile registers 24 cases (`CONF-SCW-001…024`); formal conformance has not
-been executed and no conformance verdict is claimed.
+The accepted SDD alignment target is
+[`8ede3810b29fbba4d0e6ae6751a0025ceedda140`](https://github.com/tinkle-org/syntra/commit/8ede3810b29fbba4d0e6ae6751a0025ceedda140)
+(upstream PR #20, RFCs 0001–0010 with the recorded dispositions).
+`upstream.lock.json` pins byte-identical schema and conformance inputs, including
+42 registered SC1 cases (`CONF-SCW-001…042`) and 17 recovery cases.
+This is an implementation target, not a claim of completed alignment or a formal
+specification freeze. [Phase 2](docs/phase2-core-rpc.md) implements the new
+Core/RPC parser, ID, deadline, bounds and execution-accounting contracts.
+[Phase 3](docs/phase3-update-recovery.md) adds the optional negotiated recovery
+runtime on the actual Core and SC1/WSS paths; [the SDD matrix](docs/sdd-alignment.md)
+records the remaining phases and evidence.
+The implementation remains experimental; formal conformance has not been
+executed and no conformance verdict is claimed.
 Read [SC1.md](SC1.md) for the wire format and source-backed API sketch,
 and [AUDIT.md](AUDIT.md) for recorded results and historical evidence.
 The core `Frame` schema and baseline `syntra-ws` framing/endpoints remain
 unchanged; custom runtime writers must adopt the emission-gate contract below.
-Schema and fixture provenance is in [MIGRATION.md](MIGRATION.md).
+Schema and fixture provenance is in [MIGRATION.md](MIGRATION.md). Copied upstream
+documents retain their original wording and relative links; resolve those links
+in the pinned upstream tree. Neither stale copied status notes nor local tests
+override accepted owner specifications.
 
 Use **Rust 1.88.0** for production builds and current verification. The
 crate MSRV floor is **1.88**; it is a build compatibility constraint, not a
@@ -155,35 +167,73 @@ presence, JSON gateways, service discovery and gRPC clients are outside the
 workspace's scope. There is no HTTP/HTTPS request-response transport
 planned; HTTP is used for the WebSocket upgrade. UDP is deferred.
 Reliable-session helpers do not claim exactly-once effects or make arbitrary
-RPC retries safe. Recovery cursors and payloads stay opaque; the helpers are
-not a complete subscription/recovery service.
+RPC retries safe. Recovery cursors and payloads stay opaque. The accepted
+update/recovery binding is explicitly configured and negotiated as described below;
+legacy local helpers do not themselves supply wire behavior or durable effects.
+
+### Negotiated update/recovery
+
+Configure `Host::configure_recovery(service)` while CONNECTED, before hello.
+For SC1/WSS, wrap the existing factory with
+`RecoveryAuthenticatorFactory::new(base, service)`; the accept path configures
+the service before consuming the encrypted hello. The service binds the actual
+Core principal and invokes the application's bounded `RecoverySource` policy.
+With no configured service, profile calls return `UNIMPLEMENTED` and Core
+interoperability remains available.
+
+`recovery::wire_client::RecoveryClient::new` attaches one immutable inbox to its
+Initiator. Explicit ACTIVE negotiation enables recovery routing before the generic
+lossy notification queue. Typed APIs implement all nine methods, fixed-boundary
+rounds, replay and snapshot fencing, bounded retries and subscriber-local overflow.
+Snapshot installation preserves the provider generation; only declared scoped
+provider loss or a shared rebase changes it. Mixed notification protocols require
+explicit demultiplexing, not a failed-decode fallback.
+
+Applications supply recoverable source-side issued checkpoint/snapshot bindings
+and full-state persistence under `(principal, stable stream, generation, checkpoint)`.
+`recovery::persistence::FileRecoveryStore` is a native single-writer full-record
+reference with atomic replacement and uncertainty reporting, not encrypted credential
+storage or a production source/history database. A digest or memory store is not
+durable-effect evidence. See [the Phase 3 contract](docs/phase3-update-recovery.md)
+for API ownership, limits, failure handling and storage assumptions. Automatic
+recovered-service reconnect, ABI v2, mobile/browser integration and formal
+conformance remain later-phase work.
 
 ### Resource and compatibility behavior
 
-- `ConnectionConfig::default().max_outstanding` changes from 64 to 32 for
-  all runtime users that use the default, including non-SC1 transports.
-  Explicit overrides remain available; writer and notification capacities
-  still default to 256 each.
+- `ConnectionConfig::default().max_outstanding` is 32. Validated runtime
+  constructors require 16..=1024, with writer/notification capacities 1..=1024
+  (both default 256). Use `try_new*` for fallible construction; legacy `new*`
+  constructors panic on invalid configuration. Stricter execution/principal
+  admission quotas are separate from the supported Core concurrency floor.
 - A serialized frame is limited to 1 MiB, including envelope overhead. A
   payload at a separate application limit can therefore fail encoding.
-  Failed request encoding does not reserve a call slot or start its timer.
-- The runtime host admits a notification only while its bounded queue has
-  capacity. Saturation drops the newest notification and counts it; terminal
-  RPC results remain admissible. Only successful enqueues wake notification
-  waiters. No matching subscription work is claimed beyond carriage.
+  Failed request encoding retires any reserved ID and cleans its registration.
+  The absolute call budget starts before readiness/writer queue waiting.
+- The initiator's bounded notification queue drops the newest notification and
+  counts losses when saturated. Host output has bounded writer backpressure
+  and separately charged terminal-output slots. Negotiated recovery now has
+  per-H data/control routing before this generic queue. Remaining generic/mobile
+  shutdown and lifecycle guarantees still have their own later-phase gates.
 - SC1 limits ciphertext records to 65,535 bytes and plaintext to 65,519
   bytes; the encrypted frame stream may span records. Lifetime is at most 24
-  hours or 2^32 records per direction. SC1 `Limits::validate` requires runtime
-  outstanding-RPC, writer and notification capacities in `1..=1024`; this is
-  adapter validation, not a universal runtime configuration bound. See
+  hours or 2^32 records per direction. SC1 `Limits::validate` also validates the
+  shared runtime configuration. Default factories share a process-wide budget
+  of 1024 live executions across connections/replacements; custom factories
+  can return a retained host/principal budget. External work must retain its
+  execution lease until it stops. See
   [SC1.md](SC1.md) for exact clocks, cancellation requirements and
   revocation checks.
-- Unknown fields alongside a known body are tolerated. Unknown top-level
-  content without a known body yields `UNIMPLEMENTED`; a genuinely empty body
-  yields `INVALID_ARGUMENT`. Body tags are 10–15; 16–17 remain reserved.
+- Unknown metadata alongside a known body is tolerated. Metadata alone, with
+  no body, yields `INVALID_ARGUMENT`. Body tags are 10–15, 16–17 remain
+  forbidden, and a sole valid future 18–31 body yields `UNIMPLEMENTED`.
   Reserved tags, duplicate oneof alternatives, malformed unknown wire data
   and nesting beyond depth 32 are rejected by the bounded codec on decode
   and emission; opaque payload bytes are not parsed.
+- Request IDs are permanently non-reused and ordered at FIFO enqueue/emission;
+  host high-water violations close without an offending-ID result. Pending
+  terminal gates check the deadline first; previously selected outcomes stay
+  terminal. The exact migration and bounds are in [Phase 2](docs/phase2-core-rpc.md).
 
 ## Native FFI
 
@@ -255,7 +305,11 @@ Generated files are committed under
 Rust plugin **`neoeinstein-prost:v0.4.0` revision 1**, as pinned in
 `buf.gen.yaml`. The eight logical schema paths have explicit mappings to
 this module. The `.proto` snapshots intentionally retain their original
-options; do not rewrite them by hand.
+options, including the deferred `go_package` migration; do not rewrite them by
+hand. Check all schema/suite bytes offline with
+`python3 scripts/check-upstream-pin.py`; add `--upstream ../syntra` to compare
+with the exact committed Git blobs. The explicit refresh procedure is in
+[MIGRATION.md](MIGRATION.md#accepted-sdd-snapshot-and-alignment-target).
 
 ```sh
 buf generate --template buf.gen.yaml

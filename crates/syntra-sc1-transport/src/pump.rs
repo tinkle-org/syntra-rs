@@ -1,13 +1,17 @@
 //! Carrier-neutral bounded SC1 pump. Socket ownership stays in carrier modules.
 use std::{
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use syntra_core::{
     decode_frame, proto::frame::Body, ConnectionState, SyntraError, ValidationContext,
 };
-use syntra_runtime::{AuthError, Authenticator, ConnectionConfig, Handler, Host, Initiator};
+use syntra_runtime::connection::validate_close_grace;
+use syntra_runtime::recovery::wire::RecoveryService;
+use syntra_runtime::{
+    AuthError, Authenticator, ConnectionConfig, ExecutionBudget, Handler, Host, Initiator,
+};
 use syntra_secure_channel::{
     frame_plaintext, respond, Channel, ClientConfig, ClientHandshake, FrameDecoder, ServerConfig,
     VerifiedIdentity, MAX_CIPHERTEXT, MAX_PLAINTEXT, MAX_WRAPPER,
@@ -48,6 +52,7 @@ pub struct Limits {
     pub record_timeout: Duration,
     pub frame_timeout: Duration,
     pub write_timeout: Duration,
+    /// Carrier shutdown/owner join budget, separate from application close grace.
     pub close_timeout: Duration,
     pub lifetime: Duration,
 }
@@ -66,6 +71,7 @@ impl Default for Limits {
 }
 impl Limits {
     pub fn validate(&self, runtime: &ConnectionConfig) -> Result<(), Error> {
+        runtime.validate().map_err(|_| Error::Configuration)?;
         let durations = [
             self.attempt_timeout,
             self.channel_timeout,
@@ -78,19 +84,6 @@ impl Limits {
         if durations
             .iter()
             .any(|d| d.is_zero() || *d > Duration::from_secs(86_400))
-            || runtime.writer_capacity == 0
-            || runtime.writer_capacity > 1024
-            || runtime.notification_capacity == 0
-            || runtime.notification_capacity > 1024
-            || runtime.max_outstanding == 0
-            || runtime.max_outstanding > 1024
-            || [
-                runtime.handshake_timeout,
-                runtime.default_timeout,
-                runtime.max_rpc_timeout,
-            ]
-            .iter()
-            .any(|d| d.is_zero() || *d > Duration::from_secs(86_400))
         {
             return Err(Error::Configuration);
         }
@@ -98,11 +91,42 @@ impl Limits {
     }
 }
 
+/// Process-wide aggregate execution cap for SC1 hosts using the default factory
+/// budget, including external work retaining an execution lease. Independent of
+/// each connection's `max_outstanding` and its protocol capacity floor of 16.
+pub const DEFAULT_AGGREGATE_EXECUTION_LIMIT: usize = 1024;
+
+static DEFAULT_EXECUTION_BUDGET: OnceLock<ExecutionBudget> = OnceLock::new();
+
 /// Called only after authenticated client data reconstructs a valid first hello.
 /// Returning authorization must re-check current enrollment policy here. A factory
 /// can capture the private-constructed identity in an Authenticator wrapper.
 pub trait AuthenticatorFactory: Send + Sync {
     fn create(&self, identity: &VerifiedIdentity) -> Result<Arc<dyn Authenticator>, AuthError>;
+
+    /// Aggregate execution policy for accepted hosts. All factories using this
+    /// default (including closures) share one process-wide budget capped at
+    /// [`DEFAULT_AGGREGATE_EXECUTION_LIMIT`], across connections and replacements.
+    ///
+    /// Override to clone a host- or principal-owned budget reused across every
+    /// connection/replacement in that scope; never create a fresh budget here.
+    /// Stricter quotas (including below 16) do not lower the core RPC capacity.
+    /// This hook must return promptly without blocking. External work must retain
+    /// its execution lease until it actually stops, independent of transport close.
+    fn execution_budget(&self) -> ExecutionBudget {
+        DEFAULT_EXECUTION_BUDGET
+            .get_or_init(|| ExecutionBudget::new(DEFAULT_AGGREGATE_EXECUTION_LIMIT))
+            .clone()
+    }
+
+    /// Server-owned recovery policy, disabled by default. Called once per accepted
+    /// host before hello ingestion; must return promptly without blocking. Never
+    /// derive this choice from client hints or unauthenticated carrier headers.
+    /// The runtime binds the immutable service to the actual core principal only
+    /// after authentication, not to an identity supplied by this hook.
+    fn recovery_service(&self) -> Option<Arc<RecoveryService>> {
+        None
+    }
 }
 impl<F> AuthenticatorFactory for F
 where
@@ -110,6 +134,33 @@ where
 {
     fn create(&self, identity: &VerifiedIdentity) -> Result<Arc<dyn Authenticator>, AuthError> {
         self(identity)
+    }
+}
+
+/// Opt an existing factory (including a closure) into server-owned recovery.
+/// Authentication and aggregate execution policy remain the base factory's.
+pub struct RecoveryAuthenticatorFactory<F: AuthenticatorFactory> {
+    base: F,
+    service: Arc<RecoveryService>,
+}
+
+impl<F: AuthenticatorFactory> RecoveryAuthenticatorFactory<F> {
+    pub fn new(base: F, service: Arc<RecoveryService>) -> Self {
+        Self { base, service }
+    }
+}
+
+impl<F: AuthenticatorFactory> AuthenticatorFactory for RecoveryAuthenticatorFactory<F> {
+    fn create(&self, identity: &VerifiedIdentity) -> Result<Arc<dyn Authenticator>, AuthError> {
+        self.base.create(identity)
+    }
+
+    fn execution_budget(&self) -> ExecutionBudget {
+        self.base.execution_budget()
+    }
+
+    fn recovery_service(&self) -> Option<Arc<RecoveryService>> {
+        Some(self.service.clone())
     }
 }
 
@@ -190,8 +241,10 @@ struct Pump {
 }
 impl Pump {
     async fn close_gracefully(self, grace: Duration) -> Result<(), Error> {
-        if grace.is_zero() || grace > Duration::from_secs(86_400) {
-            return Err(Error::Configuration);
+        validate_close_grace(grace).map_err(|_| Error::Configuration)?;
+        if grace.is_zero() {
+            self.close().await;
+            return Ok(());
         }
         let deadline = Instant::now() + grace;
         let (done, completed) = oneshot::channel();
@@ -234,10 +287,11 @@ enum Peer {
     Host(Arc<Host>),
 }
 impl Peer {
-    async fn ingest(&self, bytes: &[u8]) {
+    // Receipt affects host RPC budgets only; initiator correlation has its own clock.
+    async fn ingest_received_at(&self, bytes: &[u8], received_at: std::time::Instant) {
         match self {
             Self::Client(c) => c.ingest(bytes).await,
-            Self::Host(h) => h.ingest(bytes).await,
+            Self::Host(h) => h.ingest_received_at(bytes, received_at).await,
         }
     }
     async fn lost(&self) {
@@ -311,6 +365,21 @@ impl From<FrameDecoder> for ReceiveState {
     }
 }
 
+type ReceivedFrame = (Zeroizing<Vec<u8>>, std::time::Instant);
+
+/// Extract and timestamp the entire bounded batch before validation or delivery.
+/// A lazy iterator here would renew later frames' budgets after an earlier await.
+fn received_frames(
+    decoder: &mut FrameDecoder,
+    plaintext: &[u8],
+) -> Result<Vec<ReceivedFrame>, Error> {
+    Ok(decoder
+        .push(plaintext)?
+        .into_iter()
+        .map(|frame| (Zeroizing::new(frame), Instant::now().into_std()))
+        .collect())
+}
+
 async fn read_frames<R, F, Fut>(
     mut reader: R,
     channel: Arc<Mutex<Channel>>,
@@ -321,7 +390,7 @@ async fn read_frames<R, F, Fut>(
 ) -> Result<(), Error>
 where
     R: RecordReader,
-    F: FnMut(Zeroizing<Vec<u8>>) -> Fut,
+    F: FnMut(Zeroizing<Vec<u8>>, std::time::Instant) -> Fut,
     Fut: Future<Output = Result<(), Error>>,
 {
     let ReceiveState {
@@ -350,7 +419,7 @@ where
         if Instant::now() >= deadline {
             return Err(Error::Timeout);
         }
-        let frames = decoder.push(&plaintext)?;
+        let frames = received_frames(&mut decoder, &plaintext)?;
         // A new partial frame starts at parsing, before any backpressured delivery.
         // Completion of an earlier frame in this batch permits a new assembly budget.
         if !decoder.is_partial() {
@@ -361,11 +430,11 @@ where
         let delivery_deadline = (Instant::now() + limits.write_timeout)
             .min(frame_deadline.unwrap_or(end))
             .min(end);
-        for frame in frames {
+        for (frame, received_at) in frames {
             if Instant::now() >= delivery_deadline {
                 return Err(Error::Timeout);
             }
-            timeout_at(delivery_deadline, ingest(Zeroizing::new(frame)))
+            timeout_at(delivery_deadline, ingest(frame, received_at))
                 .await
                 .map_err(|_| Error::Timeout)??;
             if Instant::now() >= delivery_deadline {
@@ -452,10 +521,10 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
                 receive,
                 end,
                 read_limits,
-                move |frame| {
+                move |frame, received_at| {
                     let peer = read_peer.clone();
                     async move {
-                        peer.ingest(&frame).await;
+                        peer.ingest_received_at(&frame, received_at).await;
                         if peer.closed() {
                             Err(Error::Closed)
                         } else {
@@ -684,7 +753,7 @@ pub async fn accept_records<R: RecordReader, W: RecordWriter>(
     limits.validate(&runtime)?;
     let attempt = Instant::now() + limits.attempt_timeout;
     let channel_deadline = attempt.min(Instant::now() + limits.channel_timeout);
-    let (channel, mut decoder, first_frame, end) = timeout_at(channel_deadline, async {
+    let established = timeout_at(channel_deadline, async {
         let first = reader.read_record(MAX_WRAPPER).await?;
         let (mut channel, second) = respond(security, &first)?;
         let end = Instant::now() + limits.lifetime;
@@ -702,7 +771,7 @@ pub async fn accept_records<R: RecordReader, W: RecordWriter>(
                 .await
                 .map_err(|_| Error::Timeout)??;
             let plaintext = channel.decrypt(&record)?;
-            let mut frames = decoder.push(&plaintext)?;
+            let mut frames = received_frames(&mut decoder, &plaintext)?;
             if !frames.is_empty() {
                 // The first envelope must be hello, with no pipelined application data.
                 if frames.len() != 1 || decoder.is_partial() {
@@ -715,10 +784,10 @@ pub async fn accept_records<R: RecordReader, W: RecordWriter>(
     })
     .await
     .map_err(|_| Error::Timeout)??;
+    let (channel, mut decoder, (first_frame, received_at), end) = established;
     if Instant::now() >= channel_deadline.min(end) {
         return Err(Error::Timeout);
     }
-    let first_frame = Zeroizing::new(first_frame);
     let first = decode_frame(
         &first_frame,
         ValidationContext::pre_handshake(ConnectionState::Connected),
@@ -737,10 +806,21 @@ pub async fn accept_records<R: RecordReader, W: RecordWriter>(
     if Instant::now() >= attempt.min(end) {
         return Err(Error::Timeout);
     }
-    let (host, mut outbound) = Host::new(runtime, auth, handler);
-    timeout_at(attempt.min(end), host.ingest(&first_frame))
-        .await
-        .map_err(|_| Error::Timeout)?;
+    let (host, mut outbound) =
+        Host::try_new_with_execution_budget(runtime, auth, handler, factory.execution_budget())
+            .map_err(|_| Error::Configuration)?;
+    if let Some(service) = factory.recovery_service() {
+        timeout_at(attempt.min(end), host.configure_recovery(service))
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::Configuration)?;
+    }
+    timeout_at(
+        attempt.min(end),
+        host.ingest_received_at(&first_frame, received_at),
+    )
+    .await
+    .map_err(|_| Error::Timeout)?;
     if host.is_closed() {
         return Err(Error::Authentication);
     }

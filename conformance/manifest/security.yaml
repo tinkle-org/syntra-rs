@@ -1,0 +1,181 @@
+# Security negative cases (Section Q). One case per STEST group; Mandatory.
+# Prose companion: specifications/security/test-plan.md (SNTR-STEST-001…011).
+# Every case includes the STEST-900 cross-cutting checks: no credential/token in
+# URLs, logs, errors, or metric labels; hygiene negative grep; timing-agnostic
+# pass criteria; secure-profile AND (where permitted) loopback-plaintext scoping.
+# Certificate fixtures are harness-named (test-pki:*) — never embedded here.
+format_version: "1.0"
+profile: SNTR-CORE-V1
+cases:
+  - id: CONF-SEC-001
+    requirement: [SNTR-STEST-001, SNTR-TSEC-003, SNTR-TLS-003]
+    profile: SNTR-CORE-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport, invalid_chain]
+    input:
+      transport: { action: tls_handshake, version: TLS1_3, pki: test-pki-untrusted }
+    expected:
+      connection_state: CLOSED
+      session_state: none
+      error: { code: UNAVAILABLE }
+      hygiene: { absent_from: ["opaque", credential, token, ".pem", "PRIVATE KEY"] }
+    notes: "Excessive/malicious transport setup refused: invalid/wrong-chain/malformed certificates fail before any hello/credential; no fallback; UNAVAILABLE to waiters."
+
+  - id: CONF-SEC-002
+    requirement: [SNTR-STEST-007, SNTR-WIRE-006, SNTR-SER-006, SNTR-OPQ-006]
+    profile: SNTR-CORE-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session, oversize_ready]
+    input:
+      transport: { action: send_wire_hex, wire_hex: "00100001", no_payload_bytes: true, allocation_proof_required: true }
+    expected:
+      connection_state: CLOSED
+      session_state: terminated_abnormally
+      error: { code: RESOURCE_EXHAUSTED }
+      hygiene: { absent_from: [credential, token] }
+    notes: "Excessive frame length: exactly-MAX accepted; MAX+1 and 2xMAX rejected (RESOURCE_EXHAUSTED pre-handshake or connection closure) with no allocation failure or panic. Applies identically to simulated-ciphertext bytes."
+
+  - id: CONF-SEC-003
+    requirement: [SNTR-STEST-007, SNTR-STEST-008, SNTR-SER-007]
+    profile: SNTR-CORE-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input:
+      transport: { action: send_framed_envelope_fixtures, fixtures: [deeply_nested_protobuf, truncated_varint, invalid_utf8_method, overlong_length] }
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      error: { code: INVALID_ARGUMENT }
+    notes: "Excessive Protobuf nesting / malformed input where applicable: depth/size/UTF-8 violations rejected deterministically (INVALID_ARGUMENT or RESOURCE_EXHAUSTED), never panic/unbounded allocation/leak."
+
+  - id: CONF-SEC-004
+    requirement: [SNTR-STEST-004, SNTR-STEST-005, SNTR-AUTH-006, SNTR-AUTH-009]
+    profile: SNTR-CORE-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [transport_connected]
+    input:
+      credentials: "fixture:opaque-invalid"
+      frames:
+        - { request_id: 0, body: hello, min_version: 1, max_version: 1 }
+    expected:
+      connection_state: CLOSED
+      session_state: none
+      error: { code: UNAUTHENTICATED }
+      hygiene: { absent_from: ["opaque-invalid", credential, token] }
+    notes: "Invalid authentication: malformed/replayed/invalid credentials rejected (UNAUTHENTICATED); valid-but-insufficient principals rejected (PERMISSION_DENIED) with no handler effect and no existence oracle beyond documented behavior."
+
+  - id: CONF-SEC-005
+    requirement: [SNTR-STEST-003, SNTR-ASEC-005, SNTR-RPL-010]
+    profile: SNTR-CORE-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session, expired_credential]
+    input:
+      frames:
+        - { request_id: 9, body: request, method: "/example.Echo/Echo", payload_b64: "aGk=", timeout_ms: 500 }
+    expected:
+      connection_state: CLOSED
+      session_state: withdrawn
+      error: { code: UNAUTHENTICATED }
+    notes: "Expired credentials: well-formed-but-expired credential (and expired resume token if defined) yields UNAUTHENTICATED; no state established; binding withdrawn within the documented propagation window."
+
+  - id: CONF-SEC-006
+    requirement: [SNTR-STEST-006, SNTR-STEST-011, SNTR-RPL-011, SNTR-SESS-006]
+    profile: SNTR-CORE-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [transport_connected]
+    input:
+      credentials: "fixture:replayed-resume-bytes"
+      frames:
+        - { request_id: 0, body: hello, min_version: 1, max_version: 1 }
+    expected:
+      connection_state: CLOSED
+      session_state: none
+      error: { code: UNAUTHENTICATED }
+    notes: "Replay attempt: unknown/expired/wrong-audience/rotated tokens and connection_id-as-token all fail (UNAUTHENTICATED or FAILED_PRECONDITION + close); no session; repeated attempts rate-limited."
+
+  - id: CONF-SEC-007
+    requirement: [SNTR-STEST-005, SNTR-ASEC-022, SNTR-RPC-032]
+    profile: SNTR-CORE-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input:
+      credentials: "fixture:valid-but-insufficient"
+      frames:
+        - { request_id: 15, body: request, method: "/example.KV/Get", payload_b64: "cHJvdGVjdGVk", timeout_ms: 500 }
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      error: { code: PERMISSION_DENIED }
+    notes: "Unauthorized method: protected method/subscription with insufficient principal rejected before handler effects; connection stays usable."
+
+  - id: CONF-SEC-008
+    requirement: [SNTR-STEST-002, SNTR-TSEC-004]
+    profile: SNTR-CORE-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport, wrong_hostname]
+    input:
+      transport: { action: tls_handshake, version: TLS1_3, pki: test-pki-wrong-san }
+    expected: { connection_state: CLOSED, session_state: none }
+    notes: "TLS hostname mismatch: chain-valid-for-a-different-name (SAN/CN/IP rows) rejected before credential presentation, even though the chain validates."
+
+  - id: CONF-SEC-009
+    requirement: [SNTR-STEST-010, SNTR-TSEC-002, SNTR-TSEC-007, SNTR-VER-007]
+    profile: SNTR-CORE-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport, weak_tls_only]
+    input:
+      transport: { action: tls_handshake, version: TLS1_2_only }
+      faults: { observe_retry_after_failure: true, offer_plaintext_retry: true, offer_weaker_wire_version: true }
+    expected: { connection_state: CLOSED, session_state: none }
+    notes: "WSS/HTTPS downgrade: TLS <1.3, plaintext retry after TLS failure, and weaker wire-version/capability downgrades all refused; no credential disclosure; highest secure overlap selected when legitimate."
+
+  - id: CONF-SEC-010
+    requirement: [SNTR-HS-012, SNTR-WIRE-003, SNTR-CORE-011]
+    profile: SNTR-CORE-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [handshake_started]
+    input:
+      frames:
+        - { request_id: 7, body: request, method: "/example.Echo/Echo", payload_b64: "aGk=", timeout_ms: 500 }
+        - { request_id: 0, body: hello, min_version: 1, max_version: 1 }
+    expected:
+      connection_state: CLOSED
+      session_state: none
+      error: { code: FAILED_PRECONDITION }
+    notes: "Invalid state transition: pre-ACTIVE RPC and second hello each trigger handshake failure + close; re-handshake on the same transport forbidden."
+
+  - id: CONF-SEC-011
+    requirement: [SNTR-STEST-009, SNTR-ASEC-020, SNTR-REL-007, SNTR-REL-008]
+    profile: SNTR-CORE-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session, flood_ready]
+    input:
+      faults: { flood_handshakes: true, flood_concurrent_rpcs: 64, flood_events: true }
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      error: { code: RESOURCE_EXHAUSTED }
+      hygiene: { absent_from: [credential, token] }
+    notes: "Resource exhaustion / slow-client handling: RESOURCE_EXHAUSTED + rate-limit/block of the offender; conformant principal unaffected per documented priority; recovery without restart; initiator backs off with jitter."

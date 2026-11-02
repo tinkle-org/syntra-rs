@@ -1,0 +1,135 @@
+# Portable Secure WebSocket cases (Section I/WSS). Profile: SNTR-WSS-H1-V1. All Mandatory for the claim.
+# Prose companion: conformance/requirements/secure-websocket.md (CONF-WSS-001…010).
+# The full CONF-WS-001…017 suite MUST additionally pass over wss:// (same IDs,
+# TLS active); only WSS-specific TLS/binding behavior is listed here.
+format_version: "1.0"
+profile: SNTR-WSS-H1-V1
+cases:
+  - id: CONF-WSS-001
+    requirement: [SNTR-WSS-001, SNTR-WSS-010, SNTR-WSS-040, SNTR-TSEC-002, SNTR-TSEC-003, SNTR-TSEC-004]
+    profile: SNTR-WSS-H1-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport, valid_chain]
+    input:
+      transport: { action: wss_upgrade, uri: "wss://syntra.example/syntra/v1/ws", alpn: "http/1.1", protocol: "syntra.v1", pki: test-pki-valid-leaf }
+      credentials: "fixture:opaque-valid-A"
+    expected:
+      connection_state: ACTIVE
+      session_state: active
+      transport: { status: 101, protocol: "syntra.v1" }
+    notes: "Valid WSS Upgrade over TLS 1.3: TLS (SNI/ALPN/chain/hostname/expiry) validated before any Syntra byte; 101 selects syntra.v1; hello->ready completes."
+
+  - id: CONF-WSS-002
+    requirement: [SNTR-WSS-110, SNTR-WSS-111, SNTR-TSEC-003, SNTR-TSEC-020]
+    profile: SNTR-WSS-H1-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport, invalid_chain]
+    input:
+      transport: { action: wss_upgrade, uri: "wss://syntra.example/syntra/v1/ws", protocol: "syntra.v1", pki: test-pki-untrusted }
+    expected: { connection_state: CLOSED, session_state: none }
+    notes: "Invalid chain: terminal TLS failure; no hello sent; no credential transmitted; fail-closed with a non-oracle error; no plaintext retry or validation skip."
+
+  - id: CONF-WSS-003
+    requirement: [SNTR-WSS-112, SNTR-TSEC-004]
+    profile: SNTR-WSS-H1-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport, wrong_hostname]
+    input:
+      transport: { action: wss_upgrade, uri: "wss://syntra.example/syntra/v1/ws", protocol: "syntra.v1", pki: test-pki-wrong-san }
+    expected: { connection_state: CLOSED, session_state: none }
+    notes: "Wrong hostname: rejected even though the chain validates; no credential sent to the unverified endpoint."
+
+  - id: CONF-WSS-004
+    requirement: [SNTR-WSS-111, SNTR-TSEC-003]
+    profile: SNTR-WSS-H1-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport]
+    input:
+      transport: { action: wss_upgrade, uri: "wss://syntra.example/syntra/v1/ws", protocol: "syntra.v1", pki: test-pki-expired }
+    expected: { connection_state: CLOSED, session_state: none }
+    notes: "Expired certificate: rejected before any credential is sent; no Syntra hello."
+
+  - id: CONF-WSS-005
+    requirement: [SNTR-WSS-110, SNTR-WSS-113, SNTR-TSEC-002, SNTR-TSEC-007]
+    profile: SNTR-WSS-H1-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport, weak_tls_only]
+    input:
+      transport: { action: tls_handshake, version: TLS1_2_only, then: wss_upgrade }
+    expected: { connection_state: CLOSED, session_state: none }
+    notes: "TLS below 1.3 refused: negotiation fails; no session; no fallback to ws://."
+
+  - id: CONF-WSS-006
+    requirement: [SNTR-WSS-113, SNTR-TSEC-007]
+    profile: SNTR-WSS-H1-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport, valid_chain]
+    input:
+      transport: { action: downgrade_probe, from: "wss", to: "ws" }
+      faults: { tls_failure_then_plaintext_temptation: true }
+    expected: { connection_state: CLOSED, session_state: none }
+    notes: "WSS-to-WS downgrade absent: no credential disclosure and no session over plaintext; wss->ws redirect not followed; client reports terminal transport failure."
+
+  - id: CONF-WSS-007
+    requirement: [SNTR-WSS-013]
+    profile: SNTR-WSS-H1-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport, valid_chain]
+    input:
+      transport: { action: redirect_probe, to: "wss://other.example/syntra/v1/ws" }
+    expected: { connection_state: CLOSED, session_state: none }
+    notes: "Secure redirect rules: 3xx to wss re-validated from scratch (chain+hostname), no automatic Authorization/Cookie forwarding, explicit consent; undocumented or wss->ws redirects refused. Vacuously passes where the deployment serves the path directly."
+
+  - id: CONF-WSS-008
+    requirement: [SNTR-WSS-114, SNTR-TSEC-008, SNTR-TSEC-031]
+    profile: SNTR-WSS-H1-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport, valid_chain]
+    input:
+      transport: { action: proxy_mismatch_probe }
+    expected: { connection_state: CLOSED, session_state: none }
+    notes: "Proxy/termination mismatch rejected (mismatched SNI, stripped identity, insecure proxy-to-host leg): handshake failure, no session, no silent fallback; correct termination succeeds."
+
+  - id: CONF-WSS-009
+    requirement: [SNTR-WSS-115, SNTR-TSEC-006]
+    profile: SNTR-WSS-H1-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [no_transport, valid_chain]
+    input:
+      transport: { action: rotation_window_probe, pki: test-pki-rotation-overlap }
+    expected: { connection_state: CONNECTED, session_state: none }
+    notes: "Rotation accepted: handshakes before/during/after rotation with currently valid chains succeed; no hard-coded-leaf pinning."
+
+  - id: CONF-WSS-010
+    requirement: [SNTR-WSS-120, SNTR-SESS-003, SNTR-SESS-006, SNTR-SESS-008]
+    profile: SNTR-WSS-H1-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [transport_connected]
+    input:
+      credentials: "fixture:stale-resume-bytes"
+      transport: { action: wss_reconnect, uri: "wss://syntra.example/syntra/v1/ws", protocol: "syntra.v1" }
+    expected:
+      connection_state: CLOSED
+      session_state: none
+      error: { code: UNAUTHENTICATED }
+    notes: "WSS reconnect and resume: new TLS 1.3 + Upgrade + fresh hello/credential yields a new session with fresh IDs; resumption without a negotiated capability rejected (UNAUTHENTICATED/FAILED_PRECONDITION + close); cross-transport presentation rejected identically."

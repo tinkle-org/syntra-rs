@@ -1,6 +1,38 @@
 # Rust implementation status
 
-## Current scope and evidence
+## Accepted SDD alignment target
+
+The active specification/schema/conformance target is
+`syntra@8ede3810b29fbba4d0e6ae6751a0025ceedda140` (PR #20).
+The implementation branch starts at
+`syntra-rs@73f9775043ba2625a823f5cca3fbe92cdf345293`.
+Phase 1 synchronizes all 69 upstream proto/conformance inputs, regenerates Rust
+with the existing pinned plugin, and adds content-verified provenance and the
+[complete P0–P2 trace matrix](sdd-alignment.md). It changes no runtime behavior.
+
+The target registers 42 SC1 and 17 recovery cases. The accepted contract is not
+yet a formal freeze, and neither copied manifests nor historical unit tests
+establish a conformance verdict. [Phase 2](phase2-core-rpc.md) now implements
+request-ID/high-water ordering, deadline-first terminal gates, bounded execution
+leases/output ownership, raw body/outcome validation, preallocation field caps,
+the concurrency floor and graceful-close configuration bounds. The local tests
+and remaining limits are recorded in `AUDIT.md` and that contract document.
+[Phase 3](phase3-update-recovery.md) now adds same-generation snapshots,
+connection-local negotiation, all nine wire methods, bounded per-H queues and
+round fences, actual Core/SC1-WSS attachment and full-state native persistence.
+Applications still supply recoverable provider-side history/issued bindings and
+their declared persistence integration; no generic business database is implied.
+RFC 0010, full mobile/shutdown integration and ABI v2 remain open. The pre-wave
+records below are historical starting-point evidence, not the current contract.
+
+The selected subsequent scope includes a SQLite enrollment reference with
+deployment-supplied key protection/rollback authority, runtime-backed ABI v2,
+browser SC1 with explicit browser limits, and mobile evidence harnesses.
+Go alignment is coordinated separately. Physical-device evidence, independent
+human security review and the future upstream freeze remain external release
+gates. Execution pauses for approval before each major phase.
+
+## Pre-wave implementation scope and evidence
 
 The native experimental, unpublished `syntra-sc1-transport` targets the
 accepted RFC 0007 SC1 v1 profile `SNTR-SC1-WSS-V1` (24 cases
@@ -57,7 +89,11 @@ independent Noise cryptographic vectors or independent cross-language interop.
 Historical extraction, local-revision-1 tests and timing captures retain their
 original scope in the audit and migration records.
 
-## Remaining Rust implementation backlog
+## Historical pre-wave backlog
+
+This retained inventory described the starting revision. The current Phase 2
+contract and remaining-phase matrix above supersede its parser/RPC/accounting
+entries; its historical wording is not a claim those changes are still absent.
 
 ### Host identity, validity and revocation
 
@@ -100,16 +136,17 @@ original scope in the audit and migration records.
 
 ### Independent interoperability and release evidence
 
-- Execute the 24 registered `CONF-SCW` cases against the accepted profile and
+- Execute the 42 registered `CONF-SCW` cases against the accepted profile and
   record results and remaining gaps. Upstream acceptance alone does not establish
   implementation conformance.
 - Execute independent pure-Go/Rust SC1 interoperability with both initiator and
   responder roles and both bootstrap and returning modes, plus independent
   cryptographic vectors. Same-library round trips and public encoding fixtures
   do not replace this evidence.
-- Validate supported direct/proxy topologies, TLS termination and identity
+- Validate direct host-owned SC1/WSS TLS termination and identity
   boundaries, real devices, connection/resource limits and adverse network
-  conditions. Container execution and browser runtime checks remain outstanding;
+  conditions. SC1 proxy termination remains deferred upstream, not an enabled
+  topology awaiting only tests. Container execution and browser runtime checks remain outstanding;
   the current pipe benchmark is not a WSS/network performance measurement.
 - Obtain independent human composition/security review and address its findings.
   Automated source reviews do not satisfy this gate.

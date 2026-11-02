@@ -15,4 +15,6 @@ pub use client::{
     CallError, CoreReady, Failure, GenerationValue, LifecycleStatus, Notification, ReconnectConfig,
     ReconnectingClient,
 };
-pub use pump::{AuthenticatorFactory, ClientHandle, Error, HostHandle, Limits};
+pub use pump::{
+    AuthenticatorFactory, ClientHandle, Error, HostHandle, Limits, RecoveryAuthenticatorFactory,
+};

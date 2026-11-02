@@ -1,6 +1,7 @@
 //! Endpoint + TLS policy configuration.
 
 use std::time::Duration;
+use syntra_runtime::connection::{validate_close_grace, DEFAULT_CLOSE_GRACE};
 
 /// WebSocket endpoint configuration.
 #[derive(Debug, Clone)]
@@ -22,7 +23,7 @@ pub struct WsConfig {
     pub sni_override: Option<String>,
     /// TCP + TLS + WS Upgrade timeout.
     pub connect_timeout: Duration,
-    /// Close grace period for in-flight results (SNTR-HS-006/013).
+    /// Close grace (0..=30 seconds, default 5); zero tears down immediately.
     pub close_grace: Duration,
     /// Ping interval for transport liveness (WS section 1I).
     pub ping_interval: Duration,
@@ -42,7 +43,7 @@ impl WsConfig {
             allow_insecure: false,
             sni_override: None,
             connect_timeout: Duration::from_secs(10),
-            close_grace: Duration::from_secs(2),
+            close_grace: DEFAULT_CLOSE_GRACE,
             ping_interval: Duration::from_secs(30),
             pong_timeout: Duration::from_secs(10),
             write_grace: Duration::from_secs(5),
@@ -58,11 +59,23 @@ impl WsConfig {
             allow_insecure: true,
             sni_override: None,
             connect_timeout: Duration::from_secs(10),
-            close_grace: Duration::from_secs(2),
+            close_grace: DEFAULT_CLOSE_GRACE,
             ping_interval: Duration::from_secs(30),
             pong_timeout: Duration::from_secs(10),
             write_grace: Duration::from_secs(5),
         }
+    }
+
+    /// Validate adapter policy before opening a socket or constructing a runtime.
+    pub fn validate(&self) -> Result<(), crate::TransportError> {
+        validate_close_grace(self.close_grace)
+            .map_err(|error| crate::TransportError::Protocol(error.to_string()))?;
+        if self.ping_interval.is_zero() {
+            return Err(crate::TransportError::Protocol(
+                "ping interval must be nonzero".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -175,6 +188,42 @@ pub(crate) async fn connect_with_timeout<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_grace_defaults_and_boundaries_match_runtime_policy() {
+        for mut config in [
+            WsConfig::secure("wss://h/syntra/v1/ws"),
+            WsConfig::insecure_dev("ws://127.0.0.1/syntra/v1/ws"),
+        ] {
+            assert_eq!(config.close_grace, Duration::from_secs(5));
+            for grace in [Duration::ZERO, Duration::from_secs(30)] {
+                config.close_grace = grace;
+                assert!(config.validate().is_ok());
+            }
+            for grace in [
+                Duration::from_secs(30) + Duration::from_nanos(1),
+                Duration::MAX,
+            ] {
+                config.close_grace = grace;
+                let error = config.validate().unwrap_err();
+                assert!(matches!(error, crate::TransportError::Protocol(_)));
+                assert_eq!(
+                    error.to_syntra_error().code(),
+                    syntra_core::ErrorCode::InvalidArgument
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_ping_interval_is_a_configuration_error() {
+        let mut config = WsConfig::secure("wss://h/syntra/v1/ws");
+        config.ping_interval = Duration::ZERO;
+        assert_eq!(
+            config.validate().unwrap_err().to_syntra_error().code(),
+            syntra_core::ErrorCode::InvalidArgument
+        );
+    }
 
     #[tokio::test]
     async fn connect_deadline_cancels_pending_establishment() {

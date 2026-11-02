@@ -4,6 +4,9 @@
 // as 0e8b0f8a4a789cb3d6d00b993e281867d2325e06); registered at
 // conformance/test-vectors/sc1/context-vectors.yaml. Pin 94404d7 above is
 // proposal-review history (RFC 0007 section 11). Registration is not execution.
+// Active schema/suite pin: 8ede3810b29fbba4d0e6ae6751a0025ceedda140 (PR #20).
+// Public values still match conformance/plans/sc1-context-v1.json at that pin;
+// RFC 0010 adds lifecycle cases, not a change to these context/prologue bytes.
 // These are encoding examples, not Noise ciphertext or cryptographic vectors,
 // conformance registration, or evidence of executed interoperability.
 

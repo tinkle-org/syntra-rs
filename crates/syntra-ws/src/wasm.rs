@@ -77,6 +77,10 @@ pub async fn connect(
     credential: Vec<u8>,
     conn_cfg: ConnectionConfig,
 ) -> Result<WsHandle, TransportError> {
+    conn_cfg
+        .validate()
+        .map_err(|error| TransportError::Protocol(error.to_string()))?;
+    cfg.validate()?;
     let endpoint = crate::config::Endpoint::parse(&cfg.url, cfg.allow_insecure)?;
     if !endpoint.is_secure {
         tracing::warn!("insecure WS enabled: restricted-development only, never public traffic");
@@ -150,10 +154,14 @@ pub async fn connect(
         write_shutdown.store(true, Ordering::Relaxed);
         // Closing the sink initiates WebSocket.close; do not retain the
         // split socket forever if the browser never delivers its close event.
-        tokio::select! {
-            biased;
-            _ = sink.close() => {},
-            _ = syntra_runtime::sleep_for(close_grace) => {},
+        // With zero grace, dropping both halves initiates close without waiting
+        // for a browser close event; transport loss below wakes the read half.
+        if !close_grace.is_zero() {
+            tokio::select! {
+                biased;
+                _ = syntra_runtime::sleep_for(close_grace) => {},
+                _ = sink.close() => {},
+            }
         }
         drop(sink);
         write_conn.on_transport_lost().await;

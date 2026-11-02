@@ -1,0 +1,193 @@
+# Portable session cases (Section F). Profile: SNTR-SESS-V1. All Mandatory except R01.
+# Prose companion: conformance/auth-session/session.md (CONF-SESS-001…010) and authentication.md.
+format_version: "1.0"
+profile: SNTR-SESS-V1
+cases:
+  - id: CONF-SESS-001
+    requirement: [SNTR-SESS-001, SNTR-HS-004, SNTR-AUTH-005, SNTR-AUTH-007]
+    profile: SNTR-SESS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [transport_connected]
+    input:
+      credentials: "fixture:opaque-valid-A"
+      frames:
+        - { request_id: 0, body: hello, min_version: 1, max_version: 1 }
+    expected:
+      connection_state: ACTIVE
+      session_state: active
+      frames:
+        - { request_id: 0, body: ready, has_connection_id: true }
+    notes: "Successful authentication: exactly one ready with a fresh opaque connection_id; principal bound for this connection only."
+    vector_refs: ["protobuf/GOLD-PROT-HELLO-01", "protobuf/GOLD-PROT-READY-01"]
+
+  - id: CONF-SESS-002
+    requirement: [SNTR-AUTH-006, SNTR-AUTH-009, SNTR-HS-004]
+    profile: SNTR-SESS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [transport_connected]
+    input:
+      credentials: "fixture:opaque-invalid"
+      frames:
+        - { request_id: 0, body: hello, min_version: 1, max_version: 1 }
+    expected:
+      connection_state: CLOSED
+      session_state: none
+      error: { code: UNAUTHENTICATED, message_pattern: "NEGATIVE:opaque-invalid" }
+      hygiene: { absent_from: ["opaque-invalid", credential, token] }
+    notes: "Authentication failure: invalid/expired/revoked/unauthorized credentials (four sub-runs) yield UNAUTHENTICATED or PERMISSION_DENIED with generic text; no credential echo."
+
+  - id: CONF-SESS-003
+    requirement: [SNTR-HS-012, SNTR-WIRE-003, SNTR-CORE-011]
+    profile: SNTR-SESS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [handshake_started]
+    input:
+      frames:
+        - { request_id: 7, body: request, method: "/example.Echo/Echo", payload_b64: "aGk=", timeout_ms: 500 }
+    expected:
+      connection_state: CLOSED
+      session_state: none
+      error: { code: FAILED_PRECONDITION }
+    notes: "Request before ACTIVE: handshake failure + close; handler MUST NOT dispatch; authorization hooks MUST NOT be bypassed. Variants: cancel, notification pre-ACTIVE."
+
+  - id: CONF-SESS-004
+    requirement: [SNTR-SESS-005, SNTR-AUTH-008]
+    profile: SNTR-SESS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session, expired_credential]
+    input:
+      frames:
+        - { request_id: 9, body: request, method: "/example.Echo/Echo", payload_b64: "aGk=", timeout_ms: 500 }
+    expected:
+      connection_state: CLOSED
+      session_state: withdrawn
+      error: { code: UNAUTHENTICATED }
+    notes: "Session expiration: expiry signaled as UNAUTHENTICATED (binding withdrawn) or UNAVAILABLE (host shutdown); never silent. Uses short-lived fixture credential or injected clock — never a flaky wall-clock wait."
+
+  - id: CONF-SESS-005
+    requirement: [SNTR-SESS-006, SNTR-SESS-020]
+    profile: SNTR-SESS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [transport_connected]
+    input:
+      credentials: "fixture:connection-id-as-credential"
+      frames:
+        - { request_id: 0, body: hello, min_version: 1, max_version: 1 }
+    expected:
+      connection_state: CLOSED
+      session_state: none
+      error: { code: UNAUTHENTICATED }
+    notes: "Invalid session: connection_id (or any stale/unknown resume bytes) presented as credential/token MUST be rejected; treated as protocol violation; no session established."
+
+  - id: CONF-SESS-006
+    requirement: [SNTR-HS-006, SNTR-HS-013, SNTR-SESS-004]
+    profile: SNTR-SESS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input:
+      transport: { action: graceful_close, stop_new_rpcs: true }
+    expected:
+      connection_state: CLOSED
+      session_state: terminated_normally
+    notes: "Session close: no CloseSession message exists; transport teardown per profile ends the session normally."
+
+  - id: CONF-SESS-007
+    requirement: [SNTR-HS-014, SNTR-SESS-004, SNTR-REL-009]
+    profile: SNTR-SESS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [active_session]
+    input:
+      faults: { abrupt_transport_loss: true, in_flight_request_ids: [12] }
+    expected:
+      connection_state: CLOSED
+      session_state: terminated_abnormally
+      error: { code: UNAVAILABLE, message_pattern: "NEGATIVE:success" }
+    notes: "Connection loss: UNAVAILABLE to all in-flight RPCs; outcome reported as unknown; MUST NOT be reported as application success."
+
+  - id: CONF-SESS-008
+    requirement: [SNTR-SESS-006, SNTR-SESS-020, SNTR-RPL-011]
+    profile: SNTR-SESS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [transport_connected]
+    input:
+      credentials: "fixture:stale-resume-bytes"
+      frames:
+        - { request_id: 0, body: hello, min_version: 1, max_version: 1 }
+    expected:
+      connection_state: CLOSED
+      session_state: none
+      error: { code: UNAUTHENTICATED }
+    notes: "Resume rejected (no capability): unknown/expired/wrong-audience resume presentation fails with UNAUTHENTICATED or FAILED_PRECONDITION + close."
+
+  - id: CONF-SESS-009
+    requirement: [SNTR-RPL-011, SNTR-ASEC-008, SNTR-SESS-006]
+    profile: SNTR-SESS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [transport_connected]
+    input:
+      credentials: "fixture:replayed-resume-bytes"
+      faults: { repeat_presentation: 2 }
+      frames:
+        - { request_id: 0, body: hello, min_version: 1, max_version: 1 }
+    expected:
+      connection_state: CLOSED
+      session_state: none
+      error: { code: UNAUTHENTICATED }
+    notes: "Resume replay: re-presenting previously observed resume-shaped bytes MUST NOT yield a session; repeated attempts rate-limited as suspected replay."
+
+  - id: CONF-SESS-010
+    requirement: [SNTR-HS-003, SNTR-HS-010, SNTR-VER-002]
+    profile: SNTR-SESS-V1
+    roles: [client, server]
+    capabilities: []
+    mandatory: true
+    preconditions: [transport_connected]
+    input:
+      frames:
+        - { request_id: 0, body: hello, min_version: 2, max_version: 2 }
+    expected:
+      connection_state: CLOSED
+      session_state: none
+      error: { code: UNIMPLEMENTED }
+    notes: "Unsupported protocol version row (low-only shown; harness repeats high-only and disjoint). No credential evaluation; no downgrade retry."
+
+  - id: CONF-SESS-R01
+    requirement: [SNTR-SESS-006]
+    profile: SNTR-SESS-V1
+    roles: [client, server]
+    capabilities: [resume-v1]
+    mandatory: false
+    preconditions: [transport_connected]
+    input:
+      credentials: "fixture:rfc-resume-token"
+      frames:
+        - { request_id: 0, body: hello, min_version: 1, max_version: 1 }
+    expected:
+      connection_state: ACTIVE
+      session_state: active
+    notes: "Resume accepted — OPTIONAL, gated on resume-v1. No resumption RFC exists in default v1, so conformant runners report SKIP with reason 'capability resume-v1 unclaimed'. When the RFC exists, this case asserts principal re-binding with fresh request_id space and no implicit restoration of RPCs/subscriptions/cursors."
+
+# CONF-RS-001..005 are reserved draft test plans, NOT executable cases.
+# See specifications/core/sessions.md §7.1 for coverage and review blockers.
+# Their former guessed JSON payloads, noncanonical method paths, out-of-schema
+# retry maps, and delivery_id_b64 pseudo-fields do not define a wire contract.
+# Restore executable cases only after an accepted RFC defines canonical
+# negotiation/control/delivery payloads and deterministic fixture setup.

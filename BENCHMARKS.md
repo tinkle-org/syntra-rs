@@ -14,9 +14,13 @@ requires `development-carriers` because it uses the restricted TCP stream
 fixture over in-memory duplex I/O. Default features are empty and expose WSS
 as the default carrier; these pipe cases do not measure WSS or TLS. The channel
 targets the accepted upstream `SNTR-SC1-WSS-V1` contract at
-`0e8b0f8a4a789cb3d6d00b993e281867d2325e06` (accepted 2026-10-29); see
+`8ede3810b29fbba4d0e6ae6751a0025ceedda140` (PR #20); see
 [SC1.md](SC1.md) for the current contract and [MIGRATION.md](MIGRATION.md) for
 the historical proposal-review and separate extraction/schema pins.
+
+The active pin does not relabel historical measurements. Full SDD implementation,
+declared operational budgets and real-device/network evidence remain pending in
+[the alignment matrix](docs/sdd-alignment.md).
 
 The earlier emission-gate run on Rust 1.88.0, darwin/arm64 recorded passing
 Criterion smoke runs for all three targets: `frame_codec`, `channel` and `pipe`

@@ -8,8 +8,8 @@ crate explicitly opts into `development-carriers` for restricted TCP and
 plaintext WS fixtures. The shared `pump` is public and carrier-neutral. Baseline
 `syntra-ws` keeps its framing/endpoints; runtime writers must honor the emission
 gate behavior contract. See [SC1.md](../../SC1.md) for the accepted upstream
-`SNTR-SC1-WSS-V1` contract at `0e8b0f8a4a789cb3d6d00b993e281867d2325e06`
-(accepted 2026-10-29), the canonical endpoint `/syntra/v1/sc1/ws` and exact
+`SNTR-SC1-WSS-V1` alignment target at `8ede3810b29fbba4d0e6ae6751a0025ceedda140`
+(PR #20; full implementation still pending), the canonical endpoint `/syntra/v1/sc1/ws` and exact
 subprotocol `syntra.sc1.v1`. [MIGRATION.md](../../MIGRATION.md) records the
 historical proposal-review and separate extraction/schema pins.
 
