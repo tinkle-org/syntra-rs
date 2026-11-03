@@ -322,7 +322,8 @@ access to its remote plugin service, but no local `protoc`.
 
 Unified implementation evidence is produced by
 `scripts/conformance_evidence.py`, optionally with `--candidate-agreement offline`
-or `--candidate-agreement worktree` and supplemental `--run-local` lanes. See
+or `--candidate-agreement release` and supplemental `--run-local` lanes. The
+release mode verifies committed candidate inputs, not publication authorization. See
 [implementation evidence](CONTRIBUTING.md#implementation-evidence) for commands,
 the exact Git-input requirement and result interpretation. Candidate agreement,
 fixture transcription checks and local test execution have distinct scopes;

@@ -8,9 +8,10 @@
 //! not provide descriptor-relative no-follow traversal on every supported OS;
 //! these checks are not a sandbox against malicious concurrent path replacement.
 //!
-//! fs2's kernel advisory exclusive lock is held by an unduplicated File for the
-//! store's entire lifetime, including across processes. Crash/exit releases it;
-//! the lock file is deliberately never removed. All writers must cooperate.
+//! fs2's kernel advisory exclusive lock is held by a private File for the store's
+//! entire lifetime, including across processes, and explicitly unlocked on drop.
+//! Crash/exit closes the descriptor; the lock file is deliberately never removed.
+//! All writers must cooperate.
 //! Do not use this on network/shared filesystems or filesystems without atomic
 //! same-directory replacement, file sync_all, and parent-directory sync_all.
 //! Successful commits rely on those primitives and the storage device honoring
@@ -48,10 +49,31 @@ pub struct FileRecoveryStore {
     path: PathBuf,
     limits: StoreLimits,
     // Must not be cloned, unlocked early, or removed from the directory.
-    _lock: File,
+    _lock: StoreLock,
     fenced: bool,
     #[cfg(test)]
     cut: Option<TestCut>,
+}
+
+struct StoreLock(File);
+
+impl StoreLock {
+    fn acquire(file: File) -> Result<Self, PersistenceError> {
+        fs2::FileExt::try_lock_exclusive(&file).map_err(|_| PersistenceError::Unavailable)?;
+        // Only a successful acquisition owns an unlock, including on open errors
+        // before FileRecoveryStore has been fully constructed.
+        Ok(Self(file))
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        // Linux flock belongs to the open-file description. A concurrent spawn
+        // can inherit it until exec closes CLOEXEC descriptors, so close alone
+        // need not release it when this owner drops. Unlock before closing; never
+        // unlink the stable lock file. On failure, close remains the fallback.
+        let _release = fs2::FileExt::unlock(&self.0);
+    }
 }
 
 struct Inventory {
@@ -100,8 +122,9 @@ impl FileRecoveryStore {
             }
             Err(_) => return Err(PersistenceError::Unavailable),
         };
-        fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| PersistenceError::Unavailable)?;
+        let lock = StoreLock::acquire(lock)?;
         if lock
+            .0
             .metadata()
             .map_err(|_| PersistenceError::Unavailable)?
             .len()
@@ -692,6 +715,45 @@ mod tests {
         store
             .commit(&scope(), Some(&expected), snapshot(true))
             .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_lock_description_does_not_extend_store_lifetime() {
+        let directory = Directory::new();
+        let mut store = FileRecoveryStore::open(&directory.0, StoreLimits::default()).unwrap();
+        store.commit(&scope(), None, snapshot(false)).unwrap();
+        // A concurrent Command spawn can inherit this open-file description
+        // until exec closes CLOEXEC descriptors. Retain an equivalent reference
+        // deterministically, without forking the multithreaded test harness.
+        let inherited = store._lock.0.try_clone().unwrap();
+        assert_eq!(
+            FileRecoveryStore::open(&directory.0, StoreLimits::default()).err(),
+            Some(PersistenceError::Unavailable)
+        );
+        // A failed contender must not unlock the live owner.
+        assert!(child(&directory.0, "lock").success());
+        drop(store);
+        let mut reopened = FileRecoveryStore::open(&directory.0, StoreLimits::default()).unwrap();
+        assert_eq!(reopened.load(&scope()).unwrap(), Some(snapshot(false)));
+        reopened
+            .commit(
+                &scope(),
+                Some(&ExpectedPosition::from(&snapshot(false))),
+                snapshot(true),
+            )
+            .unwrap();
+        drop(inherited);
+        // Closing an old inherited reference must not release the successor's
+        // independently acquired lock, or require replacing the lock file.
+        assert_eq!(
+            FileRecoveryStore::open(&directory.0, StoreLimits::default()).err(),
+            Some(PersistenceError::Unavailable)
+        );
+        assert!(child(&directory.0, "lock").success());
+        drop(reopened);
+        let reopened = FileRecoveryStore::open(&directory.0, StoreLimits::default()).unwrap();
+        assert_eq!(reopened.load(&scope()).unwrap(), Some(snapshot(true)));
     }
 
     #[test]
