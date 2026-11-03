@@ -43,15 +43,29 @@ jobs:
           key: cargo-registry-${{ runner.os }}-1.88.0-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-registry-${{ runner.os }}-1.88.0-
-      - name: Locked workspace tests
+      - name: Default dependency isolation (host + WASM, no dev/test graph)
+        run: python3 scripts/cargo_contracts.py isolation
+      - name: Candidate offline agreement (not external SDD provenance)
+        run: python3 -B scripts/protocol_contract.py --offline
+      - name: Locked default-members tests
+        run: cargo test --locked
+      - name: Locked workspace tests (carrier fixtures included)
         run: cargo test --locked --workspace
+      - name: Explicit native transport and storage features
+        run: |
+          cargo test --locked -p syntra-transport --no-default-features --features tcp,websocket,reconnect,native-enrollment
+          cargo test --locked -p syntra-runtime --no-default-features --features file-store
       - name: Production + fixture FFI (separate, no --all-features)
         run: |
           cargo test --locked -p syntra-ffi --no-default-features --features production
           cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
           python3 crates/syntra-ffi/tests/build_contract.py
-      - name: WASM compile (non-FFI)
-        run: cargo check --locked -p syntra-core -p syntra-runtime -p syntra-ws -p syntra-web --target wasm32-unknown-unknown
+      - name: WASM baseline (core, runtime and record-protection kernel)
+        run: cargo check --locked -p syntra-core -p syntra-runtime --target wasm32-unknown-unknown
+      - name: Browser production compile
+        run: cargo check --locked -p syntra-web --no-default-features --features browser-connection --target wasm32-unknown-unknown
+      - name: Browser fixture compile (not a production artifact)
+        run: cargo check --locked -p syntra-web --no-default-features --features browser-test-fixture --target wasm32-unknown-unknown
 
   compat-macos:
     name: native compat (macOS)
@@ -66,13 +80,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
           toolchain: "1.88.0"
-      - name: Native tests (workspace default + FFI modes)
+      - name: Native tests (isolated defaults, workspace, explicit features + FFI modes)
         run: |
+          cargo test --locked
           cargo test --locked --workspace
+          cargo test --locked -p syntra-transport --no-default-features --features tcp,websocket,reconnect,native-enrollment
+          cargo test --locked -p syntra-runtime --no-default-features --features file-store
           cargo test --locked -p syntra-ffi --no-default-features --features production
           cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
-      # C smoke via build_contract runs where nm/cc exist; macOS is covered
-      # here. Windows C-smoke stays in release validation (MSVC nm differences).
+      # Cross-toolchain C smoke runs in CI's Linux build_contract lane; these
+      # compatibility jobs exercise Rust tests, not the C compiler/symbol ABI.
 
   compat-windows:
     name: native compat (windows)
@@ -87,9 +104,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
           toolchain: "1.88.0"
-      - name: Native tests (workspace default + FFI modes)
+      - name: Native tests (isolated defaults, workspace, explicit features + FFI modes)
         run: |
+          cargo test --locked
           cargo test --locked --workspace
+          cargo test --locked -p syntra-transport --no-default-features --features tcp,websocket,reconnect,native-enrollment
+          cargo test --locked -p syntra-runtime --no-default-features --features file-store
           cargo test --locked -p syntra-ffi --no-default-features --features production
           cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
         shell: pwsh
@@ -138,6 +158,10 @@ jobs:
         run: cargo deny --locked check
       - name: cargo-audit full
         run: cargo audit --deny warnings
-      # Longer fuzz / sanitizer campaigns are manual: see docs/ci.md §5.
-      # They run here as workflow_dispatch with explicit duration caps, never
-      # as required PR checks.
+      - name: Optional native carrier, enrollment and file-store policy
+        run: cargo deny --locked --features syntra-transport/tcp,syntra-transport/websocket,syntra-transport/reconnect,syntra-transport/native-enrollment,syntra-runtime/file-store check advisories licenses sources
+      - name: Browser production dependency policy
+        run: cargo deny --locked --features syntra-web/browser-connection --target wasm32-unknown-unknown check advisories licenses sources
+      - name: Browser fixture dependency policy (not a production artifact)
+        run: cargo deny --locked --features syntra-web/browser-test-fixture --target wasm32-unknown-unknown check advisories licenses sources
+      # This workflow runs dependency checks, not fuzz or sanitizer campaigns.

@@ -1,11 +1,16 @@
-//! Native C ABI surface: test fixture plus production frame-pump.
+//! Syntra 1.0 native C ABI: shared-runtime embedding or isolated test fixture.
 //!
 //! Default builds export no Syntra C ABI symbols.
-//! - `test-fixture`: legacy blocking loopback ABI for native tests only.
+//! - `test-fixture`: blocking loopback ABI for native tests only.
 //!   `syntra_open` always creates an in-process echo/get-put fixture.
-//! - `production`: transport-agnostic initiator/responder cores. The
-//!   embedding application owns transport bytes, authentication policy,
-//!   authorization policy, method dispatch, persistence, and recovery.
+//! - `production`: shared-runtime initiator/host and typed recovery client. The
+//!   low-level plaintext Core frame adapter implements no cryptographic record
+//!   protection and does not establish a canonical connection or an end-to-end
+//!   secure session. The embedding application's protected-I/O driver owns
+//!   Syntra encrypted establishment, record protection, carrier framing,
+//!   transport security, peer verification and ordered I/O.
+//!   The application owns authentication policy, authorization policy, method
+//!   effects and actual durable persistence.
 //!
 //! All WASM targets are rejected at compile time. The production ABI is
 //! native-only; no browser ABI is defined here.
@@ -18,8 +23,9 @@
 //! `python3 crates/syntra-ffi/tests/build_contract.py`.
 //!
 //! Authentication, authorization, method schemas, domain behavior, replay
-//! storage, presence, and durable data remain host-owned. Externally
-//! reachable production traffic requires TLS.
+//! storage, presence, and durable data remain host-owned. The plaintext frame
+//! boundary is not an unencrypted Syntra mode. WSS additionally requires verified
+//! TLS supplied by the application driver; TLS does not replace Syntra encryption.
 //!
 //! # Caller obligations (fixture only)
 //! All non-null pointers must be valid, aligned, and live for the call; input
@@ -34,6 +40,11 @@
 #[cfg(target_family = "wasm")]
 compile_error!("syntra-ffi does not support WASM: native ABIs only; no browser ABI is available");
 
+#[cfg(all(feature = "production", feature = "test-fixture"))]
+compile_error!(
+    "production and test-fixture are mutually exclusive ABI modes; never ship the fixture"
+);
+
 #[cfg(all(feature = "test-fixture", not(target_family = "wasm")))]
 mod fixture;
 
@@ -44,10 +55,4 @@ pub use fixture::*;
 mod production;
 
 #[cfg(all(feature = "production", not(target_family = "wasm")))]
-mod reliable;
-
-#[cfg(all(feature = "production", not(target_family = "wasm")))]
 pub use production::*;
-
-#[cfg(all(feature = "production", not(target_family = "wasm")))]
-pub use reliable::*;

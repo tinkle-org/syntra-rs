@@ -85,16 +85,11 @@ impl HandlerOutcome {
 ///
 /// Authorization is fail-closed by default: the provided `authorize`
 /// default denies every RPC with `PERMISSION_DENIED` (generic message, no
-/// oracle). This is a deliberate compatibility break for handlers written
-/// against the pre-policy trait, which only implemented `handle` and were
-/// implicitly permissive. Migration paths:
-/// - implement `authorize` with a principal-aware per-method policy
-///   (preferred for protected methods; must be nonblocking and may
-///   re-check expiry/revocation);
-/// - wrap a legacy permissive handler in [`AllowAll`] to restore the old
-///   allow behavior explicitly (tests, trusted embeds);
-/// - use [`FnHandler`] for closures, which remains allow-all by
-///   construction and is unchanged by this default.
+/// oracle). Protected methods require a principal-aware per-method policy;
+/// it must be nonblocking and may re-check expiry/revocation. [`AllowAll`]
+/// and [`FnHandler`] explicitly allow every bound principal to invoke every
+/// method and are intended for tests or trusted embeds where that policy
+/// is intentional.
 ///
 /// Only generic authentication/authorization codes and messages are
 /// exposed on the wire; policy internals must never leak.
@@ -116,7 +111,7 @@ pub trait Handler: Send + Sync {
         cancel: crate::connection::CancelToken,
     ) -> HandlerFut;
 
-    /// Backward-compatible execution hook. Override this when work can outlive
+    /// Execution-lifetime hook. Override this when work can outlive
     /// the returned future (spawned tasks, blocking jobs, external operations),
     /// transferring a lease copy into that work until it actually stops.
     /// The default treats dropping the returned future as cooperative stop.
@@ -139,13 +134,11 @@ pub trait Handler: Send + Sync {
 
 pub type HandlerFut = std::pin::Pin<Box<dyn std::future::Future<Output = HandlerOutcome> + Send>>;
 
-/// Explicit opt-in allow-all wrapper for migration. Wrapping a legacy
-/// permissive `Handler` in `AllowAll` restores the pre-policy behavior
-/// (every bound principal may invoke every method) without changing the
-/// inner handler's method semantics. Prefer a principal-aware `authorize`
-/// implementation for protected methods; use this wrapper only for trusted
-/// tests/embeds where the allow-all posture is intentional and documented
-/// at the construction site.
+/// Explicit opt-in allow-all wrapper: every bound principal may invoke every
+/// method without changing the inner handler's method semantics or execution
+/// lease handling. Prefer a principal-aware `authorize` implementation for
+/// protected methods; use this wrapper only for trusted tests/embeds where the
+/// allow-all posture is intentional and documented at the construction site.
 pub struct AllowAll<H>(pub H);
 
 impl<H> Handler for AllowAll<H>
@@ -176,12 +169,11 @@ where
     }
 }
 
-/// Legacy allow-all adapter so closures can serve as handlers in tests and
+/// Explicit allow-all adapter so closures can serve as handlers in tests and
 /// embeds. Constructing this adapter explicitly allows every bound principal
-/// (including anonymous) to invoke the closure. Behavior is unchanged by
-/// the fail-closed `Handler::authorize` default: `FnHandler` overrides
-/// `authorize` to allow. For protected methods use a
-/// `Handler` implementation with a principal-aware `authorize` policy instead.
+/// (including anonymous) to invoke the closure. `FnHandler` overrides
+/// the fail-closed `Handler::authorize` default to allow. For protected methods
+/// use a `Handler` implementation with a principal-aware `authorize` policy instead.
 pub struct FnHandler<F>(pub F);
 
 impl<F, Fut> Handler for FnHandler<F>
@@ -219,6 +211,7 @@ struct WithdrawalOwner {
 
 #[derive(Default)]
 struct Calls {
+    clock: crate::elapsed::ElapsedClock,
     pending: HashMap<u64, PendingCall>,
     delivery_stopped: bool,
     // Owned until BOTH execution (including transferred leases) and output
@@ -229,8 +222,10 @@ struct Calls {
 impl Calls {
     fn select(&mut self, id: u64, candidate: HandlerOutcome) {
         if let Some(call) = self.pending.remove(&id) {
-            let outcome = if now() >= call.deadline {
+            let outcome = if self.clock.now() >= call.deadline {
                 HandlerOutcome::error(ErrorCode::DeadlineExceeded, "deadline exceeded")
+            } else if !self.clock.is_continuous() {
+                HandlerOutcome::error(ErrorCode::Unavailable, "elapsed continuity lost")
             } else {
                 candidate
             };
@@ -357,7 +352,111 @@ impl Host {
         handler: Arc<dyn Handler>,
         host_supported: Vec<u32>,
     ) -> Result<(Arc<Self>, mpsc::Receiver<Vec<u8>>), SyntraError> {
-        Self::try_build(config, auth, handler, host_supported, None)
+        Self::try_build(
+            config,
+            auth,
+            handler,
+            host_supported,
+            None,
+            crate::elapsed::ElapsedClock::new(),
+        )
+    }
+
+    pub fn try_new_with_clock(
+        config: ConnectionConfig,
+        auth: Arc<dyn Authenticator>,
+        handler: Arc<dyn Handler>,
+        clock: crate::elapsed::ElapsedClock,
+    ) -> Result<(Arc<Self>, mpsc::Receiver<Vec<u8>>), SyntraError> {
+        Self::try_build(
+            config,
+            auth,
+            handler,
+            vec![syntra_core::MAX_VERSION],
+            None,
+            clock,
+        )
+    }
+
+    pub fn elapsed_clock(&self) -> crate::elapsed::ElapsedClock {
+        self.conn.shared.clock.clone()
+    }
+
+    pub fn carrier_io_allowed(&self) -> bool {
+        self.conn.carrier_io_allowed()
+    }
+    pub fn with_carrier_io<R>(&self, poll: impl FnOnce() -> R) -> Option<R> {
+        self.conn.with_carrier_io(poll)
+    }
+    pub(crate) fn retain_runtime_task(&self, task: TaskHandle) {
+        self.conn.shared.tasks.register(task);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn own_native_task(
+        &self,
+        handle: tokio::task::JoinHandle<()>,
+    ) -> crate::shutdown::OwnedTask {
+        self.conn.own_native_task(handle)
+    }
+    pub fn register_transport_tasks(&self, count: usize) -> Result<(), SyntraError> {
+        self.conn.register_transport_tasks(count)
+    }
+    pub fn acknowledge_transport_task_joined(&self) -> Result<(), SyntraError> {
+        self.conn.acknowledge_transport_task_joined()
+    }
+    pub fn acknowledge_transport_closed(&self) {
+        self.conn.acknowledge_transport_closed();
+    }
+
+    /// Stop admission synchronously and retain one drain/close/join continuation.
+    /// Requires a running/entered executor on native. Cancelling a waiter neither
+    /// cancels this owner nor releases external execution leases.
+    pub fn begin_shutdown(&self, total: Duration) -> Result<crate::ShutdownReport, SyntraError> {
+        let host = self.weak_self.upgrade().expect("live Host owner");
+        self.conn.start_shutdown(total, move |budget| {
+            spawn_task(async move {
+                host.conn.begin_closing().await;
+                host.close_recovery();
+                host.conn
+                    .drain_until(budget.drain_cutoff, || {
+                        host.inflight_len() == 0 && host.output.in_use() == 0
+                    })
+                    .await;
+                host.stop_delivery("connection shutdown");
+                host.conn.close().await;
+                host.unbind_session().await;
+                host.conn
+                    .shared
+                    .tasks
+                    .join_until(&budget.clock, budget.deadline)
+                    .await;
+            })
+        })?;
+        Ok(self.shutdown_report())
+    }
+
+    pub async fn shutdown(&self, total: Duration) -> Result<crate::ShutdownReport, SyntraError> {
+        self.begin_shutdown(total)?;
+        self.conn.await_shutdown_owner().await;
+        Ok(self.shutdown_report())
+    }
+
+    pub fn shutdown_report(&self) -> crate::ShutdownReport {
+        self.conn
+            .shutdown_report_for(self.inflight_len(), self.execution_len())
+    }
+    pub fn shutdown_budget(&self) -> Option<crate::ShutdownBudget> {
+        self.conn.shutdown_budget()
+    }
+
+    pub fn suspend(&self) {
+        self.conn.suspend();
+    }
+
+    pub async fn platform_wake(&self) {
+        self.suspend();
+        self.conn.shared.clock.wake();
+        self.on_transport_lost().await;
     }
 
     /// Fallible counterpart of [`Host::new_with_execution_budget`]. The shared
@@ -375,6 +474,26 @@ impl Host {
             handler,
             vec![syntra_core::MAX_VERSION],
             Some(budget),
+            crate::elapsed::ElapsedClock::new(),
+        )
+    }
+
+    /// Preserve a host/principal aggregate execution budget while sharing one
+    /// elapsed domain with the carrier, channel lifetime and authority checks.
+    pub fn try_new_with_execution_budget_and_clock(
+        config: ConnectionConfig,
+        auth: Arc<dyn Authenticator>,
+        handler: Arc<dyn Handler>,
+        budget: ExecutionBudget,
+        clock: crate::elapsed::ElapsedClock,
+    ) -> Result<(Arc<Self>, mpsc::Receiver<Vec<u8>>), SyntraError> {
+        Self::try_build(
+            config,
+            auth,
+            handler,
+            vec![syntra_core::MAX_VERSION],
+            Some(budget),
+            clock,
         )
     }
 
@@ -384,15 +503,17 @@ impl Host {
         handler: Arc<dyn Handler>,
         host_supported: Vec<u32>,
         shared_execution: Option<ExecutionBudget>,
+        clock: crate::elapsed::ElapsedClock,
     ) -> Result<(Arc<Self>, mpsc::Receiver<Vec<u8>>), SyntraError> {
         config.validate()?;
         let (wtx, wrx) = mpsc::channel(config.writer_capacity);
-        let (shared, notif_rx) = Shared::new(
+        let (shared, notif_rx) = Shared::new_with_clock(
             Role::Host,
             wtx,
             config.clone(),
             syntra_core::MIN_VERSION,
             syntra_core::MAX_VERSION,
+            clock.clone(),
         );
         let handshake_done = Arc::new(Notify::new());
         let host = Arc::new_cyclic(|weak_self| Self {
@@ -401,7 +522,10 @@ impl Host {
             handler,
             sessions: SessionManager::new(),
             host_supported,
-            calls: Arc::new(Mutex::new(Calls::default())),
+            calls: Arc::new(Mutex::new(Calls {
+                clock: clock.clone(),
+                ..Calls::default()
+            })),
             progress: Arc::new(Notify::new()),
             admission: tokio::sync::Mutex::new(()),
             highwater: Mutex::new(0),
@@ -426,19 +550,21 @@ impl Host {
         let timer_conn = host.conn.clone();
         let mut closed = timer_conn.subscribe_close();
         let done = handshake_done.clone();
-        let deadline = now() + config.handshake_timeout;
+        let deadline = clock.now() + config.handshake_timeout;
+        *host.conn.shared.handshake_deadline.lock().unwrap() = Some(deadline);
         let task = spawn_task(async move {
             tokio::select! {
                 biased;
                 _ = closed.changed() => {},
                 _ = done.notified() => {},
-                _ = sleep_until(deadline) => timer_conn.expire_handshake().await,
+                _ = clock.sleep_until(deadline) => timer_conn.expire_handshake().await,
             }
         });
         *host
             .handshake_task
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(task);
+            .unwrap_or_else(|e| e.into_inner()) = Some(task.clone());
+        host.conn.shared.tasks.register(task);
         Ok((host, wrx))
     }
 
@@ -475,7 +601,7 @@ impl Host {
     }
 
     /// Retained worker owners, including external-execution completion waiters.
-    /// Phase 5 shutdown integration must report incomplete while this is nonzero;
+    /// Shutdown cannot complete while retained workers remain unjoined;
     /// `close()` is not a claim that external application work has stopped.
     pub fn worker_len(&self) -> usize {
         self.calls
@@ -489,20 +615,30 @@ impl Host {
     /// One ordered receiver must call/poll ingest in reconstructed-frame order;
     /// spawning unordered ingest tasks cannot preserve transport receive order.
     pub async fn ingest(&self, bytes: &[u8]) {
-        self.ingest_received_at(bytes, now()).await;
+        self.ingest_received_at(bytes, self.conn.shared.clock.now())
+            .await;
     }
 
     /// Adapter hook: timestamp immediately on reconstructing a complete bounded
     /// frame, BEFORE queueing/validation, using the same elapsed clock as timers.
-    /// On native use `tokio::time::Instant::now().into_std()`; on wasm use
-    /// `web_time::Instant`. Suspend continuity remains the adapter's obligation.
+    /// Timestamp with `host.elapsed_clock().now()` on complete-frame receipt.
+    /// An adapter using another clock domain is only partially integrated for
+    /// suspension and must retire its connection on wake before buffered input.
     /// Like `ingest`, this must be first-polled by one ordered receiver. Dropping
     /// an ingest before admission discards that unit; adapters must then close.
     /// A future timestamp is invalid local adapter input and closes with local
     /// `INVALID_ARGUMENT`, rather than extending the effective RPC budget.
     pub async fn ingest_received_at(&self, bytes: &[u8], received_at: Instant) {
+        // Preserve first-poll FIFO admission: no lifecycle/state await
+        // may move in front of this ordered receive gate.
         let _ordered = self.admission.lock().await;
-        if received_at > now() {
+        if !self.conn.accept_inbound().await {
+            if self.conn.is_closed() {
+                self.on_transport_lost().await;
+            }
+            return;
+        }
+        if received_at > self.conn.shared.clock.now() {
             self.fail_protocol_and_close(SyntraError::Protocol {
                 code: ErrorCode::InvalidArgument,
                 message: "receipt timestamp must not be in the future".into(),
@@ -818,24 +954,58 @@ impl Host {
             Err(_) => return,
         };
         let mut state = self.conn.shared.state.write().await;
-        if *state != ConnectionState::Authenticating || self.conn.is_closed() {
+        if *state != ConnectionState::Authenticating
+            || self.conn.is_closed()
+            || self.conn.lifecycle_blocked()
+        {
+            return;
+        }
+        let expired = self
+            .conn
+            .shared
+            .handshake_deadline
+            .lock()
+            .unwrap()
+            .is_some_and(|deadline| self.conn.shared.clock.now() >= deadline);
+        if expired {
+            drop(state);
+            self.conn.expire_handshake().await;
             return;
         }
         let Ok(active) = state.transition(StateEvent::ReadyReceived) else {
             return;
         };
-        *self.conn.shared.version.write().await = Some(selected);
-        // Bind before exposing ACTIVE or queueing ready. Close uses the
-        // same state lock, then unbinds; it can never miss a late binding.
-        self.sessions.bind(Session {
-            connection_id: connection_id.clone(),
-            principal,
-            version: selected,
-            established_at: Instant::now(),
-        });
-        *self.bound_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(connection_id.clone());
-        *state = active;
-        permit.send(ready.encode_to_vec());
+        let mut version = self.conn.shared.version.write().await;
+        let committed = {
+            let _handoff = self.conn.shared.emissions.lock().unwrap();
+            if !self.conn.carrier_io_allowed() {
+                return;
+            }
+            if self.conn.handshake_expired() {
+                false
+            } else {
+                *version = Some(selected);
+                // Bind before exposing ACTIVE or queueing ready. Close uses the
+                // same state lock, then unbinds; it can never miss a late binding.
+                self.sessions.bind(Session {
+                    connection_id: connection_id.clone(),
+                    principal,
+                    version: selected,
+                    established_at: Instant::now(),
+                });
+                *self.bound_id.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(connection_id.clone());
+                *state = active;
+                permit.send(ready.encode_to_vec());
+                true
+            }
+        };
+        drop(version);
+        if !committed {
+            drop(state);
+            self.conn.expire_handshake().await;
+            return;
+        }
         drop(state);
         self.conn
             .complete_handshake(crate::connection::HandshakeDone { connection_id })
@@ -901,7 +1071,15 @@ impl Host {
     ) {
         let deadline = received_at + self.request_timeout(&req);
         let state = self.conn.shared.state.read().await;
-        if *state != ConnectionState::Active || self.conn.is_closed() {
+        if *state != ConnectionState::Active
+            || self.conn.is_closed()
+            || self.conn.lifecycle_blocked()
+            || self
+                .conn
+                .shared
+                .shutdown_requested
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             return;
         }
         let session = {
@@ -910,7 +1088,7 @@ impl Host {
         };
         // Check before policy AND after synchronous policy; even a policy that
         // exceeds its nonblocking contract cannot cause expired handler effects.
-        let mut rejection = if now() >= deadline {
+        let mut rejection = if self.conn.shared.clock.now() >= deadline {
             Some(HandlerOutcome::error(
                 ErrorCode::DeadlineExceeded,
                 "deadline exceeded",
@@ -951,18 +1129,20 @@ impl Host {
                 )),
             }
         };
-        let profile =
-            if rejection.is_none() && now() < deadline && recovery::is_profile(&req.method) {
-                match self.prepare_recovery(&session.as_ref().expect("checked binding").principal) {
-                    Ok(call) => Some(call),
-                    Err(error) => {
-                        rejection = Some(recovery::outcome(error));
-                        None
-                    }
+        let profile = if rejection.is_none()
+            && self.conn.shared.clock.now() < deadline
+            && recovery::is_profile(&req.method)
+        {
+            match self.prepare_recovery(&session.as_ref().expect("checked binding").principal) {
+                Ok(call) => Some(call),
+                Err(error) => {
+                    rejection = Some(recovery::outcome(error));
+                    None
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
         let withdraw = matches!(
             &rejection,
             Some(HandlerOutcome::Error {
@@ -973,7 +1153,7 @@ impl Host {
         // Withdrawal is a connection policy action even if the elapsed RPC
         // deadline wins its terminal result. Never turn revocation back into a
         // valid binding merely because synchronous policy returned late.
-        let rejection = if now() >= deadline {
+        let rejection = if self.conn.shared.clock.now() >= deadline {
             Some(HandlerOutcome::error(
                 ErrorCode::DeadlineExceeded,
                 "deadline exceeded",
@@ -1035,6 +1215,14 @@ impl Host {
         mut rejection: Option<HandlerOutcome>,
         profile: Option<recovery::Call>,
     ) -> bool {
+        if self
+            .conn
+            .shared
+            .shutdown_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return true;
+        }
         let Some(output) = self.output.try_acquire() else {
             return false;
         };
@@ -1108,6 +1296,7 @@ impl Host {
                     {
                         let mut calls = registry.lock().unwrap_or_else(|e| e.into_inner());
                         if sender.is_closed()
+                            || sender.lifecycle_blocked()
                             || sender
                                 .shared
                                 .principal_withdrawn
@@ -1117,7 +1306,7 @@ impl Host {
                                 id,
                                 HandlerOutcome::error(ErrorCode::Unavailable, "connection closed"),
                             );
-                        } else if now() >= deadline {
+                        } else if sender.shared.clock.now() >= deadline {
                             calls.select(
                                 id,
                                 HandlerOutcome::error(
@@ -1134,7 +1323,7 @@ impl Host {
                         Box::pin(std::future::ready(profile.handle(
                             &req.method,
                             &req.payload,
-                            deadline.saturating_duration_since(now()),
+                            deadline.saturating_duration_since(sender.shared.clock.now()),
                             &sender,
                         )))
                     } else {
@@ -1156,7 +1345,7 @@ impl Host {
                 // also checks now under the synchronous terminal gate.
                 let selected_outcome = tokio::select! {
                     biased;
-                    _ = sleep_until(deadline) => {
+                    _ = sender.shared.clock.sleep_until(deadline) => {
                         registry.lock().unwrap_or_else(|e| e.into_inner()).select(id,
                             HandlerOutcome::error(ErrorCode::DeadlineExceeded, "deadline exceeded"));
                         None
@@ -1226,6 +1415,7 @@ impl Host {
                 std::panic::resume_unwind(panic);
             }
         });
+        self.conn.shared.tasks.register(task.clone());
         calls.workers.insert(id, task);
         true
     }
@@ -1259,12 +1449,19 @@ impl Host {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .stop_delivery("transport lost");
+                if !sender.shared.clock.is_continuous() {
+                    sender.on_transport_lost().await;
+                }
                 return;
             }
         };
         let _state = sender.shared.state.read().await;
         let calls = registry.lock().unwrap_or_else(|e| e.into_inner());
-        if !calls.delivery_stopped && !sender.is_closed() && !sender.writer_is_fenced() {
+        if !calls.delivery_stopped
+            && !sender.is_closed()
+            && !sender.writer_is_fenced()
+            && !sender.lifecycle_blocked()
+        {
             permit.send(bytes);
         }
     }
@@ -1307,6 +1504,12 @@ impl Host {
         if *state != ConnectionState::Active
             || self.conn.is_closed()
             || self.conn.writer_is_fenced()
+            || self.conn.lifecycle_blocked()
+            || self
+                .conn
+                .shared
+                .shutdown_requested
+                .load(std::sync::atomic::Ordering::Acquire)
         {
             return Err(SyntraError::Closed("connection closing".to_string()));
         }
@@ -1351,11 +1554,15 @@ impl Host {
             self.close().await;
             return Ok(());
         }
-        let deadline = now() + grace;
+        let deadline = self.conn.shared.clock.now() + grace;
+        let reserve = (grace / 4)
+            .max(Duration::from_nanos(1))
+            .min(Duration::from_secs(1));
+        let drain_cutoff = deadline - reserve;
         self.conn.begin_closing().await;
         self.close_recovery();
         self.conn
-            .drain_until(deadline, || {
+            .drain_until(drain_cutoff, || {
                 self.inflight_len() == 0 && self.output.in_use() == 0
             })
             .await;
@@ -1384,7 +1591,7 @@ impl Host {
     /// continuation, not termination/join of retained external execution.
     pub async fn withdraw_principal(&self) {
         use std::sync::atomic::Ordering;
-        let deadline = now() + SHUTDOWN_GRACE;
+        let deadline = self.conn.shared.clock.now() + SHUTDOWN_GRACE;
         let (mut done, from_handler) = {
             let mut state = self.conn.shared.state.write().await;
             let from_handler = self
@@ -1443,7 +1650,7 @@ impl Host {
                         }
                         tokio::select! {
                             biased;
-                            _ = sleep_until(deadline) => break,
+                            _ = conn.shared.clock.sleep_until(deadline) => break,
                             _ = closed.changed() => break,
                             _ = changed => {},
                         }
@@ -1454,9 +1661,15 @@ impl Host {
                         .stop_delivery("connection closed");
                     conn.close().await;
                     Self::wait_workers_until(&calls, &progress, deadline).await;
-                    Self::stop_owned_handshake_timer_until(&handshake_task, deadline).await;
+                    Self::stop_owned_handshake_timer_until(
+                        &handshake_task,
+                        deadline,
+                        &conn.shared.clock,
+                    )
+                    .await;
                     complete.send_replace(true);
                 });
+                self.conn.shared.tasks.register(task.clone());
                 let observer = done.clone();
                 *owner = Some(WithdrawalOwner { _task: task, done });
                 (observer, from_handler)
@@ -1490,7 +1703,7 @@ impl Host {
     /// let `close` exceed 1s on wasm (N workers + timer); sharing the
     /// deadline keeps the total bounded.
     async fn shutdown_tasks(&self) {
-        let deadline = now() + SHUTDOWN_GRACE;
+        let deadline = self.conn.shared.clock.now() + SHUTDOWN_GRACE;
         self.abort_inflight_until(deadline).await;
         self.stop_handshake_timer_until(deadline).await;
         self.stop_recovery_until(deadline).await;
@@ -1502,10 +1715,16 @@ impl Host {
     }
 
     async fn wait_workers_until(calls: &Mutex<Calls>, progress: &Notify, deadline: Instant) {
+        let clock = calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clock
+            .clone();
         // Do NOT abort/drain owners of transferred execution. They retain their
         // handles and accounting through actual completion, even after close.
         // Self-initiated shutdown cannot wait for its own handler to return.
-        // Full shutdown-incomplete reporting/join ownership is Phase 5 API work.
+        // Shutdown retains join ownership and reports incomplete if work remains
+        // at the deadline or elapsed-clock continuity is lost.
         loop {
             let changed = progress.notified();
             tokio::pin!(changed);
@@ -1516,12 +1735,12 @@ impl Host {
                 .workers
                 .values()
                 .any(|task| !task.is_current());
-            if !waiting || now() >= deadline {
+            if !waiting || clock.now() >= deadline || !clock.is_continuous() {
                 break;
             }
             tokio::select! {
                 biased;
-                _ = sleep_until(deadline) => break,
+                _ = clock.sleep_until(deadline) => break,
                 _ = changed => {},
             }
         }
@@ -1542,17 +1761,23 @@ impl Host {
     }
 
     async fn stop_handshake_timer(&self) {
-        self.stop_handshake_timer_until(now() + SHUTDOWN_GRACE)
+        self.stop_handshake_timer_until(self.conn.shared.clock.now() + SHUTDOWN_GRACE)
             .await;
     }
 
     async fn stop_handshake_timer_until(&self, deadline: Instant) {
-        Self::stop_owned_handshake_timer_until(&self.handshake_task, deadline).await;
+        Self::stop_owned_handshake_timer_until(
+            &self.handshake_task,
+            deadline,
+            &self.conn.shared.clock,
+        )
+        .await;
     }
 
     async fn stop_owned_handshake_timer_until(
         handshake_task: &Mutex<Option<TaskHandle>>,
         deadline: Instant,
+        clock: &crate::elapsed::ElapsedClock,
     ) {
         let task = handshake_task
             .lock()
@@ -1563,8 +1788,7 @@ impl Host {
             // Shares the shutdown deadline with the in-flight drain: the
             // timer observes close/handshake-done and exits promptly, but
             // a stalled wasm timer must not hang shutdown.
-            task.join_bounded(deadline.saturating_duration_since(now()))
-                .await;
+            let _ = clock.timeout_until(deadline, task.join()).await;
         }
     }
 

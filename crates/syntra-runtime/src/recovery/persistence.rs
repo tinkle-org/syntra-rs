@@ -1,11 +1,13 @@
 //! Local atomic recovery persistence of (principal, stream, generation, checkpoint,
 //! **full opaque application state**). This is not a wire format or an effects
-//! digest adapter; the legacy `store` helper is independent.
+//! digest adapter; the `store` helper is independent.
 //!
 //! No source handles, client storage credentials, or authentication tokens belong
 //! here. Scopes and checkpoints are sensitive application data, not credentials
 //! granting access. Debug/error output deliberately excludes their contents.
 //!
+//! The persistence interface and memory store are available on every target.
+//! The native `FileRecoveryStore` requires the opt-in `file-store` Cargo feature.
 //! The synchronous boundary permits native filesystem implementations. Async
 //! native clients MUST offload file operations (for example, `spawn_blocking`)
 //! and await completion before confirming. Dropping that task's join handle does
@@ -17,10 +19,10 @@ use std::{collections::HashMap, fmt};
 use syntra_core::ErrorCode as SyntraErrorCode;
 use thiserror::Error;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "file-store", not(target_arch = "wasm32")))]
 #[path = "persistence_file.rs"]
 mod file;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "file-store", not(target_arch = "wasm32")))]
 pub use file::FileRecoveryStore;
 
 pub const MAX_SCOPE_BYTES: usize = 1_024;

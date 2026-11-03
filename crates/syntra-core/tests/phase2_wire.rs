@@ -57,6 +57,96 @@ fn rejected(raw: &[u8], code: ErrorCode) -> String {
 }
 
 #[test]
+fn active_version_mismatch_is_failed_precondition_but_zero_is_invalid_argument() {
+    for (version, expected) in [
+        (0, ErrorCode::InvalidArgument),
+        (2, ErrorCode::FailedPrecondition),
+        (u32::MAX, ErrorCode::FailedPrecondition),
+    ] {
+        // A valid Cancel envelope with a last-occurrence version override.
+        let raw = [frame(14, &[]), field(1, 0, &varint(u64::from(version)))].concat();
+        validate_wire_structure(&raw).unwrap();
+        let decoded = Frame::decode(raw.as_slice()).unwrap();
+        assert_eq!(decoded.version, version);
+        assert_eq!(decode_frame(&raw, active()).unwrap_err().code(), expected);
+        assert_eq!(
+            validate_frame(&decoded, active()).unwrap_err().code(),
+            expected
+        );
+        assert_eq!(
+            encode_frame(&decoded, active()).unwrap_err().code(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn non_active_version_validation_keeps_invalid_argument() {
+    for state in [
+        ConnectionState::Connected,
+        ConnectionState::Negotiating,
+        ConnectionState::Authenticating,
+        ConnectionState::Closing,
+        ConnectionState::Closed,
+    ] {
+        for (version, negotiated_version) in [(0, None), (0, Some(1)), (2, Some(1))] {
+            let raw = [frame(14, &[]), field(1, 0, &varint(version))].concat();
+            let ctx = ValidationContext {
+                state,
+                negotiated_version,
+            };
+            assert_eq!(
+                decode_frame(&raw, ctx).unwrap_err().code(),
+                ErrorCode::InvalidArgument
+            );
+        }
+    }
+}
+
+#[test]
+fn active_version_mismatch_preserves_structural_and_bounds_precedence() {
+    let mismatch = [frame(14, &[]), vec![8, 2]].concat();
+    let mut huge_length = varint(90 << 3 | 2);
+    huge_length.extend(varint(MAX_FRAME_BYTES as u64 + 1));
+    for (suffix, expected) in [
+        (vec![0x80], ErrorCode::InvalidArgument),   // Truncated tag.
+        (len(16, &[]), ErrorCode::InvalidArgument), // Reserved field.
+        (len(14, &[]), ErrorCode::InvalidArgument), // Duplicate body.
+        (huge_length, ErrorCode::ResourceExhausted),
+    ] {
+        rejected(&[mismatch.clone(), suffix].concat(), expected);
+    }
+    let oversized_field = frame(11, &len(1, &vec![b'x'; MAX_CONNECTION_ID_BYTES + 1]));
+    rejected(
+        &[oversized_field, vec![8, 2]].concat(),
+        ErrorCode::InvalidArgument,
+    );
+    let oversized_envelope = Frame {
+        version: 2,
+        request_id: 0,
+        body: Some(Body::Notification(syntra_core::Notification {
+            payload: vec![0; MAX_FRAME_BYTES],
+        })),
+    };
+    assert_eq!(
+        validate_frame(&oversized_envelope, active())
+            .unwrap_err()
+            .code(),
+        ErrorCode::ResourceExhausted
+    );
+    rejected(
+        &oversized_envelope.encode_to_vec(),
+        ErrorCode::ResourceExhausted,
+    );
+    // Version validation still precedes request-ID validation.
+    let invalid_id = [mismatch, vec![16, 0]].concat();
+    assert_eq!(
+        decode_frame(&invalid_id, active()).unwrap_err().code(),
+        ErrorCode::FailedPrecondition
+    );
+}
+
+#[test]
 fn body_partition_and_metadata_are_exact() {
     for number in 18..=31 {
         assert_eq!(

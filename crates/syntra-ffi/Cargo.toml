@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
-description = "Native C ABI surface: test fixture plus production frame-pump; no default ABI exports; WASM unsupported."
+description = "Shared-runtime native production ABI 1 with isolated test-fixture mode; no default exports; WASM unsupported."
 
 [lib]
 name = "syntra_ffi"
@@ -18,14 +18,18 @@ default = []
 # Test-only loopback ABI, NOT a production transport. Never enable in shipped
 # binaries (including via --all-features). Default builds expose no C ABI.
 test-fixture = ["dep:syntra-core", "dep:syntra-runtime", "dep:tokio"]
-# Production transport-agnostic frame-pump ABI. Native-only, no WASM.
-production = ["dep:syntra-core", "dep:prost", "dep:getrandom"]
+# Sole production ABI: shared Host/Initiator/recovery, native-only. Mutually
+# exclusive with test-fixture (their intentionally separate C contracts differ).
+production = ["dep:syntra-core", "dep:prost", "dep:syntra-runtime", "dep:tokio"]
 
 [dependencies]
 prost = { workspace = true, optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-getrandom = { version = "0.3", optional = true }
 syntra-core = { path = "../syntra-core", version = "1.0.0-rc.1", optional = true }
 syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.1", optional = true }
 tokio = { version = "1", default-features = false, features = ["sync", "time", "rt-multi-thread", "macros"], optional = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+# Random test-library filenames; production connection IDs come from runtime.
+getrandom = "0.3"

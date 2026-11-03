@@ -1,9 +1,7 @@
-"""Read-only content check for the accepted Syntra schema and suite snapshot.
+"""Read-only scoped SDD provenance and implementation-owned input check.
 
-The historical extraction/review pins belong in MIGRATION.md. The active
-contract pin and every snapshot digest live in upstream.lock.json; the reviewed
-identity is also checked by upstream_snapshot.py. Use --upstream ../syntra to
-add comparison with the committed upstream Git blobs, independent of worktrees.
+Uses SYNTRA_SDD_ROOT or ../syntra, reading exact pinned Git blobs even if HEAD
+has advanced. --offline checks only local proto/test-asset digests.
 """
 
 import subprocess

@@ -2,23 +2,18 @@
 members = [
     "crates/syntra-core",
     "crates/syntra-runtime",
-    "crates/syntra-secure-channel",
-    "crates/syntra-sc1-transport",
-    "crates/syntra-ws",
+    "crates/syntra-transport",
     "crates/syntra-ffi",
     "crates/syntra-web",
     "crates/syntra-integration",
 ]
-# Ordinary root builds exclude the explicitly development-only container peer.
-# `--workspace` still exercises it and intentionally unifies development features.
+# Default builds select embeddable protocol libraries. Platform adapters and
+# reference peers are exercised by explicit integration lanes.
 default-members = [
     "crates/syntra-core",
     "crates/syntra-runtime",
-    "crates/syntra-secure-channel",
-    "crates/syntra-sc1-transport",
-    "crates/syntra-ws",
+    "crates/syntra-transport",
     "crates/syntra-ffi",
-    "crates/syntra-web",
 ]
 resolver = "2"
 

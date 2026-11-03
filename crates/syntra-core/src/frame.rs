@@ -161,7 +161,13 @@ pub fn validate_frame(frame: &Frame, ctx: ValidationContext) -> Result<FrameKind
             })?;
             if frame.version != v {
                 return Err(SyntraError::Protocol {
-                    code: ErrorCode::InvalidArgument,
+                    // Zero is malformed; changing an established version
+                    // violates the negotiated connection contract.
+                    code: if frame.version == 0 {
+                        ErrorCode::InvalidArgument
+                    } else {
+                        ErrorCode::FailedPrecondition
+                    },
                     message: "frame version mismatch".to_string(),
                 });
             }

@@ -3,25 +3,26 @@
 //! This crate owns envelope codec, validation (`SNTR-WIRE-*`,
 //! `SNTR-SER-*`), version negotiation, the six-state connection machine
 //! (`SNTR-HS-001`), request-id allocation, the bounded pending-RPC table,
-//! method-shape validation, and typed errors. It never touches the
-//! network and never interprets application payloads.
+//! method-shape validation, typed errors, and the integral Syntra 1.0 encryption
+//! kernel in [`secure_channel`]. The kernel owns authenticated context, Noise
+//! establishment, ordered record protection and bounded frame-stream assembly.
+//! This crate never touches the network or interprets application payloads;
+//! scheduling, host policy and carrier I/O belong to its callers.
 //!
-//! Wire sources: committed prost output of `proto/syntra/v1/*.proto`
-//! (see `buf.gen.yaml`; pins in upstream [schema generation]).
-//! Generated types are data structures only; all behavior here is
-//! implemented against the upstream [specifications].
+//! Wire types are committed prost output of `proto/syntra/v1/*.proto`, generated
+//! with `buf.gen.yaml`. Generated types are data structures only. Input provenance
+//! and the candidate protocol contract are described in the repository's
+//! [contributor guide]; connection encryption and embedding boundaries are in the
+//! [connection guide].
 //!
-//! Open questions this crate does NOT invent bindings for (see
-//! [session open questions] and [auth/session lifecycle RFC]):
-//! typed pre-`ACTIVE` error carrier (B1), pre-`ACTIVE` notification conflict
-//! (B2). Accepted RFC 0004 D1 forbids connection-local request-ID reuse;
-//! RFC 0005 D2/D3 fixes byte bounds; RFC 0008 D1 fixes raw-wire validation.
-//! Where a conflict exists the enforced rule is documented on the item.
+//! Pre-`ACTIVE` failures expose local typed errors and close the connection
+//! without an error envelope; application frames, including notifications,
+//! are forbidden before `ACTIVE`. Request IDs are never reused within a
+//! connection; byte bounds and raw-wire validation apply on decode and emission.
+//! The enforced rules are documented on each item.
 //!
-//! [schema generation]: https://github.com/tinkle-org/syntra/blob/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/specifications/schema/generation.md
-//! [specifications]: https://github.com/tinkle-org/syntra/tree/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/specifications
-//! [session open questions]: https://github.com/tinkle-org/syntra/blob/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/SESSION-OPEN-QUESTIONS.md
-//! [auth/session lifecycle RFC]: https://github.com/tinkle-org/syntra/blob/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/rfcs/0002-auth-session-lifecycle.md
+//! [contributor guide]: https://github.com/tinkle-org/syntra-rs/blob/main/CONTRIBUTING.md#input-provenance-and-authority
+//! [connection guide]: https://github.com/tinkle-org/syntra-rs/blob/main/CONNECTION.md
 
 /// Committed prost output (see `buf.gen.yaml`). Do not hand-edit; this
 /// file is byte-pinned to a pinned `buf generate` run (drift-checked).
@@ -37,6 +38,7 @@ pub mod frame;
 pub mod handshake;
 pub mod reliable;
 pub mod rpc;
+pub mod secure_channel;
 pub mod state;
 
 pub use codec::{decode_frame, encode_frame, MAX_FRAME_BYTES};

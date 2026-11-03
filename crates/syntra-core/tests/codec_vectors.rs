@@ -278,7 +278,12 @@ fn version_discipline() {
             credential: vec![],
         })),
     };
-    assert!(decode_frame(&f.encode_to_vec(), connected()).is_err());
+    assert_eq!(
+        decode_frame(&f.encode_to_vec(), connected())
+            .unwrap_err()
+            .code(),
+        ErrorCode::InvalidArgument
+    );
     // ACTIVE mismatch rejected.
     let f = Frame {
         version: 2,
@@ -289,7 +294,10 @@ fn version_discipline() {
             timeout_ms: 1,
         })),
     };
-    assert!(validate_frame(&f, active()).is_err());
+    assert_eq!(
+        validate_frame(&f, active()).unwrap_err().code(),
+        ErrorCode::FailedPrecondition
+    );
 }
 
 #[test]

@@ -186,14 +186,9 @@ async fn structurally_invalid_results_never_supply_correlation() {
 
 #[tokio::test]
 async fn active_handshake_frames_and_version_mismatch_are_immediately_fatal() {
-    let mut wrong_version = frame(
-        42,
-        Body::Result(RpcResult {
-            outcome: Some(Outcome::Payload(vec![])),
-        }),
-    );
-    wrong_version.version = 2;
-    for invalid in [
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut invalid_frames = vec![
         frame(
             0,
             Body::Hello(ClientHello {
@@ -208,28 +203,100 @@ async fn active_handshake_frames_and_version_mismatch_are_immediately_fatal() {
                 connection_id: "unexpected".into(),
             }),
         ),
-        wrong_version,
-    ] {
-        let expected = if invalid.version == 2 {
+    ];
+    for version in [0, 2] {
+        for mut invalid in [
+            frame(
+                42,
+                Body::Result(RpcResult {
+                    outcome: Some(Outcome::Payload(vec![])),
+                }),
+            ),
+            Frame::decode(request(42).as_slice()).unwrap(),
+            frame(0, Body::Notification(Notification { payload: vec![] })),
+        ] {
+            invalid.version = version;
+            invalid_frames.push(invalid);
+        }
+    }
+    for invalid in invalid_frames {
+        let expected = if invalid.version == 0 {
             ErrorCode::InvalidArgument
         } else {
             ErrorCode::FailedPrecondition
         };
         let bytes = invalid.encode_to_vec();
-        let (client, _writer) = client().await;
+        let (client, mut writer) = client().await;
         client.ingest(&bytes).await;
         assert!(client.is_closed());
         assert_eq!(client.terminal_reason().unwrap().code(), expected);
+        assert_eq!(client.pending_len(), 0);
+        assert!(client.next_notification().await.is_none());
+        assert!(
+            writer.try_recv().is_err(),
+            "fatal input must not emit a frame"
+        );
         client.on_transport_lost().await;
         assert_eq!(client.terminal_reason().unwrap().code(), expected);
-        let (host, _writer) = host(ConnectionConfig::default(), blocked()).await;
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(FnHandler({
+            let dispatched = dispatched.clone();
+            move |_, _, _| {
+                dispatched.fetch_add(1, Ordering::SeqCst);
+                async { HandlerOutcome::Payload(vec![]) }
+            }
+        }));
+        let (host, mut writer) = host(ConnectionConfig::default(), handler).await;
         host.ingest(&bytes).await;
         assert!(host.is_closed());
         assert_eq!(host.terminal_reason().unwrap().code(), expected);
         assert_eq!(host.sessions().count(), 0);
+        assert_eq!(host.inflight_len(), 0);
+        assert_eq!(host.execution_len(), 0);
+        assert_eq!(host.worker_len(), 0);
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+        assert!(
+            writer.try_recv().is_err(),
+            "fatal input must not emit a frame"
+        );
         host.on_transport_lost().await;
         assert_eq!(host.terminal_reason().unwrap().code(), expected);
     }
+}
+
+#[tokio::test]
+async fn active_version_mismatch_preserves_an_already_selected_result() {
+    let (client, mut writer) = client().await;
+    let mut call = Box::pin(client.call(METHOD, vec![], 5000));
+    assert!(futures_util::poll!(&mut call).is_pending());
+    let id = Frame::decode(writer.recv().await.unwrap().as_slice())
+        .unwrap()
+        .request_id;
+    let mut pending = Box::pin(client.call(METHOD, vec![], 5000));
+    assert!(futures_util::poll!(&mut pending).is_pending());
+    let pending_id = Frame::decode(writer.recv().await.unwrap().as_slice())
+        .unwrap()
+        .request_id;
+    let mut result = frame(
+        id,
+        Body::Result(RpcResult {
+            outcome: Some(Outcome::Payload(b"selected".to_vec())),
+        }),
+    );
+    client.ingest(&result.encode_to_vec()).await;
+    assert_eq!(client.pending_len(), 1);
+    result.version = 2;
+    result.request_id = pending_id;
+    client.ingest(&result.encode_to_vec()).await;
+    assert!(client.is_closed());
+    assert_eq!(
+        client.terminal_reason().unwrap().code(),
+        ErrorCode::FailedPrecondition
+    );
+    assert_eq!(call.await.unwrap(), b"selected");
+    assert_eq!(pending.await.unwrap_err().code(), ErrorCode::Unavailable);
+    assert_eq!(client.pending_len(), 0);
+    assert!(writer.try_recv().is_err());
 }
 
 #[tokio::test]

@@ -8,60 +8,67 @@ a security-patched toolchain. Current pins are `prost =0.13.5`,
 0.26 and `rustls 0.23`. Keep dependency versions and checksums consistent
 unless updating them is part of the change.
 
-Read [SC1.md](SC1.md) for the current accepted upstream `SNTR-SC1-WSS-V1`
-alignment target at `8ede3810b29fbba4d0e6ae6751a0025ceedda140` (PR #20)
-and [AUDIT.md](AUDIT.md) for local reviews and current gaps.
-[MIGRATION.md](MIGRATION.md) records the historical proposal-review and separate
-extraction and historical contract pins, along with the content-verified
-snapshot procedure. [The SDD matrix](docs/sdd-alignment.md) distinguishes the
-accepted target from the remaining implementation and evidence work.
+Read [CONNECTION.md](CONNECTION.md) for Syntra 1.0 encryption and connection
+guidance. Keep pinned upstream inputs distinct from the candidate implementation
+and its verification; see [input provenance](#input-provenance-and-authority).
 The implementation remains experimental and unpublished; formal conformance has
 not been executed and independent security review remains outstanding.
-Latest local results are recorded in
-[AUDIT.md](AUDIT.md#current-recorded-verification); historical runs remain
-separate.
 
-`syntra-sc1-transport` is experimental and unpublished, replacing the prerelease
-`syntra-tcp` and `syntra-ws-sc1` crates with an intentional source/API/wire break.
-Its empty default feature set exposes native WSS; `development-carriers` adds
-restricted TCP and plaintext loopback WS. The public `pump` stays carrier-neutral
-and independent of the gated TCP module. Keep baseline `syntra-ws` framing and
-endpoints unchanged while honoring the runtime writer emission-gate contract.
-Browser SC1 is not implemented, and production FFI has its own state machine
-rather than automatically becoming an SC1 SDK. The opt-in reconnecting client's
-owned-status, generation, retry and close contracts are in
-[SC1.md](SC1.md#reconnecting-client).
+`syntra-transport` has an empty default feature set: the native carrier-neutral
+record driver is available without socket dependencies. Select `tcp` or `websocket`
+explicitly for native carriers; `websocket` includes WSS and loopback-only WS
+dials, both carrying protected records. Reconnection requires the separate
+`reconnect` feature. `native-enrollment` is also explicitly opt-in.
+
+Keep the ownership boundaries: `syntra-core` owns framing and record protection
+through `syntra_core::secure_channel`, `syntra-runtime` owns sessions, `syntra-transport`
+owns native I/O, and `syntra-web` owns the browser-local driver. The browser's
+default `browser-connection` feature exposes protected WSS with provisioned
+Noise pins and encrypted ClientHello; it has no plaintext connect API. See
+[browser procedures](crates/syntra-web/tests/browser.md) for separate build,
+synthetic-carrier and real WSS checks. FFI features require their own checks.
 
 ## Checks
 
 ```sh
 export RUSTUP_TOOLCHAIN=1.88.0
 cargo fmt --all -- --check
+cargo test --locked
 cargo test --locked --workspace
-cargo test --locked -p syntra-sc1-transport --no-default-features
-cargo test --locked -p syntra-sc1-transport --features development-carriers
-cargo bench --locked -p syntra-sc1-transport --features development-carriers --bench pipe -- --test
+cargo test --locked -p syntra-runtime --no-default-features --features file-store
+cargo test --locked -p syntra-transport --no-default-features
+cargo test --locked -p syntra-transport --no-default-features --features tcp
+cargo test --locked -p syntra-transport --no-default-features --features websocket
+cargo test --locked -p syntra-transport --no-default-features --features tcp,websocket,reconnect
+cargo bench --locked -p syntra-transport --no-default-features --features tcp --bench pipe -- --test
+python3 scripts/cargo_contracts.py isolation
 cargo clippy --locked --workspace --all-targets -- --no-deps
 cargo test --locked -p syntra-ffi --no-default-features --features production
 cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
 python3 crates/syntra-ffi/tests/build_contract.py
-cargo check --locked -p syntra-core -p syntra-runtime -p syntra-ws -p syntra-web --target wasm32-unknown-unknown
+cargo check --locked -p syntra-core -p syntra-runtime --target wasm32-unknown-unknown
+cargo check --locked -p syntra-web --no-default-features --features browser-connection --target wasm32-unknown-unknown
+cargo check --locked -p syntra-web --no-default-features --features browser-test-fixture --target wasm32-unknown-unknown
 git diff --check
 ```
 
-Root builds/tests without `--workspace` use `default-members`, excluding the
-container integration crate. `--workspace` intentionally includes integration
-and unifies `development-carriers` into `syntra-sc1-transport`. Keep the isolated
-`--no-default-features` and explicit development-feature invocations separate;
-CI has separate steps for them. Workspace success alone is not WSS-default
-isolation evidence.
+Root builds/tests without package selectors or `--workspace` use
+the four `default-members` (`syntra-core`, `syntra-runtime`, `syntra-transport`,
+`syntra-ffi`), excluding only `syntra-web` and `syntra-integration` from
+the six-member workspace. `--workspace` includes those members and unifies the
+integration crate's `tcp` and `websocket` features into `syntra-transport`.
+Keep the isolated default and explicit carrier/reconnect invocations separate;
+workspace success alone does not establish socket-free default isolation.
+The isolation script checks normal dependency graphs on host and WASM targets.
+Native transport driver APIs require Tokio; WASM applications use `syntra-web`.
+The transport's native features must be disabled on WASM.
 
 Install the `wasm32-unknown-unknown` target for this toolchain first. The
 FFI contract also requires Python 3, `nm` and a C compiler. Run the relevant
 focused tests while iterating. The container suite is ignored by workspace
 runs; follow its own tooling instructions and record the actual peer
 revision. A same-implementation container round trip does not establish
-independent cross-language SC1 interoperability.
+independent cross-language Syntra interoperability.
 
 Security checks:
 
@@ -75,41 +82,44 @@ cargo audit --deny warnings
 `cargo deny` gates licenses, advisories and sources; `cargo audit` gates
 RustSec advisories. Recheck when dependencies or reachable code paths
 change; dependency presence and code reachability are different scan
-findings. See `.github/SECURITY.md` for private vulnerability reports.
+findings. See [the security policy](.github/SECURITY.md) for private vulnerability reports.
 
 Fuzz and negative tests:
 
-Fuzz and sanitizer campaigns are scheduled/manual only, never required PR
-checks. Run the negative and regression suites explicitly when touching
+The checked-in workflows do not provide fuzz or sanitizer campaigns. Run the
+negative and regression suites explicitly when touching
 their parsers: `codec_vectors`, `encode_allocation`, `runtime_defects`,
-pump split-point and fault-injection tests. Conformance vectors in
-`conformance/test-vectors/` must keep passing. Local fixture tests, carrier
+pump split-point and fault-injection tests. Pinned upstream conformance vectors
+and the selected local assets in `tests/interoperability/fixtures/` must retain
+their provenance. Local fixture tests, carrier
 integration tests and true independent Rust wire interop are separate
 evidence; name the level actually exercised.
 
 The exact context/prologue fixture tests cover **public encoding only**, not
-independent Noise cryptographic vectors. Upstream acceptance is complete.
-Remaining release requirements include formal conformance, independent pure-Go/Rust
-interoperability in both roles and modes, recovery and mobile validation, and
-independent security review. Do not infer completion from same-library round trips
-or public fixture matches.
+independent Noise cryptographic vectors. Preserve the scope and contract revision
+of each result. Same-library round trips, candidate agreement checks and pinned
+input checks do not establish formal conformance, independent cross-language
+interoperability, device validation or independent security review.
 
 Workflows (all actions SHA-pinned, `contents: read`, timeouts, concurrency
 cancel for PRs):
 
-- `CI` – fast required PR/main checks (`fmt`, `clippy`, `rust`,
-  `generated-rust`, `package`, `security`, `actionlint`,
-  `dependency-review`, aggregator `required`). Require `required` in the
-  main-branch ruleset; do not require individual jobs.
+- `CI` – PR/main validation (`clippy`, `rust`, `generated-rust`,
+  `manifest-cases`, `package`, `security`, `actionlint`, `dependency-review`,
+  aggregator `required`). `fmt` is informational. Require `required` in the
+  main-branch ruleset. The retained `manifest-cases` job ID produces unified
+  implementation evidence and ten supplemental WSS scenarios; it does not execute
+  an upstream transport-profile suite.
 - `Scheduled` – extended validation on Linux/macOS/Windows, coverage and
   vulnerability scans (does not gate).
 - `Integration` – separate Docker-based connectivity checks; see
   [crates/syntra-integration/README.md](crates/syntra-integration/README.md).
 - `Benchmarks` – report-only Criterion samples across workspace benches,
   including codec, channel and pipe cases; see [BENCHMARKS.md](BENCHMARKS.md).
-- `Release Please` – push-to-main-only automation using conventional
-  commits. Merging a release PR pushes the root `vX.Y.Z` tag; no binaries
-  are published and PRs cannot trigger it.
+- `Release-plz` – validated release PRs, per-package `syntra-<crate>-vX.Y.Z`
+  tags and gated Cargo publishing for eligible packages. Packages marked
+  `publish = false` are excluded. Protocol releases remain separate; see
+  [release-plz.toml](release-plz.toml) and the workflow's credential gates.
 
 Dependabot updates `cargo` and `github-actions` weekly; update SHAs via
 Dependabot PRs after review, never floating tags.
@@ -126,18 +136,18 @@ writes and revocation as appropriate. Keep host callbacks nonblocking and
 verify policy before handler effects. Exercise `Listener` admission through
 the ready write and owned shutdown when changing orchestration. Writer tests
 must preserve FIFO snapshot ownership, admission accounting, loop progress
-during stalls, bounded terminal drains and cancellation/join behavior. SC1
-issuance/delivery/ack recovery, rotation, subscription routing and
-execution-terminal proofs remain open integration work; do not describe them
-as implemented merely because a primitive/helper regression passes. Snow and
-runtime secret-erasure limits must remain explicit until evidence changes.
+during stalls, bounded terminal drains and cancellation/join behavior. Validate
+enrollment, recovery, rotation and lifecycle changes at their actual integration
+boundaries; a primitive/helper regression alone does not prove the complete
+flow. Snow and runtime secret-erasure limits must remain explicit until
+evidence changes.
 
 Custom initiator writers must preserve the byte-pump's original `Vec<u8>`
 allocation and pass it once to `Initiator::prepare_outbound` immediately before
 synchronous carrier handoff/encryption. Skip `None`; after `Some`, finish that
 unit in order or abort. Never re-gate fragments or ciphertext. Check the source
-doc comment and [SC1.md](SC1.md#runtime-emission-gate) when changing a writer;
-the gate preserves the byte-pump API while adding an emission contract.
+doc comment and [CONNECTION.md](CONNECTION.md) when changing a writer;
+the gate is part of the byte-pump emission contract.
 
 For reconnect changes, preserve single-dial ownership, cancellation-safe inline
 establishment, complete ready-batch ingestion and existing partial-frame deadlines.
@@ -145,19 +155,137 @@ Status snapshots must stay owned, not borrowed watch guards; generation-fenced
 calls must never migrate/replay into a successor. Exercise explicit controls,
 elapsed outage budgets through pauses, terminal blocking and retained cleanup
 ownership on close timeout. Automated source reviews do not replace
-independent human review. Track protocol/host-policy, durable recovery and FFI/mobile
-work in [implementation status](docs/implementation-status.md).
+independent human review. Record remaining protocol/host-policy, durable recovery
+and FFI/mobile work with the source revision and evidence scope in implementation
+issues. Scope each verification claim to the code and boundary exercised.
 
-Repository implementation licensing is Apache-2.0 (`LICENSE` and the root
-manifest). No MTProto implementation code was copied; do not conflate external
-design-document references or their licensing with source-code provenance.
+Repository implementation licensing is Apache-2.0 ([LICENSE](LICENSE) and the root
+manifest). Preserve source provenance when updating schemas and fixtures.
+
+## Input provenance and authority
+
+Original Rust source extraction credit:
+[`tinkle-org/syntra` at `2a91da7fdb96f3e75badf07614c14e4f85c9ba1c`](https://github.com/tinkle-org/syntra/commit/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c).
+
+[`upstream.lock.json`](upstream.lock.json) identifies the reviewed source repository
+`https://github.com/tinkle-org/syntra` and exact commit
+`8ede3810b29fbba4d0e6ae6751a0025ceedda140`. Lock format v2 has scope
+`implementation-inputs` and exactly **11 declared paths**: eight schemas, the
+Protobuf corpus, WebSocket fixtures and TCP byte vectors. The existing revision
+and input digests are preserved. It records consumed inputs rather than a complete
+upstream suite or root inventory.
+
+Local implementation inputs are the eight `.proto` files under `proto/` and one
+test asset, [`protobuf-vectors.yaml`](tests/interoperability/fixtures/protobuf-vectors.yaml),
+copied from upstream `conformance/test-vectors/protobuf/vectors.yaml`. The explicit
+allowlist and digest/Git verification live in
+[`scripts/sdd_inputs.py`](scripts/sdd_inputs.py) and
+[`scripts/upstream_snapshot.py`](scripts/upstream_snapshot.py). The two other
+declared vector sources are read from committed upstream blobs to verify
+handwritten transcriptions in [`vectors.rs`](tests/interoperability/vectors.rs);
+they are not additional local corpus copies. Resolve upstream-only document
+paths in the [pinned source tree](https://github.com/tinkle-org/syntra/tree/8ede3810b29fbba4d0e6ae6751a0025ceedda140).
+
+```sh
+python3 scripts/check-upstream-pin.py --offline
+python3 scripts/check-upstream-pin.py --upstream ../syntra
+```
+
+`--offline` checks local input inventory and digests against the reviewed lock; it
+does not establish Git provenance. Default checking uses `SYNTRA_SDD_ROOT` or
+`../syntra`; `--upstream PATH` selects an explicit local Git object database.
+That database must contain the exact pinned commit. The checker compares the
+11 declared inputs with committed Git blobs, never HEAD or worktree files, and
+never fetches or writes. Unrelated upstream paths are intentionally ignored;
+the local `proto/` inventory must still match exactly, including filenames and
+bytes. The checks do not establish protocol acceptance or conformance. Review
+intentional source-revision, declared-input, copied-input and generated-output
+updates together; do not edit pinned bytes or their hashes just to make checks pass.
+
+### Candidate agreement
+
+The separate v2 [`protocol-contract.json`](protocol-contract.json) records the
+current Syntra 1.0 candidate's domain, carrier bindings and context layout. Its
+source observation truthfully records the sibling's baseline HEAD, branch and
+dirty state, with `kind: worktree-not-release` and no candidate commit. The
+baseline HEAD is not a committed candidate. Release-pin verification cannot pass
+until the actual candidate bytes are committed and that real commit is verified
+and recorded; a successful agreement check does not authorize publication.
+
+The candidate context fixture is a **derived** artifact at
+[`syntra-1.0-context.json`](tests/interoperability/fixtures/syntra-1.0-context.json).
+The explicit `syntra-context-identifiers-by-source-order-v1` transformation maps
+context IDs to `SYNTRA-CONTEXT-01`, `SYNTRA-CONTEXT-02`, and so on, and negative
+recipe IDs to `SYNTRA-N01`, `SYNTRA-N02`, and so on, updating their base references
+by source-array order. Other fields, encoded bytes and mutation recipes are
+preserved. Raw source hashes are recorded separately from the derived fixture's
+hash. `carrier_bindings` uses `kind: CARRIER` through the recorded
+`transport-registry-to-carrier-bindings-v1` projection of the source registry;
+its canonical derived hash is separate from the raw registry hash. These are
+carrier bindings of one protocol, not selectable transport profiles.
+
+```sh
+python3 -B scripts/protocol_contract.py --offline
+python3 -B scripts/protocol_contract.py --worktree --upstream ../syntra
+```
+
+Offline candidate agreement checks the recorded local semantic artifacts and
+compiled source encoding probe without verifying external bytes. Worktree mode
+also verifies the recorded external machine-input bytes, transformations and
+HEAD/branch/dirty identity. Neither mode runs a complete crate or carrier suite.
+The separate `--run-rust --output NEW_EXTERNAL_DIRECTORY` option adds five exact
+supplemental Rust regressions with command logs. Candidate fixtures and
+implementation checks must not be presented as execution of the pinned upstream
+suite. Protocol specifications and conformance definitions remain upstream-owned;
+normative changes belong in that process first.
+
+## Implementation evidence
+
+[`scripts/conformance_evidence.py`](scripts/conformance_evidence.py) produces a
+unified implementation-evidence report. It verifies the 11 declared upstream Git
+inputs and local copies, checks fixture transcriptions, and optionally adds
+candidate agreement and supplemental local execution. It has no transport-profile
+selection or full-suite inventory mode. Install the parser from
+`scripts/requirements-evidence.txt` before running it.
+
+```sh
+python3 -B scripts/conformance_evidence.py --upstream ../syntra --candidate-agreement offline
+python3 -B scripts/conformance_evidence.py --upstream ../syntra --candidate-agreement worktree
+```
+
+Here `offline` applies only to candidate agreement: the evidence runner still
+requires the local Git object database containing the exact accepted-base commit.
+It performs no network fetch. Omit `--candidate-agreement` to collect input and
+transcription evidence without candidate agreement.
+
+Repeat `--run-local` to select supplemental lanes. The following runs all 14
+currently available lanes and writes command logs and `report.json` into a new
+directory outside the worktree. Choose a fresh output path for each run.
+
+```sh
+python3 -B scripts/conformance_evidence.py --upstream ../syntra \
+  --candidate-agreement offline \
+  --run-local corpus --run-local echo \
+  --run-local enrollment-preready --run-local enrollment-revocation \
+  --run-local wss-envelope --run-local wss-unknown-field --run-local wss-ready \
+  --run-local wss-reserved-method --run-local wss-payloads --run-local wss-duplicate-id \
+  --run-local wss-deadline --run-local wss-internal-error \
+  --run-local wss-reverse-completion --run-local wss-recovery-isolation \
+  --output /tmp/syntra-implementation-evidence
+```
+
+Each local result records its command, test, artifact hash and execution verdict.
+An exit code alone or a zero-test match does not prove execution. The runner
+records implementation identity before and after execution; a changed worktree
+invalidates passing execution claims and requires a stable-snapshot rerun.
+Supplemental rows retain `formal_conformance: false`; the report retains
+`formal_conformance_claimed: false` and an external formal-conformance gate of
+`NOT_EXECUTED`. Browser/device execution, independent interoperability,
+independent cryptographic vectors, security review and specification freeze
+remain separate external evidence. A successful command does not turn those
+gates into passes.
 
 ## Schema and generated code
-
-Read [MIGRATION.md](MIGRATION.md) for source provenance and import mappings.
-Schema and fixture updates should record their upstream source revision.
-Normative protocol changes belong in the upstream RFC/specification process
-first.
 
 Use Buf CLI 1.59.0 with the remote Rust plugin `neoeinstein-prost:v0.4.0`
 revision 1 configured in `buf.gen.yaml`. Generated files are committed and
@@ -168,22 +296,23 @@ buf format --diff --exit-code
 buf lint
 buf build
 python3 scripts/check-generated.py
-python3 scripts/check-upstream-pin.py
+python3 scripts/check-upstream-pin.py --offline
+python3 -m pip install -r scripts/requirements-evidence.txt
 python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 ```
 
-The drift script uses Python's standard library and only writes to a
+The generated-code drift script uses Python's standard library and only writes to a
 temporary directory. To intentionally regenerate committed Rust output, run
 `buf generate --template buf.gen.yaml`, then inspect the resulting diff.
-Accepted wire contracts remain upstream-owned; Rust owns its compatibility and
-execution evidence. The local fixture and byte-drift checks cover only their
-stated scope. `proto/` and `conformance/` are exact managed snapshots; do not edit
-them or their digest inventory to make tests pass. Use the explicit sync command
-in MIGRATION.md after reviewing the upstream revision. Copied relative links
-resolve in that pinned source tree. Keep local runner results outside those roots.
+The eight logical schema paths have explicit Rust mappings in `buf.gen.yaml`.
+Keep the pinned `.proto` options intact. Rust owns its compatibility and execution
+evidence; local fixture and byte-drift checks cover only their stated scope.
 
 ## Reports and releases
 
 Open ordinary Rust implementation issues and pull requests in
-[`tinkle-org/syntra-rs`](https://github.com/tinkle-org/syntra-rs). There are
-no releases yet. Future releases use repository-root `vX.Y.Z` tags.
+[`tinkle-org/syntra-rs`](https://github.com/tinkle-org/syntra-rs). Cargo packages
+use the per-package release process in [release-plz.toml](release-plz.toml),
+independently of upstream protocol specification releases.
+There is no published previous package version. Release-plz manages future
+per-package changelogs when preparing releases.

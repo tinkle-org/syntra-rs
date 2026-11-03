@@ -1,6 +1,7 @@
 //! Public, bounded local fixtures; not a production DurableSource or CONF runner.
 use std::collections::BTreeMap;
 use std::future::Future;
+#[cfg(all(feature = "file-store", not(target_arch = "wasm32")))]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -597,9 +598,14 @@ pub async fn batch<S: RecoveryPersistence + 'static>(c: &mut RecoveryClient<S>) 
     }
 }
 
+#[cfg(all(feature = "file-store", not(target_arch = "wasm32")))]
 static DIR_SERIAL: AtomicUsize = AtomicUsize::new(0);
-pub struct Disk(pub PathBuf);
-impl Disk {
+#[cfg(all(feature = "file-store", not(target_arch = "wasm32")))]
+pub type FixtureStore = FileRecoveryStore;
+#[cfg(all(feature = "file-store", not(target_arch = "wasm32")))]
+pub struct StoreFixture(pub PathBuf);
+#[cfg(all(feature = "file-store", not(target_arch = "wasm32")))]
+impl StoreFixture {
     pub fn new() -> Self {
         Self(std::env::temp_dir().canonicalize().unwrap().join(format!(
             "syntra-wire-public-{}-{}",
@@ -615,7 +621,49 @@ impl Disk {
         .await
         .unwrap()
     }
-    pub async fn seeded(&self, index: usize) -> FileRecoveryStore {
+}
+#[cfg(all(feature = "file-store", not(target_arch = "wasm32")))]
+impl Drop for StoreFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+// Retain state across client/connection replacement without requiring a backend.
+// This mutex only protects synchronous test-store calls; no guard crosses an await.
+#[cfg(not(all(feature = "file-store", not(target_arch = "wasm32"))))]
+#[derive(Clone)]
+pub struct FixtureStore(Arc<Mutex<MemoryRecoveryStore>>);
+#[cfg(not(all(feature = "file-store", not(target_arch = "wasm32"))))]
+pub struct StoreFixture(FixtureStore);
+#[cfg(not(all(feature = "file-store", not(target_arch = "wasm32"))))]
+impl StoreFixture {
+    pub fn new() -> Self {
+        Self(FixtureStore(Arc::new(Mutex::new(
+            MemoryRecoveryStore::new(),
+        ))))
+    }
+    pub async fn open(&self) -> FixtureStore {
+        self.0.clone()
+    }
+}
+#[cfg(not(all(feature = "file-store", not(target_arch = "wasm32"))))]
+impl RecoveryPersistence for FixtureStore {
+    fn load(&self, scope: &PersistenceScope) -> Result<Option<DurableRecord>, PersistenceError> {
+        self.0.lock().unwrap().load(scope)
+    }
+    fn commit(
+        &mut self,
+        scope: &PersistenceScope,
+        expected: Option<&ExpectedPosition>,
+        record: DurableRecord,
+    ) -> Result<(), PersistenceError> {
+        self.0.lock().unwrap().commit(scope, expected, record)
+    }
+}
+
+impl StoreFixture {
+    pub async fn seeded(&self, index: usize) -> FixtureStore {
         let mut store = self.open().await;
         bounded(tokio::task::spawn_blocking(move || {
             store.commit(&scope(A), None, record(index)).unwrap();
@@ -623,10 +671,5 @@ impl Disk {
         }))
         .await
         .unwrap()
-    }
-}
-impl Drop for Disk {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }

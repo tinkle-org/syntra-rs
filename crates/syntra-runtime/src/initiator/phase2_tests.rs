@@ -8,6 +8,66 @@ use tokio::sync::Barrier;
 
 const METHOD: &str = "/example.Echo/Echo";
 
+#[tokio::test(start_paused = true)]
+async fn ready_rechecks_suspend_and_elapsed_after_last_version_lock_await() {
+    for suspend in [false, true] {
+        let config = ConnectionConfig::default();
+        let (client, mut writer) = Initiator::new(config.clone());
+        let handshake = client.handshake(vec![]);
+        tokio::pin!(handshake);
+        assert!(futures_util::poll!(&mut handshake).is_pending());
+        writer.recv().await.unwrap();
+        // Readers allow ctx() to run, but block the final version commit.
+        let version = client.conn.shared.version.read().await;
+        let bytes = Frame {
+            version: 1,
+            request_id: 0,
+            body: Some(Body::Ready(syntra_core::ServerReady {
+                connection_id: "late-commit".into(),
+            })),
+        }
+        .encode_to_vec();
+        let mut delivery = Box::pin(client.ingest(&bytes));
+        assert!(futures_util::poll!(&mut delivery).is_pending());
+        if suspend {
+            client.suspend();
+        } else {
+            tokio::time::advance(config.handshake_timeout + Duration::from_millis(1)).await;
+        }
+        drop(version);
+        delivery.await;
+        assert_ne!(client.state().await, ConnectionState::Active);
+        if suspend {
+            client.platform_wake().await;
+        }
+        assert!(handshake.await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn suspended_buffered_notification_does_not_enter_application_or_recovery_queue() {
+    let (client, _) = active(ConnectionConfig::default()).await;
+    let held = client.conn.shared.state.write().await;
+    let bytes = Frame {
+        version: 1,
+        request_id: 0,
+        body: Some(Body::Notification(syntra_core::Notification {
+            payload: vec![1],
+        })),
+    }
+    .encode_to_vec();
+    let mut delivery = Box::pin(client.ingest(&bytes));
+    assert!(futures_util::poll!(&mut delivery).is_pending());
+    client.suspend();
+    drop(held);
+    delivery.await;
+    assert_eq!(
+        client.conn.shared.notif_tx.capacity(),
+        client.conn.shared.notif_tx.max_capacity()
+    );
+    client.platform_wake().await;
+}
+
 async fn active(config: ConnectionConfig) -> (Initiator, mpsc::Receiver<Vec<u8>>) {
     let (client, writer) = Initiator::try_new(config).expect("valid configuration");
     *client.conn.shared.state.write().await = ConnectionState::Active;
