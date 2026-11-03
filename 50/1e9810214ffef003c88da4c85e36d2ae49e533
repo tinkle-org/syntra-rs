@@ -1,0 +1,19 @@
+README.md
+  s_87028cb7ccdea0::t_64e4dea859c337 15-17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "501e9810214ffef003c88da4c85e36d2ae49e533",
+  "prompts": {},
+  "sessions": {
+    "s_87028cb7ccdea0": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e5d795292ffe489581DU7idtTu",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}
