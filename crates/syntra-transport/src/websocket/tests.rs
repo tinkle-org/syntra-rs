@@ -54,7 +54,7 @@ fn tls() -> (TlsServerSettings, rustls::RootCertStore) {
     roots.add(cert.cert.der().clone()).unwrap();
     let settings = TlsServerSettings::new(
         vec![cert.cert.der().clone()],
-        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
     )
     .unwrap();
     (settings, roots)

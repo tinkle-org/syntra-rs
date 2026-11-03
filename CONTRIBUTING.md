@@ -3,9 +3,9 @@
 Run commands from the repository root. **Rust 1.88.0 is the toolchain**;
 the crate MSRV floor of **1.88** is an API/build compatibility constraint,
 not a secure-runtime recommendation. Production binaries must be built with
-a security-patched toolchain. Current pins are `prost =0.13.5`,
+a security-patched toolchain. Current pins are `prost =0.14.4`,
 `snow =0.10.0`, `getrandom 0.3`, `tokio 1`, `tungstenite`/`tokio-tungstenite`
-0.26 and `rustls 0.23`. Keep dependency versions and checksums consistent
+0.30 and `rustls 0.23`. Keep dependency versions and checksums consistent
 unless updating them is part of the change.
 
 Read [CONNECTION.md](CONNECTION.md) for Syntra 1.0 encryption and connection
