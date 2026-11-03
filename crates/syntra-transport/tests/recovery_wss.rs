@@ -93,7 +93,7 @@ fn certificate() -> &'static Certificate {
         let generated = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
         Certificate {
             der: generated.cert.der().clone(),
-            key: generated.key_pair.serialize_der(),
+            key: generated.signing_key.serialize_der(),
         }
     })
 }

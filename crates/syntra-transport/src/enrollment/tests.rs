@@ -1159,7 +1159,7 @@ async fn wss_pair(
     let der = cert.cert.der().clone();
     let settings = crate::websocket::TlsServerSettings::new(
         vec![der.clone()],
-        PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+        PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
     )
     .unwrap();
     let mut roots = rustls::RootCertStore::empty();

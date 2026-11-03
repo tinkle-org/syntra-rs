@@ -25,11 +25,11 @@ security-patched toolchain. Current dependency pins are:
 
 | Dependency | Version |
 | --- | --- |
-| `prost` | =0.13.5 |
+| `prost` | =0.14.4 |
 | `snow` | =0.10.0 |
 | `getrandom` | 0.3 |
 | `tokio` | 1 |
-| `tungstenite` / `tokio-tungstenite` | 0.26 |
+| `tungstenite` / `tokio-tungstenite` | 0.30 |
 | `rustls` | 0.23 |
 
 Cargo package release configuration is in [release-plz.toml](release-plz.toml).
