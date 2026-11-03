@@ -1,0 +1,60 @@
+protocol-contract.json
+  s_87028cb7ccdea0::t_8e42f6eb73777a 3-4,17-18,24-28
+scripts/tests/test_conformance_evidence.py
+  s_87028cb7ccdea0::t_967f82b491ed0f 63,134-148
+  s_87028cb7ccdea0::t_e1b4929782b12c 149
+README.md
+  s_87028cb7ccdea0::t_967f82b491ed0f 325-326
+CONTRIBUTING.md
+  s_87028cb7ccdea0::t_8e42f6eb73777a 209-215,231,235-242,260,326-343
+crates/syntra-integration/README.md
+  s_87028cb7ccdea0::t_8e42f6eb73777a 38-39
+crates/syntra-runtime/tests/recovery_persistence.rs
+  s_33455f9ca19049::t_dad098c1b575dd 317-319
+crates/syntra-runtime/src/recovery/persistence_file.rs
+  s_33455f9ca19049::t_0670979b92edd5 735
+  s_33455f9ca19049::t_dad098c1b575dd 11-14,52,58-78,125,127,729
+  s_33455f9ca19049::t_3a8626367f943d 720-728,730-734,736-758
+scripts/tests/test_protocol_contract.py
+  s_87028cb7ccdea0::t_bbc58e9df98f26 342
+  s_3729668106d220::t_a3202999e65392 29-33,339-341,343-419
+  s_3729668106d220::t_6d5c322fdc3405 420
+scripts/conformance_evidence.py
+  s_87028cb7ccdea0::t_967f82b491ed0f 180-181
+CONNECTION.md
+  s_87028cb7ccdea0::t_8e42f6eb73777a 11-14
+BENCHMARKS.md
+  s_87028cb7ccdea0::t_8e42f6eb73777a 19-20
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c206bcc3da523ca46e5b87b96726c9a6f707613a",
+  "prompts": {},
+  "sessions": {
+    "s_33455f9ca19049": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e5d7359d9ffej9oX6DLuXdP94K",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    },
+    "s_3729668106d220": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e5d78756effebVWJmCyp5SJIsA",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    },
+    "s_87028cb7ccdea0": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e5d795292ffe489581DU7idtTu",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}
