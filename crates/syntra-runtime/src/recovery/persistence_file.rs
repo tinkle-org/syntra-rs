@@ -9,7 +9,13 @@
 //! these checks are not a sandbox against malicious concurrent path replacement.
 //!
 //! fs2's kernel advisory exclusive lock is held by a private File for the store's
-//! entire lifetime, including across processes, and explicitly unlocked on drop.
+//! entire lifetime, including across processes, and explicitly unlocked on drop
+//! only by the acquiring process. A forked child must not use an inherited
+//! FileRecoveryStore as an independent owner; dropping its inherited descriptor
+//! must not release the parent's lock.
+//! Linux/Android ownership also includes the active PID namespace and requires
+//! accessible `/proc/self/ns/pid` at acquisition. If identity cannot be checked
+//! at drop, only close is attempted; inherited descriptors may delay release.
 //! Crash/exit closes the descriptor; the lock file is deliberately never removed.
 //! All writers must cooperate.
 //! Do not use this on network/shared filesystems or filesystems without atomic
@@ -44,6 +50,7 @@ const MAX_ORPHANS: usize = 64;
 
 /// Native blocking, single-writer recovery snapshots. See the module's private
 /// filesystem and durability assumptions. Keep this off async executor threads.
+/// A forked child must not use an inherited store as an independent owner.
 /// No Debug implementation exposes its private filesystem path.
 pub struct FileRecoveryStore {
     path: PathBuf,
@@ -55,14 +62,47 @@ pub struct FileRecoveryStore {
     cut: Option<TestCut>,
 }
 
-struct StoreLock(File);
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProcessIdentity {
+    pid: u32,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pid_namespace: (u64, u64),
+}
+
+impl ProcessIdentity {
+    fn current() -> Result<Self, PersistenceError> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let pid_namespace = {
+            use std::os::unix::fs::MetadataExt;
+
+            // Follow the magic link to the active namespace, not the namespace
+            // selected for future children or an inherited namespace descriptor.
+            let namespace =
+                fs::metadata("/proc/self/ns/pid").map_err(|_| PersistenceError::Unavailable)?;
+            (namespace.dev(), namespace.ino())
+        };
+        Ok(Self {
+            pid: std::process::id(),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            pid_namespace,
+        })
+    }
+}
+
+struct StoreLock {
+    file: File,
+    owner: ProcessIdentity,
+}
 
 impl StoreLock {
     fn acquire(file: File) -> Result<Self, PersistenceError> {
+        // Finish fallible identity lookup before acquiring a lock that might be
+        // inherited concurrently; every acquired lock must have an unlock guard.
+        let owner = ProcessIdentity::current()?;
         fs2::FileExt::try_lock_exclusive(&file).map_err(|_| PersistenceError::Unavailable)?;
         // Only a successful acquisition owns an unlock, including on open errors
         // before FileRecoveryStore has been fully constructed.
-        Ok(Self(file))
+        Ok(Self { file, owner })
     }
 }
 
@@ -71,8 +111,12 @@ impl Drop for StoreLock {
         // Linux flock belongs to the open-file description. A concurrent spawn
         // can inherit it until exec closes CLOEXEC descriptors, so close alone
         // need not release it when this owner drops. Unlock before closing; never
-        // unlink the stable lock file. On failure, close remains the fallback.
-        let _release = fs2::FileExt::unlock(&self.0);
+        // unlink the stable lock file. A forked child must only close its inherited
+        // descriptor, not unlock the shared description owned by the parent.
+        // On failure, close remains the fallback.
+        if ProcessIdentity::current().is_ok_and(|current| current == self.owner) {
+            let _release = fs2::FileExt::unlock(&self.file);
+        }
     }
 }
 
@@ -124,7 +168,7 @@ impl FileRecoveryStore {
         };
         let lock = StoreLock::acquire(lock)?;
         if lock
-            .0
+            .file
             .metadata()
             .map_err(|_| PersistenceError::Unavailable)?
             .len()
@@ -726,7 +770,7 @@ mod tests {
         // A concurrent Command spawn can inherit this open-file description
         // until exec closes CLOEXEC descriptors. Retain an equivalent reference
         // deterministically, without forking the multithreaded test harness.
-        let inherited = store._lock.0.try_clone().unwrap();
+        let inherited = store._lock.file.try_clone().unwrap();
         assert_eq!(
             FileRecoveryStore::open(&directory.0, StoreLimits::default()).err(),
             Some(PersistenceError::Unavailable)
@@ -754,6 +798,53 @@ mod tests {
         drop(reopened);
         let reopened = FileRecoveryStore::open(&directory.0, StoreLimits::default()).unwrap();
         assert_eq!(reopened.load(&scope()).unwrap(), Some(snapshot(true)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreign_process_drop_does_not_unlock_shared_description() {
+        let directory = Directory::new();
+        let store = FileRecoveryStore::open(&directory.0, StoreLimits::default()).unwrap();
+        assert!(store._lock.owner == ProcessIdentity::current().unwrap());
+        // Model a forked child's PID mismatch with a duplicate of the same open
+        // file description, without forking a multithreaded test harness.
+        let inherited = StoreLock {
+            file: store._lock.file.try_clone().unwrap(),
+            owner: ProcessIdentity {
+                pid: std::process::id().wrapping_add(1),
+                ..store._lock.owner
+            },
+        };
+        drop(inherited);
+        assert_eq!(
+            FileRecoveryStore::open(&directory.0, StoreLimits::default()).err(),
+            Some(PersistenceError::Unavailable)
+        );
+        assert!(child(&directory.0, "lock").success());
+        drop(store);
+        drop(FileRecoveryStore::open(&directory.0, StoreLimits::default()).unwrap());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn same_pid_other_namespace_drop_does_not_unlock_shared_description() {
+        let directory = Directory::new();
+        let store = FileRecoveryStore::open(&directory.0, StoreLimits::default()).unwrap();
+        let mut owner = store._lock.owner;
+        owner.pid_namespace.1 = owner.pid_namespace.1.wrapping_add(1);
+        // Exercise same-PID aliasing in ordinary test runs too. The standalone
+        // file_store_pid_namespace example verifies it with real namespaces.
+        drop(StoreLock {
+            file: store._lock.file.try_clone().unwrap(),
+            owner,
+        });
+        assert_eq!(
+            FileRecoveryStore::open(&directory.0, StoreLimits::default()).err(),
+            Some(PersistenceError::Unavailable)
+        );
+        assert!(child(&directory.0, "lock").success());
+        drop(store);
+        drop(FileRecoveryStore::open(&directory.0, StoreLimits::default()).unwrap());
     }
 
     #[test]
