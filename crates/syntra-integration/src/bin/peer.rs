@@ -1,10 +1,10 @@
-//! Minimal SC1 echo peer for container integration tests.
+//! Minimal Syntra 1.0 echo peer for container connectivity tests, not conformance.
 //! Reads provisioning from the environment; never generates production keys.
 use std::sync::Arc;
+use syntra_core::secure_channel::{Carrier, Mode, Secret32, ServerConfig};
 use syntra_core::ErrorCode;
 use syntra_runtime::{ConnectionConfig, FnHandler, HandlerOutcome, StaticToken};
-use syntra_sc1_transport::{tcp, websocket, HostHandle, Limits};
-use syntra_secure_channel::{Carrier, Mode, Secret32, ServerConfig};
+use syntra_transport::{tcp, websocket, HostHandle, Limits};
 
 fn hex_to_32(s: &str) -> [u8; 32] {
     let s = s.trim();
@@ -31,13 +31,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("debug")
         .try_init();
-    let tcp_addr = std::env::var("SC1_TCP_ADDR").unwrap_or_else(|_| "0.0.0.0:7001".into());
-    let ws_addr = std::env::var("SC1_WS_ADDR").unwrap_or_else(|_| "0.0.0.0:7002".into());
-    let private_hex = std::env::var("SC1_PRIVATE_HEX").expect("SC1_PRIVATE_HEX");
-    let scope = std::env::var("SC1_SCOPE").unwrap_or_else(|_| "integration".into());
-    let ak_hex = std::env::var("SC1_AK_HEX").unwrap_or_default();
-    let handle_hex = std::env::var("SC1_HANDLE_HEX").unwrap_or_default();
-    let epoch: u64 = std::env::var("SC1_EPOCH")
+    let tcp_addr = std::env::var("SYNTRA_TCP_ADDR").unwrap_or_else(|_| "0.0.0.0:7001".into());
+    let ws_addr = std::env::var("SYNTRA_WS_ADDR").unwrap_or_else(|_| "0.0.0.0:7002".into());
+    let private_hex = std::env::var("SYNTRA_PRIVATE_HEX").expect("SYNTRA_PRIVATE_HEX");
+    let scope = std::env::var("SYNTRA_SCOPE").unwrap_or_else(|_| "integration".into());
+    let ak_hex = std::env::var("SYNTRA_AK_HEX").unwrap_or_default();
+    let handle_hex = std::env::var("SYNTRA_HANDLE_HEX").unwrap_or_default();
+    let epoch: u64 = std::env::var("SYNTRA_EPOCH")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
@@ -49,21 +49,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Mode::Bootstrap
     };
-    let store: Option<Arc<dyn syntra_secure_channel::KeyStore>> = if returning {
+    let store: Option<Arc<dyn syntra_core::secure_channel::KeyStore>> = if returning {
         struct Fixed {
             key: [u8; 32],
             handle: [u8; 8],
             epoch: u64,
         }
-        impl syntra_secure_channel::KeyStore for Fixed {
+        impl syntra_core::secure_channel::KeyStore for Fixed {
             fn lookup(
                 &self,
-                ctx: &syntra_secure_channel::Context,
-            ) -> Result<Secret32, syntra_secure_channel::Error> {
+                ctx: &syntra_core::secure_channel::Context,
+            ) -> Result<Secret32, syntra_core::secure_channel::Error> {
                 if ctx.handle == self.handle && ctx.epoch == self.epoch {
                     Ok(Secret32::new(self.key))
                 } else {
-                    Err(syntra_secure_channel::Error::Authentication)
+                    Err(syntra_core::secure_channel::Error::Authentication)
                 }
             }
         }
@@ -109,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let factory = {
         let credential = b"test-credential".to_vec();
         Arc::new(
-            move |identity: &syntra_secure_channel::VerifiedIdentity|
+            move |identity: &syntra_core::secure_channel::VerifiedIdentity|
                   -> Result<Arc<dyn syntra_runtime::Authenticator>, syntra_runtime::AuthError> {
                 eprintln!(
                     "peer tcp factory: mode={:?} carrier={:?}",
@@ -178,7 +178,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ws_factory = {
         let credential = b"test-credential".to_vec();
         Arc::new(
-            move |_: &syntra_secure_channel::VerifiedIdentity|
+            move |_: &syntra_core::secure_channel::VerifiedIdentity|
                   -> Result<Arc<dyn syntra_runtime::Authenticator>, syntra_runtime::AuthError> {
                 Ok(Arc::new(StaticToken::new(
                     credential.clone(),

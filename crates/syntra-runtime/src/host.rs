@@ -27,20 +27,22 @@
 //!   `UNIMPLEMENTED`, connection stays usable;
 //! - overload → terminal `RESOURCE_EXHAUSTED`, connection stays usable
 //!   (offenders isolated, SNTR-REL-007/008);
-//! - per-RPC responder deadlines start BEFORE queue admission
-//!   (measured from receipt of the complete validated frame);
-//!   completion wins races; cancel-vs-deadline ties prefer `CANCELLED`
-//!   (recorded tie-break for open B10);
+//! - per-RPC responder deadlines start at complete bounded-frame receipt,
+//!   before validation/admission waiting; the terminal gate checks elapsed
+//!   expiry first, including exact ties (RFC 0004 D4 / RFC 0008 D2);
+//! - request IDs strictly increase in received order, including rejected calls;
+//!   reuse is a local FAILED_PRECONDITION + close, never a same-ID result;
 //! - every accepted RPC ends with exactly one terminal `result`
 //!   (SNTR-RPC-002/006/030); a second `result` for the same id is never
 //!   sent.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use web_time::{Duration, Instant};
 
+use futures_util::FutureExt;
 use prost::Message;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::{debug, warn};
 
 use syntra_core::{
@@ -49,10 +51,17 @@ use syntra_core::{
 };
 
 use crate::connection::{
-    fill_random, sleep_until, spawn_task, Connection, ConnectionConfig, Role, Shared, TaskHandle,
-    SHUTDOWN_GRACE,
+    fill_random, spawn_task, Connection, ConnectionConfig, Role, Shared, TaskHandle, SHUTDOWN_GRACE,
 };
+use crate::emission::{now, sleep_until};
 use crate::session::{AuthError, Authenticator, Principal, Session, SessionManager};
+
+#[path = "host_execution.rs"]
+mod execution;
+pub use execution::{ExecutionBudget, ExecutionLease};
+
+#[path = "host_recovery.rs"]
+mod recovery;
 
 /// Handler outcome for one dispatched RPC.
 #[derive(Debug, Clone)]
@@ -64,28 +73,24 @@ pub enum HandlerOutcome {
 impl HandlerOutcome {
     pub fn error(code: ErrorCode, message: impl Into<String>) -> Self {
         Self::Error {
-            code,
-            message: message.into(),
+            code: sanitize_code(code),
+            message: syntra_core::bounded_diagnostic(message),
         }
     }
 }
 
 /// Application handler: owns method semantics. Payloads are opaque bytes;
 /// the core never validates them. Handlers SHOULD honor `cancel` promptly
-/// but completion still wins races at the core layer.
+/// but local reporting and actual execution lifetime are independent.
 ///
 /// Authorization is fail-closed by default: the provided `authorize`
 /// default denies every RPC with `PERMISSION_DENIED` (generic message, no
-/// oracle). This is a deliberate compatibility break for handlers written
-/// against the pre-policy trait, which only implemented `handle` and were
-/// implicitly permissive. Migration paths:
-/// - implement `authorize` with a principal-aware per-method policy
-///   (preferred for protected methods; must be nonblocking and may
-///   re-check expiry/revocation);
-/// - wrap a legacy permissive handler in [`AllowAll`] to restore the old
-///   allow behavior explicitly (tests, trusted embeds);
-/// - use [`FnHandler`] for closures, which remains allow-all by
-///   construction and is unchanged by this default.
+/// oracle). Protected methods require a principal-aware per-method policy;
+/// it must be nonblocking and may re-check expiry/revocation. [`AllowAll`]
+/// and [`FnHandler`] explicitly allow every bound principal to invoke every
+/// method and are intended for tests or trusted embeds where that policy
+/// is intentional.
+///
 /// Only generic authentication/authorization codes and messages are
 /// exposed on the wire; policy internals must never leak.
 pub trait Handler: Send + Sync {
@@ -105,17 +110,35 @@ pub trait Handler: Send + Sync {
         payload: Vec<u8>,
         cancel: crate::connection::CancelToken,
     ) -> HandlerFut;
+
+    /// Execution-lifetime hook. Override this when work can outlive
+    /// the returned future (spawned tasks, blocking jobs, external operations),
+    /// transferring a lease copy into that work until it actually stops.
+    /// The default treats dropping the returned future as cooperative stop.
+    /// Both handler hooks must return promptly; deliberately spawned blocking
+    /// or external work must retain a lease for its entire actual lifetime.
+    fn handle_with_execution(
+        &self,
+        method: String,
+        payload: Vec<u8>,
+        cancel: crate::connection::CancelToken,
+        lease: ExecutionLease,
+    ) -> HandlerFut {
+        let work = self.handle(method, payload, cancel);
+        Box::pin(async move {
+            let _lease = lease;
+            work.await
+        })
+    }
 }
 
 pub type HandlerFut = std::pin::Pin<Box<dyn std::future::Future<Output = HandlerOutcome> + Send>>;
 
-/// Explicit opt-in allow-all wrapper for migration. Wrapping a legacy
-/// permissive `Handler` in `AllowAll` restores the pre-policy behavior
-/// (every bound principal may invoke every method) without changing the
-/// inner handler's method semantics. Prefer a principal-aware `authorize`
-/// implementation for protected methods; use this wrapper only for trusted
-/// tests/embeds where the allow-all posture is intentional and documented
-/// at the construction site.
+/// Explicit opt-in allow-all wrapper: every bound principal may invoke every
+/// method without changing the inner handler's method semantics or execution
+/// lease handling. Prefer a principal-aware `authorize` implementation for
+/// protected methods; use this wrapper only for trusted tests/embeds where the
+/// allow-all posture is intentional and documented at the construction site.
 pub struct AllowAll<H>(pub H);
 
 impl<H> Handler for AllowAll<H>
@@ -134,14 +157,23 @@ where
     ) -> HandlerFut {
         self.0.handle(method, payload, cancel)
     }
+
+    fn handle_with_execution(
+        &self,
+        method: String,
+        payload: Vec<u8>,
+        cancel: crate::connection::CancelToken,
+        lease: ExecutionLease,
+    ) -> HandlerFut {
+        self.0.handle_with_execution(method, payload, cancel, lease)
+    }
 }
 
-/// Legacy allow-all adapter so closures can serve as handlers in tests and
+/// Explicit allow-all adapter so closures can serve as handlers in tests and
 /// embeds. Constructing this adapter explicitly allows every bound principal
-/// (including anonymous) to invoke the closure. Behavior is unchanged by
-/// the fail-closed `Handler::authorize` default: `FnHandler` overrides
-/// `authorize` to allow. For protected methods use a
-/// `Handler` implementation with a principal-aware `authorize` policy instead.
+/// (including anonymous) to invoke the closure. `FnHandler` overrides
+/// the fail-closed `Handler::authorize` default to allow. For protected methods
+/// use a `Handler` implementation with a principal-aware `authorize` policy instead.
 pub struct FnHandler<F>(pub F);
 
 impl<F, Fut> Handler for FnHandler<F>
@@ -163,9 +195,60 @@ where
     }
 }
 
-struct InflightEntry {
+struct PendingCall {
+    deadline: Instant,
     cancel: crate::connection::CancelToken,
-    task: TaskHandle,
+    selected: oneshot::Sender<HandlerOutcome>,
+}
+
+struct WithdrawalOwner {
+    // One retained continuation per connection, never aborted by cancellation
+    // of the initiating handler/caller. Completion below is bounded protocol
+    // cleanup, not a claim that external execution stopped or this task joined.
+    _task: TaskHandle,
+    done: tokio::sync::watch::Receiver<bool>,
+}
+
+#[derive(Default)]
+struct Calls {
+    clock: crate::elapsed::ElapsedClock,
+    pending: HashMap<u64, PendingCall>,
+    delivery_stopped: bool,
+    // Owned until BOTH execution (including transferred leases) and output
+    // finish. Never drained just because correlation has become terminal.
+    workers: HashMap<u64, TaskHandle>,
+}
+
+impl Calls {
+    fn select(&mut self, id: u64, candidate: HandlerOutcome) {
+        if let Some(call) = self.pending.remove(&id) {
+            let outcome = if self.clock.now() >= call.deadline {
+                HandlerOutcome::error(ErrorCode::DeadlineExceeded, "deadline exceeded")
+            } else if !self.clock.is_continuous() {
+                HandlerOutcome::error(ErrorCode::Unavailable, "elapsed continuity lost")
+            } else {
+                candidate
+            };
+            call.cancel.cancel();
+            // Receiver ownership is the worker's; a panic is still surfaced by
+            // the task runtime, not converted to a fabricated success/result.
+            let _ = call.selected.send(outcome);
+        }
+    }
+
+    fn select_all(&mut self, code: ErrorCode, message: &str) {
+        let ids: Vec<_> = self.pending.keys().copied().collect();
+        for id in ids {
+            self.select(id, HandlerOutcome::error(code, message));
+        }
+    }
+
+    fn stop_delivery(&mut self, message: &str) {
+        // Loss settles reporting, not another wire result. In particular an ID
+        // violation must not cause a new UNAVAILABLE result under that same ID.
+        self.delivery_stopped = true;
+        self.select_all(ErrorCode::Unavailable, message);
+    }
 }
 
 /// Transport-independent Syntra host.
@@ -175,24 +258,29 @@ pub struct Host {
     handler: Arc<dyn Handler>,
     sessions: SessionManager,
     host_supported: Vec<u32>,
-    inflight: Arc<Mutex<HashMap<u64, InflightEntry>>>,
+    calls: Arc<Mutex<Calls>>,
+    progress: Arc<Notify>,
+    /// FIFO gate: acquired at the first ingest await, never held for result I/O.
+    admission: tokio::sync::Mutex<()>,
+    highwater: Mutex<u64>,
+    execution: ExecutionBudget,
+    shared_execution: Option<ExecutionBudget>,
+    /// Bound pending/selected responses independently of live executions. Limit:
+    /// max_outstanding + writer_capacity, each at most MAX_FRAME_BYTES. The
+    /// extra writer_capacity allows overload rejections while executions are
+    /// full. The writer channel has its own writer_capacity frame ceiling.
+    /// Exhaustion closes rather than growing detached sends.
+    output: ExecutionBudget,
     /// The `connection_id` bound by this connection's handshake, if any.
     bound_id: Mutex<Option<String>>,
-    handshake_task: Mutex<Option<TaskHandle>>,
+    handshake_task: Arc<Mutex<Option<TaskHandle>>>,
     /// Signalled when the handshake commits ACTIVE so the detached
     /// handshake timer exits promptly instead of retaining the
     /// `Connection` until the handshake deadline.
     handshake_done: Arc<Notify>,
-    /// Persistent withdrawal work, retained across cancellation so a
-    /// dropped `withdraw_principal` future can be retried to completion.
-    /// `withdraw_ids` are terminal `UNAUTHENTICATED` results still to queue;
-    /// `withdraw_workers` are fenced workers still to join.
-    /// `withdraw_send_mutex` serializes the terminal-result send loop so
-    /// concurrent withdraw callers cannot pop the same ID and queue
-    /// duplicate terminal results.
-    withdraw_ids: Mutex<Vec<u64>>,
-    withdraw_workers: Mutex<Vec<InflightEntry>>,
-    withdraw_send_mutex: tokio::sync::Mutex<()>,
+    withdrawal: Mutex<Option<WithdrawalOwner>>,
+    recovery: Mutex<Option<recovery::Attachment>>,
+    weak_self: Weak<Host>,
 }
 
 impl Host {
@@ -200,42 +288,260 @@ impl Host {
     /// the transport pump must drain (one serialized `Frame` per item).
     /// Starts the handshake timer: if ACTIVE is not reached in time the
     /// core is explicitly closed with `DEADLINE_EXCEEDED`.
+    ///
+    /// # Panics
+    /// Panics on invalid configuration. Use [`Host::try_new`] for fallible
+    /// construction. Valid construction requires a running executor.
     pub fn new(
         config: ConnectionConfig,
         auth: Arc<dyn Authenticator>,
         handler: Arc<dyn Handler>,
     ) -> (Arc<Self>, mpsc::Receiver<Vec<u8>>) {
-        Self::new_with_versions(config, auth, handler, vec![syntra_core::MAX_VERSION])
+        Self::try_new(config, auth, handler)
+            .expect("invalid Syntra configuration; use Host::try_new for fallible construction")
     }
 
+    /// Create a host with an explicit supported-version set.
+    ///
+    /// # Panics
+    /// Panics on invalid configuration. Use [`Host::try_new_with_versions`]
+    /// for fallible construction. Valid construction requires a running executor.
     pub fn new_with_versions(
         config: ConnectionConfig,
         auth: Arc<dyn Authenticator>,
         handler: Arc<dyn Handler>,
         host_supported: Vec<u32>,
     ) -> (Arc<Self>, mpsc::Receiver<Vec<u8>>) {
+        Self::try_new_with_versions(config, auth, handler, host_supported).expect(
+            "invalid Syntra configuration; use Host::try_new_with_versions for fallible construction",
+        )
+    }
+
+    /// Share this budget across every connection/replacement belonging to the
+    /// host or principal being limited. `max_outstanding` remains the per-host
+    /// execution ceiling (default 32) until a separate execution config lands.
+    ///
+    /// # Panics
+    /// Panics on invalid configuration. Use
+    /// [`Host::try_new_with_execution_budget`] for fallible construction.
+    /// Valid construction requires a running executor.
+    pub fn new_with_execution_budget(
+        config: ConnectionConfig,
+        auth: Arc<dyn Authenticator>,
+        handler: Arc<dyn Handler>,
+        budget: ExecutionBudget,
+    ) -> (Arc<Self>, mpsc::Receiver<Vec<u8>>) {
+        Self::try_new_with_execution_budget(config, auth, handler, budget).expect(
+            "invalid Syntra configuration; use Host::try_new_with_execution_budget for fallible construction",
+        )
+    }
+
+    /// Validate limits before creating channels or spawning the handshake timer.
+    pub fn try_new(
+        config: ConnectionConfig,
+        auth: Arc<dyn Authenticator>,
+        handler: Arc<dyn Handler>,
+    ) -> Result<(Arc<Self>, mpsc::Receiver<Vec<u8>>), SyntraError> {
+        Self::try_new_with_versions(config, auth, handler, vec![syntra_core::MAX_VERSION])
+    }
+
+    /// Fallible counterpart of [`Host::new_with_versions`].
+    pub fn try_new_with_versions(
+        config: ConnectionConfig,
+        auth: Arc<dyn Authenticator>,
+        handler: Arc<dyn Handler>,
+        host_supported: Vec<u32>,
+    ) -> Result<(Arc<Self>, mpsc::Receiver<Vec<u8>>), SyntraError> {
+        Self::try_build(
+            config,
+            auth,
+            handler,
+            host_supported,
+            None,
+            crate::elapsed::ElapsedClock::new(),
+        )
+    }
+
+    pub fn try_new_with_clock(
+        config: ConnectionConfig,
+        auth: Arc<dyn Authenticator>,
+        handler: Arc<dyn Handler>,
+        clock: crate::elapsed::ElapsedClock,
+    ) -> Result<(Arc<Self>, mpsc::Receiver<Vec<u8>>), SyntraError> {
+        Self::try_build(
+            config,
+            auth,
+            handler,
+            vec![syntra_core::MAX_VERSION],
+            None,
+            clock,
+        )
+    }
+
+    pub fn elapsed_clock(&self) -> crate::elapsed::ElapsedClock {
+        self.conn.shared.clock.clone()
+    }
+
+    pub fn carrier_io_allowed(&self) -> bool {
+        self.conn.carrier_io_allowed()
+    }
+    pub fn with_carrier_io<R>(&self, poll: impl FnOnce() -> R) -> Option<R> {
+        self.conn.with_carrier_io(poll)
+    }
+    pub(crate) fn retain_runtime_task(&self, task: TaskHandle) {
+        self.conn.shared.tasks.register(task);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn own_native_task(
+        &self,
+        handle: tokio::task::JoinHandle<()>,
+    ) -> crate::shutdown::OwnedTask {
+        self.conn.own_native_task(handle)
+    }
+    pub fn register_transport_tasks(&self, count: usize) -> Result<(), SyntraError> {
+        self.conn.register_transport_tasks(count)
+    }
+    pub fn acknowledge_transport_task_joined(&self) -> Result<(), SyntraError> {
+        self.conn.acknowledge_transport_task_joined()
+    }
+    pub fn acknowledge_transport_closed(&self) {
+        self.conn.acknowledge_transport_closed();
+    }
+
+    /// Stop admission synchronously and retain one drain/close/join continuation.
+    /// Requires a running/entered executor on native. Cancelling a waiter neither
+    /// cancels this owner nor releases external execution leases.
+    pub fn begin_shutdown(&self, total: Duration) -> Result<crate::ShutdownReport, SyntraError> {
+        let host = self.weak_self.upgrade().expect("live Host owner");
+        self.conn.start_shutdown(total, move |budget| {
+            spawn_task(async move {
+                host.conn.begin_closing().await;
+                host.close_recovery();
+                host.conn
+                    .drain_until(budget.drain_cutoff, || {
+                        host.inflight_len() == 0 && host.output.in_use() == 0
+                    })
+                    .await;
+                host.stop_delivery("connection shutdown");
+                host.conn.close().await;
+                host.unbind_session().await;
+                host.conn
+                    .shared
+                    .tasks
+                    .join_until(&budget.clock, budget.deadline)
+                    .await;
+            })
+        })?;
+        Ok(self.shutdown_report())
+    }
+
+    pub async fn shutdown(&self, total: Duration) -> Result<crate::ShutdownReport, SyntraError> {
+        self.begin_shutdown(total)?;
+        self.conn.await_shutdown_owner().await;
+        Ok(self.shutdown_report())
+    }
+
+    pub fn shutdown_report(&self) -> crate::ShutdownReport {
+        self.conn
+            .shutdown_report_for(self.inflight_len(), self.execution_len())
+    }
+    pub fn shutdown_budget(&self) -> Option<crate::ShutdownBudget> {
+        self.conn.shutdown_budget()
+    }
+
+    pub fn suspend(&self) {
+        self.conn.suspend();
+    }
+
+    pub async fn platform_wake(&self) {
+        self.suspend();
+        self.conn.shared.clock.wake();
+        self.on_transport_lost().await;
+    }
+
+    /// Fallible counterpart of [`Host::new_with_execution_budget`]. The shared
+    /// budget may impose a stricter execution quota without lowering the core
+    /// protocol's configured pending-RPC capacity below 16.
+    pub fn try_new_with_execution_budget(
+        config: ConnectionConfig,
+        auth: Arc<dyn Authenticator>,
+        handler: Arc<dyn Handler>,
+        budget: ExecutionBudget,
+    ) -> Result<(Arc<Self>, mpsc::Receiver<Vec<u8>>), SyntraError> {
+        Self::try_build(
+            config,
+            auth,
+            handler,
+            vec![syntra_core::MAX_VERSION],
+            Some(budget),
+            crate::elapsed::ElapsedClock::new(),
+        )
+    }
+
+    /// Preserve a host/principal aggregate execution budget while sharing one
+    /// elapsed domain with the carrier, channel lifetime and authority checks.
+    pub fn try_new_with_execution_budget_and_clock(
+        config: ConnectionConfig,
+        auth: Arc<dyn Authenticator>,
+        handler: Arc<dyn Handler>,
+        budget: ExecutionBudget,
+        clock: crate::elapsed::ElapsedClock,
+    ) -> Result<(Arc<Self>, mpsc::Receiver<Vec<u8>>), SyntraError> {
+        Self::try_build(
+            config,
+            auth,
+            handler,
+            vec![syntra_core::MAX_VERSION],
+            Some(budget),
+            clock,
+        )
+    }
+
+    fn try_build(
+        config: ConnectionConfig,
+        auth: Arc<dyn Authenticator>,
+        handler: Arc<dyn Handler>,
+        host_supported: Vec<u32>,
+        shared_execution: Option<ExecutionBudget>,
+        clock: crate::elapsed::ElapsedClock,
+    ) -> Result<(Arc<Self>, mpsc::Receiver<Vec<u8>>), SyntraError> {
+        config.validate()?;
         let (wtx, wrx) = mpsc::channel(config.writer_capacity);
-        let (shared, notif_rx) = Shared::new(
+        let (shared, notif_rx) = Shared::new_with_clock(
             Role::Host,
             wtx,
             config.clone(),
             syntra_core::MIN_VERSION,
             syntra_core::MAX_VERSION,
+            clock.clone(),
         );
         let handshake_done = Arc::new(Notify::new());
-        let host = Arc::new(Self {
+        let host = Arc::new_cyclic(|weak_self| Self {
             conn: Connection::wrap(shared, notif_rx),
             auth,
             handler,
             sessions: SessionManager::new(),
             host_supported,
-            inflight: Arc::new(Mutex::new(HashMap::new())),
+            calls: Arc::new(Mutex::new(Calls {
+                clock: clock.clone(),
+                ..Calls::default()
+            })),
+            progress: Arc::new(Notify::new()),
+            admission: tokio::sync::Mutex::new(()),
+            highwater: Mutex::new(0),
+            execution: ExecutionBudget::new(config.max_outstanding),
+            shared_execution,
+            output: ExecutionBudget::new(
+                config
+                    .max_outstanding
+                    .saturating_add(config.writer_capacity),
+            ),
             bound_id: Mutex::new(None),
-            handshake_task: Mutex::new(None),
+            handshake_task: Arc::new(Mutex::new(None)),
             handshake_done: handshake_done.clone(),
-            withdraw_ids: Mutex::new(Vec::new()),
-            withdraw_workers: Mutex::new(Vec::new()),
-            withdraw_send_mutex: tokio::sync::Mutex::new(()),
+            withdrawal: Mutex::new(None),
+            recovery: Mutex::new(None),
+            weak_self: weak_self.clone(),
         });
         // Handshake timer (SNTR-HS-002/011): ACTIVE or explicit close.
         // The `handshake_done` signal lets a successful handshake stop the
@@ -244,20 +550,22 @@ impl Host {
         let timer_conn = host.conn.clone();
         let mut closed = timer_conn.subscribe_close();
         let done = handshake_done.clone();
-        let deadline = Instant::now() + config.handshake_timeout;
+        let deadline = clock.now() + config.handshake_timeout;
+        *host.conn.shared.handshake_deadline.lock().unwrap() = Some(deadline);
         let task = spawn_task(async move {
             tokio::select! {
                 biased;
                 _ = closed.changed() => {},
                 _ = done.notified() => {},
-                _ = sleep_until(deadline) => timer_conn.expire_handshake().await,
+                _ = clock.sleep_until(deadline) => timer_conn.expire_handshake().await,
             }
         });
         *host
             .handshake_task
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(task);
-        (host, wrx)
+            .unwrap_or_else(|e| e.into_inner()) = Some(task.clone());
+        host.conn.shared.tasks.register(task);
+        Ok((host, wrx))
     }
 
     /// Current state (for diagnostics; not a wire value).
@@ -280,33 +588,76 @@ impl Host {
 
     /// Number of in-flight (accepted, unterminated) RPCs.
     pub fn inflight_len(&self) -> usize {
-        self.inflight
+        self.calls
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .pending
             .len()
     }
 
-    fn withdraw_pending_len(&self) -> usize {
-        self.withdraw_ids
+    /// Actual live execution charge, including work surviving timeout/close.
+    pub fn execution_len(&self) -> usize {
+        self.execution.in_use()
+    }
+
+    /// Retained worker owners, including external-execution completion waiters.
+    /// Shutdown cannot complete while retained workers remain unjoined;
+    /// `close()` is not a claim that external application work has stopped.
+    pub fn worker_len(&self) -> usize {
+        self.calls
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .workers
             .len()
     }
 
     /// Ingest one transport unit (exactly one serialized `Frame`).
+    /// One ordered receiver must call/poll ingest in reconstructed-frame order;
+    /// spawning unordered ingest tasks cannot preserve transport receive order.
     pub async fn ingest(&self, bytes: &[u8]) {
+        self.ingest_received_at(bytes, self.conn.shared.clock.now())
+            .await;
+    }
+
+    /// Adapter hook: timestamp immediately on reconstructing a complete bounded
+    /// frame, BEFORE queueing/validation, using the same elapsed clock as timers.
+    /// Timestamp with `host.elapsed_clock().now()` on complete-frame receipt.
+    /// An adapter using another clock domain is only partially integrated for
+    /// suspension and must retire its connection on wake before buffered input.
+    /// Like `ingest`, this must be first-polled by one ordered receiver. Dropping
+    /// an ingest before admission discards that unit; adapters must then close.
+    /// A future timestamp is invalid local adapter input and closes with local
+    /// `INVALID_ARGUMENT`, rather than extending the effective RPC budget.
+    pub async fn ingest_received_at(&self, bytes: &[u8], received_at: Instant) {
+        // Preserve first-poll FIFO admission: no lifecycle/state await
+        // may move in front of this ordered receive gate.
+        let _ordered = self.admission.lock().await;
+        if !self.conn.accept_inbound().await {
+            if self.conn.is_closed() {
+                self.on_transport_lost().await;
+            }
+            return;
+        }
+        if received_at > self.conn.shared.clock.now() {
+            self.fail_protocol_and_close(SyntraError::Protocol {
+                code: ErrorCode::InvalidArgument,
+                message: "receipt timestamp must not be in the future".into(),
+            })
+            .await;
+            return;
+        }
         let ctx = self.conn.ctx().await;
         let frame = match decode_frame(bytes, ctx) {
             Ok(f) => f,
             Err(e) => {
-                self.on_decode_error(bytes, e).await;
+                self.on_decode_error(bytes, e, received_at).await;
                 return;
             }
         };
-        self.dispatch(frame).await;
+        self.dispatch(frame, received_at).await;
     }
 
-    async fn on_decode_error(&self, raw: &[u8], e: SyntraError) {
+    async fn on_decode_error(&self, raw: &[u8], e: SyntraError, received_at: Instant) {
         let st = self.conn.state().await;
         if st == ConnectionState::Closed {
             return;
@@ -346,16 +697,35 @@ impl Host {
             if st == ConnectionState::Closing {
                 return;
             }
-            if let Some(Body::Request(_)) = &frame.body {
+            if let Some(Body::Request(req)) = &frame.body {
                 if frame.request_id != 0 {
                     let code = e.code();
-                    if code == ErrorCode::InvalidArgument {
-                        // Method-shape failure: terminal INVALID_ARGUMENT.
-                        self.send_result(
-                            frame.request_id,
-                            outcome_error(ErrorCode::InvalidArgument, "invalid request"),
-                        )
-                        .await;
+                    if code == ErrorCode::InvalidArgument
+                        && st == ConnectionState::Active
+                        && syntra_core::validate_method(&req.method).is_err()
+                    {
+                        // Prove that ONLY method semantics failed, preserving
+                        // every bounded structural/version/id/state precedence.
+                        let mut probe = frame.clone();
+                        if let Some(Body::Request(req)) = &mut probe.body {
+                            req.method = "/example.Echo/Echo".into();
+                        }
+                        if validate_frame(&probe, self.conn.ctx().await).is_err() {
+                            self.record_decode_failure(e).await;
+                            return;
+                        }
+                        if self.consume_request_id(frame.request_id).await {
+                            self.reject_request(
+                                frame.request_id,
+                                frame.version,
+                                received_at + self.request_timeout(req),
+                                HandlerOutcome::error(
+                                    ErrorCode::InvalidArgument,
+                                    "invalid request",
+                                ),
+                            )
+                            .await;
+                        }
                         return;
                     }
                     if code == ErrorCode::ResourceExhausted {
@@ -393,7 +763,7 @@ impl Host {
         self.conn.negotiated_version().await.unwrap_or(0)
     }
 
-    async fn dispatch(&self, frame: Frame) {
+    async fn dispatch(&self, frame: Frame, received_at: Instant) {
         let st = self.conn.state().await;
         match frame.body {
             Some(Body::Hello(h)) => {
@@ -417,7 +787,10 @@ impl Host {
                         .await;
                     return;
                 }
-                self.on_request(frame.request_id, frame.version, req).await;
+                if self.consume_request_id(frame.request_id).await {
+                    self.on_request_received_at(frame.request_id, frame.version, req, received_at)
+                        .await;
+                }
             }
             Some(Body::Result(_)) => {
                 if !matches!(st, ConnectionState::Active | ConnectionState::Closing) {
@@ -476,6 +849,7 @@ impl Host {
     }
 
     async fn fail_protocol_and_close(&self, failure: SyntraError) {
+        self.stop_delivery("connection closed");
         self.conn.fail_protocol_and_close(failure).await;
         self.unbind_session().await;
         self.shutdown_tasks().await;
@@ -580,24 +954,58 @@ impl Host {
             Err(_) => return,
         };
         let mut state = self.conn.shared.state.write().await;
-        if *state != ConnectionState::Authenticating || self.conn.is_closed() {
+        if *state != ConnectionState::Authenticating
+            || self.conn.is_closed()
+            || self.conn.lifecycle_blocked()
+        {
+            return;
+        }
+        let expired = self
+            .conn
+            .shared
+            .handshake_deadline
+            .lock()
+            .unwrap()
+            .is_some_and(|deadline| self.conn.shared.clock.now() >= deadline);
+        if expired {
+            drop(state);
+            self.conn.expire_handshake().await;
             return;
         }
         let Ok(active) = state.transition(StateEvent::ReadyReceived) else {
             return;
         };
-        *self.conn.shared.version.write().await = Some(selected);
-        // Bind before exposing ACTIVE or queueing ready. Close uses the
-        // same state lock, then unbinds; it can never miss a late binding.
-        self.sessions.bind(Session {
-            connection_id: connection_id.clone(),
-            principal,
-            version: selected,
-            established_at: Instant::now(),
-        });
-        *self.bound_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(connection_id.clone());
-        *state = active;
-        permit.send(ready.encode_to_vec());
+        let mut version = self.conn.shared.version.write().await;
+        let committed = {
+            let _handoff = self.conn.shared.emissions.lock().unwrap();
+            if !self.conn.carrier_io_allowed() {
+                return;
+            }
+            if self.conn.handshake_expired() {
+                false
+            } else {
+                *version = Some(selected);
+                // Bind before exposing ACTIVE or queueing ready. Close uses the
+                // same state lock, then unbinds; it can never miss a late binding.
+                self.sessions.bind(Session {
+                    connection_id: connection_id.clone(),
+                    principal,
+                    version: selected,
+                    established_at: Instant::now(),
+                });
+                *self.bound_id.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(connection_id.clone());
+                *state = active;
+                permit.send(ready.encode_to_vec());
+                true
+            }
+        };
+        drop(version);
+        if !committed {
+            drop(state);
+            self.conn.expire_handshake().await;
+            return;
+        }
         drop(state);
         self.conn
             .complete_handshake(crate::connection::HandshakeDone { connection_id })
@@ -622,204 +1030,408 @@ impl Host {
         budget.min(self.conn.shared.config.max_rpc_timeout)
     }
 
-    async fn on_request(&self, id: u64, version: u32, req: RpcRequest) {
-        let deadline = Instant::now() + self.effective_timeout(req.timeout_ms);
-        let negotiated = self.version_or_zero().await;
-        if version != negotiated {
-            warn!("version mismatch in ACTIVE; closing");
-            let _ = self
-                .conn
-                .transition(StateEvent::ProtocolViolationFatal)
-                .await;
-            self.close().await;
-            return;
-        }
-        // Method shape was validated at decode; re-check cheaply so a
-        // direct dispatch path can never skip it (defense in depth).
-        if syntra_core::validate_method(&req.method).is_err() {
-            self.send_result(
-                id,
-                outcome_error(ErrorCode::InvalidArgument, "invalid method"),
-            )
+    async fn consume_request_id(&self, id: u64) -> bool {
+        let increasing = {
+            let mut highwater = self.highwater.lock().unwrap_or_else(|e| e.into_inner());
+            if id <= *highwater {
+                false
+            } else {
+                *highwater = id;
+                true
+            }
+        };
+        if !increasing {
+            self.fail_protocol_and_close(SyntraError::Protocol {
+                code: ErrorCode::FailedPrecondition,
+                message: "non-increasing request_id".into(),
+            })
             .await;
-            return;
         }
+        increasing
+    }
+
+    // Compatibility for the existing colocated tests; real input always goes
+    // through the ordered, bounded decode path above.
+    #[cfg(test)]
+    async fn on_request(&self, id: u64, version: u32, req: RpcRequest) {
+        let received_at = now();
+        let _ordered = self.admission.lock().await;
+        if self.consume_request_id(id).await {
+            self.on_request_received_at(id, version, req, received_at)
+                .await;
+        }
+    }
+
+    async fn on_request_received_at(
+        &self,
+        id: u64,
+        version: u32,
+        req: RpcRequest,
+        received_at: Instant,
+    ) {
+        let deadline = received_at + self.request_timeout(&req);
         let state = self.conn.shared.state.read().await;
-        if *state != ConnectionState::Active || self.conn.is_closed() {
+        if *state != ConnectionState::Active
+            || self.conn.is_closed()
+            || self.conn.lifecycle_blocked()
+            || self
+                .conn
+                .shared
+                .shutdown_requested
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             return;
         }
         let session = {
             let bound = self.bound_id.lock().unwrap_or_else(|e| e.into_inner());
             bound.as_deref().and_then(|id| self.sessions.get(id))
         };
-        let Some(session) = session else {
-            drop(state);
-            self.withdraw_principal_with_request(Some(id)).await;
-            return;
-        };
-        let admitted = self.start_request(id, negotiated, req, session, deadline);
-        drop(state);
-        if let Err((code, message)) = admitted {
-            if code == ErrorCode::Unauthenticated {
-                self.withdraw_principal_with_request(Some(id)).await;
+        // Check before policy AND after synchronous policy; even a policy that
+        // exceeds its nonblocking contract cannot cause expired handler effects.
+        let mut rejection = if self.conn.shared.clock.now() >= deadline {
+            Some(HandlerOutcome::error(
+                ErrorCode::DeadlineExceeded,
+                "deadline exceeded",
+            ))
+        } else if syntra_core::validate_method(&req.method).is_err() {
+            Some(HandlerOutcome::error(
+                ErrorCode::InvalidArgument,
+                "invalid method",
+            ))
+        } else if recovery::is_profile(&req.method) {
+            // Built-in profile policy belongs to RecoverySource, not to the
+            // unrelated application's fail-closed Handler policy.
+            if !self.recovery_configured() || !recovery::known_method(&req.method) {
+                Some(recovery::outcome(recovery::ProviderError::Unimplemented))
+            } else if session.is_none() {
+                Some(recovery::outcome(recovery::ProviderError::Unauthenticated))
             } else {
-                self.send_result(id, outcome_error(code, message)).await;
+                None
             }
-        }
-    }
-
-    // Synchronous admission makes it impossible to hold the blocking table
-    // lock over an await. Caller holds the state read lock through insertion.
-    fn start_request(
-        &self,
-        id: u64,
-        negotiated: u32,
-        req: RpcRequest,
-        session: Session,
-        deadline: Instant,
-    ) -> Result<(), (ErrorCode, &'static str)> {
-        // Concurrency bound: reject excess, keep usable (SNTR-RPC-008).
-        let mut inflight_guard = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-        let rejection = if inflight_guard.contains_key(&id) {
-            Some((ErrorCode::FailedPrecondition, "duplicate request_id"))
-        } else if inflight_guard.len() >= self.conn.shared.config.max_outstanding {
-            Some((ErrorCode::ResourceExhausted, "too many outstanding RPCs"))
+        } else {
+            match session
+                .as_ref()
+                .map(|s| self.handler.authorize(&s.principal, &req.method))
+            {
+                Some(Ok(())) => None,
+                Some(Err(e)) if e.code == ErrorCode::FailedPrecondition => {
+                    Some(HandlerOutcome::error(
+                        ErrorCode::FailedPrecondition,
+                        "principal change not permitted",
+                    ))
+                }
+                Some(Err(e)) if e.code != ErrorCode::Unauthenticated => Some(
+                    HandlerOutcome::error(ErrorCode::PermissionDenied, "access denied"),
+                ),
+                _ => Some(HandlerOutcome::error(
+                    ErrorCode::Unauthenticated,
+                    "credential not accepted",
+                )),
+            }
+        };
+        let profile = if rejection.is_none()
+            && self.conn.shared.clock.now() < deadline
+            && recovery::is_profile(&req.method)
+        {
+            match self.prepare_recovery(&session.as_ref().expect("checked binding").principal) {
+                Ok(call) => Some(call),
+                Err(error) => {
+                    rejection = Some(recovery::outcome(error));
+                    None
+                }
+            }
         } else {
             None
         };
-        if let Some((code, message)) = rejection {
-            return Err((code, message));
+        let withdraw = matches!(
+            &rejection,
+            Some(HandlerOutcome::Error {
+                code: ErrorCode::Unauthenticated,
+                ..
+            })
+        );
+        // Withdrawal is a connection policy action even if the elapsed RPC
+        // deadline wins its terminal result. Never turn revocation back into a
+        // valid binding merely because synchronous policy returned late.
+        let rejection = if self.conn.shared.clock.now() >= deadline {
+            Some(HandlerOutcome::error(
+                ErrorCode::DeadlineExceeded,
+                "deadline exceeded",
+            ))
+        } else {
+            rejection
+        };
+        let admitted = self.start_request(id, version, req, deadline, rejection, profile);
+        drop(state);
+        if !admitted {
+            self.output_exhausted().await;
+        } else if withdraw {
+            self.withdraw_principal().await;
         }
-        // Authorization is synchronous and nonblocking. Admission holds the
-        // lifecycle read lock so withdrawal fences every admitted worker.
-        if let Err(error) = self.handler.authorize(&session.principal, &req.method) {
-            return Err(if error.code == ErrorCode::Unauthenticated {
-                (ErrorCode::Unauthenticated, "credential not accepted")
-            } else {
-                (ErrorCode::PermissionDenied, "access denied")
-            });
-        }
-        // Responder deadline starts BEFORE queue admission (measured from
-        // receipt of the complete validated frame, SNTR-RPC-004/1F).
-        let cancel = crate::connection::CancelToken::new();
-        // Duplicate outstanding id on the host side (retransmit storm):
-        // keep the original, reject the duplicate attempt. Locks are
-        // scoped tightly and never held across an await (the guard is
-        // !Send; holding it would poison every spawned future).
-        let handler = self.handler.clone();
-        let method = req.method.clone();
-        let payload = req.payload.to_vec();
-        let sender = self.conn.clone();
-        let inflight = self.inflight.clone();
-        let cancel_task = cancel.clone();
-        let sessions = self.sessions.clone();
-        let task = spawn_task(async move {
-            let work = {
-                let _state = sender.shared.state.read().await;
-                if sender.is_closed()
-                    || sender
-                        .shared
-                        .principal_withdrawn
-                        .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    cancel_task.cancel();
-                    sessions.unbind(&session.connection_id);
-                    inflight
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&id);
-                    return;
-                }
-                handler.handle(method, payload, cancel_task.clone())
-            };
-            // Completion wins races (biased, handler branch first);
-            // cancel-vs-deadline ties prefer CANCELLED (recorded B10).
-            // Queueing and slot release share the lifecycle lock. Withdrawal
-            // takes terminal ownership of the remaining slots and fences
-            // worker sends, including on targets with cooperative cancellation.
-            let outcome = tokio::select! {
-                biased;
-                res = work => res,
-                _ = cancel_task.cancelled() => HandlerOutcome::error(ErrorCode::Cancelled, "cancelled"),
-                _ = sleep_until(deadline) => {
-                    if cancel_task.is_cancelled() {
-                        HandlerOutcome::error(ErrorCode::Cancelled, "cancelled")
-                    } else {
-                        HandlerOutcome::error(ErrorCode::DeadlineExceeded, "deadline exceeded")
-                    }
-                }
-            };
-            cancel_task.cancel();
-            let outcome_value = match outcome {
-                HandlerOutcome::Payload(b) => outcome_payload(b),
-                HandlerOutcome::Error { code, message } => {
-                    outcome_error(sanitize_code(code), &message)
-                }
-            };
-            let mut frame = Frame {
-                version: negotiated,
-                request_id: id,
-                body: Some(Body::Result(RpcResult {
-                    outcome: Some(outcome_value),
-                })),
-            };
-            let mut bytes = frame.encode_to_vec();
-            if bytes.len() > syntra_core::MAX_FRAME_BYTES {
-                frame = Frame {
-                    version: negotiated,
-                    request_id: id,
-                    body: Some(Body::Result(RpcResult {
-                        outcome: Some(outcome_error(
-                            ErrorCode::ResourceExhausted,
-                            "result exceeds bound",
-                        )),
-                    })),
-                };
-                bytes = frame.encode_to_vec();
-            }
-            if sender
-                .send_worker_result(bytes, || {
-                    inflight
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&id);
-                })
-                .await
-                .is_err()
-            {
-                sessions.unbind(&session.connection_id);
-                inflight
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&id);
-            }
-        });
-        // Admission, task ownership, and insertion share one short lock.
-        // A fast worker cannot remove an entry before it is installed;
-        // close cannot drain a placeholder and miss the real worker.
-        inflight_guard.insert(id, InflightEntry { cancel, task });
-        Ok(())
     }
 
-    async fn on_cancel(&self, id: u64) {
-        if id == 0 {
+    async fn reject_request(
+        &self,
+        id: u64,
+        version: u32,
+        deadline: Instant,
+        outcome: HandlerOutcome,
+    ) {
+        let state = self.conn.shared.state.read().await;
+        if *state != ConnectionState::Active || self.conn.is_closed() {
             return;
         }
-        // Best-effort: signal the handler. Unknown or already-completed
-        // ids are ignored (race tolerance). Cancellation sends no result of
-        // its own, so completion still wins without a second terminal send.
-        if let Some(entry) = self
-            .inflight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&id)
-        {
-            entry.cancel.cancel();
+        let admitted = self.start_request(
+            id,
+            version,
+            RpcRequest::default(),
+            deadline,
+            Some(outcome),
+            None,
+        );
+        drop(state);
+        if !admitted {
+            self.output_exhausted().await;
         }
     }
 
-    async fn send_result(&self, id: u64, outcome: syntra_core::proto::rpc_result::Outcome) {
-        let version = self.version_or_zero().await;
+    async fn output_exhausted(&self) {
+        self.fail_protocol_and_close(SyntraError::ResourceExhausted(
+            "terminal output capacity exhausted".into(),
+        ))
+        .await;
+    }
+
+    // Admission never waits for a writer. Both accepted work and ordinary
+    // rejections own bounded output slots, distinct from execution permits.
+    // Caller holds lifecycle read + ordered admission; the std mutex below is
+    // only a short terminal/registry gate, never held over an await/user code.
+    fn start_request(
+        &self,
+        id: u64,
+        version: u32,
+        req: RpcRequest,
+        deadline: Instant,
+        mut rejection: Option<HandlerOutcome>,
+        profile: Option<recovery::Call>,
+    ) -> bool {
+        if self
+            .conn
+            .shared
+            .shutdown_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return true;
+        }
+        let Some(output) = self.output.try_acquire() else {
+            return false;
+        };
+        let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+        if calls.delivery_stopped {
+            return true;
+        }
+        // Correlation has its own explicit ceiling, independent of execution
+        // and output. Rejections below select terminal under this same gate
+        // before becoming visible to another registry reader.
+        if rejection.is_none() && calls.pending.len() >= self.conn.shared.config.max_outstanding {
+            rejection = Some(HandlerOutcome::error(
+                ErrorCode::ResourceExhausted,
+                "too many outstanding RPCs",
+            ));
+        }
+        let execution = if rejection.is_none() {
+            match ExecutionLease::acquire(&self.execution, self.shared_execution.as_ref()) {
+                Some(execution) => Some(execution),
+                None => {
+                    rejection = Some(HandlerOutcome::error(
+                        ErrorCode::ResourceExhausted,
+                        "too many live executions",
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let cancel = crate::connection::CancelToken::new();
+        let (selected, mut result) = oneshot::channel();
+        calls.pending.insert(
+            id,
+            PendingCall {
+                deadline,
+                cancel: cancel.clone(),
+                selected,
+            },
+        );
+        if let Some(outcome) = rejection {
+            calls.select(id, outcome);
+        }
+        let registry = self.calls.clone();
+        let handler = self.handler.clone();
+        let sender = self.conn.clone();
+        let (lease, observer) = match execution {
+            Some((lease, observer)) => (Some(lease), Some(observer)),
+            None => (None, None),
+        };
+        let owner_registry = registry.clone();
+        let owner_sender = sender.clone();
+        let progress = self.progress.clone();
+        let output_progress = progress.clone();
+        let sessions = self.sessions.clone();
+        let bound_id = self
+            .bound_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let body = async move {
+            // Keep the independent profile charge through output, not just the
+            // synchronous callback. Backpressure cannot grow replacement work.
+            let selected_outcome = if let Some(lease) = lease {
+                let mut closed = sender.subscribe_close();
+                let cancelled = cancel.clone();
+                let work = async {
+                    // Read lock fences dispatch against close/withdraw. Check
+                    // expiry again immediately before the synchronous hook.
+                    let state = sender.shared.state.read().await;
+                    {
+                        let mut calls = registry.lock().unwrap_or_else(|e| e.into_inner());
+                        if sender.is_closed()
+                            || sender.lifecycle_blocked()
+                            || sender
+                                .shared
+                                .principal_withdrawn
+                                .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            calls.select(
+                                id,
+                                HandlerOutcome::error(ErrorCode::Unavailable, "connection closed"),
+                            );
+                        } else if sender.shared.clock.now() >= deadline {
+                            calls.select(
+                                id,
+                                HandlerOutcome::error(
+                                    ErrorCode::DeadlineExceeded,
+                                    "deadline exceeded",
+                                ),
+                            );
+                        }
+                        if !calls.pending.contains_key(&id) {
+                            return;
+                        }
+                    }
+                    let work: HandlerFut = if let Some(profile) = &profile {
+                        Box::pin(std::future::ready(profile.handle(
+                            &req.method,
+                            &req.payload,
+                            deadline.saturating_duration_since(sender.shared.clock.now()),
+                            &sender,
+                        )))
+                    } else {
+                        handler.handle_with_execution(
+                            req.method,
+                            req.payload,
+                            cancel,
+                            lease.clone(),
+                        )
+                    };
+                    drop(state);
+                    let outcome = bounded_outcome(id, version, work.await);
+                    registry
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .select(id, outcome);
+                };
+                // Timer polling priority is not sufficient: every select above
+                // also checks now under the synchronous terminal gate.
+                let selected_outcome = tokio::select! {
+                    biased;
+                    _ = sender.shared.clock.sleep_until(deadline) => {
+                        registry.lock().unwrap_or_else(|e| e.into_inner()).select(id,
+                            HandlerOutcome::error(ErrorCode::DeadlineExceeded, "deadline exceeded"));
+                        None
+                    }
+                    outcome = &mut result => {
+                        Some(outcome.expect("host terminal sender lost"))
+                    }
+                    _ = cancelled.cancelled() => {
+                        registry.lock().unwrap_or_else(|e| e.into_inner()).select(id,
+                            HandlerOutcome::error(ErrorCode::Cancelled, "cancelled"));
+                        None
+                    }
+                    _ = closed.changed() => {
+                        registry.lock().unwrap_or_else(|e| e.into_inner()).stop_delivery("transport lost");
+                        None
+                    }
+                    _ = work => None,
+                };
+                // The losing cooperative future has now been dropped. External
+                // copies retain their execution charge regardless of reporting.
+                drop(lease);
+                selected_outcome
+            } else {
+                None
+            };
+            let outcome = match selected_outcome {
+                Some(outcome) => outcome,
+                None => result.await.expect("host terminal sender lost"),
+            };
+            Self::emit_selected(&sender, &registry, id, version, outcome, output).await;
+            drop(profile);
+            output_progress.notify_waiters();
+        };
+        let task = spawn_task(async move {
+            // A panicking hook/future must not leave an immortal pending entry
+            // and allow unbounded replacement workers. Close, retain external
+            // execution ownership, then resume the panic (never a silent drop).
+            let completed = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+            progress.notify_waiters(); // includes output released while unwinding
+            if completed.is_err() {
+                owner_registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .stop_delivery("host worker panicked");
+                owner_sender
+                    .fail_protocol_and_close(SyntraError::Protocol {
+                        code: ErrorCode::Internal,
+                        message: "host worker panicked".into(),
+                    })
+                    .await;
+            }
+            if owner_sender.is_closed() {
+                if let Some(id) = bound_id {
+                    sessions.unbind(&id);
+                }
+            }
+            if let Some(mut observer) = observer {
+                let _ = observer.changed().await;
+            }
+            owner_registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .workers
+                .remove(&id);
+            progress.notify_waiters();
+            if let Err(panic) = completed {
+                std::panic::resume_unwind(panic);
+            }
+        });
+        self.conn.shared.tasks.register(task.clone());
+        calls.workers.insert(id, task);
+        true
+    }
+
+    async fn emit_selected(
+        sender: &Connection,
+        registry: &Mutex<Calls>,
+        id: u64,
+        version: u32,
+        outcome: HandlerOutcome,
+        _output: execution::BudgetPermit,
+    ) {
+        let outcome = match outcome {
+            HandlerOutcome::Payload(payload) => outcome_payload(payload),
+            HandlerOutcome::Error { code, message } => outcome_error(code, &message),
+        };
         let frame = Frame {
             version,
             request_id: id,
@@ -827,10 +1439,38 @@ impl Host {
                 outcome: Some(outcome),
             })),
         };
+        // Selection is immutable BEFORE this wait. Withdrawal may close delivery
+        // but cannot fence away/replace an earlier selected success with an error.
         let bytes = frame.encode_to_vec();
-        if self.conn.send_bytes(bytes).await.is_err() {
-            self.on_transport_lost().await;
+        let permit = match sender.reserve_writer().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .stop_delivery("transport lost");
+                if !sender.shared.clock.is_continuous() {
+                    sender.on_transport_lost().await;
+                }
+                return;
+            }
+        };
+        let _state = sender.shared.state.read().await;
+        let calls = registry.lock().unwrap_or_else(|e| e.into_inner());
+        if !calls.delivery_stopped
+            && !sender.is_closed()
+            && !sender.writer_is_fenced()
+            && !sender.lifecycle_blocked()
+        {
+            permit.send(bytes);
         }
+    }
+
+    async fn on_cancel(&self, id: u64) {
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .select(id, HandlerOutcome::error(ErrorCode::Cancelled, "cancelled"));
     }
 
     /// Emit a host->initiator notification (opaque application bytes).
@@ -864,6 +1504,12 @@ impl Host {
         if *state != ConnectionState::Active
             || self.conn.is_closed()
             || self.conn.writer_is_fenced()
+            || self.conn.lifecycle_blocked()
+            || self
+                .conn
+                .shared
+                .shutdown_requested
+                .load(std::sync::atomic::Ordering::Acquire)
         {
             return Err(SyntraError::Closed("connection closing".to_string()));
         }
@@ -871,8 +1517,11 @@ impl Host {
         Ok(())
     }
 
-    /// Abortive close: stop admission and cancel unfinished handlers.
+    /// Abortive close: stop admission and drop cooperative handler futures.
+    /// Transferred external execution leases/owners remain live until actual
+    /// completion; inspect `execution_len`/`worker_len` for incomplete shutdown.
     pub async fn close(&self) {
+        self.stop_delivery("connection closed");
         // Move ACTIVE->CLOSING first so new RPCs fail fast at admission
         // while already-queued frames still drain (sends succeed until
         // CLOSED). Best-effort: ignore transition errors (already closing).
@@ -887,18 +1536,43 @@ impl Host {
     /// `grace` expires. The pump must keep running and flush dequeued bytes
     /// before releasing the carrier. The entire drain and task cleanup share
     /// one deadline; unfinished handlers are cancelled at expiry.
+    /// Zero skips drain. Invalid grace records `INVALID_ARGUMENT` and closes
+    /// immediately; use [`Host::try_close_gracefully`] to handle it explicitly.
     pub async fn close_gracefully(&self, grace: Duration) {
-        let deadline = Instant::now() + grace;
+        if let Err(error) = self.try_close_gracefully(grace).await {
+            self.conn.record_terminal_reason(error);
+            self.close().await;
+        }
+    }
+
+    /// Validate the 0..=30s drain grace before lifecycle changes or deadline
+    /// arithmetic. Invalid grace leaves the connection unchanged. Zero performs
+    /// abortive close; retained external execution still follows `close`'s contract.
+    pub async fn try_close_gracefully(&self, grace: Duration) -> Result<(), SyntraError> {
+        crate::connection::validate_close_grace(grace)?;
+        if grace.is_zero() {
+            self.close().await;
+            return Ok(());
+        }
+        let deadline = self.conn.shared.clock.now() + grace;
+        let reserve = (grace / 4)
+            .max(Duration::from_nanos(1))
+            .min(Duration::from_secs(1));
+        let drain_cutoff = deadline - reserve;
         self.conn.begin_closing().await;
+        self.close_recovery();
         self.conn
-            .drain_until(deadline, || {
-                self.inflight_len() == 0 && self.withdraw_pending_len() == 0
+            .drain_until(drain_cutoff, || {
+                self.inflight_len() == 0 && self.output.in_use() == 0
             })
             .await;
+        self.stop_delivery("connection closed");
         self.conn.close().await;
         self.unbind_session().await;
         self.abort_inflight_until(deadline).await;
         self.stop_handshake_timer_until(deadline).await;
+        self.stop_recovery_until(deadline).await;
+        Ok(())
     }
 
     /// First terminal local reason, retained for transport-adapter diagnostics.
@@ -910,155 +1584,115 @@ impl Host {
     /// RPCs with generic UNAUTHENTICATED results before closing. Queueing and
     /// cleanup share a one-second shutdown budget; an unavailable writer can
     /// prevent delivery. Already-queued terminal results remain authoritative.
+    /// Once committed, withdrawal has one retained owner and continues even if
+    /// this future is dropped; subsequent callers share its original deadline.
+    /// An initiating handler returns after transferring ownership, rather than
+    /// waiting for its own result slot to drain. Other callers await the bounded
+    /// continuation, not termination/join of retained external execution.
     pub async fn withdraw_principal(&self) {
-        self.withdraw_principal_with_request(None).await;
-    }
-
-    async fn withdraw_principal_with_request(&self, request_id: Option<u64>) {
         use std::sync::atomic::Ordering;
-        let deadline = Instant::now() + SHUTDOWN_GRACE;
-        // Fence once, then persist all terminal work so dropping this future
-        // can be retried. A second caller resumes rather than returning early
-        // while the connection is still open.
-        let first_withdraw = {
+        let deadline = self.conn.shared.clock.now() + SHUTDOWN_GRACE;
+        let (mut done, from_handler) = {
             let mut state = self.conn.shared.state.write().await;
-            if self.conn.is_closed() {
-                return;
-            }
-            let first = !self
-                .conn
-                .shared
-                .principal_withdrawn
-                .swap(true, Ordering::AcqRel);
-            if first {
+            let from_handler = self
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .workers
+                .values()
+                .any(TaskHandle::is_current);
+            // The lifecycle lock serializes initialization with admission and
+            // close. The std mutex only protects the single owner registration;
+            // no await or application callback occurs while holding it.
+            let mut owner = self.withdrawal.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(owner) = owner.as_ref() {
+                (owner.done.clone(), from_handler)
+            } else {
+                if self.conn.is_closed() {
+                    return;
+                }
+                self.conn
+                    .shared
+                    .principal_withdrawn
+                    .store(true, Ordering::Release);
                 *state = ConnectionState::Closing;
                 self.conn.record_terminal_reason(SyntraError::Protocol {
                     code: ErrorCode::Unauthenticated,
-                    message: "credential not accepted".to_string(),
+                    message: "credential not accepted".into(),
                 });
-                let mut bound = self.bound_id.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(id) = bound.take() {
-                    self.sessions.unbind(&id);
-                }
-            }
-            // Capture newly fenced workers even on resume: a concurrent
-            // admission cannot succeed after the flag is set, but an RPC
-            // admitted just before the flag may still be in `inflight`.
-            let drained: Vec<(u64, InflightEntry)> = self
-                .inflight
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .drain()
-                .collect();
-            if !drained.is_empty() {
-                let mut workers = self
-                    .withdraw_workers
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let mut ids = self.withdraw_ids.lock().unwrap_or_else(|e| e.into_inner());
-                for (id, entry) in drained {
-                    if !ids.contains(&id) {
-                        ids.push(id);
-                    }
-                    workers.push(entry);
-                }
-            }
-            if let Some(id) = request_id {
-                let mut ids = self.withdraw_ids.lock().unwrap_or_else(|e| e.into_inner());
-                if !ids.contains(&id) {
-                    ids.push(id);
-                }
-            }
-            first
-        };
-        // Abort is idempotent; re-aborting resumed workers is safe.
-        {
-            let workers = self
-                .withdraw_workers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            for entry in workers.iter() {
-                if !entry.task.is_current() {
-                    entry.cancel.cancel();
-                    entry.task.abort();
-                }
-            }
-        }
-        // Queue one generic terminal result per withdrawn RPC. Successful
-        // queues are removed immediately so a retry sends only the remainder.
-        // The shared one-second budget bounds a full writer; expiry leaves
-        // the remainder queued for retry rather than silently dropping it.
-        // `send_result` internally funnels through the bounded writer.
-        //
-        // The send loop holds `withdraw_send_mutex` so concurrent withdraw
-        // callers cannot pop the same ID and send duplicate terminal
-        // results. Acquisition shares the shutdown deadline with sending;
-        // expiry (or a dropped future) releases the lock with the remainder
-        // still queued, so a later retry continues where this attempt
-        // stopped.
-        let _send_guard = tokio::select! {
-            biased;
-            _ = sleep_until(deadline) => None,
-            guard = self.withdraw_send_mutex.lock() => Some(guard),
-        };
-        if let Some(_send_guard) = _send_guard {
-            loop {
-                let next = {
-                    self.withdraw_ids
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .first()
-                        .copied()
-                };
-                let Some(id) = next else { break };
-                let sent = tokio::select! {
-                    biased;
-                    _ = sleep_until(deadline) => false,
-                    _ = self.send_result(id, outcome_error(ErrorCode::Unauthenticated, "credential not accepted")) => true,
-                };
-                if !sent {
-                    break;
-                }
-                self.withdraw_ids
+                if let Some(id) = self
+                    .bound_id
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .retain(|kept| *kept != id);
-                if Instant::now() >= deadline {
-                    break;
+                    .take()
+                {
+                    self.sessions.unbind(&id);
                 }
+                self.settle_pending(ErrorCode::Unauthenticated, "credential not accepted");
+                self.close_recovery();
+
+                let conn = self.conn.clone();
+                let calls = self.calls.clone();
+                let output = self.output.clone();
+                let progress = self.progress.clone();
+                let handshake_task = self.handshake_task.clone();
+                let (complete, done) = tokio::sync::watch::channel(false);
+                // No &Host / Arc<Host> capture: dropping the handler must neither
+                // drop this continuation nor leave a Host/task ownership cycle.
+                let task = spawn_task(async move {
+                    let mut closed = conn.subscribe_close();
+                    loop {
+                        let changed = progress.notified();
+                        tokio::pin!(changed);
+                        changed.as_mut().enable();
+                        if output.in_use() == 0 || conn.is_closed() {
+                            break;
+                        }
+                        tokio::select! {
+                            biased;
+                            _ = conn.shared.clock.sleep_until(deadline) => break,
+                            _ = closed.changed() => break,
+                            _ = changed => {},
+                        }
+                    }
+                    calls
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .stop_delivery("connection closed");
+                    conn.close().await;
+                    Self::wait_workers_until(&calls, &progress, deadline).await;
+                    Self::stop_owned_handshake_timer_until(
+                        &handshake_task,
+                        deadline,
+                        &conn.shared.clock,
+                    )
+                    .await;
+                    complete.send_replace(true);
+                });
+                self.conn.shared.tasks.register(task.clone());
+                let observer = done.clone();
+                *owner = Some(WithdrawalOwner { _task: task, done });
+                (observer, from_handler)
             }
+        };
+        // No await between selecting this worker's terminal outcome and
+        // returning to its handler. Awaiting done here would depend on this
+        // very future being dropped before its output can be emitted.
+        if from_handler {
+            return;
         }
-        // Close even when the writer stayed full: the connection must not
-        // remain half-closed. Unsent IDs stay queued for a retry while the
-        // connection is still open, and `close_gracefully` observes them.
-        self.conn
-            .fail_protocol_and_close(SyntraError::Protocol {
-                code: ErrorCode::Unauthenticated,
-                message: "credential not accepted".to_string(),
-            })
-            .await;
-        // Join fenced workers under the remaining budget. Detaching on expiry
-        // is bounded; native abort already preempted them.
-        let workers: Vec<InflightEntry> = self
-            .withdraw_workers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain(..)
-            .collect();
-        for entry in workers {
-            entry
-                .task
-                .join_bounded(deadline.saturating_duration_since(Instant::now()))
-                .await;
+        while !*done.borrow_and_update() {
+            done.changed()
+                .await
+                .expect("host withdrawal owner stopped before completing");
         }
-        self.stop_handshake_timer_until(deadline).await;
-        let _ = first_withdraw;
     }
 
     /// Abrupt transport loss: `UNAVAILABLE` (unknown outcome) to all
     /// in-flight RPCs, session discarded (SNTR-SESS-004).
     /// Bounded by one shared `SHUTDOWN_GRACE` (see `close`).
     pub async fn on_transport_lost(&self) {
+        self.stop_delivery("transport lost");
         self.conn.on_transport_lost().await;
         self.unbind_session().await;
         self.shutdown_tasks().await;
@@ -1069,46 +1703,83 @@ impl Host {
     /// let `close` exceed 1s on wasm (N workers + timer); sharing the
     /// deadline keeps the total bounded.
     async fn shutdown_tasks(&self) {
-        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        let deadline = self.conn.shared.clock.now() + SHUTDOWN_GRACE;
         self.abort_inflight_until(deadline).await;
         self.stop_handshake_timer_until(deadline).await;
+        self.stop_recovery_until(deadline).await;
     }
 
     async fn abort_inflight_until(&self, deadline: Instant) {
-        let entries: Vec<InflightEntry> = {
-            let mut g = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-            g.drain().map(|(_, e)| e).collect()
-        };
-        for e in &entries {
-            // Signalling the initiating handler's own token would make
-            // its select! drop this shutdown future at the first join.
-            // Let it complete cleanup and unwind naturally instead.
-            if !e.task.is_current() {
-                e.cancel.cancel();
-                e.task.abort();
+        self.settle_pending(ErrorCode::Unavailable, "connection closed");
+        Self::wait_workers_until(&self.calls, &self.progress, deadline).await;
+    }
+
+    async fn wait_workers_until(calls: &Mutex<Calls>, progress: &Notify, deadline: Instant) {
+        let clock = calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clock
+            .clone();
+        // Do NOT abort/drain owners of transferred execution. They retain their
+        // handles and accounting through actual completion, even after close.
+        // Self-initiated shutdown cannot wait for its own handler to return.
+        // Shutdown retains join ownership and reports incomplete if work remains
+        // at the deadline or elapsed-clock continuity is lost.
+        loop {
+            let changed = progress.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let waiting = calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .workers
+                .values()
+                .any(|task| !task.is_current());
+            if !waiting || clock.now() >= deadline || !clock.is_continuous() {
+                break;
             }
-        }
-        for e in entries {
-            // Bounded wait: native `abort` preempts so the join completes
-            // immediately (fast path unchanged); on wasm `abort` is a
-            // no-op and a non-cooperative handler would otherwise hang
-            // `close` forever. The wait shares the shutdown deadline with
-            // the handshake timer (mirroring Go `handlerShutdownGrace`
-            // and WS `shutdown_grace`) and detaches best-effort.
-            e.task
-                .join_bounded(deadline.saturating_duration_since(Instant::now()))
-                .await;
+            tokio::select! {
+                biased;
+                _ = clock.sleep_until(deadline) => break,
+                _ = changed => {},
+            }
         }
     }
 
+    fn settle_pending(&self, code: ErrorCode, message: &str) {
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .select_all(code, message);
+    }
+
+    fn stop_delivery(&self, message: &str) {
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stop_delivery(message);
+    }
+
     async fn stop_handshake_timer(&self) {
-        self.stop_handshake_timer_until(Instant::now() + SHUTDOWN_GRACE)
+        self.stop_handshake_timer_until(self.conn.shared.clock.now() + SHUTDOWN_GRACE)
             .await;
     }
 
     async fn stop_handshake_timer_until(&self, deadline: Instant) {
-        let task = self
-            .handshake_task
+        Self::stop_owned_handshake_timer_until(
+            &self.handshake_task,
+            deadline,
+            &self.conn.shared.clock,
+        )
+        .await;
+    }
+
+    async fn stop_owned_handshake_timer_until(
+        handshake_task: &Mutex<Option<TaskHandle>>,
+        deadline: Instant,
+        clock: &crate::elapsed::ElapsedClock,
+    ) {
+        let task = handshake_task
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
@@ -1117,12 +1788,12 @@ impl Host {
             // Shares the shutdown deadline with the in-flight drain: the
             // timer observes close/handshake-done and exits promptly, but
             // a stalled wasm timer must not hang shutdown.
-            task.join_bounded(deadline.saturating_duration_since(Instant::now()))
-                .await;
+            let _ = clock.timeout_until(deadline, task.join()).await;
         }
     }
 
     async fn unbind_session(&self) {
+        self.close_recovery();
         // Hosts own exactly one connection and bind at most one session
         // for it; unbind that id (if any) so CLOSED discards all
         // per-connection state except diagnostics (SNTR-HS-006).
@@ -1143,14 +1814,46 @@ impl Host {
     }
 }
 
+impl Drop for Host {
+    fn drop(&mut self) {
+        self.close_recovery();
+    }
+}
+
 fn outcome_payload(b: Vec<u8>) -> syntra_core::proto::rpc_result::Outcome {
     syntra_core::proto::rpc_result::Outcome::Payload(b)
 }
 
+fn bounded_outcome(id: u64, version: u32, outcome: HandlerOutcome) -> HandlerOutcome {
+    match outcome {
+        HandlerOutcome::Error { code, message } => HandlerOutcome::error(code, message),
+        HandlerOutcome::Payload(payload) => {
+            let frame = Frame {
+                version,
+                request_id: id,
+                body: Some(Body::Result(RpcResult {
+                    outcome: Some(outcome_payload(payload)),
+                })),
+            };
+            if frame.encoded_len() > syntra_core::MAX_FRAME_BYTES {
+                HandlerOutcome::error(ErrorCode::ResourceExhausted, "result exceeds bound")
+            } else {
+                let Some(Body::Result(RpcResult {
+                    outcome: Some(syntra_core::proto::rpc_result::Outcome::Payload(payload)),
+                })) = frame.body
+                else {
+                    unreachable!("constructed payload result")
+                };
+                HandlerOutcome::Payload(payload)
+            }
+        }
+    }
+}
+
 fn outcome_error(code: ErrorCode, message: &str) -> syntra_core::proto::rpc_result::Outcome {
     syntra_core::proto::rpc_result::Outcome::Error(syntra_core::proto::RpcError {
-        code: code.as_i32(),
-        message: message.to_string(),
+        code: sanitize_code(code).as_i32(),
+        message: syntra_core::bounded_diagnostic(message),
     })
 }
 
@@ -1199,6 +1902,10 @@ fn credential_is_live_session(sessions: &SessionManager, credential: &[u8]) -> b
     false
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "host_phase2_tests.rs"]
+mod phase2_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1213,7 +1920,7 @@ mod tests {
             body: Some(Body::Hello(ClientHello {
                 min_version: min,
                 max_version: max,
-                credential: cred.into(),
+                credential: cred,
             })),
         }
         .encode_to_vec()
@@ -1777,7 +2484,7 @@ mod tests {
             request_id: 7,
             body: Some(Body::Request(RpcRequest {
                 method: "/example.Echo/Echo".into(),
-                payload: vec![].into(),
+                payload: vec![],
                 timeout_ms: 100,
             })),
         }
@@ -1802,7 +2509,7 @@ mod tests {
             request_id: 9,
             body: Some(Body::Request(RpcRequest {
                 method: "nope".into(),
-                payload: vec![].into(),
+                payload: vec![],
                 timeout_ms: 100,
             })),
         }
@@ -1827,9 +2534,10 @@ mod tests {
     #[tokio::test]
     async fn immediate_handlers_do_not_resurrect_completed_requests() {
         const REQUESTS: u64 = 4096;
+        const WINDOW: usize = 1024;
         let config = ConnectionConfig {
-            max_outstanding: REQUESTS as usize,
-            writer_capacity: REQUESTS as usize,
+            max_outstanding: WINDOW,
+            writer_capacity: WINDOW,
             ..ConnectionConfig::default()
         };
         let (host, mut wrx) = Host::new(config, Arc::new(AllowAnonymous), echo_handler());
@@ -1837,18 +2545,24 @@ mod tests {
         wrx.recv().await.unwrap();
         let dispatcher = host.clone();
         let runtime = tokio::runtime::Handle::current();
+        // Keep the long stress run within validated production capacities.
+        // A consumed result opens one more dispatch slot, without serializing
+        // worker completion/task attachment across the two executor threads.
+        let window = Arc::new(tokio::sync::Semaphore::new(WINDOW));
+        let dispatch_window = window.clone();
         // Dispatch on a separate OS thread while this executor runs the
         // handlers, exercising completion before task-handle attachment.
         let dispatch = tokio::task::spawn_blocking(move || {
             runtime.block_on(async {
                 for id in 1..=REQUESTS {
+                    dispatch_window.acquire().await.unwrap().forget();
                     dispatcher
                         .on_request(
                             id,
                             1,
                             RpcRequest {
                                 method: "/example.Echo/Echo".into(),
-                                payload: vec![].into(),
+                                payload: vec![],
                                 timeout_ms: 5000,
                             },
                         )
@@ -1866,6 +2580,7 @@ mod tests {
                         outcome: Some(syntra_core::proto::rpc_result::Outcome::Payload(_))
                     }))
                 ));
+                window.add_permits(1);
             }
             dispatch.await.unwrap();
         })
@@ -1895,7 +2610,7 @@ mod tests {
             1,
             RpcRequest {
                 method: "/example.Test/Wait".into(),
-                payload: vec![].into(),
+                payload: vec![],
                 timeout_ms: 5000,
             },
         )

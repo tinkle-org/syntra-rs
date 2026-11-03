@@ -35,9 +35,7 @@ jobs:
       - name: Check formatting
         continue-on-error: true
         run: cargo fmt --all -- --check
-        # Migration: inherited `cargo fmt` differences predate this CI.
-        # See docs/ci.md §2 for the isolated formatting-only follow-up.
-        # New code MUST be rustfmt-clean; do not mix fmt fixes with behavior.
+        # Formatting is informational; changed Rust code must be rustfmt-clean.
 
   clippy:
     name: clippy lints
@@ -62,9 +60,8 @@ jobs:
           restore-keys: |
             cargo-registry-${{ runner.os }}-1.88.0-
       - name: Clippy (locked, workspace, all targets)
-        # NOTE: baseline has inherited warnings (see docs/ci.md §2).
-        # This job reports them without `-D warnings` until the baseline
-        # cleanup lands. Never add `--all-features`: production and
+        # Warnings are reported here; the strict preview is informational.
+        # Never add `--all-features`: production and
         # test-fixture FFI features are mutually distinct and the latter
         # MUST NOT ship. Never add broad `#[allow]`: fix genuine findings.
         run: cargo clippy --locked --workspace --all-targets -- --no-deps
@@ -97,20 +94,47 @@ jobs:
           key: cargo-registry-${{ runner.os }}-1.88.0-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-registry-${{ runner.os }}-1.88.0-
-      - name: Locked workspace tests (default features)
+      - name: Locked default-members tests (without integration feature unification)
+        run: cargo test --locked
+      - name: Locked workspace tests (includes integration carrier fixtures)
         run: cargo test --locked --workspace
-      - name: Isolated SC1 WSS-only defaults (no development feature unification)
-        run: cargo test --locked -p syntra-sc1-transport --no-default-features
-      - name: Explicit SC1 development-carrier regressions
-        run: cargo test --locked -p syntra-sc1-transport --features development-carriers
+      - name: Default dependency isolation (host + WASM, no dev/test graph)
+        run: python3 scripts/cargo_contracts.py isolation
+      - name: Install pinned evidence parser for exact execution proof
+        run: python3 -m pip install -r scripts/requirements-evidence.txt
+      - name: Candidate offline agreement (no uncommitted SDD required)
+        run: python3 -B scripts/protocol_contract.py --offline --run-rust --output "$RUNNER_TEMP/candidate-rust-agreement"
+      - name: Preserve candidate agreement scope and exact command logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: candidate-rust-agreement
+          path: ${{ runner.temp }}/candidate-rust-agreement
+          if-no-files-found: error
+      - name: Isolated network-free transport defaults
+        run: cargo test --locked -p syntra-transport
+      - name: Explicit TCP carrier regressions
+        run: cargo test --locked -p syntra-transport --no-default-features --features tcp
+      - name: Explicit WebSocket carrier regressions
+        run: cargo test --locked -p syntra-transport --no-default-features --features websocket
+      - name: Explicit reconnect regressions
+        run: cargo test --locked -p syntra-transport --no-default-features --features tcp,websocket,reconnect
+      - name: Native enrollment regressions (explicit SQLite reference)
+        run: cargo test --locked -p syntra-transport --no-default-features --features websocket,native-enrollment
+      - name: Runtime file-store regressions (not a default filesystem dependency)
+        run: cargo test --locked -p syntra-runtime --no-default-features --features file-store
       - name: Default FFI exposes no ABI (explicit, no --all-features)
         run: cargo test --locked -p syntra-ffi --no-default-features
       - name: Production FFI tests
         run: cargo test --locked -p syntra-ffi --no-default-features --features production
       - name: Test-fixture FFI tests
         run: cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
-      - name: WASM compile check (non-FFI crates)
-        run: cargo check --locked -p syntra-core -p syntra-runtime -p syntra-ws -p syntra-web --target wasm32-unknown-unknown
+      - name: WASM baseline (core, runtime and record-protection kernel)
+        run: cargo check --locked -p syntra-core -p syntra-runtime --target wasm32-unknown-unknown
+      - name: Browser protected connection compile (explicit production feature)
+        run: cargo check --locked -p syntra-web --no-default-features --features browser-connection --target wasm32-unknown-unknown
+      - name: Browser fixture compile (separate from production)
+        run: cargo check --locked -p syntra-web --no-default-features --features browser-test-fixture --target wasm32-unknown-unknown
       - name: FFI exports, C smoke tests and expected WASM rejection
         run: python3 crates/syntra-ffi/tests/build_contract.py
 
@@ -120,10 +144,15 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+    env:
+      SYNTRA_SDD_ROOT: ${{ github.workspace }}/../syntra-sdd
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: "1.88.0"
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.14"
@@ -133,8 +162,69 @@ jobs:
           github_token: ${{ github.token }}
       - name: Pinned Rust generation drift check
         run: python3 scripts/check-generated.py
-      - name: Upstream snapshot pin check
+      - name: Fetch accepted SDD Git objects (not floating HEAD or local documents)
+        run: |
+          git init "$SYNTRA_SDD_ROOT"
+          git -C "$SYNTRA_SDD_ROOT" remote add origin https://github.com/tinkle-org/syntra.git
+          git -C "$SYNTRA_SDD_ROOT" fetch --depth=1 origin 8ede3810b29fbba4d0e6ae6751a0025ceedda140
+      - name: Install pinned manifest parser
+        run: python3 -m pip install -r scripts/requirements-evidence.txt
+      - name: Upstream provenance and implementation test-asset check
         run: python3 scripts/check-upstream-pin.py
+      - name: Snapshot checker regression tests
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+      - name: Unified Syntra implementation evidence (no formal conformance claim)
+        run: python3 -B scripts/conformance_evidence.py --candidate-agreement offline --output "$RUNNER_TEMP/syntra-evidence"
+      - name: Upload implementation evidence (not a conformance declaration)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: syntra-implementation-evidence
+          path: ${{ runner.temp }}/syntra-evidence
+          if-no-files-found: error
+
+  manifest-cases:
+    name: unified Syntra validation + ten supplemental WSS scenarios
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      SYNTRA_SDD_ROOT: ${{ github.workspace }}/../syntra-sdd
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: "1.88.0"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.14"
+      - name: Fetch exact implementation input objects and install parser
+        run: |
+          git init "$SYNTRA_SDD_ROOT"
+          git -C "$SYNTRA_SDD_ROOT" remote add origin https://github.com/tinkle-org/syntra.git
+          git -C "$SYNTRA_SDD_ROOT" fetch --depth=1 origin 8ede3810b29fbba4d0e6ae6751a0025ceedda140
+          python3 -m pip install -r scripts/requirements-evidence.txt
+      - name: Unified implementation evidence regression tests
+        run: >-
+          python3 -B -m unittest
+          scripts/tests/test_conformance_evidence.py scripts/tests/test_manifest_adapters.py -v
+      - name: Current WSS scenarios (supplemental only, no formal verdicts)
+        run: >-
+          python3 -B scripts/conformance_evidence.py --candidate-agreement offline
+          --run-local wss-envelope --run-local wss-unknown-field --run-local wss-ready
+          --run-local wss-reserved-method --run-local wss-payloads --run-local wss-duplicate-id
+          --run-local wss-deadline --run-local wss-internal-error
+          --run-local wss-reverse-completion --run-local wss-recovery-isolation
+          --output "$RUNNER_TEMP/manifest-cases"
+      - name: Preserve implementation evidence and supplemental observations
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: syntra-implementation-wss-evidence
+          path: ${{ runner.temp }}/manifest-cases
+          if-no-files-found: error
 
   package:
     name: package + rustdoc validation
@@ -150,15 +240,9 @@ jobs:
         with:
           toolchain: "1.88.0"
       - name: Cargo package contents (non-publishing)
-        # `cargo publish --dry-run` is unsuitable while 1.0.0-rc.1 is already
-        # published: it would compare against the registry. Use the equivalent
-        # non-publishing packaging check per crate, preserving generated sources.
-        run: |
-          for p in syntra-core syntra-runtime syntra-ws syntra-web syntra-ffi; do
-            echo "--- $p ---"
-            cargo package --locked -p "$p" --list
-            cargo package --locked -p "$p" --no-verify
-          done
+        # Metadata determines public members; publish=false test support stays
+        # excluded. --no-verify checks archives, not packaged compilation.
+        run: python3 scripts/cargo_contracts.py package
       - name: Rustdoc (no deps, warnings informational)
         run: cargo doc --locked --workspace --no-deps
       - name: Public API surface check (no accidental changes)
@@ -183,10 +267,22 @@ jobs:
         run: |
           cargo install --locked cargo-deny --version 0.20.2
           cargo install --locked cargo-audit --version 0.22.2
-      - name: cargo-deny (licenses, advisories, sources)
-        run: cargo deny --locked check advisories licenses sources
       - name: cargo-audit (RustSec)
         run: cargo audit --deny warnings
+      - name: cargo-deny (licenses, advisories, sources)
+        run: cargo deny --locked check advisories licenses sources
+      - name: Native enrollment dependency policy (optional graph is not covered by defaults)
+        run: cargo deny --locked --features syntra-transport/websocket,syntra-transport/native-enrollment check advisories licenses sources
+      - name: Explicit carrier and reconnect dependency policy
+        run: cargo deny --locked --features syntra-transport/tcp,syntra-transport/websocket,syntra-transport/reconnect check advisories licenses sources
+      - name: Opt-in runtime file-store dependency policy
+        run: cargo deny --locked --features syntra-runtime/file-store check advisories licenses sources
+      - name: Browser protected connection production dependency policy
+        if: ${{ !cancelled() }}
+        run: cargo deny --locked --features syntra-web/browser-connection --target wasm32-unknown-unknown check advisories licenses sources
+      - name: Browser fixture dependency policy (separate from production)
+        if: ${{ !cancelled() }}
+        run: cargo deny --locked --features syntra-web/browser-test-fixture --target wasm32-unknown-unknown check advisories licenses sources
 
   dependency-review:
     name: dependency review
@@ -198,12 +294,8 @@ jobs:
       pull-requests: write
     outputs:
       has_manifests: ${{ steps.base.outputs.has_manifests }}
-    # Tolerate failures when the base dependency graph is unavailable: either
-    # the base ref has no manifests (e.g. PR #1 introduces the first
-    # Cargo.lock while main has only README) or the dependency graph itself
-    # is disabled/unsupported for the repository (the review action then
-    # fails with "not supported on this repository" even though manifests
-    # exist). Once the graph exists and is readable, high-severity or
+    # Dependency review is informational when the base has no manifest or the
+    # repository graph is unavailable. When the graph is readable, high-severity or
     # denied-license findings fail. cargo-deny + cargo-audit in the security
     # job remain blocking regardless.
     steps:
@@ -277,7 +369,7 @@ jobs:
 
   required:
     name: required CI status
-    needs: [clippy, rust, generated-rust, package, security, actionlint, dependency-review]
+    needs: [clippy, rust, generated-rust, manifest-cases, package, security, actionlint, dependency-review]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -298,9 +390,8 @@ jobs:
               if r not in ("success", "skipped"):
                   raise SystemExit(f"required jobs did not all succeed: {bad}")
           # rust and generated-rust are hard requirements: skipped is not success.
-          # fmt is informational while inherited formatting differences remain
-          # (see docs/ci.md §2); do not hard-require it until the follow-up lands.
-          for hard in ("rust", "generated-rust"):
+          # fmt is informational and does not gate this aggregate check.
+          for hard in ("rust", "generated-rust", "manifest-cases"):
               if bad.get(hard) != "success":
                   raise SystemExit(f"hard-required job {hard} was {bad.get(hard)}")
           # Include dependency-review when it was applicable: fail required

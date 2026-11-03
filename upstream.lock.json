@@ -1,0 +1,19 @@
+{
+  "format_version": 2,
+  "scope": "implementation-inputs",
+  "repository": "https://github.com/tinkle-org/syntra",
+  "revision": "8ede3810b29fbba4d0e6ae6751a0025ceedda140",
+  "sha256": {
+    "conformance/test-vectors/protobuf/vectors.yaml": "614e7ae45cd1739f3e0bc66b89b5d657ba607856104b59d73d93fbe8ade15360",
+    "conformance/test-vectors/tcp/byte-vectors.yaml": "e77450a8ac35f6f36b117b4e9f87f75b27778c6761ad3cc2d67a8b3ff4f041e8",
+    "conformance/test-vectors/websocket/fixtures.yaml": "932023c68a568a8e223e5584d94a5504d5eeb16323c7b1f35fbb19ca9805ecbc",
+    "proto/syntra/v1/capabilities.proto": "3a5f2d6603295cefbc40d0dd1834a2965c0ebc5e9e01b3d05e071a7c12bd9c94",
+    "proto/syntra/v1/envelope.proto": "65f4317001ec9b2e7b254f5960401fd66c52f940a5a8281cd55af6964ddd85c6",
+    "proto/syntra/v1/errors.proto": "28d4376f7bcb4ff6a5d2cf7122700289e020b3de08c1ece23053d01a0b741903",
+    "proto/syntra/v1/events.proto": "d0a01611a177364adb94bbb15d1d7abdc94093c887de7cdaa734c839010baf04",
+    "proto/syntra/v1/handshake.proto": "3d990ea03f4bda7c4a66f802930a996df89377614a1639da9d498ffc06ce2f55",
+    "proto/syntra/v1/recovery_profile.proto": "7b049df47ef8f399a1cc269c256c0e45e11600db887cd72b64c8374565e12d10",
+    "proto/syntra/v1/rpc.proto": "8f1edf322cb5e6fe8282a347a44171871eb04b8f221113027e3ef3b6c0b5234a",
+    "proto/syntra/v1/session.proto": "66758ac6185995994c5220bdf1b02031533e3198993133d731e19e29a1b925d0"
+  }
+}

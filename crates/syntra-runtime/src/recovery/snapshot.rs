@@ -4,30 +4,51 @@
 //! the transfer mechanics shared by every snapshot: bounded pages, a
 //! provider-proven boundary that subsequent batches must chain from, and an
 //! explicit completion gate. Pages are stored without interpretation and
-//! are assembled only when every page `0..total_pages` has arrived exactly
-//! once; a missing, duplicated-out-of-range, oversized, or
+//! are assembled only when every page `0..total_pages` has arrived logically
+//! once (identical retries do not increase counts); a missing, conflicting, oversized, or
 //! boundary-mismatched page fails the install without mutating committed
 //! progress. The caller confirms the boundary through the coordinator only
 //! after a successful install.
 
 /// Snapshot staging failure. Never carries snapshot bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SnapshotError {
     /// Page index outside `0..total_pages`, conflicting bytes, or
     /// zero-length page bytes.
+    #[error("invalid snapshot page")]
     InvalidPage,
     /// Snapshot handle is empty or a page handle differs from the staged handle.
+    #[error("snapshot handle mismatch")]
     HandleMismatch,
     /// Page boundary differs from the staged boundary.
+    #[error("snapshot boundary mismatch")]
     BoundaryMismatch,
     /// Not every page has arrived; installation is incomplete.
+    #[error("snapshot transfer incomplete")]
     Incomplete,
     /// Snapshot limits violated (handle too long, too many pages, page too large).
+    #[error("snapshot limit exceeded")]
     OverLimit,
-    /// Generation is not greater than the engine's current generation.
+    /// Generation differs from the engine's CURRENT generation.
+    #[error("snapshot generation mismatch")]
     StaleGeneration,
     /// Coordinator did not offer the staged snapshot as committable.
+    #[error("snapshot not offered by coordinator")]
     CoordinatorRejected,
+    /// A different descriptor cannot overwrite active staging. The caller
+    /// must retire the old round and explicitly discard its pages first.
+    #[error("conflicting active snapshot descriptor")]
+    ActiveStage,
+}
+
+impl SnapshotError {
+    /// Typed API-boundary status; never includes snapshot/handle bytes.
+    pub fn code(&self) -> syntra_core::ErrorCode {
+        match self {
+            Self::OverLimit => syntra_core::ErrorCode::ResourceExhausted,
+            _ => syntra_core::ErrorCode::FailedPrecondition,
+        }
+    }
 }
 
 /// Bounded staged snapshot under one provider-proven boundary.
@@ -38,11 +59,13 @@ pub struct StagedSnapshot {
     total_pages: u32,
     page_bytes_max: u32,
     pages: Vec<Option<Vec<u8>>>,
+    total_bytes: u64,
 }
 
 impl StagedSnapshot {
     /// Begin staging `total_pages` pages under `boundary_checkpoint`.
-    /// Bounds: handle length `1..=256`, `1 <= total_pages <= 256`,
+    /// Bounds: handle length `1..=256`, boundary length `1..=4096`,
+    /// `1 <= total_pages <= 256`,
     /// `1 <= page_bytes_max <= 262144`.
     pub fn new(
         snapshot_handle: Vec<u8>,
@@ -65,6 +88,9 @@ impl StagedSnapshot {
         if boundary_checkpoint.is_empty() {
             return Err(SnapshotError::BoundaryMismatch);
         }
+        if boundary_checkpoint.len() > 4096 {
+            return Err(SnapshotError::OverLimit);
+        }
         let n = total_pages as usize;
         let mut pages = Vec::with_capacity(n);
         pages.resize_with(n, || None);
@@ -74,6 +100,7 @@ impl StagedSnapshot {
             total_pages,
             page_bytes_max,
             pages,
+            total_bytes: 0,
         })
     }
 
@@ -90,6 +117,16 @@ impl StagedSnapshot {
     /// Expected page count.
     pub fn total_pages(&self) -> u32 {
         self.total_pages
+    }
+
+    /// Advertised per-page byte bound (part of descriptor identity).
+    pub fn page_bytes_max(&self) -> u32 {
+        self.page_bytes_max
+    }
+
+    /// Logically received bytes; identical page retries do not increase it.
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
     }
 
     /// Pages received so far.
@@ -133,7 +170,13 @@ impl StagedSnapshot {
             Some(existing) if *existing == bytes => Ok(()),
             Some(_) => Err(SnapshotError::InvalidPage),
             None => {
+                let total = self
+                    .total_bytes
+                    .checked_add(bytes.len() as u64)
+                    .filter(|n| *n <= u64::from(self.total_pages) * u64::from(self.page_bytes_max))
+                    .ok_or(SnapshotError::OverLimit)?;
                 *slot = Some(bytes);
+                self.total_bytes = total;
                 Ok(())
             }
         }
@@ -144,7 +187,10 @@ impl StagedSnapshot {
         if !self.is_complete() {
             return Err(SnapshotError::Incomplete);
         }
+        let capacity = usize::try_from(self.total_bytes).map_err(|_| SnapshotError::OverLimit)?;
         let mut out = Vec::new();
+        out.try_reserve_exact(capacity)
+            .map_err(|_| SnapshotError::OverLimit)?;
         for page in self.pages.iter().flatten() {
             out.extend_from_slice(page);
         }

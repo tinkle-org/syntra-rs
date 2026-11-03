@@ -217,18 +217,26 @@ async fn pre_active_frames_fail() {
 }
 
 #[tokio::test]
-async fn duplicate_outstanding_rejected_original_continues() {
+async fn local_duplicate_id_violation_closes_without_same_id_result() {
     use prost::Message;
     use syntra_core::proto::frame::Body;
     use syntra_core::proto::{Frame, RpcRequest};
 
     // Blocking handler: the first request stays outstanding until released.
     let release = Arc::new(tokio::sync::Notify::new());
+    let started = Arc::new(tokio::sync::Barrier::new(2));
+    let dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let release_handler = release.clone();
+    let entered = started.clone();
+    let count = dispatches.clone();
     let blocking = Arc::new(FnHandler(
         move |_m: String, _p: Vec<u8>, _c: CancelToken| {
             let release = release_handler.clone();
+            let entered = entered.clone();
+            let count = count.clone();
             async move {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                entered.wait().await;
                 release.notified().await;
                 HandlerOutcome::Payload(b"first".to_vec())
             }
@@ -256,42 +264,30 @@ async fn duplicate_outstanding_rejected_original_continues() {
         }
         .encode_to_vec()
     };
-    // First attempt accepted (handler blocks); duplicate rejected with a
-    // terminal FAILED_PRECONDITION while the original continues.
+    // Supplemental local RFC 0004 D2 regression, not a formal suite verdict.
+    // Hold the original terminal computation until violation/closure is done.
     host.ingest(&raw_request(7)).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(host.inflight_len(), 1);
-    host.ingest(&raw_request(7)).await;
-    let dup_out = wrx.recv().await.expect("duplicate result");
-    let ctx = syntra_core::ValidationContext::active(1);
-    let dup = syntra_core::decode_frame(&dup_out, ctx).expect("valid result");
-    match dup.body {
-        Some(Body::Result(r)) => match r.outcome {
-            Some(syntra_core::proto::rpc_result::Outcome::Error(e)) => {
-                assert_eq!(e.code, ErrorCode::FailedPrecondition.as_i32())
-            }
-            other => panic!("expected error, got {other:?}"),
-        },
-        other => panic!("expected result, got {other:?}"),
-    }
-    assert_eq!(host.inflight_len(), 1);
-    // Release the original: exactly one success follows, no second result.
-    release.notify_one();
-    let first_out = tokio::time::timeout(Duration::from_secs(2), wrx.recv())
+    tokio::time::timeout(Duration::from_secs(2), started.wait())
         .await
-        .expect("first result in time")
-        .expect("channel open");
-    let first = syntra_core::decode_frame(&first_out, ctx).expect("valid result");
-    match first.body {
-        Some(Body::Result(r)) => match r.outcome {
-            Some(syntra_core::proto::rpc_result::Outcome::Payload(p)) => {
-                assert_eq!(p, b"first")
-            }
-            other => panic!("expected payload, got {other:?}"),
-        },
-        other => panic!("expected result, got {other:?}"),
-    }
+        .expect("original handler entered the barrier");
+    assert_eq!(host.inflight_len(), 1);
+    host.ingest(&raw_request(7)).await;
+    assert!(host.is_closed());
+    assert_eq!(host.state().await, ConnectionState::Closed);
+    assert_eq!(
+        host.terminal_reason().unwrap().code(),
+        ErrorCode::FailedPrecondition
+    );
     assert_eq!(host.inflight_len(), 0);
+    assert_eq!(host.sessions().count(), 0);
+    assert!(wrx.try_recv().is_err(), "no result under the offending ID");
+    release.notify_one();
+    host.close().await;
+    assert_eq!(dispatches.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        wrx.try_recv().is_err(),
+        "held original cannot emit after closure"
+    );
     // Pending-table unit contract: duplicate insert rejects, original kept.
     let table = syntra_core::PendingTable::new(4);
     let _rx = table.insert(42, "/example.Echo/Echo".into()).unwrap();

@@ -15,8 +15,7 @@ ignore = []
 version = 2
 # Apache-2.0 Syntra crates: only permissive licenses are allowed.
 # Anything not listed (including GPL/AGPL/LGPL copyleft) fails the check.
-# Unlicense (public-domain dedication, OSI-approved) is allowed for
-# memchr/pharos/ws_stream_wasm via ws_stream_wasm.
+# Unlicense (public-domain dedication, OSI-approved) is allowed.
 allow = [
   "Apache-2.0",
   "MIT",
@@ -27,7 +26,11 @@ allow = [
   "Unlicense",
 ]
 confidence-threshold = 0.8
-exceptions = []
+# Reviewed upstream foldhash 0.1.5 LICENSE: permissive Zlib terms require
+# preserving the notice and marking altered sources; no copyleft obligations.
+# rusqlite 0.37.0 -> hashlink 0.10.0 -> hashbrown 0.15.5 uses this package.
+# Limit approval to this exact package/version, not all future Zlib dependencies.
+exceptions = [{ crate = "foldhash@0.1.5", allow = ["Zlib"] }]
 
 [licenses.private]
 ignore = false

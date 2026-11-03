@@ -5,9 +5,9 @@
 //! on success). There is no `ServerHello` in v1. Credentials travel only
 //! in `ClientHello.credential` — never in URLs, logs, or debug output.
 //!
-//! Open blocker B1 (typed pre-`ACTIVE` error carrier): this crate defines
-//! the local error codes; no zero-`request_id` `result` and no second
-//! `hello` is ever emitted to carry them (handshake.md section 2A.10).
+//! Pre-`ACTIVE` handshake failures expose local typed errors and close the
+//! connection; no zero-`request_id` `result` and no second `hello` is emitted
+//! to carry them (handshake.md section 2A.10; B1).
 
 use crate::error::{ErrorCode, SyntraError};
 
@@ -15,12 +15,14 @@ use crate::error::{ErrorCode, SyntraError};
 pub const MIN_VERSION: u32 = 1;
 /// Maximum supported Syntra version for this implementation.
 pub const MAX_VERSION: u32 = 1;
-/// Default handshake deadline (SNTR-HS-002/011). Transport profiles may
-/// state otherwise; this value is documented per deployment.
+/// Default message-handshake deadline. Connection drivers also enforce the
+/// enclosing encrypted-establishment and carrier-attempt budgets.
 pub const HANDSHAKE_TIMEOUT_DEFAULT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Maximum credential bytes accepted before policy evaluation.
 /// Bounds unauthenticated input (DoS boundary); deployments document theirs.
-pub const MAX_CREDENTIAL_BYTES: usize = 16 * 1024;
+pub const MAX_CREDENTIAL_BYTES: usize = 8_192;
+/// Maximum UTF-8 encoded bytes in a diagnostic connection identifier (RFC 0005 D2).
+pub const MAX_CONNECTION_ID_BYTES: usize = 128;
 
 /// Validate a `ClientHello` range. Both bounds nonzero, min <= max.
 pub fn validate_hello_range(min_version: u32, max_version: u32) -> Result<(), SyntraError> {
@@ -61,7 +63,7 @@ pub fn negotiate_version(
 /// Validate a received `connection_id`: opaque UTF-8 diagnostic, never an
 /// authenticator or resume token. Must be non-empty and bounded.
 pub fn validate_connection_id(id: &str) -> Result<(), SyntraError> {
-    if id.is_empty() || id.len() > 256 {
+    if id.is_empty() || id.len() > MAX_CONNECTION_ID_BYTES {
         return Err(SyntraError::Protocol {
             code: ErrorCode::InvalidArgument,
             message: "invalid connection_id length".to_string(),

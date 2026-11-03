@@ -1,0 +1,2 @@
+# Safe YAML parser for the manifest/evidence tooling only; not a Rust dependency.
+PyYAML==6.0.3

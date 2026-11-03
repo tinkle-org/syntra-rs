@@ -6,12 +6,12 @@
 //!   affected RPC — the connection stays usable, no socket is closed;
 //! - `request_id` is the `uint64` correlation field of the enclosing
 //!   `Frame` (not a field of `RpcRequest`), initiator-chosen, nonzero,
-//!   unique among *outstanding* RPCs on that connection only;
-//! - duplicate *outstanding* ids reject the new attempt with
-//!   `FAILED_PRECONDITION` while the original continues untouched;
-//! - reuse after a terminal `result` is permitted by the core model;
-//!   whether a stale replay is also rejected is the open conflict B3 —
-//!   this crate enforces duplicate-*outstanding* only and documents it.
+//!   strictly increasing in request-Frame emission order, never reused on
+//!   that connection (accepted RFC 0004 D1; gaps are permitted);
+//! - the initiator serializes allocation and FIFO enqueue under its admission
+//!   mutex. Atomic allocation alone does not order concurrent enqueue;
+//! - the host owns ordered high-water admission and fail-close on ID misuse.
+//!   `PendingTable` only correlates live calls; it is not a replay validator.
 //!
 //! `request_id` MUST NOT be used for cross-connection deduplication;
 //! durable continuity uses the application operation key in the payload
@@ -86,14 +86,12 @@ pub fn validate_method(method: &str) -> Result<(), SyntraError> {
     Ok(())
 }
 
-/// Allocates nonzero ids unique among outstanding RPCs.
+/// Allocates strictly increasing, nonzero connection-local IDs without reuse.
 ///
-/// The allocator hands out monotonically increasing ids (wrapping).
-/// Callers MUST check the pending table and skip ids still in use
-/// (see `PendingTable::is_pending`), because reuse-after-completion is
-/// permitted but duplicate-*outstanding* is rejected with
-/// `FAILED_PRECONDITION`.
-#[derive(Debug, Default)]
+/// Allocated/skipped IDs stay retired. Callers must serialize allocation with
+/// FIFO enqueue to preserve request emission order. Use a new allocator only
+/// for a new connection, never to reset an existing connection's ID space.
+#[derive(Debug)]
 pub struct RequestIdAllocator {
     next: AtomicU64,
 }
@@ -106,22 +104,30 @@ impl RequestIdAllocator {
         }
     }
 
-    /// Return the next candidate id (nonzero). The caller must verify
-    /// it is not currently outstanding and retry on collision (wraparound).
-    pub fn next_candidate(&self) -> u64 {
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
-        // fetch_add returns the previous value; skip 0 on wrap.
-        if id == 0 {
-            self.next.fetch_add(1, Ordering::Relaxed)
-        } else {
-            id
+    /// Choose the first nonzero ID for a NEW connection's namespace. This does
+    /// not permit replacing/resetting the allocator on an existing connection.
+    /// The protocol allows gaps and does not require starting at one.
+    pub fn starting_at(first: std::num::NonZeroU64) -> Self {
+        Self {
+            next: AtomicU64::new(first.get()),
         }
     }
 
-    /// Reset the id space. Called only when the connection dies;
-    /// the id space dies with the connection.
-    pub fn reset(&self) {
-        self.next.store(1, Ordering::Relaxed);
+    /// Return the next ID, including `u64::MAX` once, then fail permanently.
+    pub fn next_candidate(&self) -> Result<u64, SyntraError> {
+        // Zero is an exhausted sentinel, not a candidate. Relaxed ordering
+        // suffices for uniqueness; the caller's admission mutex orders enqueue.
+        self.next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+                (id != 0).then(|| id.checked_add(1).unwrap_or(0))
+            })
+            .map_err(|_| SyntraError::ResourceExhausted("request_id space exhausted".into()))
+    }
+}
+
+impl Default for RequestIdAllocator {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -145,7 +151,8 @@ struct Slot {
 /// unknown/completed ids is ignored; duplicate outstanding ids are
 /// rejected with `FAILED_PRECONDITION` while the original waiter keeps
 /// running; `result` for an unknown id is ignored with a diagnostic
-/// (no error storm).
+/// (no error storm). This table does not enforce host high-water admission;
+/// callers must apply connection-level ID validation before inserting.
 #[derive(Debug)]
 pub struct PendingTable {
     inner: Mutex<HashMap<u64, Slot>>,
@@ -215,8 +222,8 @@ impl PendingTable {
     }
 
     /// Remove one waiter without completing (deadline/cancel-abandon).
-    /// A late `result` afterwards is ignored as unknown (completion wins
-    /// races; abandonment does not cancel the host without `cancel`).
+    /// A late `result` afterwards is ignored as unknown. The runtime owns the
+    /// deadline-checked terminal gate; abandonment alone does not stop the host.
     pub fn abandon(&self, id: u64) {
         self.inner.lock().unwrap().remove(&id);
     }
@@ -292,7 +299,23 @@ mod tests {
     fn never_zero() {
         let a = RequestIdAllocator::new();
         for _ in 0..10_000 {
-            assert_ne!(a.next_candidate(), 0);
+            assert_ne!(a.next_candidate().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn default_starts_at_one_and_exhaustion_is_permanent() {
+        assert_eq!(RequestIdAllocator::default().next_candidate().unwrap(), 1);
+        let a = RequestIdAllocator {
+            next: AtomicU64::new(u64::MAX - 1),
+        };
+        assert_eq!(a.next_candidate().unwrap(), u64::MAX - 1);
+        assert_eq!(a.next_candidate().unwrap(), u64::MAX);
+        for _ in 0..3 {
+            assert_eq!(
+                a.next_candidate().unwrap_err().code(),
+                ErrorCode::ResourceExhausted
+            );
         }
     }
 }

@@ -1,0 +1,379 @@
+{
+  "status": "candidate-sdd",
+  "domain_ascii": "syntra.1.0",
+  "note": "Public context/prologue encoding fixtures only; no Noise ciphertext, runtime execution or independent interoperability verdict.",
+  "contexts": [
+    {
+      "id": "SYNTRA-CONTEXT-01",
+      "mode": 1,
+      "carrier": 1,
+      "server_key_id": 0,
+      "epoch": 0,
+      "handle_hex": "0000000000000000",
+      "scope": "a",
+      "context_hex": "73796e7472612e312e3001010000000000000000000000000000000000000000000161",
+      "prologue_hex": "73796e7472612e312e3001010000000000000000000000000000000000000000000161",
+      "context_bytes": 35,
+      "m1_bytes": 83
+    },
+    {
+      "id": "SYNTRA-CONTEXT-02",
+      "mode": 1,
+      "carrier": 3,
+      "server_key_id": 16909060,
+      "epoch": 0,
+      "handle_hex": "0000000000000000",
+      "scope": "example.service",
+      "context_hex": "73796e7472612e312e3001030102030400000000000000000000000000000000000f6578616d706c652e73657276696365",
+      "prologue_hex": "73796e7472612e312e3001030102030400000000000000000000000000000000000f6578616d706c652e73657276696365",
+      "context_bytes": 49,
+      "m1_bytes": 97
+    },
+    {
+      "id": "SYNTRA-CONTEXT-03",
+      "mode": 2,
+      "carrier": 2,
+      "server_key_id": 16909060,
+      "epoch": 1,
+      "handle_hex": "0102030405060708",
+      "scope": "example.service",
+      "context_hex": "73796e7472612e312e3002020102030400000000000000010102030405060708000f6578616d706c652e73657276696365",
+      "prologue_hex": "73796e7472612e312e3002020102030400000000000000010102030405060708000f6578616d706c652e73657276696365",
+      "context_bytes": 49,
+      "m1_bytes": 97
+    },
+    {
+      "id": "SYNTRA-CONTEXT-04",
+      "mode": 2,
+      "carrier": 3,
+      "server_key_id": 4294967295,
+      "epoch": 18446744073709551615,
+      "handle_hex": "0807060504030201",
+      "scope": "\u00e9",
+      "context_hex": "73796e7472612e312e300203ffffffffffffffffffffffff08070605040302010002c3a9",
+      "prologue_hex": "73796e7472612e312e300203ffffffffffffffffffffffff08070605040302010002c3a9",
+      "context_bytes": 36,
+      "m1_bytes": 84
+    },
+    {
+      "id": "SYNTRA-CONTEXT-05",
+      "mode": 2,
+      "carrier": 1,
+      "server_key_id": 16909060,
+      "epoch": 1,
+      "handle_hex": "0102030405060708",
+      "scope": "example.service",
+      "context_hex": "73796e7472612e312e3002010102030400000000000000010102030405060708000f6578616d706c652e73657276696365",
+      "prologue_hex": "73796e7472612e312e3002010102030400000000000000010102030405060708000f6578616d706c652e73657276696365",
+      "context_bytes": 49,
+      "m1_bytes": 97
+    },
+    {
+      "id": "SYNTRA-CONTEXT-06",
+      "mode": 1,
+      "carrier": 2,
+      "server_key_id": 0,
+      "epoch": 0,
+      "handle_hex": "0000000000000000",
+      "scope": "a",
+      "context_hex": "73796e7472612e312e3001020000000000000000000000000000000000000000000161",
+      "prologue_hex": "73796e7472612e312e3001020000000000000000000000000000000000000000000161",
+      "context_bytes": 35,
+      "m1_bytes": 83
+    },
+    {
+      "id": "SYNTRA-CONTEXT-07",
+      "mode": 2,
+      "carrier": 1,
+      "server_key_id": 4294967295,
+      "epoch": 18446744073709551615,
+      "handle_hex": "0807060504030201",
+      "scope": "\u00e9",
+      "context_hex": "73796e7472612e312e300201ffffffffffffffffffffffff08070605040302010002c3a9",
+      "prologue_hex": "73796e7472612e312e300201ffffffffffffffffffffffff08070605040302010002c3a9",
+      "context_bytes": 36,
+      "m1_bytes": 84
+    },
+    {
+      "id": "SYNTRA-CONTEXT-08",
+      "mode": 2,
+      "carrier": 2,
+      "server_key_id": 4294967295,
+      "epoch": 18446744073709551615,
+      "handle_hex": "0807060504030201",
+      "scope": "\u00e9",
+      "context_hex": "73796e7472612e312e300202ffffffffffffffffffffffff08070605040302010002c3a9",
+      "prologue_hex": "73796e7472612e312e300202ffffffffffffffffffffffff08070605040302010002c3a9",
+      "context_bytes": 36,
+      "m1_bytes": 84
+    },
+    {
+      "id": "SYNTRA-CONTEXT-09",
+      "mode": 1,
+      "carrier": 3,
+      "server_key_id": 0,
+      "epoch": 0,
+      "handle_hex": "0000000000000000",
+      "scope": "a",
+      "context_hex": "73796e7472612e312e3001030000000000000000000000000000000000000000000161",
+      "prologue_hex": "73796e7472612e312e3001030000000000000000000000000000000000000000000161",
+      "context_bytes": 35,
+      "m1_bytes": 83
+    }
+  ],
+  "negative_recipes": [
+    {
+      "id": "SYNTRA-N01",
+      "base": "SYNTRA-CONTEXT-01",
+      "mutation": "unsupported-domain",
+      "detail": "Replace the ten domain bytes with ASCII invalid.00; preserve all other bytes.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N02",
+      "base": "SYNTRA-CONTEXT-01",
+      "mutation": "unsupported-format",
+      "detail": "Present eight zero bytes as an unsupported context format. Reject without attempting format discovery or fallback.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N03",
+      "base": "SYNTRA-CONTEXT-01",
+      "mutation": "zero-mode",
+      "detail": "Set byte 10 to 0.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N04",
+      "base": "SYNTRA-CONTEXT-01",
+      "mutation": "unknown-carrier",
+      "detail": "Set byte 11 to 4.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N05",
+      "base": "SYNTRA-CONTEXT-01",
+      "mutation": "bootstrap-epoch",
+      "detail": "Set u64BE epoch at bytes 16..23 to 1.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N06",
+      "base": "SYNTRA-CONTEXT-03",
+      "mutation": "returning-handle",
+      "detail": "Set bytes 24..31 to zero.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N07",
+      "base": "SYNTRA-CONTEXT-01",
+      "mutation": "empty-scope",
+      "detail": "Set scope length to 0 and remove scope bytes.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N08",
+      "base": "SYNTRA-CONTEXT-01",
+      "mutation": "oversize-scope",
+      "detail": "Set scope length to 256 and supply exactly 256 ASCII bytes.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N09",
+      "base": "SYNTRA-CONTEXT-01",
+      "mutation": "truncated",
+      "detail": "Remove the final scope byte, leaving its length unchanged.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N10",
+      "base": "SYNTRA-CONTEXT-01",
+      "mutation": "trailing",
+      "detail": "Append 00 after an otherwise exact context; not part of the 48-byte Noise suffix.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N11",
+      "base": "SYNTRA-CONTEXT-01",
+      "mutation": "invalid-utf8",
+      "detail": "Replace the single scope byte with ff.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N12",
+      "base": "SYNTRA-CONTEXT-04",
+      "mutation": "scope-byte-length",
+      "detail": "Set scope length to 1 while retaining c3a9; lengths count bytes, not characters.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N13",
+      "base": "SYNTRA-CONTEXT-05",
+      "mutation": "returning-handle",
+      "detail": "Set bytes 24..31 to zero.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N14",
+      "base": "SYNTRA-CONTEXT-07",
+      "mutation": "scope-byte-length",
+      "detail": "Set scope length to 1 while retaining c3a9; lengths count bytes, not characters.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N15",
+      "base": "SYNTRA-CONTEXT-06",
+      "mutation": "unsupported-domain",
+      "detail": "Replace the ten domain bytes with ASCII invalid.00; preserve all other bytes.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N16",
+      "base": "SYNTRA-CONTEXT-06",
+      "mutation": "unsupported-format",
+      "detail": "Present eight zero bytes as an unsupported context format. Reject without attempting format discovery or fallback.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N17",
+      "base": "SYNTRA-CONTEXT-06",
+      "mutation": "zero-mode",
+      "detail": "Set byte 10 to 0.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N18",
+      "base": "SYNTRA-CONTEXT-06",
+      "mutation": "unknown-carrier",
+      "detail": "Set byte 11 to 4.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N19",
+      "base": "SYNTRA-CONTEXT-06",
+      "mutation": "bootstrap-epoch",
+      "detail": "Set u64BE epoch at bytes 16..23 to 1.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N20",
+      "base": "SYNTRA-CONTEXT-06",
+      "mutation": "empty-scope",
+      "detail": "Set scope length to 0 and remove scope bytes.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N21",
+      "base": "SYNTRA-CONTEXT-06",
+      "mutation": "oversize-scope",
+      "detail": "Set scope length to 256 and supply exactly 256 ASCII bytes.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N22",
+      "base": "SYNTRA-CONTEXT-06",
+      "mutation": "truncated",
+      "detail": "Remove the final scope byte, leaving its length unchanged.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N23",
+      "base": "SYNTRA-CONTEXT-06",
+      "mutation": "trailing",
+      "detail": "Append 00 after an otherwise exact context; not part of the 48-byte Noise suffix.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N24",
+      "base": "SYNTRA-CONTEXT-06",
+      "mutation": "invalid-utf8",
+      "detail": "Replace the single scope byte with ff.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N25",
+      "base": "SYNTRA-CONTEXT-08",
+      "mutation": "scope-byte-length",
+      "detail": "Set scope length to 1 while retaining c3a9; lengths count bytes, not characters.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N26",
+      "base": "SYNTRA-CONTEXT-09",
+      "mutation": "unsupported-domain",
+      "detail": "Replace the ten domain bytes with ASCII invalid.00; preserve all other bytes.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N27",
+      "base": "SYNTRA-CONTEXT-09",
+      "mutation": "unsupported-format",
+      "detail": "Present eight zero bytes as an unsupported context format. Reject without attempting format discovery or fallback.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N28",
+      "base": "SYNTRA-CONTEXT-09",
+      "mutation": "zero-mode",
+      "detail": "Set byte 10 to 0.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N29",
+      "base": "SYNTRA-CONTEXT-09",
+      "mutation": "unknown-carrier",
+      "detail": "Set byte 11 to 4.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N30",
+      "base": "SYNTRA-CONTEXT-09",
+      "mutation": "bootstrap-epoch",
+      "detail": "Set u64BE epoch at bytes 16..23 to 1.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N31",
+      "base": "SYNTRA-CONTEXT-04",
+      "mutation": "returning-handle",
+      "detail": "Set bytes 24..31 to zero.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N32",
+      "base": "SYNTRA-CONTEXT-09",
+      "mutation": "empty-scope",
+      "detail": "Set scope length to 0 and remove scope bytes.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N33",
+      "base": "SYNTRA-CONTEXT-09",
+      "mutation": "oversize-scope",
+      "detail": "Set scope length to 256 and supply exactly 256 ASCII bytes.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N34",
+      "base": "SYNTRA-CONTEXT-09",
+      "mutation": "truncated",
+      "detail": "Remove the final scope byte, leaving its length unchanged.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N35",
+      "base": "SYNTRA-CONTEXT-09",
+      "mutation": "trailing",
+      "detail": "Append 00 after an otherwise exact context; not part of the 48-byte Noise suffix.",
+      "expected": "reject-before-noise"
+    },
+    {
+      "id": "SYNTRA-N36",
+      "base": "SYNTRA-CONTEXT-09",
+      "mutation": "invalid-utf8",
+      "detail": "Replace the single scope byte with ff.",
+      "expected": "reject-before-noise"
+    }
+  ],
+  "source": "specifications/transports.md"
+}

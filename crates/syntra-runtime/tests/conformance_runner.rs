@@ -1,8 +1,11 @@
-//! Shared conformance runner — async Rust leg (pairing `rust-async`).
+//! Supplemental local scenarios — async Rust byte-pump leg.
 //!
 //! Exercises selected loopback/manual byte-pump cases described in
-//! `conformance/runner/scenarios.yaml`. Recovery tests run separately;
-//! this file does not certify every scenario or the full manifest matrix.
+//! historical scenario descriptions, not a manifest-driven CONF executor.
+//! No `conformance/runner/scenarios.yaml` exists at the accepted upstream pin.
+//! Recovery tests run separately; these are not formal conformance verdicts or
+//! independent Rust/Go interoperability. The corpus copy's committed origin is
+//! checked by scripts/check-upstream-pin.py before the evidence runner uses it.
 //!
 //! Fault injection is deterministic: a seeded counter decides drop/duplicate/
 //! truncate faults, so the same seed replays the same pattern.
@@ -416,12 +419,12 @@ async fn sc_oversize_handler_result_bounded() {
 }
 
 #[tokio::test]
-async fn sc_duplicate_outstanding_rejected() {
+async fn local_duplicate_id_violation_closes_without_same_id_result() {
     use prost::Message;
     use syntra_core::proto::frame::Body;
     use syntra_core::proto::{Frame, RpcRequest};
     let release = Arc::new(tokio::sync::Notify::new());
-    let started = Arc::new(tokio::sync::Notify::new());
+    let started = Arc::new(tokio::sync::Barrier::new(2));
     let dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let rh = release.clone();
     let entered = started.clone();
@@ -433,7 +436,7 @@ async fn sc_duplicate_outstanding_rejected() {
             let count = count.clone();
             async move {
                 count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                entered.notify_one();
+                entered.wait().await;
                 rh.notified().await;
                 HandlerOutcome::Payload(b"first".to_vec())
             }
@@ -472,35 +475,28 @@ async fn sc_duplicate_outstanding_rejected() {
         .encode_to_vec()
     };
     host.ingest(&req(7)).await;
-    tokio::time::timeout(Duration::from_secs(2), started.notified())
+    // Local RFC 0004 D2 regression only, not a formal CONF-RPC-004 verdict.
+    // Keep original terminal computation held until duplicate detection/close.
+    tokio::time::timeout(Duration::from_secs(2), started.wait())
         .await
         .expect("original handler started");
     host.ingest(&req(7)).await;
-    let dup = tokio::time::timeout(Duration::from_secs(2), wrx.recv())
-        .await
-        .expect("duplicate rejected")
-        .expect("open");
-    let ctx = ValidationContext::active(1);
-    let f = decode_frame(&dup, ctx).expect("valid");
-    assert_eq!(f.request_id, 7);
-    match f.body {
-        Some(Body::Result(r)) => match r.outcome {
-            Some(syntra_core::proto::rpc_result::Outcome::Error(e)) => {
-                assert_eq!(e.code, ErrorCode::FailedPrecondition.as_i32())
-            }
-            other => panic!("expected error, got {other:?}"),
-        },
-        other => panic!("expected result, got {other:?}"),
-    }
+    assert!(host.is_closed());
+    assert_eq!(host.state().await, syntra_core::ConnectionState::Closed);
+    assert_eq!(
+        host.terminal_reason().unwrap().code(),
+        ErrorCode::FailedPrecondition
+    );
+    assert_eq!(host.inflight_len(), 0);
+    assert_eq!(host.sessions().count(), 0);
+    assert!(
+        wrx.try_recv().is_err(),
+        "no duplicate-attempt or original result"
+    );
     release.notify_one();
-    let first = tokio::time::timeout(Duration::from_secs(2), wrx.recv())
-        .await
-        .expect("first")
-        .expect("open");
-    assert_terminal_payload(&first, b"first", 7);
+    host.close().await;
     assert_eq!(dispatches.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(wrx.try_recv().is_err(), "no extra host terminal queued");
-    host.close().await;
 }
 
 #[tokio::test]
@@ -597,13 +593,21 @@ async fn sc_fault_injection_deterministic() {
         if sends.len() == 2 {
             dups += 1;
             let release = Arc::new(tokio::sync::Notify::new());
+            let started = Arc::new(tokio::sync::Barrier::new(2));
+            let dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let rh = release.clone();
+            let entered = started.clone();
+            let count = dispatches.clone();
             let ph = payload.clone();
             let blocking = Arc::new(FnHandler(
                 move |_m: String, _p: Vec<u8>, _c: CancelToken| {
                     let rh2 = rh.clone();
+                    let entered = entered.clone();
+                    let count = count.clone();
                     let p = ph.clone();
                     async move {
+                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        entered.wait().await;
                         rh2.notified().await;
                         HandlerOutcome::Payload(p)
                     }
@@ -611,38 +615,24 @@ async fn sc_fault_injection_deterministic() {
             ));
             let (host, mut wrx) = establish_host(&mut hello_fi, blocking, &mut hello_faults).await;
             host.ingest(&sends[0]).await;
+            tokio::time::timeout(Duration::from_secs(2), started.wait())
+                .await
+                .expect("original held before duplicate injection");
             host.ingest(&sends[1]).await;
-            let dup_resp = tokio::time::timeout(Duration::from_secs(2), wrx.recv())
-                .await
-                .expect("duplicate rejected")
-                .expect("open");
-            let ctx = ValidationContext::active(1);
-            let f = decode_frame(&dup_resp, ctx).expect("valid");
-            match f.body {
-                Some(Body::Result(r)) => match r.outcome {
-                    Some(syntra_core::proto::rpc_result::Outcome::Error(e)) => {
-                        assert_eq!(e.code, ErrorCode::FailedPrecondition.as_i32());
-                    }
-                    other => panic!("expected duplicate error, got {other:?}"),
-                },
-                other => panic!("expected result, got {other:?}"),
-            }
+            // Supplemental local ID-misuse expectation, not a suite verdict.
+            assert!(host.is_closed());
+            assert_eq!(host.state().await, syntra_core::ConnectionState::Closed);
+            assert_eq!(
+                host.terminal_reason().unwrap().code(),
+                ErrorCode::FailedPrecondition
+            );
+            assert_eq!(host.inflight_len(), 0);
+            assert_eq!(host.sessions().count(), 0);
+            assert!(wrx.try_recv().is_err(), "no result under offending ID");
             release.notify_one();
-            let first = tokio::time::timeout(Duration::from_secs(2), wrx.recv())
-                .await
-                .expect("first")
-                .expect("open");
-            let f1 = decode_frame(&first, ctx).expect("valid");
-            match f1.body {
-                Some(Body::Result(r)) => match r.outcome {
-                    Some(syntra_core::proto::rpc_result::Outcome::Payload(p)) => {
-                        assert_eq!(p, payload, "opaque payload preserved")
-                    }
-                    other => panic!("expected payload, got {other:?}"),
-                },
-                other => panic!("expected result, got {other:?}"),
-            }
             host.close().await;
+            assert_eq!(dispatches.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(wrx.try_recv().is_err(), "no original result after closure");
             continue;
         }
         let (host, mut wrx) =
@@ -777,7 +767,7 @@ async fn sc_wire_vectors_decode() {
 }
 
 fn corpus_hex(id: &str) -> String {
-    let text = include_str!("../../../conformance/test-vectors/protobuf/vectors.yaml");
+    let text = include_str!("../../../tests/interoperability/fixtures/protobuf-vectors.yaml");
     let marker = format!("  - id: {id}");
     let mut selected = false;
     let mut found = Vec::new();

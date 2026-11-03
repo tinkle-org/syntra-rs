@@ -1,6 +1,7 @@
-# Rust-only extraction of the upstream template at
-# 2a91da7fdb96f3e75badf07614c14e4f85c9ba1c. Use Buf CLI 1.59.0.
-# Runtime: prost =0.13.5. Generated Rust must remain byte-identical.
+# Rust-only template extracted at 2a91da7fdb96f3e75badf07614c14e4f85c9ba1c.
+# Schema/suite target: 8ede3810b29fbba4d0e6ae6751a0025ceedda140 (upstream.lock.json).
+# Use Buf CLI 1.59.0 and prost =0.13.5. Regenerate after snapshot changes;
+# generated Rust must match this pinned plugin, not historical output bytes.
 # Read-only drift check: python3 scripts/check-generated.py
 version: v2
 clean: true

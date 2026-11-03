@@ -26,11 +26,11 @@
 //! - per-RPC deadlines start BEFORE queue admission; local validation
 //!   failures clean the pending entry; dropped futures abandon the
 //!   waiter (host still owns the RPC until `cancel` or its own
-//!   deadline); completion wins every race (`biased` select with the
-//!   result branch first; a timer that fires first still re-checks for
-//!   an arrived result before reporting expiry).
+//!   deadline). Every terminal candidate passes a serialized deadline-first
+//!   gate. A previously selected result survives later expiry and teardown;
+//!   unvalidated buffered bytes do not win retroactively.
 
-use web_time::{Duration, Instant};
+use web_time::Duration;
 
 use prost::Message;
 use tokio::sync::oneshot::error::RecvError;
@@ -41,8 +41,7 @@ use syntra_core::{
     PendingOutcome, RpcRequest, StateEvent, SyntraError, ValidationContext,
 };
 
-use crate::connection::{sleep_until, Connection, ConnectionConfig, HandshakeDone, Role, Shared};
-use crate::emission::{now as rpc_now, sleep_until as rpc_sleep_until};
+use crate::connection::{Connection, ConnectionConfig, HandshakeDone, Role, Shared};
 
 /// Transport-independent Syntra initiator.
 #[derive(Clone)]
@@ -51,10 +50,32 @@ pub struct Initiator {
 }
 
 impl Initiator {
+    /// Internal one-time routing attachment. No capability is enabled until a
+    /// validated profile negotiation; mixed notification protocols need an
+    /// explicitly designed demultiplexer, never a failed-decode fallback.
+    pub(crate) fn attach_recovery_inbox(
+        &self,
+        inbox: std::sync::Arc<crate::recovery::wire_client::RecoveryInbox>,
+    ) -> Result<(), SyntraError> {
+        let mut route = self.conn.shared.recovery_inbox.lock().unwrap();
+        if self.is_closed() || route.is_some() {
+            return Err(SyntraError::Protocol {
+                code: ErrorCode::FailedPrecondition,
+                message: "recovery requires a fresh, unattached connection".into(),
+            });
+        }
+        *route = Some(inbox);
+        Ok(())
+    }
+
     /// Create an initiator in `CONNECTED` with the given writer. Returns
     /// the initiator plus the receiver the transport pump must drain
     /// (one serialized `Frame` per item). Pass each original writer item to
     /// [`Initiator::prepare_outbound`] before emitting it.
+    ///
+    /// # Panics
+    /// Panics on invalid configuration. Use [`Initiator::try_new`] for
+    /// fallible construction at application/configuration boundaries.
     pub fn new(config: ConnectionConfig) -> (Self, mpsc::Receiver<Vec<u8>>) {
         Self::new_with_proposal(config, syntra_core::MIN_VERSION, syntra_core::MAX_VERSION)
     }
@@ -64,15 +85,135 @@ impl Initiator {
         min_version: u32,
         max_version: u32,
     ) -> (Self, mpsc::Receiver<Vec<u8>>) {
+        Self::try_new_with_proposal(config, min_version, max_version).expect(
+            "invalid Syntra configuration; use Initiator::try_new for fallible construction",
+        )
+    }
+
+    pub fn try_new(
+        config: ConnectionConfig,
+    ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), SyntraError> {
+        Self::try_new_with_proposal(config, syntra_core::MIN_VERSION, syntra_core::MAX_VERSION)
+    }
+
+    /// Inject a trusted suspend-inclusive source (also used by FFI/mobile tests).
+    pub fn try_new_with_clock(
+        config: ConnectionConfig,
+        clock: crate::elapsed::ElapsedClock,
+    ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), SyntraError> {
+        config.validate()?;
+        let (wtx, wrx) = mpsc::channel(config.writer_capacity);
+        let (shared, notifications) = Shared::new_with_clock(
+            Role::Initiator,
+            wtx,
+            config,
+            syntra_core::MIN_VERSION,
+            syntra_core::MAX_VERSION,
+            clock,
+        );
+        Ok((
+            Self {
+                conn: Connection::wrap(shared, notifications),
+            },
+            wrx,
+        ))
+    }
+
+    pub fn elapsed_clock(&self) -> crate::elapsed::ElapsedClock {
+        self.conn.shared.clock.clone()
+    }
+
+    /// Raw carrier polls must check this immediately before reading/writing,
+    /// including library-generated Ping/Pong/Close writes. CLOSED alone does not
+    /// forbid bounded teardown output; suspend/unknown continuity always does.
+    pub fn carrier_io_allowed(&self) -> bool {
+        self.conn.carrier_io_allowed()
+    }
+    pub fn with_carrier_io<R>(&self, poll: impl FnOnce() -> R) -> Option<R> {
+        self.conn.with_carrier_io(poll)
+    }
+    pub(crate) fn retain_runtime_task(&self, task: crate::connection::TaskHandle) {
+        self.conn.shared.tasks.register(task);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn own_native_task(
+        &self,
+        handle: tokio::task::JoinHandle<()>,
+    ) -> crate::shutdown::OwnedTask {
+        self.conn.own_native_task(handle)
+    }
+
+    pub fn register_transport_tasks(&self, count: usize) -> Result<(), SyntraError> {
+        self.conn.register_transport_tasks(count)
+    }
+    pub fn acknowledge_transport_task_joined(&self) -> Result<(), SyntraError> {
+        self.conn.acknowledge_transport_task_joined()
+    }
+    pub fn acknowledge_transport_closed(&self) {
+        self.conn.acknowledge_transport_closed();
+    }
+
+    /// Synchronously stop new RPC admission and install one retained owner.
+    /// Requires a running/entered executor on native; repeat calls keep the
+    /// first absolute budget. Foreign adapters must attest close and actual joins.
+    pub fn begin_shutdown(&self, total: Duration) -> Result<crate::ShutdownReport, SyntraError> {
+        let conn = self.conn.clone();
+        self.conn.start_shutdown(total, move |budget| {
+            crate::connection::spawn_task(async move {
+                conn.begin_closing().await;
+                conn.drain_until(budget.drain_cutoff, || conn.pending_len() == 0)
+                    .await;
+                conn.close().await;
+                conn.shared
+                    .tasks
+                    .join_until(&budget.clock, budget.deadline)
+                    .await;
+            })
+        })?;
+        Ok(self.shutdown_report())
+    }
+
+    /// Cancellation of this waiter never cancels the retained shutdown owner.
+    /// Carrier close and actual transport joins must be acknowledged separately.
+    pub async fn shutdown(&self, total: Duration) -> Result<crate::ShutdownReport, SyntraError> {
+        self.begin_shutdown(total)?;
+        self.conn.await_shutdown_owner().await;
+        Ok(self.shutdown_report())
+    }
+
+    pub fn shutdown_report(&self) -> crate::ShutdownReport {
+        self.conn.shutdown_report_for(self.pending_len(), 0)
+    }
+    pub fn shutdown_budget(&self) -> Option<crate::ShutdownBudget> {
+        self.conn.shutdown_budget()
+    }
+
+    pub fn suspend(&self) {
+        self.conn.suspend();
+    }
+
+    /// Retire before accepting wake-buffered results or output. This deliberately
+    /// requires fresh security, authorization, CoreReady and recovery negotiation.
+    pub async fn platform_wake(&self) {
+        self.conn.platform_wake().await;
+    }
+
+    pub fn try_new_with_proposal(
+        config: ConnectionConfig,
+        min_version: u32,
+        max_version: u32,
+    ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), SyntraError> {
+        config.validate()?;
+        syntra_core::validate_hello_range(min_version, max_version)?;
         let (wtx, wrx) = mpsc::channel(config.writer_capacity);
         let (shared, notif_rx) =
             Shared::new(Role::Initiator, wtx, config, min_version, max_version);
-        (
+        Ok((
             Self {
                 conn: Connection::wrap(shared, notif_rx),
             },
             wrx,
-        )
+        ))
     }
 
     /// Current state (for diagnostics; not a wire value).
@@ -97,13 +238,13 @@ impl Initiator {
     /// Transport writers MUST pass the original `Vec` from the receiver here
     /// (without cloning/reallocating it), immediately before synchronous carrier
     /// handoff/encryption. The allocation identifies this queue item independently
-    /// of wire ID reuse. Call once per item, before encryption, never on fragments
+    /// of its permanently non-reused wire ID. Call once per item, before encryption, never on fragments
     /// or ciphertext. After `Some`, finish this unit in order or abort the carrier;
     /// do not retry or rewrite it. This linearizes handoff with terminal selection,
     /// not the first OS write after arbitrary awaits inside a carrier sink.
     ///
-    /// Uses the runtime's elapsed RPC clock; platform suspend continuity remains
-    /// the embedding application's responsibility.
+    /// Uses the connection's suspend-inclusive clock on supported native targets.
+    /// Platforms must fence callbacks with suspend/wake when continuity is unknown.
     pub fn prepare_outbound(&self, bytes: Vec<u8>) -> Option<Vec<u8>> {
         self.conn.shared.prepare_outbound(bytes)
     }
@@ -129,7 +270,7 @@ impl Initiator {
     /// `ClientHello.credential`. This function never logs it and the
     /// caller should drop it after the handshake where possible.
     pub async fn handshake(&self, credential: Vec<u8>) -> Result<String, SyntraError> {
-        let deadline = Instant::now() + self.conn.shared.config.handshake_timeout;
+        let deadline = self.conn.shared.clock.now() + self.conn.shared.config.handshake_timeout;
         let (min_version, max_version) = {
             let shared = &self.conn.shared;
             (shared.proposed_min, shared.proposed_max)
@@ -168,6 +309,7 @@ impl Initiator {
                 });
             }
             let mut waiter = self.conn.shared.handshake_tx.lock().await;
+            *self.conn.shared.handshake_deadline.lock().unwrap() = Some(deadline);
             *state = state.transition(StateEvent::HelloSent)?;
             *waiter = Some(tx);
         }
@@ -175,7 +317,7 @@ impl Initiator {
         let bytes = frame.encode_to_vec();
         let sent = tokio::select! {
             biased;
-            _ = sleep_until(deadline) => Err(SyntraError::DeadlineExceeded("handshake timed out".to_string())),
+            _ = self.conn.shared.clock.sleep_until(deadline) => Err(SyntraError::DeadlineExceeded("handshake timed out".to_string())),
             sent = self.conn.send_bytes(bytes) => sent,
         };
         if let Err(e) = sent {
@@ -191,7 +333,7 @@ impl Initiator {
             biased;
             res = rx => res
                 .map_err(|_| SyntraError::Closed("handshake waiter dropped".to_string()))?,
-            _ = sleep_until(deadline) => {
+            _ = self.conn.shared.clock.sleep_until(deadline) => {
                 self.conn
                     .fail_handshake_and_close(
                         ErrorCode::DeadlineExceeded,
@@ -214,6 +356,9 @@ impl Initiator {
     /// Ingest one transport unit (exactly one serialized `Frame`).
     /// Called by the transport adapter's read loop.
     pub async fn ingest(&self, bytes: &[u8]) {
+        if !self.conn.accept_inbound().await {
+            return;
+        }
         let ctx = self.conn.ctx().await;
         let frame = match syntra_core::decode_frame(bytes, ctx) {
             Ok(f) => f,
@@ -242,6 +387,19 @@ impl Initiator {
             self.conn.fail_handshake_and_close(code, message).await;
             return;
         }
+        // CONF-RPC-010 permits one narrowly defined local correlation failure:
+        // an otherwise valid result envelope with zero raw outcomes. Never
+        // recover an ID from malformed/duplicate/future raw choices via Prost.
+        if let Some(id) = syntra_core::missing_result_outcome_id(raw, self.conn.ctx().await) {
+            self.conn.shared.fail_rpc(
+                id,
+                SyntraError::Protocol {
+                    code: ErrorCode::InvalidArgument,
+                    message: "result outcome must be set".into(),
+                },
+            );
+            return;
+        }
         // Correlation and envelope classification require structurally valid
         // bytes: Prost alone merges duplicate oneofs and ignores reserved tags.
         if syntra_core::validate_wire_structure(raw).is_ok() {
@@ -256,15 +414,11 @@ impl Initiator {
                     let invalid_outcome = result.outcome.is_none()
                         || matches!(result.outcome, Some(syntra_core::proto::rpc_result::Outcome::Error(ref error)) if error.code == 0);
                     if frame.request_id != 0 && invalid_outcome {
-                        self.conn.shared.complete_rpc(
+                        self.conn.shared.fail_rpc(
                             frame.request_id,
-                            syntra_core::RpcResult {
-                                outcome: Some(syntra_core::proto::rpc_result::Outcome::Error(
-                                    syntra_core::proto::RpcError {
-                                        code: ErrorCode::InvalidArgument.as_i32(),
-                                        message: "invalid result outcome".to_string(),
-                                    },
-                                )),
+                            SyntraError::Protocol {
+                                code: ErrorCode::InvalidArgument,
+                                message: "invalid result outcome".into(),
                             },
                         );
                         return;
@@ -392,7 +546,19 @@ impl Initiator {
             return;
         }
         let mut state = self.conn.shared.state.write().await;
-        if self.conn.is_closed() {
+        if self.conn.is_closed() || self.conn.lifecycle_blocked() {
+            return;
+        }
+        let expired = self
+            .conn
+            .shared
+            .handshake_deadline
+            .lock()
+            .unwrap()
+            .is_some_and(|deadline| self.conn.shared.clock.now() >= deadline);
+        if expired {
+            drop(state);
+            self.conn.expire_handshake().await;
             return;
         }
         // Re-check after all validation awaits: close may have won.
@@ -407,8 +573,24 @@ impl Initiator {
         else {
             return;
         };
-        *self.conn.shared.version.write().await = Some(frame.version);
-        *state = active;
+        let mut version = self.conn.shared.version.write().await;
+        {
+            let _handoff = self.conn.shared.emissions.lock().unwrap();
+            if !self.conn.carrier_io_allowed() {
+                return;
+            }
+            if !self.conn.handshake_expired() {
+                *version = Some(frame.version);
+                *state = active;
+            }
+        }
+        if *state != ConnectionState::Active {
+            drop(version);
+            drop(state);
+            self.conn.expire_handshake().await;
+            return;
+        }
+        drop(version);
         self.conn
             .complete_handshake(HandshakeDone {
                 connection_id: ready.connection_id,
@@ -438,10 +620,22 @@ impl Initiator {
         }
         // Missing outcome was already rejected by validation; unknown ids
         // are ignored with a diagnostic (no error storm).
-        self.conn.shared.complete_rpc(frame.request_id, result);
+        let withdrawal = matches!(&result.outcome,
+            Some(syntra_core::proto::rpc_result::Outcome::Error(error))
+                if error.code == ErrorCode::Unauthenticated as i32);
+        let correlated = self.conn.shared.complete_rpc(frame.request_id, result);
+        if withdrawal && correlated {
+            self.conn
+                .fail_protocol_and_close(SyntraError::Protocol {
+                    code: ErrorCode::Unauthenticated,
+                    message: "credential not accepted".into(),
+                })
+                .await;
+        }
     }
 
     async fn on_notification(&self, frame: Frame) {
+        self.conn.shared.expire_rpcs();
         let notif = match frame.body {
             Some(Body::Notification(n)) => n,
             _ => return,
@@ -461,17 +655,45 @@ impl Initiator {
         }
         // In CLOSING notifications are tolerated for drain; they never
         // complete an RPC and never extend the drain.
+        let recovery = self.conn.shared.recovery_inbox.lock().unwrap().clone();
+        if recovery.as_ref().is_some_and(|inbox| inbox.is_closed()) {
+            // An immutable retired attachment still owns this stream. Late
+            // recovery output must never be reinterpreted as generic app data.
+            return;
+        }
+        if let Some(inbox) = recovery.filter(|inbox| inbox.is_enabled()) {
+            // Never perform application persistence/callbacks on the reader.
+            // Drop the lifecycle read guard before a possible fail-close.
+            let routed = {
+                let _handoff = self.conn.shared.emissions.lock().unwrap();
+                if !self.conn.carrier_io_allowed() {
+                    return;
+                }
+                inbox.push(&notif.payload)
+            };
+            drop(state);
+            if let Err(error) = routed {
+                self.conn
+                    .fail_protocol_and_close(SyntraError::Protocol {
+                        code: error.code(),
+                        message: "invalid recovery notification".into(),
+                    })
+                    .await;
+            }
+            return;
+        }
         // Notifications never complete an RPC. Bounded notification
         // queue stays non-blocking: overflow drops with loss accounting,
         // never unbounded queueing.
         let dropped_len = notif.payload.len() as u64;
-        if self
-            .conn
-            .shared
-            .notif_tx
-            .try_send(notif.payload.into())
-            .is_err()
-        {
+        let queued = {
+            let _handoff = self.conn.shared.emissions.lock().unwrap();
+            if !self.conn.carrier_io_allowed() {
+                return;
+            }
+            self.conn.shared.notif_tx.try_send(notif.payload.into())
+        };
+        if queued.is_err() {
             // Cumulative loss accounting stays the signal; the latest
             // totals are published for every loss waiter, and the drop
             // diagnostic is throttled so a burst cannot amplify into logs.
@@ -503,16 +725,8 @@ impl Initiator {
         budget.min(self.conn.shared.config.max_rpc_timeout)
     }
 
-    async fn alloc_id(&self) -> Result<u64, SyntraError> {
-        for _ in 0..4096 {
-            let id = self.conn.shared.ids.next_candidate();
-            if id != 0 && !self.conn.shared.pending.is_pending(id) {
-                return Ok(id);
-            }
-        }
-        Err(SyntraError::ResourceExhausted(
-            "request-id space exhausted".to_string(),
-        ))
+    fn alloc_id(&self) -> Result<u64, SyntraError> {
+        self.conn.shared.ids.next_candidate()
     }
 
     /// Invoke a method: payload is opaque application bytes;
@@ -520,13 +734,14 @@ impl Initiator {
     ///
     /// - The deadline starts BEFORE queue admission.
     /// - Validates method shape before sending (`INVALID_ARGUMENT`).
-    /// - Allocates a nonzero id unique among outstanding RPCs.
+    /// - Allocates a permanently non-reused, nonzero connection-local ID in FIFO
+    ///   request enqueue order; a single ordered writer preserves emission order.
     /// - Enforces bounded outstanding (`RESOURCE_EXHAUSTED`).
     /// - Sends one `request`; awaits exactly one terminal `result`.
     /// - Interleaved notifications do not complete the RPC.
     /// - Local timeout abandons the waiter but does not cancel the host
     ///   without an explicit [`Initiator::cancel`].
-    /// - A result that arrived by the deadline wins over the timer.
+    /// - A result validated and selected before the deadline remains terminal.
     pub async fn call(
         &self,
         method: &str,
@@ -541,12 +756,12 @@ impl Initiator {
     /// Cancellable RPC: same as [`Initiator::call`] but aborts early when
     /// `cancel` fires. On cancellation this sends best-effort `Cancel{}`
     /// for an admitted request, abandons the waiter, and returns
-    /// `CANCELLED`. The host still ends the RPC with exactly one
-    /// terminal `result` (completion wins races); the late result is
+    /// `CANCELLED` unless the deadline has already been reached. Cancellation
+    /// is advisory for host execution; its late result is
     /// ignored as unknown. (`SNTR-RPC-005/021`.)
     ///
-    /// Tie-breaks (recorded, open B10): completion beats both
-    /// cancellation and deadline; cancellation beats deadline.
+    /// RFC 0004 D4: at every pending terminal gate, reached deadline wins;
+    /// otherwise the first eligible observed candidate wins irreversibly.
     pub async fn call_cancellable(
         &self,
         method: &str,
@@ -585,12 +800,39 @@ impl Initiator {
         mut id_out: Option<&mut u64>,
     ) -> (u64, Result<Vec<u8>, SyntraError>) {
         let fail = |e: SyntraError| (0u64, Err(e));
-        let deadline = rpc_now() + self.budget(timeout_ms);
+        if !self.conn.shared.clock.is_continuous() {
+            self.conn.on_transport_lost().await;
+            return fail(SyntraError::Unavailable("elapsed continuity lost".into()));
+        }
+        let deadline = self.conn.shared.clock.now() + self.budget(timeout_ms);
         let admission = async {
+            if self.conn.is_closed()
+                || self.conn.writer_is_fenced()
+                || self.conn.lifecycle_blocked()
+                || self
+                    .conn
+                    .shared
+                    .shutdown_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(SyntraError::Closed("connection closed".into()));
+            }
+            // Keep ID assignment and FIFO queue insertion in the same order.
+            // This lock is dropped on every cancelled/expired reservation; a
+            // skipped ID is permanently retired, never reissued.
+            let _admission = self.conn.shared.rpc_admission.lock().await;
             // Hold the read lock only through pending insertion, so close
             // cannot drain the table just before a late insertion.
             let state = self.conn.shared.state.read().await;
-            if self.conn.is_closed() || self.conn.writer_is_fenced() {
+            if self.conn.is_closed()
+                || self.conn.writer_is_fenced()
+                || self.conn.lifecycle_blocked()
+                || self
+                    .conn
+                    .shared
+                    .shutdown_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
                 return Err(SyntraError::Closed("connection closed".to_string()));
             }
             if *state != ConnectionState::Active {
@@ -608,7 +850,16 @@ impl Initiator {
                     code: ErrorCode::FailedPrecondition,
                     message: "no negotiated version".to_string(),
                 })?;
-            let id = self.alloc_id().await?;
+            let id = match self.alloc_id() {
+                Ok(id) => id,
+                Err(error) => {
+                    // Closing takes the state write lock. Never try to upgrade
+                    // our admission read guard while exhausting the ID space.
+                    drop(state);
+                    self.conn.fail_protocol_and_close(error.clone()).await;
+                    return Err(error);
+                }
+            };
             if let Some(slot) = id_out.as_deref_mut() {
                 *slot = id;
             }
@@ -640,17 +891,22 @@ impl Initiator {
             if self.conn.is_closed()
                 || self.conn.writer_is_fenced()
                 || *state != ConnectionState::Active
+                || self
+                    .conn
+                    .shared
+                    .shutdown_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
             {
                 return Err(SyntraError::Closed("connection closed".to_string()));
             }
             // select! checked before polling admission. Re-check at the
             // actual enqueue point as encoding/lock acquisition may have
             // consumed the remaining budget during that poll.
+            if self.conn.shared.clock.now() >= deadline {
+                return Err(SyntraError::DeadlineExceeded(format!("{method} timed out")));
+            }
             if cancel.is_cancelled() {
                 return Err(SyntraError::Cancelled(format!("{method} cancelled")));
-            }
-            if rpc_now() >= deadline {
-                return Err(SyntraError::DeadlineExceeded(format!("{method} timed out")));
             }
             guard.enqueue(bytes, |bytes| {
                 permit.send(bytes);
@@ -664,15 +920,24 @@ impl Initiator {
         // sent for work that never left the initiator.
         let admitted = tokio::select! {
             biased;
-            _ = cancel.cancelled() => Err(SyntraError::Cancelled(format!("{method} cancelled"))),
-            _ = rpc_sleep_until(deadline) => Err(SyntraError::DeadlineExceeded(format!("{method} timed out"))),
+            _ = self.conn.shared.clock.sleep_until(deadline) => Err(SyntraError::DeadlineExceeded(format!("{method} timed out"))),
+            _ = cancel.cancelled() => Err(if self.conn.shared.clock.now() >= deadline {
+                SyntraError::DeadlineExceeded(format!("{method} timed out"))
+            } else { SyntraError::Cancelled(format!("{method} cancelled")) }),
             admitted = admission => admitted,
         };
         let (id, version, mut rx, mut failure, guard) = match admitted {
             Ok(admitted) => admitted,
-            Err(e) => return fail(e),
+            Err(e) => {
+                if !self.conn.shared.clock.is_continuous() {
+                    self.conn.on_transport_lost().await;
+                    return fail(SyntraError::Unavailable("elapsed continuity lost".into()));
+                }
+                return fail(e);
+            }
         };
-        // Completion wins every race (biased, result branch first).
+        // Results in these channels have ALREADY passed the terminal gate.
+        // Candidate notification order alone cannot replace a selected result.
         enum Outcome {
             Done(Result<PendingOutcome, RecvError>),
             Local(SyntraError),
@@ -689,23 +954,15 @@ impl Initiator {
                 Ok(_) => Outcome::Done(res),
             },
             Ok(error) = &mut failure => Outcome::Local(error),
-            _ = cancel.cancelled() => match rx.try_recv() {
-                Ok(res) => Outcome::Done(Ok(res)),
-                _ => Outcome::Cancelled,
-            },
-            _ = rpc_sleep_until(deadline) => match rx.try_recv() {
-                Ok(res) => Outcome::Done(Ok(res)),
-                _ if cancel.is_cancelled() => Outcome::Cancelled,
-                _ => Outcome::TimedOut,
-            },
+            _ = cancel.cancelled() => Outcome::Cancelled,
+            _ = self.conn.shared.clock.sleep_until(deadline) => Outcome::TimedOut,
         };
-        // A result/gate failure can be selected after select! polls the timer
-        // but before local termination takes the lock. Preserve that selection.
-        let selected = match &outcome {
-            Outcome::Cancelled => guard.terminate_with(|| {
-                // Queue the advisory control before releasing this registration,
-                // without awaiting/re-looking-up a potentially reused pending ID.
-                if !self.conn.is_closed() && !self.conn.writer_is_fenced() {
+        let local_candidate = match outcome {
+            Outcome::Cancelled => {
+                let selected = guard.fail(SyntraError::Cancelled(format!("{method} cancelled")));
+                // Cancellation is advisory for peer execution, but terminal
+                // locally. Bytes already handed off are never rewritten.
+                if selected && !self.conn.is_closed() && !self.conn.writer_is_fenced() {
                     let bytes = Frame {
                         version,
                         request_id: id,
@@ -714,19 +971,26 @@ impl Initiator {
                     .encode_to_vec();
                     let _ = self.conn.shared.writer.try_send(bytes);
                 }
-            }),
-            Outcome::TimedOut => guard.terminate(),
-            _ => true,
+                true
+            }
+            Outcome::TimedOut => {
+                if self.conn.shared.clock.is_continuous() {
+                    guard.fail(SyntraError::DeadlineExceeded(format!("{method} timed out")));
+                } else {
+                    self.conn.on_transport_lost().await;
+                }
+                true
+            }
+            _ => false,
         };
-        let outcome = match outcome {
-            Outcome::Cancelled | Outcome::TimedOut if !selected => match rx.try_recv() {
-                Ok(result) => Outcome::Done(Ok(result)),
-                Err(_) => match failure.try_recv() {
-                    Ok(error) => Outcome::Local(error),
-                    Err(_) => Outcome::Local(SyntraError::Closed("rpc waiter dropped".into())),
-                },
-            },
-            other => other,
+        let outcome = if local_candidate {
+            tokio::select! {
+                biased;
+                Ok(error) = &mut failure => Outcome::Local(error),
+                result = &mut rx => Outcome::Done(result),
+            }
+        } else {
+            outcome
         };
         match outcome {
             Outcome::Local(error) => (id, Err(error)),
@@ -755,7 +1019,7 @@ impl Initiator {
 
     /// Best-effort cancellation (`SNTR-RPC-005`). Before transport handoff,
     /// prevents request emission and settles the caller locally. After handoff
-    /// it is advisory: the host still selects a terminal result (success wins races).
+    /// it still settles locally, but cannot undo host effects or rewrite bytes.
     /// Unknown/completed ids are ignored to tolerate races.
     pub async fn cancel(&self, request_id: u64) -> Result<(), SyntraError> {
         if request_id == 0 {
@@ -764,7 +1028,9 @@ impl Initiator {
                 message: "cancel requires nonzero request_id".to_string(),
             });
         }
-        self.conn.shared.cancel_queued_rpc(request_id);
+        self.conn
+            .shared
+            .fail_rpc(request_id, SyntraError::Cancelled("RPC cancelled".into()));
         let version = match self.conn.negotiated_version().await {
             Some(v) => v,
             None => return Ok(()), // no ACTIVE connection; nothing to cancel
@@ -864,12 +1130,21 @@ impl Initiator {
     /// The transport pump must keep running and flush dequeued bytes before
     /// releasing its carrier. Unfinished RPCs settle with unknown outcome.
     pub async fn close_gracefully(&self, grace: Duration) {
-        let deadline = Instant::now() + grace;
+        if let Err(error) = self.try_close_gracefully(grace).await {
+            self.conn.record_terminal_reason(error);
+            self.close().await;
+        }
+    }
+
+    pub async fn try_close_gracefully(&self, grace: Duration) -> Result<(), SyntraError> {
+        crate::connection::validate_close_grace(grace)?;
+        let deadline = self.conn.shared.clock.now() + grace;
         self.conn.begin_closing().await;
         self.conn
             .drain_until(deadline, || self.pending_len() == 0)
             .await;
         self.conn.close().await;
+        Ok(())
     }
 
     /// First terminal local reason, retained for transport-adapter diagnostics.
@@ -1374,3 +1649,7 @@ mod tests {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod emission_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "initiator/phase2_tests.rs"]
+mod phase2_tests;

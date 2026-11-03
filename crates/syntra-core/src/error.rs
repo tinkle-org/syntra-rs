@@ -7,6 +7,25 @@
 
 use thiserror::Error;
 
+/// Maximum UTF-8 encoded bytes in public diagnostic text (RFC 0005 D2).
+pub const MAX_DIAGNOSTIC_BYTES: usize = 4_096;
+
+/// Bound locally produced public text without splitting a UTF-8 character.
+///
+/// This is not sanitization: callers must still exclude secrets and private
+/// diagnostics. Received text is validated, never silently truncated.
+pub fn bounded_diagnostic(message: impl Into<String>) -> String {
+    let mut message = message.into();
+    if message.len() > MAX_DIAGNOSTIC_BYTES {
+        let mut end = MAX_DIAGNOSTIC_BYTES;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+    }
+    message
+}
+
 /// Wire error codes. Mirrors `syntra.v1.ErrorCode` (errors.proto).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i32)]
@@ -107,7 +126,7 @@ impl RpcError {
         Self {
             code,
             raw_code: None,
-            message: message.into(),
+            message: bounded_diagnostic(message),
         }
     }
 }

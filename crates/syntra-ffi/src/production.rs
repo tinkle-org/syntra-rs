@@ -1,2589 +1,1534 @@
-//! Production native C ABI over transport-agnostic protocol cores.
-//!
-//! This module owns protocol mechanics only: version negotiation, frame
-//! validation, correlation tracking, deadlines, cancellation observation,
-//! and outbound queueing. The embedding application owns transport bytes,
-//! authentication policy, authorization policy, method dispatch, persistence,
-//! and recovery.
-//!
-//! Design:
-//! - Stable opaque pointer handles, opened exactly once, closed exactly once.
-//! - Explicit `(ptr, len)` buffer ownership: inputs are borrowed for the call,
-//!   outputs are owned and released exactly once with `syntra_ffi_free`.
-//! - Status codes are FFI-layer failures only. Per-RPC failures travel inside
-//!   `RpcResult` frames.
-//! - Host authentication completes asynchronously in the embedding
-//!   application. `host_accept_hello` validates shape and selects a version;
-//!   the application resolves policy, then calls `host_auth_complete` with
-//!   the bound principal to receive the `ServerReady` frame.
+//! Syntra 1.0 production ABI 1 over the shared runtime.
+//! Low-level plaintext Core frames; the application driver owns protected I/O.
+//! See syntra_production.h for the memory, callback and carrier contracts.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::pin::Pin;
 use std::ptr;
-use std::slice;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll, Waker};
+use std::thread::JoinHandle as Thread;
 use std::time::{Duration, Instant};
 
-use prost::Message;
-
-use syntra_core::{
-    validate_hello_range, validate_method, validate_wire_structure, ConnectionState, Frame,
-    ValidationContext, MAX_CREDENTIAL_BYTES, MAX_FRAME_BYTES,
+use syntra_core::{ErrorCode, SyntraError, MAX_CREDENTIAL_BYTES, MAX_FRAME_BYTES};
+use syntra_runtime::elapsed::{ElapsedClock, ElapsedSource};
+use syntra_runtime::{
+    AuthError, Authenticator, CancelToken, ConnectionConfig, ExecutionBudget, ExecutionLease,
+    Handler, HandlerFut, HandlerOutcome, Host, Initiator, Principal,
 };
+use tokio::runtime::{Builder, Handle};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
-// -- ABI version and status -----------------------------------------------
+const OK: i32 = 0;
+const EMPTY: i32 = 1;
+const INCOMPLETE: i32 = 2;
+const INVALID: i32 = -1;
+const CLOSED: i32 = -2;
+const MISMATCH: i32 = -3;
+const INTERNAL: i32 = -6;
+const STALE: i32 = -7;
+const BUSY: i32 = -8;
+const LIMIT: usize = 32;
 
-/// Production ABI version. Bumped on any incompatible change.
-pub const SYNTRA_FFI_ABI_VERSION: u32 = 1;
+/// Sole production ABI; independent of Core wire/profile versions.
+pub const SYNTRA_ABI_VERSION: u32 = 1;
+/// Plaintext Core frame adapter, not a secure carrier.
+pub const SYNTRA_CAP_CORE: u64 = 1;
+/// Reserved cryptographic record protection; unset by this plaintext adapter.
+pub const SYNTRA_CAP_RECORD_PROTECTION: u64 = 2;
+/// Typed recovery client and foreign persistence receipts, not a provider.
+pub const SYNTRA_CAP_RECOVERY_CLIENT: u64 = 4;
+/// Shared-runtime suspend/wake lifecycle and elapsed clock integration.
+pub const SYNTRA_CAP_LIFECYCLE: u64 = 8;
 
-/// FFI-layer success.
-pub const SYNTRA_FFI_OK: i32 = 0;
-/// Invalid argument, malformed frame, or protocol violation.
-pub const SYNTRA_FFI_INVALID: i32 = -1;
-/// Operation on a closed handle.
-pub const SYNTRA_FFI_CLOSED: i32 = -2;
-/// ABI version mismatch. Reserved for future use; not returned. Compare
-/// `syntra_ffi_abi_version()` against `SYNTRA_FFI_ABI_VERSION` out of band.
-pub const SYNTRA_FFI_ABI_MISMATCH: i32 = -3;
-/// Allocation failure.
-pub const SYNTRA_FFI_NOMEM: i32 = -4;
-/// Deadline expired. Reserved as a return code; expiration is reported via
-/// out-params (`expired=1`) and reap lists, with `SYNTRA_FFI_OK` returned.
-pub const SYNTRA_FFI_EXPIRED: i32 = -5;
-/// Internal failure (including contained panic).
-pub const SYNTRA_FFI_INTERNAL: i32 = -6;
+type AbiResult<T> = Result<T, i32>;
+type Output = Result<Vec<u8>, SyntraError>;
+type Work = JoinHandle<(u64, Output)>;
 
-/// Maximum RPC timeout enforced at this boundary (30 s).
-const MAX_RPC_TIMEOUT_MS: u32 = 30_000;
-/// Maximum concurrent RPCs enforced when the opener requests zero.
-const DEFAULT_MAX_PENDING: u32 = 16;
-/// Hard cap for concurrent RPCs at this boundary.
-const HARD_MAX_PENDING: u32 = 256;
-/// Cap for drained terminal IDs per call.
-const MAX_DRAIN_IDS: usize = 256;
+// IDs fence replacement handles as well as per-handle slots. Exhaustion is
+// permanent; no wrapping, random collision assumption or pointer identity.
+static NEXT: AtomicU64 = AtomicU64::new(1);
+fn fresh() -> AbiResult<u64> {
+    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .map_err(|_| INTERNAL)
+}
 
-/// Shared admission limits for host results, expiry results and notifications.
-const MAX_OUTBOUND_FRAMES: usize = 256;
-const MAX_OUTBOUND_BYTES: usize = 16 * MAX_FRAME_BYTES;
-
-// -- Opaque handles --------------------------------------------------------
-
-/// Opaque initiator core. Transport pump lives in the embedding application.
+/// Synchronous policy hooks, copied at open. Context is an opaque caller word.
 #[repr(C)]
-pub struct syntra_ffi_client_t {
-    inner: Mutex<ClientInner>,
+#[derive(Clone, Copy)]
+pub struct syntra_policy_t {
+    pub context: usize,
+    pub authenticate:
+        Option<unsafe extern "C" fn(usize, *const u8, usize, *mut u8, usize, *mut usize) -> i32>,
+    pub authorize: Option<unsafe extern "C" fn(usize, *const u8, usize, *const u8, usize) -> i32>,
 }
 
-/// Opaque responder core. Dispatch lives in the embedding application.
+/// Trusted local elapsed nanoseconds, sampled promptly on arbitrary threads.
 #[repr(C)]
-pub struct syntra_ffi_host_t {
-    inner: Mutex<HostInner>,
+#[derive(Clone, Copy)]
+pub struct syntra_clock_t {
+    pub context: usize,
+    pub sample: Option<unsafe extern "C" fn(usize, *mut u64) -> i32>,
 }
 
-struct PendingCall {
-    deadline: Instant,
-    #[allow(dead_code)]
-    method: String,
+struct ClockSource(syntra_clock_t);
+impl ElapsedSource for ClockSource {
+    fn elapsed(&self) -> Option<Duration> {
+        let mut nanos = 0;
+        let sample = self.0.sample?;
+        // SAFETY: caller retains callback/context through owner destruction.
+        // The callback may only write this live scalar, and cannot reenter FFI.
+        (unsafe { sample(self.0.context, &mut nanos) } == 0).then_some(Duration::from_nanos(nanos))
+    }
 }
 
-struct ClientInner {
-    min_version: u32,
-    max_version: u32,
-    credential: Vec<u8>,
-    hello_sent: bool,
-    default_timeout_ms: u32,
-    max_pending: u32,
-    negotiated: u32,
-    active: bool,
-    pending: HashMap<u64, PendingCall>,
-    outcomes: HashMap<u64, Vec<u8>>,
-    notifications: VecDeque<Vec<u8>>,
-    /// Cumulative notifications dropped under overflow (bounded queue,
-    /// non-blocking drop-newest). Paired with `notification_dropped_bytes`;
-    /// both advance exactly once per drop (no double-counting).
-    notification_dropped: u64,
-    notification_dropped_bytes: u64,
-    closed: bool,
-}
-
-struct HostCall {
-    deadline: Instant,
-}
-
-struct HostInner {
-    min_version: u32,
-    max_version: u32,
-    max_pending: u32,
-    negotiated: u32,
-    active: bool,
-    principal: String,
-    connection_id: String,
-    pending_queue: VecDeque<(u64, Vec<u8>)>,
-    pending_map: HashMap<u64, HostCall>,
-    cancelled: HashSet<u64>,
-    outbound: VecDeque<Vec<u8>>,
-    outbound_bytes: usize,
-    closed: bool,
-}
-
-impl HostInner {
-    /// Reserve before retiring any pending call so backpressure is retryable.
-    fn reserve_outbound(&mut self, frames: usize, bytes: usize) -> Result<(), i32> {
-        if frames > MAX_OUTBOUND_FRAMES - self.outbound.len()
-            || bytes > MAX_OUTBOUND_BYTES - self.outbound_bytes
-        {
-            return Err(SYNTRA_FFI_NOMEM);
+struct Policy(syntra_policy_t);
+impl Authenticator for Policy {
+    fn authenticate(&self, credential: &[u8]) -> Result<Principal, AuthError> {
+        let mut principal = [0u8; 1024];
+        let mut len = 0;
+        let callback = self.0.authenticate.ok_or_else(AuthError::unauthenticated)?;
+        // SAFETY: callbacks/context remain live until successful destroy. The
+        // header prohibits retention/reentry and bounds writes to this stack
+        // buffer. All borrowed slices live through this synchronous invocation.
+        let code = unsafe {
+            callback(
+                self.0.context,
+                credential.as_ptr(),
+                credential.len(),
+                principal.as_mut_ptr(),
+                principal.len(),
+                &mut len,
+            )
+        };
+        if code != 0 || !(1..=principal.len()).contains(&len) {
+            return Err(if code == 7 {
+                AuthError::denied()
+            } else {
+                AuthError::unauthenticated()
+            });
         }
-        self.outbound
-            .try_reserve(frames)
-            .map_err(|_| SYNTRA_FFI_NOMEM)
-    }
-
-    fn push_outbound(&mut self, bytes: Vec<u8>) {
-        self.outbound_bytes += bytes.len();
-        self.outbound.push_back(bytes);
+        let subject =
+            std::str::from_utf8(&principal[..len]).map_err(|_| AuthError::unauthenticated())?;
+        Ok(Principal::new(subject))
     }
 }
 
-// -- Buffer helpers --------------------------------------------------------
-
-fn init_output(out: *mut *mut u8, out_len: *mut usize) -> Result<(), i32> {
-    if out.is_null() || out_len.is_null() {
-        return Err(SYNTRA_FFI_INVALID);
+struct Dispatch {
+    method: Option<String>,
+    payload: Vec<u8>,
+    cancel: CancelToken,
+    reply: oneshot::Sender<HandlerOutcome>,
+    // Foreign execution can outlive cancellation/drop of HandlerFut. This
+    // lease is released only on completion acknowledgement, or before delivery.
+    _lease: ExecutionLease,
+}
+#[derive(Default)]
+struct Dispatches(HashMap<u64, Dispatch>);
+impl Dispatches {
+    fn reap_undelivered(&mut self) {
+        self.0
+            .retain(|_, d| d.method.is_none() || !d.reply.is_closed());
     }
+}
+struct ForeignHandler {
+    policy: Policy,
+    dispatches: Arc<Mutex<Dispatches>>,
+}
+impl Handler for ForeignHandler {
+    fn authorize(&self, principal: &Principal, method: &str) -> Result<(), AuthError> {
+        let callback = self.policy.0.authorize.ok_or_else(AuthError::denied)?;
+        // SAFETY: same lifetime/reentry contract as authenticate; these slices
+        // are immutable and borrowed only for this synchronous invocation.
+        let code = unsafe {
+            callback(
+                self.policy.0.context,
+                principal.subject.as_ptr(),
+                principal.subject.len(),
+                method.as_ptr(),
+                method.len(),
+            )
+        };
+        match code {
+            0 => Ok(()),
+            16 => Err(AuthError::unauthenticated()),
+            _ => Err(AuthError::denied()),
+        }
+    }
+
+    fn handle(&self, _: String, _: Vec<u8>, _: CancelToken) -> HandlerFut {
+        // Host always invokes handle_with_execution. Fail closed if that ever
+        // changes; never dispatch foreign work without an execution lease.
+        Box::pin(async { HandlerOutcome::error(ErrorCode::Internal, "execution lease required") })
+    }
+
+    fn handle_with_execution(
+        &self,
+        method: String,
+        payload: Vec<u8>,
+        cancel: CancelToken,
+        lease: ExecutionLease,
+    ) -> HandlerFut {
+        let (tx, rx) = oneshot::channel();
+        let admitted = (|| {
+            let mut slots = self.dispatches.lock().map_err(|_| INTERNAL)?;
+            slots.reap_undelivered();
+            if slots.0.len() == LIMIT {
+                return Err(BUSY);
+            }
+            slots.0.insert(
+                fresh()?,
+                Dispatch {
+                    method: Some(method),
+                    payload,
+                    cancel,
+                    reply: tx,
+                    _lease: lease,
+                },
+            );
+            Ok(())
+        })();
+        Box::pin(async move {
+            if admitted.is_err() {
+                return HandlerOutcome::error(ErrorCode::ResourceExhausted, "dispatch unavailable");
+            }
+            rx.await.unwrap_or_else(|_| {
+                HandlerOutcome::error(ErrorCode::Internal, "completion owner lost")
+            })
+        })
+    }
+}
+
+#[derive(Clone)]
+enum Endpoint {
+    Client(Initiator),
+    Host(Arc<Host>),
+}
+impl Endpoint {
+    fn clock(&self) -> ElapsedClock {
+        match self {
+            Self::Client(c) => c.elapsed_clock(),
+            Self::Host(h) => h.elapsed_clock(),
+        }
+    }
+    fn suspend(&self) {
+        match self {
+            Self::Client(c) => c.suspend(),
+            Self::Host(h) => h.suspend(),
+        }
+    }
+    async fn platform_wake(&self) {
+        match self {
+            Self::Client(c) => c.platform_wake().await,
+            Self::Host(h) => h.platform_wake().await,
+        }
+    }
+    fn closed(&self) -> bool {
+        match self {
+            Self::Client(c) => c.is_closed(),
+            Self::Host(h) => h.is_closed(),
+        }
+    }
+    fn reason(&self) -> i32 {
+        match self {
+            Self::Client(c) => c.terminal_reason(),
+            Self::Host(h) => h.terminal_reason(),
+        }
+        .map_or(0, |e| e.code().as_i32())
+    }
+    fn begin_shutdown(&self, total: Duration) -> AbiResult<syntra_runtime::ShutdownBudget> {
+        match self {
+            Self::Client(c) => c.begin_shutdown(total),
+            Self::Host(h) => h.begin_shutdown(total),
+        }
+        .map_err(|_| INVALID)?;
+        match self {
+            Self::Client(c) => c.shutdown_budget(),
+            Self::Host(h) => h.shutdown_budget(),
+        }
+        .ok_or(INTERNAL)
+    }
+    fn shutdown_report(&self) -> syntra_runtime::ShutdownReport {
+        match self {
+            Self::Client(c) => c.shutdown_report(),
+            Self::Host(h) => h.shutdown_report(),
+        }
+    }
+    fn register_reader(&self) -> AbiResult<()> {
+        match self {
+            Self::Client(c) => c.register_transport_tasks(1),
+            Self::Host(h) => h.register_transport_tasks(1),
+        }
+        .map_err(|_| INTERNAL)
+    }
+    fn reader_joined(&self) -> AbiResult<()> {
+        match self {
+            Self::Client(c) => c.acknowledge_transport_task_joined(),
+            Self::Host(h) => h.acknowledge_transport_task_joined(),
+        }
+        .map_err(|_| INTERNAL)
+    }
+    fn carrier_closed(&self) {
+        match self {
+            Self::Client(c) => c.acknowledge_transport_closed(),
+            Self::Host(h) => h.acknowledge_transport_closed(),
+        }
+    }
+    async fn transport_lost(&self) {
+        match self {
+            Self::Client(c) => c.on_transport_lost().await,
+            Self::Host(h) => h.on_transport_lost().await,
+        }
+    }
+}
+
+struct Job {
+    work: Option<Work>,
+    result: Option<AbiResult<(u64, Output)>>,
+    cancel: Option<CancelToken>,
+    recovery: bool,
+}
+impl Job {
+    fn observe(&mut self) -> bool {
+        if let Some(work) = self.work.as_mut() {
+            if work.is_finished() {
+                if let Poll::Ready(result) =
+                    Pin::new(work).poll(&mut Context::from_waker(Waker::noop()))
+                {
+                    self.result = Some(result.map_err(|_| INTERNAL));
+                    self.work = None;
+                }
+            }
+        }
+        self.result.is_some()
+    }
+}
+struct Shutdown {
+    deadline: Instant,
+    drain_cutoff: Instant,
+    work: Option<JoinHandle<()>>,
+    carrier_closed: bool,
+}
+struct State {
+    writer: mpsc::Receiver<Vec<u8>>,
+    receipts: VecDeque<(u64, Instant)>,
+    emitting: Option<u64>,
+    jobs: HashMap<u64, Job>,
+    shutdown: Option<Shutdown>,
+    withdrawal: Option<JoinHandle<()>>,
+    transport_loss: Option<JoinHandle<()>>,
+    wake: Option<JoinHandle<()>>,
+    retired: bool,
+    notification_pending: Option<u64>,
+    failed: bool,
+    stop: Option<oneshot::Sender<()>>,
+    thread: Option<Thread<()>>,
+}
+
+/// Opaque native owner. No address is used as a generation or completion ID.
+#[repr(C)]
+pub struct syntra_t {
+    generation: u64,
+    runtime: Handle,
+    endpoint: Endpoint,
+    inbound: mpsc::Sender<(Vec<u8>, Instant)>,
+    reader: Mutex<Option<JoinHandle<()>>>,
+    dispatches: Arc<Mutex<Dispatches>>,
+    handshake_started: AtomicBool,
+    recovery: Mutex<Option<Arc<recovery::Recovery>>>,
+    // std Mutex: synchronous ownership transitions only, never held across
+    // await or foreign policy callbacks. Runtime tasks use separate channels.
+    state: Mutex<State>,
+}
+
+fn config() -> ConnectionConfig {
+    ConnectionConfig {
+        writer_capacity: LIMIT,
+        notification_capacity: LIMIT,
+        ..ConnectionConfig::default()
+    }
+}
+
+fn open(policy: Option<syntra_policy_t>) -> AbiResult<Box<syntra_t>> {
+    open_with_clock(policy, None)
+}
+
+fn open_with_clock(
+    policy: Option<syntra_policy_t>,
+    clock: Option<ElapsedClock>,
+) -> AbiResult<Box<syntra_t>> {
+    let generation = fresh()?;
+    let dispatches = Arc::new(Mutex::new(Dispatches::default()));
+    let slots = dispatches.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (stop, stopped) = oneshot::channel();
+    let thread = std::thread::Builder::new()
+        .name("syntra-ffi".into())
+        .spawn(move || {
+            // A dedicated current-thread executor keeps timers/tasks running while
+            // foreign code is idle, without blocking a caller-owned Tokio worker.
+            let runtime = match Builder::new_current_thread().enable_time().build() {
+                Ok(r) => r,
+                Err(_) => {
+                    let _ = ready_tx.send(Err(INTERNAL));
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                let built = (|| {
+                    let (endpoint, writer) = if let Some(callbacks) = policy {
+                        static BUDGET: OnceLock<ExecutionBudget> = OnceLock::new();
+                        let (h, rx) = Host::try_new_with_execution_budget_and_clock(
+                            config(),
+                            Arc::new(Policy(callbacks)),
+                            Arc::new(ForeignHandler {
+                                policy: Policy(callbacks),
+                                dispatches: slots,
+                            }),
+                            BUDGET.get_or_init(|| ExecutionBudget::new(1024)).clone(),
+                            clock.unwrap_or_default(),
+                        )
+                        .map_err(|_| INVALID)?;
+                        (Endpoint::Host(h), rx)
+                    } else {
+                        let (c, rx) =
+                            Initiator::try_new_with_clock(config(), clock.unwrap_or_default())
+                                .map_err(|_| INVALID)?;
+                        (Endpoint::Client(c), rx)
+                    };
+                    endpoint.register_reader()?;
+                    let (inbound, mut rx) = mpsc::channel::<(Vec<u8>, Instant)>(LIMIT);
+                    let peer = endpoint.clone();
+                    let reader = tokio::spawn(async move {
+                        while let Some((bytes, received)) = rx.recv().await {
+                            match &peer {
+                                Endpoint::Client(c) => c.ingest(&bytes).await,
+                                Endpoint::Host(h) => h.ingest_received_at(&bytes, received).await,
+                            }
+                        }
+                    });
+                    Ok((Handle::current(), endpoint, writer, inbound, reader))
+                })();
+                if ready_tx.send(built).is_ok() {
+                    let _ = stopped.await;
+                }
+            });
+            // No FFI spawn_blocking jobs or foreign callbacks are started during
+            // teardown. Dropping this runtime cancels remaining cooperative tasks;
+            // the native thread is subsequently joined before destroy succeeds.
+            drop(runtime);
+        })
+        .map_err(|_| INTERNAL)?;
+    let (runtime, endpoint, writer, inbound, reader) = match ready_rx.recv() {
+        Ok(Ok(built)) => built,
+        _ => {
+            // An initialization error may leave the runtime awaiting shutdown.
+            drop(stop);
+            let _ = thread.join();
+            return Err(INTERNAL);
+        }
+    };
+    Ok(Box::new(syntra_t {
+        generation,
+        runtime,
+        endpoint,
+        inbound,
+        reader: Mutex::new(Some(reader)),
+        dispatches,
+        handshake_started: AtomicBool::new(false),
+        recovery: Mutex::new(None),
+        state: Mutex::new(State {
+            writer,
+            receipts: VecDeque::new(),
+            emitting: None,
+            jobs: HashMap::new(),
+            shutdown: None,
+            withdrawal: None,
+            transport_loss: None,
+            wake: None,
+            retired: false,
+            notification_pending: None,
+            failed: false,
+            stop: Some(stop),
+            thread: Some(thread),
+        }),
+    }))
+}
+
+impl syntra_t {
+    fn submit(
+        &self,
+        f: impl Future<Output = (u64, Output)> + Send + 'static,
+        cancel: Option<CancelToken>,
+    ) -> AbiResult<u64> {
+        let mut state = self.state.lock().map_err(|_| INTERNAL)?;
+        if state.failed {
+            return Err(INTERNAL);
+        }
+        if state.retired
+            || state.shutdown.is_some()
+            || state.withdrawal.is_some()
+            || self.endpoint.closed()
+        {
+            return Err(CLOSED);
+        }
+        if state.jobs.len() >= LIMIT {
+            return Err(BUSY);
+        }
+        let token = fresh()?;
+        state.jobs.insert(
+            token,
+            Job {
+                work: Some(self.runtime.spawn(f)),
+                result: None,
+                cancel,
+                recovery: false,
+            },
+        );
+        Ok(token)
+    }
+}
+
+fn boundary(f: impl FnOnce() -> AbiResult<i32>) -> i32 {
+    catch_unwind(AssertUnwindSafe(f))
+        .unwrap_or(Err(INTERNAL))
+        .unwrap_or_else(|code| code)
+}
+
+// Raw-pointer access is confined to these helpers and the consuming destroy.
+// SAFETY contracts are imposed by the header, not inferred from null checks.
+unsafe fn owner<'a>(p: *mut syntra_t, generation: u64) -> AbiResult<&'a syntra_t> {
+    // SAFETY: caller holds a live owner, no concurrent destroy, properly aligned.
+    let owner = unsafe { p.as_ref() }.ok_or(INVALID)?;
+    if owner.generation != generation {
+        return Err(STALE);
+    }
+    Ok(owner)
+}
+unsafe fn write<T>(p: *mut T, value: T) -> AbiResult<()> {
+    if p.is_null() {
+        return Err(INVALID);
+    }
+    // SAFETY: required writable/aligned nonaliasing output lives for this call.
     unsafe {
-        *out = ptr::null_mut();
-        *out_len = 0;
+        p.write(value);
     }
     Ok(())
 }
-
-fn borrow_bytes(ptr: *const u8, len: usize) -> Result<Vec<u8>, i32> {
+unsafe fn bytes(p: *const u8, len: usize, max: usize) -> AbiResult<Vec<u8>> {
+    if len > max || (p.is_null() && len != 0) {
+        return Err(INVALID);
+    }
     if len == 0 {
         return Ok(Vec::new());
     }
-    if ptr.is_null() {
-        return Err(SYNTRA_FFI_INVALID);
-    }
-    unsafe { Ok(slice::from_raw_parts(ptr, len).to_vec()) }
+    // SAFETY: bounded input region is live/immutable for the call; copied before
+    // returning or scheduling work, with no retained foreign pointer.
+    Ok(unsafe { std::slice::from_raw_parts(p, len) }.to_vec())
 }
-
-fn alloc_owned(bytes: &[u8], out_ptr: *mut *mut u8, out_len: *mut usize) -> i32 {
-    if out_ptr.is_null() || out_len.is_null() {
-        return SYNTRA_FFI_INVALID;
-    }
-    unsafe {
-        *out_ptr = ptr::null_mut();
-        *out_len = 0;
-    }
-    if bytes.is_empty() {
-        return SYNTRA_FFI_OK;
-    }
-    if bytes.len() > MAX_FRAME_BYTES {
-        return SYNTRA_FFI_INVALID;
-    }
-    let mut boxed = bytes.to_vec().into_boxed_slice();
-    let ptr = boxed.as_mut_ptr();
-    let len = boxed.len();
-    std::mem::forget(boxed);
-    unsafe {
-        *out_ptr = ptr;
-        *out_len = len;
-    }
-    SYNTRA_FFI_OK
-}
-
-fn alloc_owned_vec(bytes: Vec<u8>, out_ptr: *mut *mut u8, out_len: *mut usize) -> i32 {
-    if out_ptr.is_null() || out_len.is_null() {
-        return SYNTRA_FFI_INVALID;
-    }
-    unsafe {
-        *out_ptr = ptr::null_mut();
-        *out_len = 0;
-    }
-    if bytes.is_empty() {
-        return SYNTRA_FFI_OK;
-    }
-    let mut boxed = bytes.into_boxed_slice();
-    let ptr = boxed.as_mut_ptr();
-    let len = boxed.len();
-    std::mem::forget(boxed);
-    unsafe {
-        *out_ptr = ptr;
-        *out_len = len;
-    }
-    SYNTRA_FFI_OK
-}
-
-fn effective_timeout_ms(requested: u32, def: u32) -> u64 {
-    let base = if requested == 0 { def } else { requested };
-    let clamped = base.min(MAX_RPC_TIMEOUT_MS);
-    if clamped == 0 {
-        1
+unsafe fn buffer(data: Vec<u8>, out: *mut *mut u8, len: *mut usize) -> AbiResult<()> {
+    let data = data.into_boxed_slice();
+    let n = data.len();
+    let p = if n == 0 {
+        ptr::null_mut()
     } else {
-        clamped as u64
-    }
-}
-
-fn generate_connection_id() -> Result<String, i32> {
-    connection_id_with_rng(getrandom::fill)
-}
-
-fn connection_id_with_rng<E>(fill: impl FnOnce(&mut [u8]) -> Result<(), E>) -> Result<String, i32> {
-    let mut random = [0u8; 16];
-    fill(&mut random).map_err(|_| SYNTRA_FFI_INTERNAL)?;
-    let mut id = String::with_capacity(32);
-    for byte in random {
-        use std::fmt::Write;
-        write!(&mut id, "{byte:02x}").map_err(|_| SYNTRA_FFI_INTERNAL)?;
-    }
-    Ok(id)
-}
-
-fn deadline_result(version: u32, request_id: u64) -> Vec<u8> {
-    Frame {
-        version,
-        request_id,
-        body: Some(syntra_core::proto::frame::Body::Result(
-            syntra_core::proto::RpcResult {
-                outcome: Some(syntra_core::proto::rpc_result::Outcome::Error(
-                    syntra_core::proto::RpcError {
-                        code: syntra_core::ErrorCode::DeadlineExceeded.as_i32(),
-                        message: "deadline exceeded".to_string(),
-                    },
-                )),
-            },
-        )),
-    }
-    .encode_to_vec()
-}
-
-fn decode_frame(bytes: &[u8], ctx: ValidationContext) -> Result<Frame, i32> {
-    syntra_core::codec::decode_frame(bytes, ctx).map_err(|_| SYNTRA_FFI_INVALID)
-}
-
-fn client_lock<'a>(
-    c: *mut syntra_ffi_client_t,
-) -> Result<std::sync::MutexGuard<'a, ClientInner>, i32> {
-    if c.is_null() {
-        return Err(SYNTRA_FFI_INVALID);
-    }
-    let handle = unsafe { &*c };
-    handle.inner.lock().map_err(|_| SYNTRA_FFI_INTERNAL)
-}
-
-fn host_lock<'a>(h: *mut syntra_ffi_host_t) -> Result<std::sync::MutexGuard<'a, HostInner>, i32> {
-    if h.is_null() {
-        return Err(SYNTRA_FFI_INVALID);
-    }
-    let handle = unsafe { &*h };
-    handle.inner.lock().map_err(|_| SYNTRA_FFI_INTERNAL)
-}
-
-// -- Version and memory -----------------------------------------------------
-
-/// Returns the production ABI version (`1`).
-#[no_mangle]
-pub extern "C" fn syntra_ffi_abi_version() -> u32 {
-    SYNTRA_FFI_ABI_VERSION
-}
-
-/// Releases an owned `(ptr, len)` buffer exactly once.
-/// `(NULL, 0)` is valid and does nothing.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_free(ptr: *mut u8, len: usize) {
-    if ptr.is_null() || len == 0 {
-        return;
-    }
+        Box::into_raw(data).cast::<u8>()
+    };
+    // SAFETY: outputs were checked before ownership/state mutation at entry.
     unsafe {
-        let _ = Vec::from_raw_parts(ptr, len, len);
+        write(out, p)?;
+        write(len, n)
     }
 }
 
-// -- Client session ----------------------------------------------------------
-
-/// Opens an initiator core. The credential is retained for hello construction.
+/// Native ABI version, independent of negotiated Core wire versions.
 #[no_mangle]
-pub extern "C" fn syntra_ffi_client_open(
-    min_version: u32,
-    max_version: u32,
-    credential: *const u8,
-    credential_len: usize,
-    default_timeout_ms: u32,
-    max_concurrent: u32,
-    out: *mut *mut syntra_ffi_client_t,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if out.is_null() {
-            return SYNTRA_FFI_INVALID;
-        }
-        unsafe { *out = ptr::null_mut() };
-        if min_version == 0 || max_version == 0 || min_version > max_version {
-            return SYNTRA_FFI_INVALID;
-        }
-        // Bound the caller length before copying: a huge valid buffer would
-        // otherwise make `borrow_bytes` attempt an aborting allocation.
-        if credential_len > MAX_CREDENTIAL_BYTES {
-            return SYNTRA_FFI_INVALID;
-        }
-        let cred = match borrow_bytes(credential, credential_len) {
-            Ok(v) => v,
-            Err(c) => return c,
-        };
-        if cred.len() > MAX_CREDENTIAL_BYTES {
-            return SYNTRA_FFI_INVALID;
-        }
-        let max_pending = if max_concurrent == 0 {
-            DEFAULT_MAX_PENDING
-        } else if max_concurrent > HARD_MAX_PENDING {
-            return SYNTRA_FFI_INVALID;
-        } else {
-            max_concurrent
-        };
-        let def = if default_timeout_ms == 0 {
-            3000
-        } else {
-            default_timeout_ms.min(MAX_RPC_TIMEOUT_MS)
-        };
-        let core = Box::new(syntra_ffi_client_t {
-            inner: Mutex::new(ClientInner {
-                min_version,
-                max_version,
-                credential: cred,
-                hello_sent: false,
-                default_timeout_ms: def,
-                max_pending,
-                negotiated: 0,
-                active: false,
-                pending: HashMap::new(),
-                outcomes: HashMap::new(),
-                notifications: VecDeque::new(),
-                notification_dropped: 0,
-                notification_dropped_bytes: 0,
-                closed: false,
-            }),
-        });
-        unsafe { *out = Box::into_raw(core) };
-        SYNTRA_FFI_OK
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
+pub extern "C" fn syntra_abi_version() -> u32 {
+    SYNTRA_ABI_VERSION
+}
+/// Local implementation availability: Core, typed recovery client and lifecycle.
+/// Not peer negotiation or security status; record protection remains unset.
+#[no_mangle]
+pub extern "C" fn syntra_capabilities() -> u64 {
+    SYNTRA_CAP_CORE | SYNTRA_CAP_RECOVERY_CLIENT | SYNTRA_CAP_LIFECYCLE
 }
 
-/// Builds the hello frame once for transport transmission, then drops the stored credential.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_client_hello_frame(
-    c: *mut syntra_ffi_client_t,
-    out: *mut *mut u8,
-    out_len: *mut usize,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if let Err(code) = init_output(out, out_len) {
-            return code;
-        }
-        let mut inner = match client_lock(c) {
-            Ok(g) => g,
-            Err(code) => return code,
-        };
-        if inner.closed {
-            return SYNTRA_FFI_CLOSED;
-        }
-        if inner.hello_sent
-            || inner.active
-            || validate_hello_range(inner.min_version, inner.max_version).is_err()
-        {
-            return SYNTRA_FFI_INVALID;
-        }
-        let hello = syntra_core::proto::ClientHello {
-            min_version: inner.min_version,
-            max_version: inner.max_version,
-            credential: inner.credential.clone().into(),
-        };
-        let frame = Frame {
-            version: inner.max_version,
-            request_id: 0,
-            body: Some(syntra_core::proto::frame::Body::Hello(hello)),
-        };
-        let bytes = frame.encode_to_vec();
-        if bytes.len() > MAX_FRAME_BYTES {
-            return SYNTRA_FFI_INVALID;
-        }
-        let rc = alloc_owned_vec(bytes, out, out_len);
-        if rc == SYNTRA_FFI_OK {
-            inner.hello_sent = true;
-            inner.credential = Vec::new();
-        }
-        rc
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
+// Each exported unsafe entry uses the common header's pointer contract.
+// Keeping it in one native header avoids divergent per-language contracts.
+#[allow(clippy::missing_safety_doc)]
+mod exports {
+    use super::*;
 
-/// Activates the initiator from a ready frame.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_client_activate(
-    c: *mut syntra_ffi_client_t,
-    ready_frame: *const u8,
-    len: usize,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if len > MAX_FRAME_BYTES {
-            return SYNTRA_FFI_INVALID;
-        }
-        let bytes = match borrow_bytes(ready_frame, len) {
-            Ok(v) => v,
-            Err(code) => return code,
-        };
-        let frame = match decode_frame(
-            &bytes,
-            ValidationContext::pre_handshake(ConnectionState::Authenticating),
-        ) {
-            Ok(f) => f,
-            Err(code) => return code,
-        };
-        let mut inner = match client_lock(c) {
-            Ok(g) => g,
-            Err(code) => return code,
-        };
-        if inner.closed {
-            return SYNTRA_FFI_CLOSED;
-        }
-        if inner.active || !inner.hello_sent {
-            return SYNTRA_FFI_INVALID;
-        }
-        if frame.request_id != 0 {
-            return SYNTRA_FFI_INVALID;
-        }
-        match frame.body {
-            Some(syntra_core::proto::frame::Body::Ready(_)) => {}
-            _ => return SYNTRA_FFI_INVALID,
-        }
-        if frame.version < inner.min_version || frame.version > inner.max_version {
-            return SYNTRA_FFI_INVALID;
-        }
-        if frame.version == 0 {
-            return SYNTRA_FFI_INVALID;
-        }
-        inner.negotiated = frame.version;
-        inner.active = true;
-        SYNTRA_FFI_OK
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-/// Ingests one transport frame. Reports completed RPC ids and notifications.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_client_on_frame(
-    c: *mut syntra_ffi_client_t,
-    frame: *const u8,
-    len: usize,
-    terminal_ids: *mut u64,
-    terminal_cap: usize,
-    terminal_n: *mut usize,
-    notifications: *mut i32,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if terminal_n.is_null()
-            || notifications.is_null()
-            || (terminal_ids.is_null() && terminal_cap != 0)
-        {
-            return SYNTRA_FFI_INVALID;
-        }
-        unsafe {
-            *terminal_n = 0;
-            *notifications = 0;
-        }
-        if len > MAX_FRAME_BYTES {
-            return SYNTRA_FFI_INVALID;
-        }
-        let bytes = match borrow_bytes(frame, len) {
-            Ok(v) => v,
-            Err(code) => return code,
-        };
-        if bytes.is_empty() {
-            return SYNTRA_FFI_INVALID;
-        }
-        let mut inner = match client_lock(c) {
-            Ok(g) => g,
-            Err(code) => return code,
-        };
-        if inner.closed {
-            return SYNTRA_FFI_CLOSED;
-        }
-        if !inner.active || inner.negotiated == 0 {
-            return SYNTRA_FFI_INVALID;
-        }
-        let decoded = match decode_frame(&bytes, ValidationContext::active(inner.negotiated)) {
-            Ok(f) => f,
-            Err(code) => return code,
-        };
-        if decoded.version != inner.negotiated {
-            return SYNTRA_FFI_INVALID;
-        }
-        match decoded.body {
-            Some(syntra_core::proto::frame::Body::Result(_)) => {
-                let id = decoded.request_id;
-                if id == 0 || !inner.pending.contains_key(&id) {
-                    return SYNTRA_FFI_OK;
-                }
-                inner.pending.remove(&id);
-                inner.outcomes.insert(id, bytes);
-                if !terminal_ids.is_null() && terminal_cap > 0 {
-                    unsafe {
-                        *terminal_ids = id;
-                        *terminal_n = 1;
-                    }
-                }
-                SYNTRA_FFI_OK
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_client_open(
+        abi: u32,
+        out: *mut *mut syntra_t,
+        generation: *mut u64,
+    ) -> i32 {
+        boundary(|| {
+            // SAFETY: header requires independent writable outputs.
+            unsafe {
+                write(out, ptr::null_mut())?;
+                write(generation, 0)?;
             }
-            Some(syntra_core::proto::frame::Body::Notification(n)) => {
-                if decoded.request_id != 0 {
-                    return SYNTRA_FFI_INVALID;
-                }
-                // Bounded non-blocking queue with cumulative loss accounting
-                // (unified with async Rust `record_notification_loss` and the
-                // Go cores): when full, the incoming (newest) notification
-                // drops and the cumulative counters advance by exactly one
-                // drop plus its payload bytes. Previously queued items are
-                // preserved; no silent oldest-eviction.
-                if inner.notifications.len() >= 256 {
-                    let payload_bytes = n.payload.len() as u64;
-                    inner.notification_dropped += 1;
-                    inner.notification_dropped_bytes += payload_bytes;
-                    return SYNTRA_FFI_OK;
-                }
-                inner.notifications.push_back(bytes);
-                unsafe { *notifications = 1 };
-                SYNTRA_FFI_OK
+            if abi != SYNTRA_ABI_VERSION {
+                return Err(MISMATCH);
             }
-            _ => SYNTRA_FFI_INVALID,
-        }
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-/// Begins an RPC and returns the request frame for transport.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_client_begin_call(
-    c: *mut syntra_ffi_client_t,
-    request_id: u64,
-    method: *const u8,
-    method_len: usize,
-    payload: *const u8,
-    payload_len: usize,
-    timeout_ms: u32,
-    out_req_frame: *mut *mut u8,
-    out_len: *mut usize,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if let Err(code) = init_output(out_req_frame, out_len) {
-            return code;
-        }
-        if request_id == 0 {
-            return SYNTRA_FFI_INVALID;
-        }
-        // Bound caller lengths before copying (see borrow_bytes).
-        if method_len > 512 {
-            return SYNTRA_FFI_INVALID;
-        }
-        if payload_len > MAX_FRAME_BYTES {
-            return SYNTRA_FFI_INVALID;
-        }
-        let method_bytes = match borrow_bytes(method, method_len) {
-            Ok(v) => v,
-            Err(code) => return code,
-        };
-        let method_str = match String::from_utf8(method_bytes) {
-            Ok(s) => s,
-            Err(_) => return SYNTRA_FFI_INVALID,
-        };
-        if validate_method(&method_str).is_err() {
-            return SYNTRA_FFI_INVALID;
-        }
-        let payload_bytes = match borrow_bytes(payload, payload_len) {
-            Ok(v) => v,
-            Err(code) => return code,
-        };
-        if payload_bytes.len() > MAX_FRAME_BYTES {
-            return SYNTRA_FFI_INVALID;
-        }
-        if timeout_ms > MAX_RPC_TIMEOUT_MS {
-            return SYNTRA_FFI_INVALID;
-        }
-        let mut inner = match client_lock(c) {
-            Ok(g) => g,
-            Err(code) => return code,
-        };
-        if inner.closed {
-            return SYNTRA_FFI_CLOSED;
-        }
-        if !inner.active || inner.negotiated == 0 {
-            return SYNTRA_FFI_INVALID;
-        }
-        if inner.pending.contains_key(&request_id) || inner.outcomes.contains_key(&request_id) {
-            return SYNTRA_FFI_INVALID;
-        }
-        // Unread results retain their admission slots, bounding both their
-        // count and bytes (each result is at most MAX_FRAME_BYTES).
-        if inner.pending.len() + inner.outcomes.len() >= inner.max_pending as usize {
-            return SYNTRA_FFI_NOMEM;
-        }
-        let budget = effective_timeout_ms(timeout_ms, inner.default_timeout_ms);
-        let req = syntra_core::proto::RpcRequest {
-            method: method_str.clone(),
-            payload: payload_bytes.into(),
-            timeout_ms: budget as u32,
-        };
-        let frame = Frame {
-            version: inner.negotiated,
-            request_id,
-            body: Some(syntra_core::proto::frame::Body::Request(req)),
-        };
-        let bytes = frame.encode_to_vec();
-        if bytes.len() > MAX_FRAME_BYTES {
-            return SYNTRA_FFI_INVALID;
-        }
-        inner.pending.insert(
-            request_id,
-            PendingCall {
-                deadline: Instant::now() + Duration::from_millis(budget),
-                method: method_str,
-            },
-        );
-        alloc_owned(&bytes, out_req_frame, out_len)
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-/// Builds a cancel frame for an outstanding RPC.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_client_cancel(
-    c: *mut syntra_ffi_client_t,
-    request_id: u64,
-    out_cancel_frame: *mut *mut u8,
-    out_len: *mut usize,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if let Err(code) = init_output(out_cancel_frame, out_len) {
-            return code;
-        }
-        if request_id == 0 {
-            return SYNTRA_FFI_INVALID;
-        }
-        let inner = match client_lock(c) {
-            Ok(g) => g,
-            Err(code) => return code,
-        };
-        if inner.closed {
-            return SYNTRA_FFI_CLOSED;
-        }
-        if !inner.active || !inner.pending.contains_key(&request_id) {
-            return SYNTRA_FFI_OK;
-        }
-        let frame = Frame {
-            version: inner.negotiated,
-            request_id,
-            body: Some(syntra_core::proto::frame::Body::Cancel(
-                syntra_core::proto::Cancel {},
-            )),
-        };
-        let bytes = frame.encode_to_vec();
-        alloc_owned(&bytes, out_cancel_frame, out_len)
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-/// Takes a completed RPC outcome frame.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_client_take_outcome(
-    c: *mut syntra_ffi_client_t,
-    request_id: u64,
-    out: *mut *mut u8,
-    out_len: *mut usize,
-    present: *mut i32,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if present.is_null() {
-            return SYNTRA_FFI_INVALID;
-        }
-        unsafe { *present = 0 };
-        if let Err(code) = init_output(out, out_len) {
-            return code;
-        }
-        let mut inner = match client_lock(c) {
-            Ok(g) => g,
-            Err(code) => return code,
-        };
-        if inner.closed {
-            return SYNTRA_FFI_CLOSED;
-        }
-        match inner.outcomes.remove(&request_id) {
-            Some(bytes) => {
-                let rc = alloc_owned_vec(bytes, out, out_len);
-                if rc != SYNTRA_FFI_OK {
-                    return rc;
-                }
-                unsafe { *present = 1 };
-                SYNTRA_FFI_OK
+            let h = open(None)?;
+            // SAFETY: outputs validated before constructing the owner.
+            unsafe {
+                write(generation, h.generation)?;
+                write(out, Box::into_raw(h))?;
             }
-            None => SYNTRA_FFI_OK,
-        }
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-/// Takes the next queued notification frame.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_client_poll_notification(
-    c: *mut syntra_ffi_client_t,
-    out: *mut *mut u8,
-    out_len: *mut usize,
-    present: *mut i32,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if present.is_null() {
-            return SYNTRA_FFI_INVALID;
-        }
-        unsafe { *present = 0 };
-        if let Err(code) = init_output(out, out_len) {
-            return code;
-        }
-        let mut inner = match client_lock(c) {
-            Ok(g) => g,
-            Err(code) => return code,
-        };
-        if inner.closed {
-            return SYNTRA_FFI_CLOSED;
-        }
-        match inner.notifications.pop_front() {
-            Some(bytes) => {
-                let rc = alloc_owned_vec(bytes, out, out_len);
-                if rc != SYNTRA_FFI_OK {
-                    return rc;
-                }
-                unsafe { *present = 1 };
-                SYNTRA_FFI_OK
+            Ok(OK)
+        })
+    }
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_host_open(
+        abi: u32,
+        policy: syntra_policy_t,
+        out: *mut *mut syntra_t,
+        generation: *mut u64,
+    ) -> i32 {
+        boundary(|| {
+            // SAFETY: header requires independent writable outputs.
+            unsafe {
+                write(out, ptr::null_mut())?;
+                write(generation, 0)?;
             }
-            None => SYNTRA_FFI_OK,
-        }
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-/// Reports cumulative notification-loss totals for the initiator core:
-/// `(dropped_count, dropped_bytes)` for notifications discarded when the
-/// bounded queue was full. The queue stays non-blocking and drops the newest
-/// notification. Counters advance exactly once per drop (no double-counting)
-/// and unify with the async Rust `notification_loss` and Go `LossTotals`.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_client_notification_loss(
-    c: *mut syntra_ffi_client_t,
-    dropped_out: *mut u64,
-    dropped_bytes_out: *mut u64,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if dropped_out.is_null() || dropped_bytes_out.is_null() {
-            return SYNTRA_FFI_INVALID;
-        }
-        let inner = match client_lock(c) {
-            Ok(g) => g,
-            Err(code) => return code,
-        };
-        if inner.closed {
-            return SYNTRA_FFI_CLOSED;
-        }
-        unsafe {
-            *dropped_out = inner.notification_dropped;
-            *dropped_bytes_out = inner.notification_dropped_bytes;
-        }
-        SYNTRA_FFI_OK
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-/// Drains expired RPC ids.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_client_reap_expired(
-    c: *mut syntra_ffi_client_t,
-    ids: *mut u64,
-    cap: usize,
-    n: *mut usize,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if n.is_null() {
-            return SYNTRA_FFI_INVALID;
-        }
-        unsafe { *n = 0 };
-        if ids.is_null() && cap != 0 {
-            return SYNTRA_FFI_INVALID;
-        }
-        let mut inner = match client_lock(c) {
-            Ok(g) => g,
-            Err(code) => return code,
-        };
-        if inner.closed {
-            return SYNTRA_FFI_CLOSED;
-        }
-        let now = Instant::now();
-        let mut expired = Vec::new();
-        for (id, call) in inner.pending.iter() {
-            if call.deadline <= now {
-                expired.push(*id);
+            if abi != SYNTRA_ABI_VERSION {
+                return Err(MISMATCH);
             }
-        }
-        expired.sort_unstable();
-        let limit = cap.min(MAX_DRAIN_IDS);
-        let mut written = 0usize;
-        for id in expired.into_iter().take(limit) {
-            inner.pending.remove(&id);
-            unsafe { *ids.add(written) = id };
-            written += 1;
-        }
-        unsafe { *n = written };
-        SYNTRA_FFI_OK
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-/// Consumes the initiator handle, including on INTERNAL. No concurrent or subsequent use is valid.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_client_close(c: *mut syntra_ffi_client_t) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if c.is_null() {
-            return SYNTRA_FFI_INVALID;
-        }
-        let boxed: Box<syntra_ffi_client_t> = unsafe { Box::from_raw(c) };
-        let result = match boxed.inner.lock() {
-            Ok(mut inner) => {
-                if inner.closed {
-                    SYNTRA_FFI_CLOSED
-                } else {
-                    inner.closed = true;
-                    inner.pending.clear();
-                    inner.outcomes.clear();
-                    inner.notifications.clear();
-                    SYNTRA_FFI_OK
-                }
+            if policy.authenticate.is_none() || policy.authorize.is_none() {
+                return Err(INVALID);
             }
-            Err(_) => SYNTRA_FFI_INTERNAL,
-        };
-        // The allocation is freed on scope exit; callers must discard the pointer.
-        let _ = &boxed;
-        result
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-// -- Host session ------------------------------------------------------------
-
-/// Opens a responder core for one connection.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_host_open(
-    min_version: u32,
-    max_version: u32,
-    max_concurrent: u32,
-    out: *mut *mut syntra_ffi_host_t,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if out.is_null() {
-            return SYNTRA_FFI_INVALID;
-        }
-        unsafe { *out = ptr::null_mut() };
-        if min_version == 0 || max_version == 0 || min_version > max_version {
-            return SYNTRA_FFI_INVALID;
-        }
-        let max_pending = if max_concurrent == 0 {
-            DEFAULT_MAX_PENDING
-        } else if max_concurrent > HARD_MAX_PENDING {
-            return SYNTRA_FFI_INVALID;
-        } else {
-            max_concurrent
-        };
-        let core = Box::new(syntra_ffi_host_t {
-            inner: Mutex::new(HostInner {
-                min_version,
-                max_version,
-                max_pending,
-                negotiated: 0,
-                active: false,
-                principal: String::new(),
-                connection_id: String::new(),
-                pending_queue: VecDeque::new(),
-                pending_map: HashMap::new(),
-                cancelled: HashSet::new(),
-                outbound: VecDeque::new(),
-                outbound_bytes: 0,
-                closed: false,
-            }),
-        });
-        unsafe { *out = Box::into_raw(core) };
-        SYNTRA_FFI_OK
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-/// Validates a hello frame and selects a version. No policy is evaluated here.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_host_accept_hello(
-    h: *mut syntra_ffi_host_t,
-    frame: *const u8,
-    len: usize,
-    version_out: *mut u32,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if version_out.is_null() {
-            return SYNTRA_FFI_INVALID;
-        }
-        unsafe { *version_out = 0 };
-        if len > MAX_FRAME_BYTES {
-            return SYNTRA_FFI_INVALID;
-        }
-        let bytes = match borrow_bytes(frame, len) {
-            Ok(v) => v,
-            Err(code) => return code,
-        };
-        let decoded = match decode_frame(
-            &bytes,
-            ValidationContext::pre_handshake(ConnectionState::Connected),
-        ) {
-            Ok(f) => f,
-            Err(code) => return code,
-        };
-        let mut inner = match host_lock(h) {
-            Ok(g) => g,
-            Err(code) => return code,
-        };
-        if inner.closed {
-            return SYNTRA_FFI_CLOSED;
-        }
-        if inner.active || inner.negotiated != 0 {
-            return SYNTRA_FFI_INVALID;
-        }
-        if decoded.request_id != 0 {
-            return SYNTRA_FFI_INVALID;
-        }
-        let hello = match decoded.body {
-            Some(syntra_core::proto::frame::Body::Hello(v)) => v,
-            _ => return SYNTRA_FFI_INVALID,
-        };
-        if decoded.version != hello.max_version {
-            return SYNTRA_FFI_INVALID;
-        }
-        if validate_hello_range(hello.min_version, hello.max_version).is_err() {
-            return SYNTRA_FFI_INVALID;
-        }
-        if hello.credential.len() > MAX_CREDENTIAL_BYTES {
-            return SYNTRA_FFI_INVALID;
-        }
-        // Intersect contiguous ranges arithmetically; never materialize
-        // `(min..=max)` which a peer or embedder could make arbitrarily
-        // large. Highest overlap wins, matching `negotiate_version`
-        // semantics for contiguous host support.
-        let lo = hello.min_version.max(inner.min_version);
-        let hi = hello.max_version.min(inner.max_version);
-        if lo > hi {
-            return SYNTRA_FFI_INVALID;
-        }
-        let selected = hi;
-        inner.negotiated = selected;
-        unsafe { *version_out = selected };
-        SYNTRA_FFI_OK
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-/// Completes authentication with a host-resolved principal and returns ready.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_host_auth_complete(
-    h: *mut syntra_ffi_host_t,
-    principal: *const ::std::os::raw::c_char,
-    principal_len: usize,
-    out_ready_frame: *mut *mut u8,
-    out_len: *mut usize,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if let Err(code) = init_output(out_ready_frame, out_len) {
-            return code;
-        }
-        if principal_len > 512 {
-            return SYNTRA_FFI_INVALID;
-        }
-        let princ_bytes = match borrow_bytes(principal as *const u8, principal_len) {
-            Ok(v) => v,
-            Err(code) => return code,
-        };
-        let princ = match String::from_utf8(princ_bytes) {
-            Ok(s) => s,
-            Err(_) => return SYNTRA_FFI_INVALID,
-        };
-        if princ.is_empty() || princ.len() > 512 {
-            return SYNTRA_FFI_INVALID;
-        }
-        let mut inner = match host_lock(h) {
-            Ok(g) => g,
-            Err(code) => return code,
-        };
-        if inner.closed {
-            return SYNTRA_FFI_CLOSED;
-        }
-        if inner.active || inner.negotiated == 0 {
-            return SYNTRA_FFI_INVALID;
-        }
-        let connection_id = match generate_connection_id() {
-            Ok(id) => id,
-            Err(code) => return code,
-        };
-        let ready = syntra_core::proto::ServerReady {
-            connection_id: connection_id.clone(),
-        };
-        let frame = Frame {
-            version: inner.negotiated,
-            request_id: 0,
-            body: Some(syntra_core::proto::frame::Body::Ready(ready)),
-        };
-        let bytes = frame.encode_to_vec();
-        if bytes.len() > MAX_FRAME_BYTES {
-            return SYNTRA_FFI_INTERNAL;
-        }
-        let rc = alloc_owned_vec(bytes, out_ready_frame, out_len);
-        if rc != SYNTRA_FFI_OK {
-            return rc;
-        }
-        inner.principal = princ;
-        inner.connection_id = connection_id;
-        inner.active = true;
-        SYNTRA_FFI_OK
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-/// Ingests one transport frame. Queues dispatchable requests and reports cancels.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_host_on_frame(
-    h: *mut syntra_ffi_host_t,
-    frame: *const u8,
-    len: usize,
-    out_response: *mut *mut u8,
-    out_len: *mut usize,
-    has_response: *mut i32,
-    cancel_ids: *mut u64,
-    cancel_cap: usize,
-    cancel_n: *mut usize,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if has_response.is_null() || cancel_n.is_null() || (cancel_ids.is_null() && cancel_cap != 0)
-        {
-            return SYNTRA_FFI_INVALID;
-        }
-        if let Err(code) = init_output(out_response, out_len) {
-            return code;
-        }
-        unsafe {
-            *has_response = 0;
-            *cancel_n = 0;
-        }
-        if len > MAX_FRAME_BYTES {
-            return SYNTRA_FFI_INVALID;
-        }
-        let bytes = match borrow_bytes(frame, len) {
-            Ok(v) => v,
-            Err(code) => return code,
-        };
-        let mut inner = match host_lock(h) {
-            Ok(g) => g,
-            Err(code) => return code,
-        };
-        if inner.closed {
-            return SYNTRA_FFI_CLOSED;
-        }
-        if !inner.active || inner.negotiated == 0 {
-            return SYNTRA_FFI_INVALID;
-        }
-        let decoded = match decode_frame(&bytes, ValidationContext::active(inner.negotiated)) {
-            Ok(f) => f,
-            Err(_) => {
-                // Core validation is the primary gate, but a well-formed
-                // Request envelope with a malformed method stays a per-RPC
-                // error, never a fatal connection failure. Raw-wire
-                // structural violations (reserved tags, duplicate bodies,
-                // truncation, alloc/depth bounds) are rejected first: only
-                // a structurally sound envelope qualifies for per-RPC
-                // method-error mapping. The prost fallback below is error
-                // mapping only and is never dispatched without validation.
-                if validate_wire_structure(&bytes).is_err() {
-                    return SYNTRA_FFI_INVALID;
-                }
-                match Frame::decode(bytes.as_slice()) {
-                    Ok(fallback)
-                        if fallback.version == inner.negotiated && fallback.request_id != 0 =>
-                    {
-                        match fallback.body {
-                            Some(syntra_core::proto::frame::Body::Request(req))
-                                if validate_method(&req.method).is_err() =>
-                            {
-                                let id = fallback.request_id;
-                                let err_frame = Frame {
-                                    version: inner.negotiated,
-                                    request_id: id,
-                                    body: Some(syntra_core::proto::frame::Body::Result(
-                                        syntra_core::proto::RpcResult {
-                                            outcome: Some(
-                                                syntra_core::proto::rpc_result::Outcome::Error(
-                                                    syntra_core::proto::RpcError {
-                                                        code:
-                                                            syntra_core::ErrorCode::InvalidArgument
-                                                                .as_i32(),
-                                                        message: "invalid method".to_string(),
-                                                    },
-                                                ),
-                                            ),
-                                        },
-                                    )),
-                                };
-                                let out = err_frame.encode_to_vec();
-                                unsafe { *has_response = 1 };
-                                return alloc_owned(&out, out_response, out_len);
-                            }
-                            _ => return SYNTRA_FFI_INVALID,
-                        }
-                    }
-                    _ => return SYNTRA_FFI_INVALID,
-                }
+            let h = open(Some(policy))?;
+            // SAFETY: outputs validated before constructing the owner.
+            unsafe {
+                write(generation, h.generation)?;
+                write(out, Box::into_raw(h))?;
             }
-        };
-        if decoded.version != inner.negotiated {
-            return SYNTRA_FFI_INVALID;
-        }
-        match decoded.body {
-            Some(syntra_core::proto::frame::Body::Request(req)) => {
-                let id = decoded.request_id;
-                if id == 0 {
-                    return SYNTRA_FFI_INVALID;
-                }
-                if validate_method(&req.method).is_err() {
-                    let err_frame = Frame {
-                        version: inner.negotiated,
-                        request_id: id,
-                        body: Some(syntra_core::proto::frame::Body::Result(
-                            syntra_core::proto::RpcResult {
-                                outcome: Some(syntra_core::proto::rpc_result::Outcome::Error(
-                                    syntra_core::proto::RpcError {
-                                        code: syntra_core::ErrorCode::InvalidArgument.as_i32(),
-                                        message: "invalid method".to_string(),
-                                    },
-                                )),
-                            },
-                        )),
-                    };
-                    let out = err_frame.encode_to_vec();
-                    unsafe { *has_response = 1 };
-                    return alloc_owned(&out, out_response, out_len);
-                }
-                if inner.pending_map.contains_key(&id) {
-                    let err_frame = Frame {
-                        version: inner.negotiated,
-                        request_id: id,
-                        body: Some(syntra_core::proto::frame::Body::Result(
-                            syntra_core::proto::RpcResult {
-                                outcome: Some(syntra_core::proto::rpc_result::Outcome::Error(
-                                    syntra_core::proto::RpcError {
-                                        code: syntra_core::ErrorCode::FailedPrecondition.as_i32(),
-                                        message: "duplicate request_id".to_string(),
-                                    },
-                                )),
-                            },
-                        )),
-                    };
-                    let out = err_frame.encode_to_vec();
-                    unsafe { *has_response = 1 };
-                    return alloc_owned(&out, out_response, out_len);
-                }
-                if (inner.pending_map.len() as u32) >= inner.max_pending {
-                    let err_frame = Frame {
-                        version: inner.negotiated,
-                        request_id: id,
-                        body: Some(syntra_core::proto::frame::Body::Result(
-                            syntra_core::proto::RpcResult {
-                                outcome: Some(syntra_core::proto::rpc_result::Outcome::Error(
-                                    syntra_core::proto::RpcError {
-                                        code: syntra_core::ErrorCode::ResourceExhausted.as_i32(),
-                                        message: "too many outstanding RPCs".to_string(),
-                                    },
-                                )),
-                            },
-                        )),
-                    };
-                    let out = err_frame.encode_to_vec();
-                    unsafe { *has_response = 1 };
-                    return alloc_owned(&out, out_response, out_len);
-                }
-                let timeout = if req.timeout_ms == 0 {
-                    3000
-                } else {
-                    req.timeout_ms.min(MAX_RPC_TIMEOUT_MS)
-                };
-                inner.pending_map.insert(
-                    id,
-                    HostCall {
-                        deadline: Instant::now() + Duration::from_millis(timeout as u64),
-                    },
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_client_open_clock(
+        abi: u32,
+        clock: syntra_clock_t,
+        out: *mut *mut syntra_t,
+        generation: *mut u64,
+    ) -> i32 {
+        boundary(|| {
+            // SAFETY: independent required outputs checked before construction.
+            unsafe {
+                write(out, ptr::null_mut())?;
+                write(generation, 0)?;
+            }
+            if abi != SYNTRA_ABI_VERSION {
+                return Err(MISMATCH);
+            }
+            if clock.sample.is_none() {
+                return Err(INVALID);
+            }
+            let clock = ElapsedClock::with_source(Arc::new(ClockSource(clock)));
+            if !clock.is_continuous() {
+                return Err(INVALID);
+            }
+            let h = open_with_clock(None, Some(clock))?;
+            // SAFETY: outputs checked above; callbacks remain caller-owned.
+            unsafe {
+                write(generation, h.generation)?;
+                write(out, Box::into_raw(h))?;
+            }
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_host_open_clock(
+        abi: u32,
+        policy: syntra_policy_t,
+        clock: syntra_clock_t,
+        out: *mut *mut syntra_t,
+        generation: *mut u64,
+    ) -> i32 {
+        boundary(|| {
+            // SAFETY: required independent outputs; context/hook lifetimes are
+            // the same as host_open and client_open_clock, not retained borrows.
+            unsafe {
+                write(out, ptr::null_mut())?;
+                write(generation, 0)?;
+            }
+            if abi != SYNTRA_ABI_VERSION {
+                return Err(MISMATCH);
+            }
+            if clock.sample.is_none() || policy.authenticate.is_none() || policy.authorize.is_none()
+            {
+                return Err(INVALID);
+            }
+            let clock = ElapsedClock::with_source(Arc::new(ClockSource(clock)));
+            if !clock.is_continuous() {
+                return Err(INVALID);
+            }
+            let h = open_with_clock(Some(policy), Some(clock))?;
+            // SAFETY: outputs checked above before starting native ownership.
+            unsafe {
+                write(generation, h.generation)?;
+                write(out, Box::into_raw(h))?;
+            }
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_suspend(p: *mut syntra_t, g: u64) -> i32 {
+        boundary(|| {
+            // SAFETY: live owner, no concurrent destruction per native contract.
+            let h = unsafe { owner(p, g)? };
+            let mut state = h.state.lock().map_err(|_| INTERNAL)?;
+            h.endpoint.suspend();
+            state.retired = true;
+            state.receipts.clear();
+            h.retire_recovery()?;
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_platform_wake(
+        p: *mut syntra_t,
+        g: u64,
+        continuity_known: i32,
+    ) -> i32 {
+        boundary(|| {
+            if !matches!(continuity_known, 0 | 1) {
+                return Err(INVALID);
+            }
+            // SAFETY: live owner; wake never revives this connection/generation.
+            let h = unsafe { owner(p, g)? };
+            let mut state = h.state.lock().map_err(|_| INTERNAL)?;
+            h.endpoint.suspend();
+            state.retired = true;
+            state.receipts.clear();
+            h.retire_recovery()?;
+            if continuity_known == 0 {
+                h.endpoint.clock().invalidate();
+            }
+            if state.wake.is_none() && state.thread.is_some() {
+                let endpoint = h.endpoint.clone();
+                state.wake = Some(
+                    h.runtime
+                        .spawn(async move { endpoint.platform_wake().await }),
                 );
-                inner.pending_queue.push_back((id, bytes));
-                SYNTRA_FFI_OK
             }
-            Some(syntra_core::proto::frame::Body::Cancel(_)) => {
-                let id = decoded.request_id;
-                if id == 0 {
-                    return SYNTRA_FFI_OK;
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_handshake(
+        p: *mut syntra_t,
+        g: u64,
+        credential: *const u8,
+        len: usize,
+        token: *mut u64,
+    ) -> i32 {
+        boundary(|| {
+            // SAFETY: common header pointer contract; inputs copied for tasks.
+            let (h, credential) = unsafe {
+                write(token, 0)?;
+                (owner(p, g)?, bytes(credential, len, MAX_CREDENTIAL_BYTES)?)
+            };
+            let Endpoint::Client(c) = &h.endpoint else {
+                return Err(INVALID);
+            };
+            if h.handshake_started.swap(true, Ordering::AcqRel) {
+                return Err(INVALID);
+            }
+            let c = c.clone();
+            let id = h
+                .submit(
+                    async move { (0, c.handshake(credential).await.map(String::into_bytes)) },
+                    None,
+                )
+                .inspect_err(|_| {
+                    h.handshake_started.store(false, Ordering::Release);
+                })?;
+            // SAFETY: output validated before submit.
+            unsafe {
+                write(token, id)?;
+            }
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_call(
+        p: *mut syntra_t,
+        g: u64,
+        method: *const u8,
+        method_len: usize,
+        payload: *const u8,
+        len: usize,
+        timeout_ms: u32,
+        token: *mut u64,
+    ) -> i32 {
+        boundary(|| {
+            // SAFETY: common header pointer contract; no pointers enter tasks.
+            let h = unsafe {
+                write(token, 0)?;
+                owner(p, g)?
+            };
+            let clock = h.endpoint.clock();
+            let started = clock.now();
+            // SAFETY: bounded borrowed slices are copied before any await; the
+            // clock sample precedes copy/validation and queue admission costs.
+            let (method, payload) = unsafe {
+                (
+                    bytes(method, method_len, 512)?,
+                    bytes(payload, len, MAX_FRAME_BYTES)?,
+                )
+            };
+            let method = String::from_utf8(method).map_err(|_| INVALID)?;
+            syntra_core::validate_method(&method).map_err(|_| INVALID)?;
+            let Endpoint::Client(c) = &h.endpoint else {
+                return Err(INVALID);
+            };
+            let c = c.clone();
+            let cancel = CancelToken::new();
+            let cc = cancel.clone();
+            let budget = if timeout_ms == 0 {
+                30_000
+            } else {
+                timeout_ms.min(120_000)
+            };
+            let deadline = started + Duration::from_millis(u64::from(budget));
+            let id = h.submit(
+                async move {
+                    let remaining =
+                        deadline.saturating_duration_since(clock.now()).as_millis() as u32;
+                    if remaining == 0 {
+                        // A positive sub-ms budget cannot be emitted as zero
+                        // (which means default) or rounded up. Wait without an
+                        // RPC slot; don't select an early deadline ahead of an
+                        // eligible cancellation before the actual cutoff.
+                        let error = tokio::select! {
+                            biased;
+                            _ = clock.sleep_until(deadline) => {
+                                if clock.now() >= deadline {
+                                    SyntraError::DeadlineExceeded("call expired before admission".into())
+                                } else {
+                                    SyntraError::Unavailable("elapsed continuity lost".into())
+                                }
+                            }
+                            _ = cc.cancelled() => {
+                                if clock.now() >= deadline {
+                                    SyntraError::DeadlineExceeded("call expired before admission".into())
+                                } else {
+                                    SyntraError::Cancelled("call cancelled before admission".into())
+                                }
+                            }
+                        };
+                        return (0, Err(error));
+                    }
+                    c.call_cancellable_tracked(&method, payload, remaining, &cc)
+                        .await
+                },
+                Some(cancel),
+            )?;
+            // SAFETY: output validated before submit.
+            unsafe {
+                write(token, id)?;
+            }
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_cancel(p: *mut syntra_t, g: u64, token: u64) -> i32 {
+        boundary(|| {
+            // SAFETY: live owner as specified by header.
+            let h = unsafe { owner(p, g)? };
+            let s = h.state.lock().map_err(|_| INTERNAL)?;
+            s.jobs
+                .get(&token)
+                .ok_or(STALE)?
+                .cancel
+                .as_ref()
+                .ok_or(INVALID)?
+                .cancel();
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_poll(
+        p: *mut syntra_t,
+        g: u64,
+        token: u64,
+        code: *mut i32,
+        request_id: *mut u64,
+        out: *mut *mut u8,
+        len: *mut usize,
+    ) -> i32 {
+        boundary(|| {
+            // SAFETY: initialize required outputs before consuming any result.
+            let h = unsafe {
+                write(code, 0)?;
+                write(request_id, 0)?;
+                write(out, ptr::null_mut())?;
+                write(len, 0)?;
+                owner(p, g)?
+            };
+            let mut s = h.state.lock().map_err(|_| INTERNAL)?;
+            let job = s.jobs.get_mut(&token).ok_or(STALE)?;
+            if job.recovery {
+                return Err(INVALID);
+            }
+            if !job.observe() {
+                return Ok(EMPTY);
+            }
+            let result = job.result.take().ok_or(INTERNAL)?;
+            s.jobs.remove(&token);
+            if s.notification_pending == Some(token) {
+                s.notification_pending = None;
+            }
+            let (id, result) = result.map_err(|_| {
+                s.failed = true;
+                INTERNAL
+            })?;
+            // SAFETY: output regions validated at entry, owned allocation is
+            // transferred once and freed only by syntra_free.
+            unsafe {
+                write(request_id, id)?;
+                match result {
+                    Ok(data) => buffer(data, out, len)?,
+                    Err(e) => write(code, e.code().as_i32())?,
                 }
-                if inner.pending_map.contains_key(&id) {
-                    inner.cancelled.insert(id);
-                    if !cancel_ids.is_null() && cancel_cap > 0 {
-                        unsafe {
-                            *cancel_ids = id;
-                            *cancel_n = 1;
-                        }
+            }
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_receipt(p: *mut syntra_t, g: u64, token: *mut u64) -> i32 {
+        boundary(|| {
+            // SAFETY: header pointer contract.
+            let h = unsafe {
+                write(token, 0)?;
+                owner(p, g)?
+            };
+            let received = h.endpoint.clock().now();
+            let mut s = h.state.lock().map_err(|_| INTERNAL)?;
+            if s.retired || s.shutdown.is_some() || h.endpoint.closed() {
+                return Err(CLOSED);
+            }
+            if s.receipts.len() >= LIMIT {
+                return Err(BUSY);
+            }
+            let id = fresh()?;
+            s.receipts.push_back((id, received));
+            // SAFETY: output checked before receipt registration.
+            unsafe {
+                write(token, id)?;
+            }
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_ingest(
+        p: *mut syntra_t,
+        g: u64,
+        receipt: u64,
+        data: *const u8,
+        len: usize,
+    ) -> i32 {
+        boundary(|| {
+            // SAFETY: input copied before the foreign borrow ends.
+            let (h, data) = unsafe { (owner(p, g)?, bytes(data, len, MAX_FRAME_BYTES)?) };
+            if data.is_empty() {
+                return Err(INVALID);
+            }
+            let mut s = h.state.lock().map_err(|_| INTERNAL)?;
+            if s.retired || s.shutdown.is_some() || h.endpoint.closed() {
+                return Err(CLOSED);
+            }
+            let &(id, received) = s.receipts.front().ok_or(STALE)?;
+            if id != receipt {
+                return Err(STALE);
+            }
+            h.inbound.try_send((data, received)).map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => BUSY,
+                mpsc::error::TrySendError::Closed(_) => INTERNAL,
+            })?;
+            s.receipts.pop_front();
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_emit(
+        p: *mut syntra_t,
+        g: u64,
+        token: *mut u64,
+        out: *mut *mut u8,
+        len: *mut usize,
+    ) -> i32 {
+        boundary(|| {
+            // SAFETY: all outputs initialized before dequeuing/preparing a unit.
+            let h = unsafe {
+                write(token, 0)?;
+                write(out, ptr::null_mut())?;
+                write(len, 0)?;
+                owner(p, g)?
+            };
+            let mut s = h.state.lock().map_err(|_| INTERNAL)?;
+            if !h.endpoint.clock().is_continuous() {
+                s.retired = true;
+                h.endpoint.suspend();
+                h.retire_recovery()?;
+            }
+            if s.retired {
+                return Err(CLOSED);
+            }
+            if s.emitting.is_some() {
+                return Err(BUSY);
+            }
+            if s.shutdown
+                .as_ref()
+                .is_some_and(|v| h.endpoint.clock().now() >= v.drain_cutoff || v.carrier_closed)
+            {
+                return Err(CLOSED);
+            }
+            let id = fresh()?;
+            while let Ok(original) = s.writer.try_recv() {
+                // Preserve the original Vec allocation until the runtime's
+                // one-shot handoff; never decode/rebuild queued RPCs here.
+                let unit = match &h.endpoint {
+                    Endpoint::Client(c) => c.prepare_outbound(original),
+                    Endpoint::Host(_) => Some(original),
+                };
+                if let Some(unit) = unit {
+                    s.emitting = Some(id);
+                    // SAFETY: validated independent outputs; one owned buffer.
+                    unsafe {
+                        write(token, id)?;
+                        buffer(unit, out, len)?;
+                    }
+                    return Ok(OK);
+                }
+            }
+            Ok(EMPTY)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_emitted(p: *mut syntra_t, g: u64, token: u64) -> i32 {
+        boundary(|| {
+            // SAFETY: live owner; caller attests whole immutable unit finished.
+            let h = unsafe { owner(p, g)? };
+            let mut s = h.state.lock().map_err(|_| INTERNAL)?;
+            if s.emitting != Some(token) {
+                return Err(STALE);
+            }
+            s.emitting = None;
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_take_dispatch(
+        p: *mut syntra_t,
+        g: u64,
+        token: *mut u64,
+        method: *mut *mut u8,
+        method_len: *mut usize,
+        payload: *mut *mut u8,
+        payload_len: *mut usize,
+    ) -> i32 {
+        boundary(|| {
+            // SAFETY: initialize all outputs before transferring dispatch.
+            let h = unsafe {
+                write(token, 0)?;
+                write(method, ptr::null_mut())?;
+                write(method_len, 0)?;
+                write(payload, ptr::null_mut())?;
+                write(payload_len, 0)?;
+                owner(p, g)?
+            };
+            let _admission = h.state.lock().map_err(|_| INTERNAL)?;
+            if _admission.retired {
+                return Err(CLOSED);
+            }
+            let mut slots = h.dispatches.lock().map_err(|_| INTERNAL)?;
+            slots.reap_undelivered();
+            let Some((&id, d)) = slots.0.iter_mut().find(|(_, d)| d.method.is_some()) else {
+                return Ok(EMPTY);
+            };
+            let name = d.method.take().ok_or(INTERNAL)?;
+            // SAFETY: required outputs checked before taking the slot. Lease
+            // stays charged until complete, even after cancellation/expiry.
+            unsafe {
+                write(token, id)?;
+                buffer(name.into_bytes(), method, method_len)?;
+                buffer(std::mem::take(&mut d.payload), payload, payload_len)?;
+            }
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_dispatch_cancelled(
+        p: *mut syntra_t,
+        g: u64,
+        token: u64,
+        cancelled: *mut i32,
+    ) -> i32 {
+        boundary(|| {
+            // SAFETY: common header contract.
+            let h = unsafe {
+                write(cancelled, 0)?;
+                owner(p, g)?
+            };
+            let slots = h.dispatches.lock().map_err(|_| INTERNAL)?;
+            let d = slots.0.get(&token).ok_or(STALE)?;
+            // SAFETY: output checked before lookup.
+            unsafe {
+                write(
+                    cancelled,
+                    i32::from(d.cancel.is_cancelled() || d.reply.is_closed()),
+                )?;
+            }
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_complete(
+        p: *mut syntra_t,
+        g: u64,
+        token: u64,
+        code: i32,
+        data: *const u8,
+        len: usize,
+    ) -> i32 {
+        boundary(|| {
+            if !(0..=16).contains(&code) || (code != 0 && len != 0) {
+                return Err(INVALID);
+            }
+            // SAFETY: copied input and live owner per header.
+            let (h, data) = unsafe { (owner(p, g)?, bytes(data, len, MAX_FRAME_BYTES - 128)?) };
+            let mut slots = h.dispatches.lock().map_err(|_| INTERNAL)?;
+            if slots.0.get(&token).is_none_or(|d| d.method.is_some()) {
+                return Err(STALE);
+            }
+            let d = slots.0.remove(&token).ok_or(STALE)?;
+            let outcome = if code == 0 {
+                HandlerOutcome::Payload(data)
+            } else {
+                HandlerOutcome::error(
+                    ErrorCode::from_i32_lossy(code).0,
+                    "application request failed",
+                )
+            };
+            // Sending is merely a candidate. The shared Host deadline gate,
+            // not this adapter, selects the terminal outcome. Dropping d's
+            // lease acknowledges external work really stopped.
+            Ok(if d.reply.send(outcome).is_ok() {
+                OK
+            } else {
+                STALE
+            })
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_notify(
+        p: *mut syntra_t,
+        g: u64,
+        data: *const u8,
+        len: usize,
+        token: *mut u64,
+    ) -> i32 {
+        boundary(|| {
+            // SAFETY: required output and copied input.
+            let (h, data) = unsafe {
+                write(token, 0)?;
+                (owner(p, g)?, bytes(data, len, MAX_FRAME_BYTES - 128)?)
+            };
+            let Endpoint::Host(host) = &h.endpoint else {
+                return Err(INVALID);
+            };
+            let host = host.clone();
+            let id = h.submit(
+                async move { (0, host.notify(data).await.map(|()| vec![])) },
+                None,
+            )?;
+            // SAFETY: output checked before submit.
+            unsafe {
+                write(token, id)?;
+            }
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_next_notification(
+        p: *mut syntra_t,
+        g: u64,
+        token: *mut u64,
+    ) -> i32 {
+        boundary(|| {
+            // SAFETY: common header contract.
+            let h = unsafe {
+                write(token, 0)?;
+                owner(p, g)?
+            };
+            let Endpoint::Client(c) = &h.endpoint else {
+                return Err(INVALID);
+            };
+            let c = c.clone();
+            let mut s = h.state.lock().map_err(|_| INTERNAL)?;
+            if h.recovery.lock().map_err(|_| INTERNAL)?.is_some() {
+                return Err(INVALID); // profile inbox has exclusive routing
+            }
+            if s.retired || s.shutdown.is_some() || s.notification_pending.is_some() {
+                return Err(BUSY);
+            }
+            // One notification waiter per handle; its job slot must be polled
+            // before issuing another. Bound it with ordinary result slots.
+            if s.jobs.len() >= LIMIT {
+                return Err(BUSY);
+            }
+            let id = fresh()?;
+            let work = h.runtime.spawn(async move {
+                (
+                    0,
+                    c.next_notification()
+                        .await
+                        .ok_or_else(|| SyntraError::Closed("notification stream closed".into())),
+                )
+            });
+            s.jobs.insert(
+                id,
+                Job {
+                    work: Some(work),
+                    result: None,
+                    cancel: None,
+                    recovery: false,
+                },
+            );
+            s.notification_pending = Some(id);
+            // SAFETY: output checked before insertion.
+            unsafe {
+                write(token, id)?;
+            }
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_withdraw(p: *mut syntra_t, g: u64) -> i32 {
+        boundary(|| {
+            // SAFETY: common header contract.
+            let h = unsafe { owner(p, g)? };
+            let Endpoint::Host(host) = &h.endpoint else {
+                return Err(INVALID);
+            };
+            let mut s = h.state.lock().map_err(|_| INTERNAL)?;
+            if s.shutdown.is_some() {
+                return Err(CLOSED);
+            }
+            if s.withdrawal.is_none() {
+                let host = host.clone();
+                s.withdrawal = Some(
+                    h.runtime
+                        .spawn(async move { host.withdraw_principal().await }),
+                );
+            }
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_shutdown(p: *mut syntra_t, g: u64, total_ms: u32) -> i32 {
+        boundary(|| {
+            if !(2..=30_000).contains(&total_ms) {
+                return Err(INVALID);
+            }
+            // SAFETY: common header contract.
+            let h = unsafe { owner(p, g)? };
+            let mut s = h.state.lock().map_err(|_| INTERNAL)?;
+            if s.shutdown.is_none() {
+                h.retire_recovery()?;
+                let total = Duration::from_millis(u64::from(total_ms));
+                // start_shutdown installs its retained owner synchronously and
+                // shares ONE elapsed budget with drain and task cleanup.
+                let _entered = h.runtime.enter();
+                let budget = h.endpoint.begin_shutdown(total)?;
+                s.shutdown = Some(Shutdown {
+                    deadline: budget.deadline,
+                    drain_cutoff: budget.drain_cutoff,
+                    work: None,
+                    carrier_closed: false,
+                });
+                s.receipts.clear();
+            }
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_transport_closed(p: *mut syntra_t, g: u64) -> i32 {
+        boundary(|| {
+            // SAFETY: caller attests carrier is closed and no partial writes
+            // or callbacks can subsequently use this generation's bytes.
+            let h = unsafe { owner(p, g)? };
+            let mut s = h.state.lock().map_err(|_| INTERNAL)?;
+            h.retire_recovery()?;
+            if s.shutdown.is_none() {
+                let _entered = h.runtime.enter();
+                let budget = h.endpoint.begin_shutdown(Duration::ZERO)?;
+                let endpoint = h.endpoint.clone();
+                let work = h
+                    .runtime
+                    .spawn(async move { endpoint.transport_lost().await });
+                s.shutdown = Some(Shutdown {
+                    deadline: budget.deadline,
+                    drain_cutoff: budget.drain_cutoff,
+                    work: Some(work),
+                    carrier_closed: true,
+                });
+            } else if !s.shutdown.as_ref().ok_or(INTERNAL)?.carrier_closed {
+                let endpoint = h.endpoint.clone();
+                s.transport_loss = Some(
+                    h.runtime
+                        .spawn(async move { endpoint.transport_lost().await }),
+                );
+            }
+            s.shutdown.as_mut().ok_or(INTERNAL)?.carrier_closed = true;
+            h.endpoint.carrier_closed();
+            // Carrier abort retires these plaintext units, NOT an emission
+            // handoff. Release channel capacity so shared shutdown accounting
+            // does not mistake discarded output for a still-owned wire write.
+            s.writer.close();
+            while s.writer.try_recv().is_ok() {}
+            s.emitting = None;
+            s.receipts.clear();
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_status(
+        p: *mut syntra_t,
+        g: u64,
+        closed: *mut i32,
+        reason: *mut i32,
+        external_work: *mut usize,
+        lost_count: *mut u64,
+        lost_bytes: *mut u64,
+    ) -> i32 {
+        boundary(|| {
+            // SAFETY: all required independent writable scalars initialized.
+            let h = unsafe {
+                write(closed, 0)?;
+                write(reason, 0)?;
+                write(external_work, 0)?;
+                write(lost_count, 0)?;
+                write(lost_bytes, 0)?;
+                owner(p, g)?
+            };
+            {
+                // Match shutdown's state -> reader lock order.
+                let mut s = h.state.lock().map_err(|_| INTERNAL)?;
+                if s.failed
+                    || (s.shutdown.is_none()
+                        && h.reader
+                            .lock()
+                            .map_err(|_| INTERNAL)?
+                            .as_ref()
+                            .is_some_and(|r| r.is_finished()))
+                {
+                    s.failed = true;
+                    return Err(INTERNAL);
+                }
+            }
+            let mut slots = h.dispatches.lock().map_err(|_| INTERNAL)?;
+            slots.reap_undelivered();
+            let loss = match &h.endpoint {
+                Endpoint::Client(c) => c.notification_loss(),
+                Endpoint::Host(_) => (0, 0),
+            };
+            // SAFETY: outputs checked before observation; no foreign borrows
+            // are retained by runtime tasks or returned as borrowed pointers.
+            unsafe {
+                write(closed, i32::from(h.endpoint.closed()))?;
+                write(reason, h.endpoint.reason())?;
+                write(external_work, slots.0.len() + h.recovery_work_count()?)?;
+                write(lost_count, loss.0)?;
+                write(lost_bytes, loss.1)?;
+            }
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_shutdown_poll(p: *mut syntra_t, g: u64) -> i32 {
+        boundary(|| {
+            // SAFETY: common live-owner contract, never consumes the pointer.
+            let h = unsafe { owner(p, g)? };
+            let mut s = h.state.lock().map_err(|_| INTERNAL)?;
+            let shutdown = s.shutdown.as_mut().ok_or(INVALID)?;
+            let expired = h.endpoint.clock().now() >= shutdown.deadline;
+            if !shutdown.carrier_closed || s.emitting.is_some() {
+                return Ok(if expired { INCOMPLETE } else { EMPTY });
+            }
+            let mut slots = h.dispatches.lock().map_err(|_| INTERNAL)?;
+            slots.reap_undelivered();
+            if !slots.0.is_empty() {
+                return Ok(if expired { INCOMPLETE } else { EMPTY });
+            }
+            if h.recovery_pending()? {
+                return Ok(if expired { INCOMPLETE } else { EMPTY });
+            }
+            // Outstanding writer permits can finish after Receiver::close.
+            // Reap their retired units on every poll until all producers join.
+            while s.writer.try_recv().is_ok() {}
+            if s.shutdown
+                .as_ref()
+                .ok_or(INTERNAL)?
+                .work
+                .as_ref()
+                .is_some_and(|j| !j.is_finished())
+                || s.jobs.values_mut().any(|j| !j.observe())
+                || s.withdrawal.as_ref().is_some_and(|j| !j.is_finished())
+                || s.transport_loss.as_ref().is_some_and(|j| !j.is_finished())
+                || s.wake.as_ref().is_some_and(|j| !j.is_finished())
+            {
+                return Ok(if expired { INCOMPLETE } else { EMPTY });
+            }
+            if let Endpoint::Host(host) = &h.endpoint {
+                if host.execution_len() != 0 || host.worker_len() != 0 {
+                    return Ok(if expired { INCOMPLETE } else { EMPTY });
+                }
+            }
+            // JoinError is visible, never a successful silent task drop.
+            if let Some(mut work) = s.shutdown.as_mut().ok_or(INTERNAL)?.work.take() {
+                if let Poll::Ready(Err(_)) =
+                    Pin::new(&mut work).poll(&mut Context::from_waker(Waker::noop()))
+                {
+                    s.failed = true;
+                }
+            }
+            if let Some(mut work) = s.withdrawal.take() {
+                if let Poll::Ready(Err(_)) =
+                    Pin::new(&mut work).poll(&mut Context::from_waker(Waker::noop()))
+                {
+                    s.failed = true;
+                }
+            }
+            if let Some(mut work) = s.transport_loss.take() {
+                if let Poll::Ready(Err(_)) =
+                    Pin::new(&mut work).poll(&mut Context::from_waker(Waker::noop()))
+                {
+                    s.failed = true;
+                }
+            }
+            if let Some(mut work) = s.wake.take() {
+                if let Poll::Ready(Err(_)) =
+                    Pin::new(&mut work).poll(&mut Context::from_waker(Waker::noop()))
+                {
+                    s.failed = true;
+                }
+            }
+            if s.jobs
+                .values()
+                .any(|j| j.result.as_ref().is_some_and(Result::is_err))
+            {
+                s.failed = true;
+            }
+            let mut reader = h.reader.lock().map_err(|_| INTERNAL)?;
+            if let Some(work) = reader.as_mut() {
+                if !work.is_finished() {
+                    work.abort();
+                    return Ok(if expired { INCOMPLETE } else { EMPTY });
+                }
+            }
+            if let Some(mut work) = reader.take() {
+                if let Poll::Ready(Err(error)) =
+                    Pin::new(&mut work).poll(&mut Context::from_waker(Waker::noop()))
+                {
+                    if !error.is_cancelled() {
+                        s.failed = true;
                     }
                 }
-                SYNTRA_FFI_OK
+                h.endpoint.reader_joined()?;
             }
-            _ => SYNTRA_FFI_INVALID,
-        }
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-/// Takes the next pending request for application dispatch.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_host_take_pending(
-    h: *mut syntra_ffi_host_t,
-    request_id_out: *mut u64,
-    out_req_frame: *mut *mut u8,
-    out_len: *mut usize,
-    present: *mut i32,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if present.is_null() || request_id_out.is_null() {
-            return SYNTRA_FFI_INVALID;
-        }
-        unsafe { *present = 0 };
-        if let Err(code) = init_output(out_req_frame, out_len) {
-            return code;
-        }
-        unsafe { *request_id_out = 0 };
-        let mut inner = match host_lock(h) {
-            Ok(g) => g,
-            Err(code) => return code,
-        };
-        if inner.closed {
-            return SYNTRA_FFI_CLOSED;
-        }
-        match inner.pending_queue.pop_front() {
-            Some((id, bytes)) => {
-                let rc = alloc_owned_vec(bytes, out_req_frame, out_len);
-                if rc != SYNTRA_FFI_OK {
-                    return rc;
-                }
-                unsafe {
-                    *present = 1;
-                    *request_id_out = id;
-                }
-                SYNTRA_FFI_OK
+            let report = h.endpoint.shutdown_report();
+            if report.failed_tasks != 0 {
+                s.failed = true;
             }
-            None => SYNTRA_FFI_OK,
-        }
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-/// Reports whether a request was cancelled.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_host_is_cancelled(
-    h: *mut syntra_ffi_host_t,
-    request_id: u64,
-    cancelled: *mut i32,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if cancelled.is_null() {
-            return SYNTRA_FFI_INVALID;
-        }
-        unsafe { *cancelled = 0 };
-        let inner = match host_lock(h) {
-            Ok(g) => g,
-            Err(code) => return code,
-        };
-        if inner.closed {
-            return SYNTRA_FFI_CLOSED;
-        }
-        if inner.cancelled.contains(&request_id) {
-            unsafe { *cancelled = 1 };
-        }
-        SYNTRA_FFI_OK
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-/// Returns the negotiated version.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_host_version(h: *mut syntra_ffi_host_t, version_out: *mut u32) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if version_out.is_null() {
-            return SYNTRA_FFI_INVALID;
-        }
-        let inner = match host_lock(h) {
-            Ok(g) => g,
-            Err(code) => return code,
-        };
-        if inner.closed {
-            return SYNTRA_FFI_CLOSED;
-        }
-        unsafe { *version_out = inner.negotiated };
-        SYNTRA_FFI_OK
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-/// Queues a result frame, or a deadline error if expired. NOMEM leaves the call retryable.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_host_answer(
-    h: *mut syntra_ffi_host_t,
-    result_frame: *const u8,
-    len: usize,
-    expired: *mut i32,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if expired.is_null() {
-            return SYNTRA_FFI_INVALID;
-        }
-        unsafe { *expired = 0 };
-        if len > MAX_FRAME_BYTES {
-            return SYNTRA_FFI_INVALID;
-        }
-        let bytes = match borrow_bytes(result_frame, len) {
-            Ok(v) => v,
-            Err(code) => return code,
-        };
-        let mut inner = match host_lock(h) {
-            Ok(g) => g,
-            Err(code) => return code,
-        };
-        if inner.closed {
-            return SYNTRA_FFI_CLOSED;
-        }
-        if inner.negotiated == 0 {
-            return SYNTRA_FFI_INVALID;
-        }
-        let decoded = match decode_frame(&bytes, ValidationContext::active(inner.negotiated)) {
-            Ok(f) => f,
-            Err(code) => return code,
-        };
-        let id = decoded.request_id;
-        if id == 0 {
-            return SYNTRA_FFI_INVALID;
-        }
-        match decoded.body {
-            Some(syntra_core::proto::frame::Body::Result(_)) => {}
-            _ => return SYNTRA_FFI_INVALID,
-        }
-        if decoded.version != inner.negotiated {
-            return SYNTRA_FFI_INVALID;
-        }
-        let is_expired = match inner.pending_map.get(&id) {
-            Some(call) => call.deadline <= Instant::now(),
-            None => {
-                unsafe { *expired = 1 };
-                return SYNTRA_FFI_OK;
+            if report.phase != syntra_runtime::ShutdownPhase::Complete {
+                return Ok(if expired { INCOMPLETE } else { EMPTY });
             }
-        };
-        let encoded = if is_expired {
-            deadline_result(inner.negotiated, id)
-        } else {
-            bytes
-        };
-        if let Err(code) = inner.reserve_outbound(1, encoded.len()) {
-            return code;
-        }
-        inner.pending_map.remove(&id);
-        inner.cancelled.remove(&id);
-        inner
-            .pending_queue
-            .retain(|(queued_id, _)| *queued_id != id);
-        inner.push_outbound(encoded);
-        unsafe { *expired = i32::from(is_expired) };
-        SYNTRA_FFI_OK
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-/// Queues a notification payload for outbound transmission.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_host_notify(
-    h: *mut syntra_ffi_host_t,
-    payload: *const u8,
-    len: usize,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if len > MAX_FRAME_BYTES {
-            return SYNTRA_FFI_INVALID;
-        }
-        let bytes = match borrow_bytes(payload, len) {
-            Ok(v) => v,
-            Err(code) => return code,
-        };
-        let mut inner = match host_lock(h) {
-            Ok(g) => g,
-            Err(code) => return code,
-        };
-        if inner.closed {
-            return SYNTRA_FFI_CLOSED;
-        }
-        if !inner.active {
-            return SYNTRA_FFI_INVALID;
-        }
-        let frame = Frame {
-            version: inner.negotiated,
-            request_id: 0,
-            body: Some(syntra_core::proto::frame::Body::Notification(
-                syntra_core::proto::Notification {
-                    payload: bytes.into(),
-                },
-            )),
-        };
-        let encoded = frame.encode_to_vec();
-        if encoded.len() > MAX_FRAME_BYTES {
-            return SYNTRA_FFI_INVALID;
-        }
-        if let Err(code) = inner.reserve_outbound(1, encoded.len()) {
-            return code;
-        }
-        inner.push_outbound(encoded);
-        SYNTRA_FFI_OK
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-/// Takes the next outbound frame.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_host_next_outbound(
-    h: *mut syntra_ffi_host_t,
-    out: *mut *mut u8,
-    out_len: *mut usize,
-    present: *mut i32,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if present.is_null() {
-            return SYNTRA_FFI_INVALID;
-        }
-        unsafe { *present = 0 };
-        if let Err(code) = init_output(out, out_len) {
-            return code;
-        }
-        let mut inner = match host_lock(h) {
-            Ok(g) => g,
-            Err(code) => return code,
-        };
-        if inner.closed {
-            return SYNTRA_FFI_CLOSED;
-        }
-        match inner.outbound.pop_front() {
-            Some(bytes) => {
-                inner.outbound_bytes -= bytes.len();
-                let rc = alloc_owned_vec(bytes, out, out_len);
-                if rc != SYNTRA_FFI_OK {
-                    return rc;
-                }
-                unsafe { *present = 1 };
-                SYNTRA_FFI_OK
+            if let Some(stop) = s.stop.take() {
+                let _ = stop.send(());
             }
-            None => SYNTRA_FFI_OK,
-        }
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-/// Drains expired host RPC ids and queues deadline results atomically.
-/// NOMEM leaves all selected calls pending until outbound capacity is drained.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_host_reap_expired(
-    h: *mut syntra_ffi_host_t,
-    ids: *mut u64,
-    cap: usize,
-    n: *mut usize,
-) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if n.is_null() {
-            return SYNTRA_FFI_INVALID;
-        }
-        unsafe { *n = 0 };
-        if ids.is_null() && cap != 0 {
-            return SYNTRA_FFI_INVALID;
-        }
-        let mut inner = match host_lock(h) {
-            Ok(g) => g,
-            Err(code) => return code,
-        };
-        if inner.closed {
-            return SYNTRA_FFI_CLOSED;
-        }
-        let now = Instant::now();
-        let mut expired = Vec::new();
-        for (id, call) in inner.pending_map.iter() {
-            if call.deadline <= now {
-                expired.push(*id);
+            if s.thread.as_ref().is_some_and(|t| !t.is_finished()) {
+                return Ok(if expired { INCOMPLETE } else { EMPTY });
             }
-        }
-        expired.sort_unstable();
-        let limit = cap.min(MAX_DRAIN_IDS);
-        let mut written = 0usize;
-        let to_reap: Vec<(u64, Vec<u8>)> = expired
-            .into_iter()
-            .take(limit)
-            .map(|id| (id, deadline_result(inner.negotiated, id)))
-            .collect();
-        let bytes = to_reap.iter().map(|(_, frame)| frame.len()).sum();
-        if let Err(code) = inner.reserve_outbound(to_reap.len(), bytes) {
-            return code;
-        }
-        // Remove queue entries for the same IDs so a reaped RPC is never
-        // returned later by `host_take_pending`.
-        if !to_reap.is_empty() {
-            let reaped: HashSet<u64> = to_reap.iter().map(|(id, _)| *id).collect();
-            inner.pending_queue.retain(|(id, _)| !reaped.contains(id));
-        }
-        for (id, encoded) in to_reap {
-            inner.pending_map.remove(&id);
-            inner.cancelled.remove(&id);
-            inner.push_outbound(encoded);
-            unsafe { *ids.add(written) = id };
-            written += 1;
-        }
-        unsafe { *n = written };
-        SYNTRA_FFI_OK
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
-}
-
-/// Consumes the responder handle, including on INTERNAL. No concurrent or subsequent use is valid.
-#[no_mangle]
-pub extern "C" fn syntra_ffi_host_close(h: *mut syntra_ffi_host_t) -> i32 {
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        if h.is_null() {
-            return SYNTRA_FFI_INVALID;
-        }
-        let boxed: Box<syntra_ffi_host_t> = unsafe { Box::from_raw(h) };
-        let result = match boxed.inner.lock() {
-            Ok(mut inner) => {
-                if inner.closed {
-                    SYNTRA_FFI_CLOSED
-                } else {
-                    inner.closed = true;
-                    inner.pending_queue.clear();
-                    inner.pending_map.clear();
-                    inner.cancelled.clear();
-                    inner.outbound.clear();
-                    SYNTRA_FFI_OK
+            if let Some(thread) = s.thread.take() {
+                if thread.join().is_err() {
+                    s.failed = true;
                 }
             }
-            Err(_) => SYNTRA_FFI_INTERNAL,
-        };
-        let _ = &boxed;
-        result
-    }));
-    r.unwrap_or(SYNTRA_FFI_INTERNAL)
+            Ok(if s.failed { INTERNAL } else { OK })
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_destroy(p: *mut syntra_t, g: u64) -> i32 {
+        boundary(|| {
+            // SAFETY: exclusive destruction, no concurrent or future calls.
+            let h = unsafe { owner(p, g)? };
+            let s = h.state.lock().map_err(|_| INTERNAL)?;
+            if s.thread.is_some() {
+                return Err(BUSY);
+            }
+            drop(s);
+            // SAFETY: exactly the Box returned by open, consumed once only
+            // after the native thread joined and external leases were released.
+            drop(unsafe { Box::from_raw(p) });
+            Ok(OK)
+        })
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn syntra_free(p: *mut u8, len: usize) {
+        if !p.is_null() {
+            // SAFETY: caller returns the original owned slice exactly once,
+            // with its original length, and has ceased all accesses to it.
+            drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(p, len)) });
+        }
+    }
 }
+pub use exports::*;
+
+#[path = "recovery.rs"]
+mod recovery;
+pub use recovery::*;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use syntra_core::proto::{frame::Body, rpc_result::Outcome, RpcError, RpcResult};
+#[path = "production_tests.rs"]
+mod tests;
 
-    fn take_bytes(out: *mut u8, len: usize) -> Vec<u8> {
-        let bytes = if len == 0 {
-            Vec::new()
-        } else {
-            unsafe { slice::from_raw_parts(out, len).to_vec() }
-        };
-        syntra_ffi_free(out, len);
-        bytes
-    }
-
-    fn active_pair() -> (*mut syntra_ffi_client_t, *mut syntra_ffi_host_t) {
-        let c = open_client();
-        let mut h = ptr::null_mut();
-        assert_eq!(syntra_ffi_host_open(1, 1, 16, &mut h), SYNTRA_FFI_OK);
-        let mut out = ptr::null_mut();
-        let mut len = 0;
-        assert_eq!(
-            syntra_ffi_client_hello_frame(c, &mut out, &mut len),
-            SYNTRA_FFI_OK
-        );
-        let hello = take_bytes(out, len);
-        let mut version = 0;
-        assert_eq!(
-            syntra_ffi_host_accept_hello(h, hello.as_ptr(), hello.len(), &mut version),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!(
-            syntra_ffi_host_auth_complete(h, b"svc".as_ptr().cast(), 3, &mut out, &mut len),
-            SYNTRA_FFI_OK
-        );
-        let ready = take_bytes(out, len);
-        assert_eq!(
-            syntra_ffi_client_activate(c, ready.as_ptr(), ready.len()),
-            SYNTRA_FFI_OK
-        );
-        (c, h)
-    }
-
-    fn begin_status(c: *mut syntra_ffi_client_t, id: u64) -> (i32, Vec<u8>) {
-        let mut out = ptr::null_mut();
-        let mut len = 0;
-        let method = b"/example.Echo/Echo";
-        let rc = syntra_ffi_client_begin_call(
-            c,
-            id,
-            method.as_ptr(),
-            method.len(),
-            b"req".as_ptr(),
-            3,
-            30000,
-            &mut out,
-            &mut len,
-        );
-        (rc, take_bytes(out, len))
-    }
-
-    fn result(id: u64, error: bool) -> Vec<u8> {
-        Frame {
-            version: 1,
-            request_id: id,
-            body: Some(Body::Result(RpcResult {
-                outcome: Some(if error {
-                    Outcome::Error(RpcError {
-                        code: 7,
-                        message: "denied".to_string(),
-                    })
-                } else {
-                    Outcome::Payload(b"response\0\xff".to_vec().into())
-                }),
-            })),
-        }
-        .encode_to_vec()
-    }
-
-    fn next_outbound(h: *mut syntra_ffi_host_t) -> Vec<u8> {
-        let mut out = ptr::null_mut();
-        let mut len = 0;
-        let mut present = 0;
-        assert_eq!(
-            syntra_ffi_host_next_outbound(h, &mut out, &mut len, &mut present),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!(present, 1);
-        take_bytes(out, len)
-    }
-
-    fn ingest_result(c: *mut syntra_ffi_client_t, bytes: &[u8], id: u64) {
-        let mut terminal = 0;
-        let mut n = 0;
-        let mut notifications = 0;
-        assert_eq!(
-            syntra_ffi_client_on_frame(
-                c,
-                bytes.as_ptr(),
-                bytes.len(),
-                &mut terminal,
-                1,
-                &mut n,
-                &mut notifications
-            ),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!((terminal, n, notifications), (id, 1, 0));
-    }
-
-    #[test]
-    fn request_dispatch_answer_outbound_client_outcome_round_trip() {
-        let (c, h) = active_pair();
-        for (id, error, expired) in [(1, false, false), (2, true, false), (3, false, true)] {
-            let (rc, request) = begin_status(c, id);
-            assert_eq!(rc, SYNTRA_FFI_OK);
-            assert_eq!(on_frame_status(h, &request), (SYNTRA_FFI_OK, 0));
-            let mut taken_id = 0;
-            let mut out = ptr::null_mut();
-            let mut len = 0;
-            let mut present = 0;
-            assert_eq!(
-                syntra_ffi_host_take_pending(h, &mut taken_id, &mut out, &mut len, &mut present),
-                SYNTRA_FFI_OK
-            );
-            assert_eq!((taken_id, present), (id, 1));
-            assert_eq!(take_bytes(out, len), request);
-            if expired {
-                host_lock(h)
-                    .unwrap()
-                    .pending_map
-                    .get_mut(&id)
-                    .unwrap()
-                    .deadline = Instant::now();
-            }
-            let supplied = result(id, error);
-            let mut was_expired = -1;
-            assert_eq!(
-                syntra_ffi_host_answer(h, supplied.as_ptr(), supplied.len(), &mut was_expired),
-                SYNTRA_FFI_OK
-            );
-            assert_eq!(was_expired, i32::from(expired));
-            let expected = if expired {
-                deadline_result(1, id)
-            } else {
-                supplied
-            };
-            let outbound = next_outbound(h);
-            assert_eq!(outbound, expected);
-            ingest_result(c, &outbound, id);
-            assert_eq!(
-                syntra_ffi_client_take_outcome(c, id, &mut out, &mut len, &mut present),
-                SYNTRA_FFI_OK
-            );
-            assert_eq!(present, 1);
-            assert_eq!(take_bytes(out, len), expected);
-            assert_eq!(
-                syntra_ffi_client_take_outcome(c, id, &mut out, &mut len, &mut present),
-                SYNTRA_FFI_OK
-            );
-            assert_eq!((out.is_null(), len, present), (true, 0, 0));
-        }
-        assert_eq!(host_lock(h).unwrap().outbound_bytes, 0);
-        assert_eq!(syntra_ffi_client_close(c), SYNTRA_FFI_OK);
-        assert_eq!(syntra_ffi_host_close(h), SYNTRA_FFI_OK);
-    }
-
-    #[test]
-    fn outbound_count_backpressure_preserves_answer_and_expiry_batch() {
-        let (c, h) = active_pair();
-        for id in 1..=2 {
-            let (rc, request) = begin_status(c, id);
-            assert_eq!(rc, SYNTRA_FFI_OK);
-            assert_eq!(on_frame_status(h, &request), (SYNTRA_FFI_OK, 0));
-        }
-        {
-            let mut inner = host_lock(h).unwrap();
-            inner.cancelled.insert(1);
-        }
-        for _ in 0..MAX_OUTBOUND_FRAMES {
-            assert_eq!(syntra_ffi_host_notify(h, ptr::null(), 0), SYNTRA_FFI_OK);
-        }
-        assert_eq!(syntra_ffi_host_notify(h, ptr::null(), 0), SYNTRA_FFI_NOMEM);
-        let supplied = result(1, false);
-        let mut expired = -1;
-        assert_eq!(
-            syntra_ffi_host_answer(h, supplied.as_ptr(), supplied.len(), &mut expired),
-            SYNTRA_FFI_NOMEM
-        );
-        assert_eq!(expired, 0);
-        {
-            let mut inner = host_lock(h).unwrap();
-            assert_eq!(inner.pending_map.len(), 2);
-            assert_eq!(inner.pending_queue.len(), 2);
-            assert!(inner.cancelled.contains(&1));
-            for call in inner.pending_map.values_mut() {
-                call.deadline = Instant::now();
-            }
-        }
-        let mut ids = [0; 2];
-        let mut n = 99;
-        assert_eq!(
-            syntra_ffi_host_reap_expired(h, ids.as_mut_ptr(), 2, &mut n),
-            SYNTRA_FFI_NOMEM
-        );
-        assert_eq!((ids, n), ([0, 0], 0));
-        assert_eq!(
-            syntra_ffi_host_answer(h, supplied.as_ptr(), supplied.len(), &mut expired),
-            SYNTRA_FFI_NOMEM
-        );
-        assert_eq!(expired, 0);
-        assert_eq!(host_lock(h).unwrap().pending_queue.len(), 2);
-        next_outbound(h);
-        assert_eq!(
-            syntra_ffi_host_reap_expired(h, ids.as_mut_ptr(), 2, &mut n),
-            SYNTRA_FFI_NOMEM
-        );
-        assert_eq!(host_lock(h).unwrap().pending_map.len(), 2);
-        // An expired answer also needs admission before retiring its call.
-        assert_eq!(
-            syntra_ffi_host_answer(h, supplied.as_ptr(), supplied.len(), &mut expired),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!(expired, 1);
-        assert_eq!(
-            syntra_ffi_host_reap_expired(h, ids.as_mut_ptr(), 2, &mut n),
-            SYNTRA_FFI_NOMEM
-        );
-        next_outbound(h);
-        assert_eq!(
-            syntra_ffi_host_reap_expired(h, ids.as_mut_ptr(), 2, &mut n),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!((ids[0], n), (2, 1));
-        {
-            let inner = host_lock(h).unwrap();
-            assert!(
-                inner.pending_map.is_empty()
-                    && inner.pending_queue.is_empty()
-                    && inner.cancelled.is_empty()
-            );
-            assert_eq!(inner.outbound.len(), MAX_OUTBOUND_FRAMES);
-        }
-        for _ in 0..MAX_OUTBOUND_FRAMES - 2 {
-            next_outbound(h);
-        }
-        assert_eq!(next_outbound(h), deadline_result(1, 1));
-        assert_eq!(next_outbound(h), deadline_result(1, 2));
-        assert_eq!(host_lock(h).unwrap().outbound_bytes, 0);
-        assert_eq!(syntra_ffi_client_close(c), SYNTRA_FFI_OK);
-        assert_eq!(syntra_ffi_host_close(h), SYNTRA_FFI_OK);
-    }
-
-    #[test]
-    fn outbound_byte_backpressure_and_answer_without_dispatch() {
-        let (c, h) = active_pair();
-        let (_, request) = begin_status(c, 1);
-        assert_eq!(on_frame_status(h, &request), (SYNTRA_FFI_OK, 0));
-        let large = vec![0; MAX_FRAME_BYTES - 32];
-        let mut accepted = 0;
-        while syntra_ffi_host_notify(h, large.as_ptr(), large.len()) == SYNTRA_FFI_OK {
-            accepted += 1;
-            assert!(accepted <= MAX_OUTBOUND_FRAMES);
-        }
-        assert!(accepted < MAX_OUTBOUND_FRAMES);
-        let supplied = Frame {
-            version: 1,
-            request_id: 1,
-            body: Some(Body::Result(RpcResult {
-                outcome: Some(Outcome::Payload(large.into())),
-            })),
-        }
-        .encode_to_vec();
-        let mut expired = 0;
-        assert_eq!(
-            syntra_ffi_host_answer(h, supplied.as_ptr(), supplied.len(), &mut expired),
-            SYNTRA_FFI_NOMEM
-        );
-        assert_eq!(host_lock(h).unwrap().pending_queue.len(), 1);
-        next_outbound(h);
-        assert_eq!(
-            syntra_ffi_host_answer(h, supplied.as_ptr(), supplied.len(), &mut expired),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!(expired, 0);
-        assert!(host_lock(h).unwrap().pending_queue.is_empty());
-        for _ in 1..accepted {
-            next_outbound(h);
-        }
-        assert_eq!(next_outbound(h), supplied);
-        assert_eq!(host_lock(h).unwrap().outbound_bytes, 0);
-        assert_eq!(syntra_ffi_client_close(c), SYNTRA_FFI_OK);
-        assert_eq!(syntra_ffi_host_close(h), SYNTRA_FFI_OK);
-    }
-
-    #[test]
-    fn unread_outcomes_retain_admission_and_cannot_be_overwritten() {
-        let (c, h) = active_pair();
-        client_lock(c).unwrap().max_pending = 2;
-        for id in 1..=2 {
-            assert_eq!(begin_status(c, id).0, SYNTRA_FFI_OK);
-            ingest_result(c, &result(id, false), id);
-        }
-        assert_eq!(begin_status(c, 3).0, SYNTRA_FFI_NOMEM);
-        assert_eq!(begin_status(c, 1).0, SYNTRA_FFI_INVALID);
-        let mut out = ptr::null_mut();
-        let mut len = 0;
-        let mut present = 0;
-        assert_eq!(
-            syntra_ffi_client_take_outcome(c, 1, &mut out, &mut len, &mut present),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!(take_bytes(out, len), result(1, false));
-        assert_eq!(begin_status(c, 3).0, SYNTRA_FFI_OK);
-        assert_eq!(begin_status(c, 4).0, SYNTRA_FFI_NOMEM);
-        assert_eq!(syntra_ffi_client_close(c), SYNTRA_FFI_OK);
-        assert_eq!(syntra_ffi_host_close(h), SYNTRA_FFI_OK);
-    }
-
-    #[test]
-    fn hello_is_once_and_ready_requires_hello_and_outputs() {
-        let mut c = ptr::null_mut();
-        let credential = b"private-token";
-        assert_eq!(
-            syntra_ffi_client_open(
-                1,
-                1,
-                credential.as_ptr(),
-                credential.len(),
-                3000,
-                16,
-                &mut c
-            ),
-            SYNTRA_FFI_OK
-        );
-        let ready = Frame {
-            version: 1,
-            request_id: 0,
-            body: Some(Body::Ready(syntra_core::proto::ServerReady {
-                connection_id: "0123456789abcdef0123456789abcdef".to_string(),
-            })),
-        }
-        .encode_to_vec();
-        assert_eq!(
-            syntra_ffi_client_activate(c, ready.as_ptr(), ready.len()),
-            SYNTRA_FFI_INVALID
-        );
-        let mut out = ptr::null_mut();
-        let mut len = 0;
-        assert_eq!(
-            syntra_ffi_client_hello_frame(c, ptr::null_mut(), &mut len),
-            SYNTRA_FFI_INVALID
-        );
-        assert_eq!(
-            syntra_ffi_client_hello_frame(c, &mut out, ptr::null_mut()),
-            SYNTRA_FFI_INVALID
-        );
-        assert_eq!(client_lock(c).unwrap().credential, credential);
-        assert!(!client_lock(c).unwrap().hello_sent);
-        assert_eq!(
-            syntra_ffi_client_hello_frame(c, &mut out, &mut len),
-            SYNTRA_FFI_OK
-        );
-        let hello = take_bytes(out, len);
-        let frame = Frame::decode(hello.as_slice()).unwrap();
-        match frame.body {
-            Some(Body::Hello(hello)) => assert_eq!(&hello.credential[..], credential),
-            _ => panic!("expected hello"),
-        }
-        assert_eq!(client_lock(c).unwrap().credential.capacity(), 0);
-        assert_eq!(
-            syntra_ffi_client_hello_frame(c, &mut out, &mut len),
-            SYNTRA_FFI_INVALID
-        );
-        assert_eq!((out.is_null(), len), (true, 0));
-        assert_eq!(
-            syntra_ffi_client_activate(c, ready.as_ptr(), ready.len()),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!(
-            syntra_ffi_client_hello_frame(c, &mut out, &mut len),
-            SYNTRA_FFI_INVALID
-        );
-        assert_eq!(
-            syntra_ffi_client_activate(c, ready.as_ptr(), ready.len()),
-            SYNTRA_FFI_INVALID
-        );
-        assert_eq!(syntra_ffi_client_close(c), SYNTRA_FFI_OK);
-    }
-
-    #[test]
-    fn connection_ids_use_128_random_bits_and_fail_closed() {
-        let id = connection_id_with_rng(|bytes| {
-            assert_eq!(bytes.len(), 16);
-            for (i, byte) in bytes.iter_mut().enumerate() {
-                *byte = i as u8;
-            }
-            Ok::<_, ()>(())
-        })
-        .unwrap();
-        assert_eq!(id, "000102030405060708090a0b0c0d0e0f");
-        assert_eq!(
-            connection_id_with_rng(|_| Err(())),
-            Err(SYNTRA_FFI_INTERNAL)
-        );
-        let first = generate_connection_id().unwrap();
-        let second = generate_connection_id().unwrap();
-        assert_eq!(first.len(), 32);
-        assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn invalid_read_outputs_preserve_queued_items_and_empty_reads_clear_buffers() {
-        let (c, h) = active_pair();
-        let (_, request) = begin_status(c, 1);
-        assert_eq!(on_frame_status(h, &request), (SYNTRA_FFI_OK, 0));
-        ingest_result(c, &result(1, false), 1);
-        let notification = Frame {
-            version: 1,
-            request_id: 0,
-            body: Some(Body::Notification(syntra_core::proto::Notification {
-                payload: b"notice".to_vec().into(),
-            })),
-        }
-        .encode_to_vec();
-        let mut n = 0;
-        let mut queued = 0;
-        assert_eq!(
-            syntra_ffi_client_on_frame(
-                c,
-                notification.as_ptr(),
-                notification.len(),
-                ptr::null_mut(),
-                0,
-                &mut n,
-                &mut queued
-            ),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!(
-            syntra_ffi_host_notify(h, b"notice".as_ptr(), 6),
-            SYNTRA_FFI_OK
-        );
-        for missing in 0..3 {
-            let mut out = ptr::null_mut();
-            let mut len = 0;
-            let mut present = 0;
-            let mut id = 0;
-            let out_arg = if missing == 0 {
-                ptr::null_mut()
-            } else {
-                &mut out
-            };
-            let len_arg = if missing == 1 {
-                ptr::null_mut()
-            } else {
-                &mut len
-            };
-            let present_arg = if missing == 2 {
-                ptr::null_mut()
-            } else {
-                &mut present
-            };
-            assert_eq!(
-                syntra_ffi_client_take_outcome(c, 1, out_arg, len_arg, present_arg),
-                SYNTRA_FFI_INVALID
-            );
-            assert_eq!(
-                syntra_ffi_client_poll_notification(c, out_arg, len_arg, present_arg),
-                SYNTRA_FFI_INVALID
-            );
-            assert_eq!(
-                syntra_ffi_host_take_pending(h, &mut id, out_arg, len_arg, present_arg),
-                SYNTRA_FFI_INVALID
-            );
-            assert_eq!(
-                syntra_ffi_host_next_outbound(h, out_arg, len_arg, present_arg),
-                SYNTRA_FFI_INVALID
-            );
-        }
-        let mut out = ptr::null_mut();
-        let mut len = 0;
-        let mut present = 0;
-        assert_eq!(
-            syntra_ffi_host_take_pending(h, ptr::null_mut(), &mut out, &mut len, &mut present),
-            SYNTRA_FFI_INVALID
-        );
-        assert_eq!(client_lock(c).unwrap().outcomes.len(), 1);
-        assert_eq!(client_lock(c).unwrap().notifications.len(), 1);
-        assert_eq!(host_lock(h).unwrap().pending_queue.len(), 1);
-        assert_eq!(host_lock(h).unwrap().outbound.len(), 1);
-        assert_eq!(
-            syntra_ffi_client_take_outcome(c, 1, &mut out, &mut len, &mut present),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!(present, 1);
-        assert_eq!(take_bytes(out, len), result(1, false));
-        assert_eq!(
-            syntra_ffi_client_poll_notification(c, &mut out, &mut len, &mut present),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!(present, 1);
-        assert_eq!(take_bytes(out, len), notification);
-        let mut id = 0;
-        assert_eq!(
-            syntra_ffi_host_take_pending(h, &mut id, &mut out, &mut len, &mut present),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!((id, present), (1, 1));
-        assert_eq!(take_bytes(out, len), request);
-        assert_eq!(next_outbound(h), notification);
-        // Sentinel pointers are never dereferenced; empty reads overwrite them.
-        out = ptr::dangling_mut();
-        len = 99;
-        present = 99;
-        assert_eq!(
-            syntra_ffi_client_take_outcome(c, 1, &mut out, &mut len, &mut present),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!((out.is_null(), len, present), (true, 0, 0));
-        out = ptr::dangling_mut();
-        len = 99;
-        assert_eq!(
-            syntra_ffi_client_poll_notification(c, &mut out, &mut len, &mut present),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!((out.is_null(), len, present), (true, 0, 0));
-        out = ptr::dangling_mut();
-        len = 99;
-        assert_eq!(
-            syntra_ffi_host_take_pending(h, &mut id, &mut out, &mut len, &mut present),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!((id, out.is_null(), len, present), (0, true, 0, 0));
-        out = ptr::dangling_mut();
-        len = 99;
-        assert_eq!(
-            syntra_ffi_host_next_outbound(h, &mut out, &mut len, &mut present),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!((out.is_null(), len, present), (true, 0, 0));
-        assert_eq!(syntra_ffi_client_close(c), SYNTRA_FFI_OK);
-        assert_eq!(syntra_ffi_host_close(h), SYNTRA_FFI_OK);
-    }
-
-    #[test]
-    fn invalid_outputs_do_not_activate_admit_complete_cancel_or_reap() {
-        let c = open_client();
-        let mut h = ptr::null_mut();
-        assert_eq!(syntra_ffi_host_open(1, 1, 16, &mut h), SYNTRA_FFI_OK);
-        let mut out = ptr::null_mut();
-        let mut len = 0;
-        assert_eq!(
-            syntra_ffi_client_hello_frame(c, &mut out, &mut len),
-            SYNTRA_FFI_OK
-        );
-        let hello = take_bytes(out, len);
-        let mut version = 0;
-        assert_eq!(
-            syntra_ffi_host_accept_hello(h, hello.as_ptr(), hello.len(), &mut version),
-            SYNTRA_FFI_OK
-        );
-        for missing in 0..2 {
-            let out_arg = if missing == 0 {
-                ptr::null_mut()
-            } else {
-                &mut out
-            };
-            let len_arg = if missing == 1 {
-                ptr::null_mut()
-            } else {
-                &mut len
-            };
-            assert_eq!(
-                syntra_ffi_host_auth_complete(h, b"svc".as_ptr().cast(), 3, out_arg, len_arg),
-                SYNTRA_FFI_INVALID
-            );
-            let inner = host_lock(h).unwrap();
-            assert!(!inner.active && inner.principal.is_empty() && inner.connection_id.is_empty());
-        }
-        assert_eq!(
-            syntra_ffi_host_auth_complete(h, b"svc".as_ptr().cast(), 3, &mut out, &mut len),
-            SYNTRA_FFI_OK
-        );
-        let ready = take_bytes(out, len);
-        assert_eq!(
-            syntra_ffi_client_activate(c, ready.as_ptr(), ready.len()),
-            SYNTRA_FFI_OK
-        );
-        let method = b"/example.Echo/Echo";
-        for missing in 0..2 {
-            let out_arg = if missing == 0 {
-                ptr::null_mut()
-            } else {
-                &mut out
-            };
-            let len_arg = if missing == 1 {
-                ptr::null_mut()
-            } else {
-                &mut len
-            };
-            assert_eq!(
-                syntra_ffi_client_begin_call(
-                    c,
-                    1,
-                    method.as_ptr(),
-                    method.len(),
-                    ptr::null(),
-                    0,
-                    30000,
-                    out_arg,
-                    len_arg
-                ),
-                SYNTRA_FFI_INVALID
-            );
-            assert!(client_lock(c).unwrap().pending.is_empty());
-            assert_eq!(
-                syntra_ffi_client_cancel(c, 999, out_arg, len_arg),
-                SYNTRA_FFI_INVALID
-            );
-        }
-        let (_, request) = begin_status(c, 1);
-        let mut response = 0;
-        let mut n = 0;
-        for missing in 0..4 {
-            let out_arg = if missing == 0 {
-                ptr::null_mut()
-            } else {
-                &mut out
-            };
-            let len_arg = if missing == 1 {
-                ptr::null_mut()
-            } else {
-                &mut len
-            };
-            let response_arg = if missing == 2 {
-                ptr::null_mut()
-            } else {
-                &mut response
-            };
-            let n_arg = if missing == 3 {
-                ptr::null_mut()
-            } else {
-                &mut n
-            };
-            assert_eq!(
-                syntra_ffi_host_on_frame(
-                    h,
-                    request.as_ptr(),
-                    request.len(),
-                    out_arg,
-                    len_arg,
-                    response_arg,
-                    ptr::null_mut(),
-                    0,
-                    n_arg
-                ),
-                SYNTRA_FFI_INVALID
-            );
-            assert!(host_lock(h).unwrap().pending_map.is_empty());
-        }
-        assert_eq!(on_frame_status(h, &request), (SYNTRA_FFI_OK, 0));
-        let cancel = Frame {
-            version: 1,
-            request_id: 1,
-            body: Some(Body::Cancel(syntra_core::proto::Cancel {})),
-        }
-        .encode_to_vec();
-        assert_eq!(
-            syntra_ffi_host_on_frame(
-                h,
-                cancel.as_ptr(),
-                cancel.len(),
-                &mut out,
-                &mut len,
-                &mut response,
-                ptr::null_mut(),
-                1,
-                &mut n
-            ),
-            SYNTRA_FFI_INVALID
-        );
-        assert!(host_lock(h).unwrap().cancelled.is_empty());
-        let supplied = result(1, false);
-        let mut notifications = 0;
-        assert_eq!(
-            syntra_ffi_client_on_frame(
-                c,
-                supplied.as_ptr(),
-                supplied.len(),
-                ptr::null_mut(),
-                1,
-                &mut n,
-                &mut notifications
-            ),
-            SYNTRA_FFI_INVALID
-        );
-        assert!(client_lock(c).unwrap().pending.contains_key(&1));
-        assert!(client_lock(c).unwrap().outcomes.is_empty());
-        client_lock(c)
-            .unwrap()
-            .pending
-            .get_mut(&1)
-            .unwrap()
-            .deadline = Instant::now();
-        host_lock(h)
-            .unwrap()
-            .pending_map
-            .get_mut(&1)
-            .unwrap()
-            .deadline = Instant::now();
-        assert_eq!(
-            syntra_ffi_client_reap_expired(c, ptr::null_mut(), 1, &mut n),
-            SYNTRA_FFI_INVALID
-        );
-        assert_eq!(
-            syntra_ffi_host_reap_expired(h, ptr::null_mut(), 1, &mut n),
-            SYNTRA_FFI_INVALID
-        );
-        assert_eq!(client_lock(c).unwrap().pending.len(), 1);
-        assert_eq!(host_lock(h).unwrap().pending_map.len(), 1);
-        assert!(host_lock(h).unwrap().outbound.is_empty());
-        assert_eq!(syntra_ffi_client_close(c), SYNTRA_FFI_OK);
-        assert_eq!(syntra_ffi_host_close(h), SYNTRA_FFI_OK);
-    }
-
-    fn open_client() -> *mut syntra_ffi_client_t {
-        let mut out: *mut syntra_ffi_client_t = ptr::null_mut();
-        let rc = syntra_ffi_client_open(1, 1, ptr::null(), 0, 3000, 16, &mut out);
-        assert_eq!(rc, SYNTRA_FFI_OK);
-        assert!(!out.is_null());
-        out
-    }
-
-    #[test]
-    fn abi_version_is_one() {
-        assert_eq!(syntra_ffi_abi_version(), 1);
-    }
-
-    #[test]
-    fn client_hello_activate_round_trip() {
-        let c = open_client();
-        let mut ptr: *mut u8 = ptr::null_mut();
-        let mut len = 0usize;
-        assert_eq!(
-            syntra_ffi_client_hello_frame(c, &mut ptr, &mut len),
-            SYNTRA_FFI_OK
-        );
-        assert!(!ptr.is_null() && len > 0);
-        let hello = unsafe { slice::from_raw_parts(ptr, len).to_vec() };
-        syntra_ffi_free(ptr, len);
-
-        let mut h: *mut syntra_ffi_host_t = ptr::null_mut();
-        assert_eq!(syntra_ffi_host_open(1, 1, 16, &mut h), SYNTRA_FFI_OK);
-        let mut ver = 0u32;
-        assert_eq!(
-            syntra_ffi_host_accept_hello(h, hello.as_ptr(), hello.len(), &mut ver),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!(ver, 1);
-
-        let princ = b"svc-test";
-        let mut rptr: *mut u8 = ptr::null_mut();
-        let mut rlen = 0usize;
-        assert_eq!(
-            syntra_ffi_host_auth_complete(
-                h,
-                princ.as_ptr() as *const _,
-                princ.len(),
-                &mut rptr,
-                &mut rlen
-            ),
-            SYNTRA_FFI_OK
-        );
-        let ready = unsafe { slice::from_raw_parts(rptr, rlen).to_vec() };
-        syntra_ffi_free(rptr, rlen);
-        assert_eq!(
-            syntra_ffi_client_activate(c, ready.as_ptr(), ready.len()),
-            SYNTRA_FFI_OK
-        );
-
-        assert_eq!(syntra_ffi_client_close(c), SYNTRA_FFI_OK);
-        assert_eq!(syntra_ffi_host_close(h), SYNTRA_FFI_OK);
-    }
-
-    fn open_active_host() -> *mut syntra_ffi_host_t {
-        let c = open_client();
-        let mut ptr: *mut u8 = ptr::null_mut();
-        let mut len = 0usize;
-        assert_eq!(
-            syntra_ffi_client_hello_frame(c, &mut ptr, &mut len),
-            SYNTRA_FFI_OK
-        );
-        let hello = unsafe { slice::from_raw_parts(ptr, len).to_vec() };
-        syntra_ffi_free(ptr, len);
-        let mut h: *mut syntra_ffi_host_t = ptr::null_mut();
-        assert_eq!(syntra_ffi_host_open(1, 1, 16, &mut h), SYNTRA_FFI_OK);
-        let mut ver = 0u32;
-        assert_eq!(
-            syntra_ffi_host_accept_hello(h, hello.as_ptr(), hello.len(), &mut ver),
-            SYNTRA_FFI_OK
-        );
-        let princ = b"svc-test";
-        let mut rptr: *mut u8 = ptr::null_mut();
-        let mut rlen = 0usize;
-        assert_eq!(
-            syntra_ffi_host_auth_complete(
-                h,
-                princ.as_ptr() as *const _,
-                princ.len(),
-                &mut rptr,
-                &mut rlen
-            ),
-            SYNTRA_FFI_OK
-        );
-        syntra_ffi_free(rptr, rlen);
-        assert_eq!(syntra_ffi_client_close(c), SYNTRA_FFI_OK);
-        h
-    }
-
-    fn on_frame_status(h: *mut syntra_ffi_host_t, bytes: &[u8]) -> (i32, i32) {
-        let mut out: *mut u8 = ptr::null_mut();
-        let mut out_len = 0usize;
-        let mut has_response = 0i32;
-        let mut cancel_n = 0usize;
-        let rc = syntra_ffi_host_on_frame(
-            h,
-            bytes.as_ptr(),
-            bytes.len(),
-            &mut out,
-            &mut out_len,
-            &mut has_response,
-            ptr::null_mut(),
-            0,
-            &mut cancel_n,
-        );
-        if has_response != 0 {
-            syntra_ffi_free(out, out_len);
-        }
-        (rc, has_response)
-    }
-
-    #[test]
-    fn notification_overflow_drops_newest_with_cumulative_loss() {
-        let c = open_client();
-        let mut h: *mut syntra_ffi_host_t = ptr::null_mut();
-        assert_eq!(syntra_ffi_host_open(1, 1, 16, &mut h), SYNTRA_FFI_OK);
-        let mut hello_ptr: *mut u8 = ptr::null_mut();
-        let mut hello_len = 0usize;
-        assert_eq!(
-            syntra_ffi_client_hello_frame(c, &mut hello_ptr, &mut hello_len),
-            SYNTRA_FFI_OK
-        );
-        let hello = unsafe { slice::from_raw_parts(hello_ptr, hello_len).to_vec() };
-        syntra_ffi_free(hello_ptr, hello_len);
-        let mut ver = 0u32;
-        assert_eq!(
-            syntra_ffi_host_accept_hello(h, hello.as_ptr(), hello.len(), &mut ver),
-            SYNTRA_FFI_OK
-        );
-        let princ = b"svc-test";
-        let mut rptr: *mut u8 = ptr::null_mut();
-        let mut rlen = 0usize;
-        assert_eq!(
-            syntra_ffi_host_auth_complete(
-                h,
-                princ.as_ptr() as *const _,
-                princ.len(),
-                &mut rptr,
-                &mut rlen
-            ),
-            SYNTRA_FFI_OK
-        );
-        let ready = unsafe { slice::from_raw_parts(rptr, rlen).to_vec() };
-        syntra_ffi_free(rptr, rlen);
-        assert_eq!(
-            syntra_ffi_client_activate(c, ready.as_ptr(), ready.len()),
-            SYNTRA_FFI_OK
-        );
-        let notif = |payload: &[u8]| {
-            Frame {
-                version: 1,
-                request_id: 0,
-                body: Some(syntra_core::proto::frame::Body::Notification(
-                    syntra_core::proto::Notification {
-                        payload: payload.to_vec().into(),
-                    },
-                )),
-            }
-            .encode_to_vec()
-        };
-        let mut terminal_n = 0usize;
-        let mut was_queued = 0i32;
-        for i in 0..256u32 {
-            let bytes = notif(format!("n-{i}").as_bytes());
-            assert_eq!(
-                syntra_ffi_client_on_frame(
-                    c,
-                    bytes.as_ptr(),
-                    bytes.len(),
-                    ptr::null_mut(),
-                    0,
-                    &mut terminal_n,
-                    &mut was_queued
-                ),
-                SYNTRA_FFI_OK
-            );
-            assert_eq!(was_queued, 1);
-        }
-        let dropped_bytes = notif(b"0123456789");
-        assert_eq!(
-            syntra_ffi_client_on_frame(
-                c,
-                dropped_bytes.as_ptr(),
-                dropped_bytes.len(),
-                ptr::null_mut(),
-                0,
-                &mut terminal_n,
-                &mut was_queued
-            ),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!(
-            was_queued, 0,
-            "overflow must not report a queued notification"
-        );
-        let mut dropped = 0u64;
-        let mut dropped_bytes_out = 0u64;
-        assert_eq!(
-            syntra_ffi_client_notification_loss(c, &mut dropped, &mut dropped_bytes_out),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!(dropped, 1);
-        assert_eq!(dropped_bytes_out, 10);
-        let dropped2 = notif(b"ab");
-        assert_eq!(
-            syntra_ffi_client_on_frame(
-                c,
-                dropped2.as_ptr(),
-                dropped2.len(),
-                ptr::null_mut(),
-                0,
-                &mut terminal_n,
-                &mut was_queued
-            ),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!(
-            syntra_ffi_client_notification_loss(c, &mut dropped, &mut dropped_bytes_out),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!((dropped, dropped_bytes_out), (2, 12));
-        let mut first: *mut u8 = ptr::null_mut();
-        let mut first_len = 0usize;
-        let mut present = 0i32;
-        assert_eq!(
-            syntra_ffi_client_poll_notification(c, &mut first, &mut first_len, &mut present),
-            SYNTRA_FFI_OK
-        );
-        assert_eq!(present, 1);
-        syntra_ffi_free(first, first_len);
-        assert_eq!(syntra_ffi_client_close(c), SYNTRA_FFI_OK);
-        assert_eq!(syntra_ffi_host_close(h), SYNTRA_FFI_OK);
-    }
-
-    #[test]
-    fn invalid_method_with_structural_violation_is_fatal() {
-        let h = open_active_host();
-        // Control: prost-encoded bad-method request is a per-RPC error.
-        let bad = Frame {
-            version: 1,
-            request_id: 7,
-            body: Some(syntra_core::proto::frame::Body::Request(
-                syntra_core::proto::RpcRequest {
-                    method: "not-a-method".to_string(),
-                    payload: Vec::new().into(),
-                    timeout_ms: 1000,
-                },
-            )),
-        };
-        let bad_bytes = bad.encode_to_vec();
-        let (rc, has_response) = on_frame_status(h, &bad_bytes);
-        assert_eq!(rc, SYNTRA_FFI_OK);
-        assert_eq!(has_response, 1);
-        // Same malformed method plus a duplicate body field on the raw
-        // wire: structural violation, so the connection fails instead of
-        // reporting a per-RPC error. The version/request_id prefix for
-        // small ids is four bytes; the remainder is the body field.
-        let mut raw = bad_bytes.clone();
-        raw.extend_from_slice(&bad_bytes[4..]);
-        let (rc, has_response) = on_frame_status(h, &raw);
-        assert_eq!(rc, SYNTRA_FFI_INVALID);
-        assert_eq!(has_response, 0);
-        assert_eq!(syntra_ffi_host_close(h), SYNTRA_FFI_OK);
-    }
-}
+#[cfg(all(test, unix))]
+#[path = "recovery_tests.rs"]
+mod recovery_tests;

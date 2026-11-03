@@ -194,11 +194,8 @@ pub mod rpc_result {
 pub struct Cancel {
 }
 /// Frame is a versioned Syntra envelope, independent of transport framing
-/// (SNTR-WIRE-001..008). See the pinned upstream
-/// <https://github.com/tinkle-org/syntra/blob/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/specifications/schema/reference.md>
-/// for runtime validation obligations and the pinned upstream
-/// <https://github.com/tinkle-org/syntra/blob/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/rfcs/0001-public-idl-layout.md>
-/// for unresolved behavioral conflicts.
+/// (SNTR-WIRE-001..008). See specifications/schema/reference.md for runtime
+/// validation obligations and RFC 0001 for unresolved behavioral conflicts.
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Frame {
@@ -213,9 +210,7 @@ pub struct Frame {
     pub request_id: u64,
     /// body selects one operation. Generated oneofs do not enforce all protocol
     /// validation: an unset body is representable and duplicate wire alternatives
-    /// may be collapsed by the decoder. See the pinned upstream
-    /// <https://github.com/tinkle-org/syntra/blob/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/rfcs/0001-public-idl-layout.md>
-    /// §B4.
+    /// may be collapsed by the decoder. See RFC 0001, B4.
     #[prost(oneof="frame::Body", tags="10, 11, 12, 13, 14, 15")]
     pub body: ::core::option::Option<frame::Body>,
 }
@@ -223,9 +218,7 @@ pub struct Frame {
 pub mod frame {
     /// body selects one operation. Generated oneofs do not enforce all protocol
     /// validation: an unset body is representable and duplicate wire alternatives
-    /// may be collapsed by the decoder. See the pinned upstream
-    /// <https://github.com/tinkle-org/syntra/blob/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c/rfcs/0001-public-idl-layout.md>
-    /// §B4.
+    /// may be collapsed by the decoder. See RFC 0001, B4.
     #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Body {
@@ -253,16 +246,39 @@ pub mod frame {
 /// snapshot recovery, and committed progress (SYN-URP-001..007,
 /// SYN-URP-010..026; SYN-URP-008/009 reserved).
 ///
-/// DRAFT proposal under RFC 0006, not accepted shipping authority. These
-/// comments describe proposed validation; generated codecs alone do not
-/// enforce it. No conformance or release claim may cite the draft as authority.
+/// RFC 0006 is accepted (2026-10-30 via docs/decisions/0002-sdd-acceptance-
+/// wave.md, §11 decision amendment authoritative). Comments aligned to that
+/// amendment (release-safe recovery semantics). Do not claim execution: these
+/// comments describe accepted-decision semantics awaiting implementations and
+/// conformance execution; generated codecs alone do not enforce them, and
+/// implementation and conformance evidence remain pending as separation of
+/// authority from evidence. No conformance or release claim may cite these
+/// comments as executed evidence.
+///
+/// Release inclusion versus wire optionality (RFC 0006 §11.1): standardized
+/// recovery is required in the target release bundle. On the wire the
+/// `syntra.update-recovery/1` capability remains optional and explicitly
+/// negotiated after ACTIVE, independently on every connection; no envelope
+/// changes introduce any wire pressure here.
 ///
 /// All payloads are versioned bytes carried inside the existing request,
-/// result, and notification envelopes with no envelope changes. Each
-/// subscription is one independent logical stream with one continuity
-/// generation. Checkpoints, handles, selectors, markers, and boundaries are
-/// opaque bytes. Confirmation proves only persistence through the
-/// application persistence point. Bounds below are deployment-documented
+/// result, and notification envelopes with no envelope changes. Identity is
+/// scoped (RFC 0006 §11.2): a subscription is one delivery instance routed by
+/// a fresh connection-scoped handle; the stream identity and principal scope
+/// and continuity generation belong to the provider-resolved scope (P, S), and
+/// checkpoints bind to (P, S, G). Generation G is the provider's continuity
+/// epoch for that scope: it changes only on true provider history loss or an
+/// explicit shared rebase — never from subscriber-local overflow, ordinary
+/// retention-window pruning, or targeted revocation termination without
+/// policy-driven history reset. Every recovery round is identified by
+/// connection + handle and holds one fixed boundary; a subscribe accept yields
+/// a fresh handle and a newly captured boundary (RFC 0006 §11.3). Checkpoints,
+/// handles, selectors, markers, and boundaries are opaque bytes. Confirmation
+/// proves only persistence through the application persistence point; the
+/// three progress observations (locally durable checkpoint, Confirm sent,
+/// peer-acknowledged checkpoint) stay distinct, and the resume checkpoint is
+/// the durable known-safe checkpoint, which may be newer than the last
+/// acknowledged one (RFC 0006 §11.6). Bounds below are deployment-documented
 /// defaults: at most 64 subscriptions per connection, at most 256 per
 /// principal, at most 16 pending profile calls per connection, at most
 /// 262144 queued notification bytes per stream, at most 1048576 per
@@ -300,7 +316,8 @@ pub mod frame {
 /// versions) missing or mismatched MUST be rejected with FAILED_PRECONDITION,
 /// never silently applied. Checkpoint/boundary/marker fields follow per-field
 /// emptiness rules, not a blanket non-empty rule: `start_checkpoint` empty
-/// means initial (SYN-URP-022), `continuation_marker` empty means first request
+/// means initial (SYN-URP-024: initial subscriptions skip Replay and start live
+/// at the subscribed boundary), `continuation_marker` empty means first request
 /// or no further page (SYN-URP-022), `terminate_reason` empty means no
 /// termination unless the terminated outcome is selected (SYN-URP-026), and
 /// predecessor/result/boundary emptiness is governed by each field comment.
@@ -313,12 +330,12 @@ pub struct RecoveryNegotiateRequest {
     /// Required.
     #[prost(uint32, tag="1")]
     pub profile_version: u32,
-    /// min_version is the lowest offered profile version. Valid value is 1
-    /// in this draft. Required.
+    /// min_version is the lowest offered profile version. Valid value is 1.
+    /// Required.
     #[prost(uint32, tag="2")]
     pub min_version: u32,
-    /// max_version is the highest offered profile version. Valid value is 1
-    /// in this draft, MUST be >= min_version. Required.
+    /// max_version is the highest offered profile version. Valid value is 1,
+    /// MUST be >= min_version. Required.
     #[prost(uint32, tag="3")]
     pub max_version: u32,
     /// capability is the ASCII capability identifier. Non-empty, at most 256
@@ -335,7 +352,7 @@ pub struct RecoveryNegotiateResponse {
     #[prost(uint32, tag="1")]
     pub profile_version: u32,
     /// selected_version is the highest overlap within the offered range.
-    /// Valid value is 1 in this draft. Required.
+    /// Valid value is 1. Required.
     #[prost(uint32, tag="2")]
     pub selected_version: u32,
     /// max_subscriptions_per_connection is the confirmed bound. Required.
@@ -362,8 +379,13 @@ pub struct RecoverySubscribeRequest {
     /// Required.
     #[prost(bytes="vec", tag="2")]
     pub stream_selector: ::prost::alloc::vec::Vec<u8>,
-    /// start_checkpoint is the confirmed checkpoint to continue from. Opaque bytes,
-    /// empty means initial, otherwise at most 4096 bytes.
+    /// start_checkpoint is the checkpoint to resume from. Opaque bytes, empty
+    /// means initial, otherwise at most 4096 bytes. Must equal the initiator's
+    /// durable known-safe checkpoint (RFC 0006 §11.6): the latest checkpoint
+    /// whose represented application effects and (P, S, G) binding are durable
+    /// or reconcilable under the application's declared persistence contract —
+    /// it may be newer than the last peer-acknowledged checkpoint when an
+    /// acknowledgement or its response was lost, and it is never fabricated.
     #[prost(bytes="vec", tag="3")]
     pub start_checkpoint: ::prost::alloc::vec::Vec<u8>,
 }
@@ -380,7 +402,13 @@ pub struct RecoverySubscribeResponse {
     /// at most 256 bytes. Required.
     #[prost(bytes="vec", tag="2")]
     pub subscription_handle: ::prost::alloc::vec::Vec<u8>,
-    /// generation is the continuity generation of the stream. Required.
+    /// generation is the continuity generation G of the provider-resolved scope
+    /// (P, S) that this delivery instance observes. Scoped epoch semantics
+    /// (RFC 0006 §11.2): G changes only on true provider history loss or an
+    /// explicit shared rebase within that scope; it does not change for
+    /// subscriber-local overflow, ordinary retention-window pruning, per-stream
+    /// termination, or plain reconnection. Checkpoints bind to (P, S, G).
+    /// Required.
     #[prost(uint64, tag="3")]
     pub generation: u64,
     /// catchup_boundary is the fixed boundary captured at subscribe accept where
@@ -431,10 +459,11 @@ pub struct RecoveryReplayRequest {
     /// at most 256 bytes.
     #[prost(bytes="vec", tag="2")]
     pub subscription_handle: ::prost::alloc::vec::Vec<u8>,
-    /// from_checkpoint is the confirmed checkpoint to replay from. Opaque bytes,
-    /// non-empty, at most 4096 bytes. On the first request it is the last
-    /// confirmed checkpoint; on continuation it MUST equal the previous page's
-    /// result_checkpoint.
+    /// from_checkpoint is the checkpoint replay starts from. Opaque bytes,
+    /// non-empty, at most 4096 bytes. On the first Replay request it MUST be the
+    /// initiator's durable known-safe checkpoint (RFC 0006 §11.6), which may be
+    /// newer than the last acknowledged checkpoint but is never fabricated.
+    /// Each continuation request carries the previous page's result_checkpoint.
     #[prost(bytes="vec", tag="3")]
     pub from_checkpoint: ::prost::alloc::vec::Vec<u8>,
     /// max_batches bounds batches in one page. Valid range is 1 to 64.
@@ -486,6 +515,19 @@ pub struct RecoveryReplayPage {
     pub batch_payloads: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
 /// RecoveryReplayComplete signals the stream has reached live.
+///
+/// Round semantics (RFC 0006 §11.3): a round is identified by connection +
+/// subscription handle, begins with Subscribe, and holds one fixed boundary;
+/// replay pages are delivered exactly one per correlated RpcResult, never as
+/// page Notifications, so this completion message travels only as the
+/// RecoveryNotification replay_complete arm. A same-handle second round or
+/// marker reset is not permitted: after a new gap the initiator retires the
+/// handle, clears held state, and subscribes again for a fresh handle and a
+/// newly captured boundary (mutable B never moves during a round). On a
+/// bounded exact retry of the preceding request with a fresh RPC request ID
+/// the host returns the retained completion verbatim without rerunning
+/// application effects or advancing pagination; retired-handle completions
+/// have no effect even when their boundary bytes equal the current round's.
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RecoveryReplayComplete {
@@ -496,7 +538,10 @@ pub struct RecoveryReplayComplete {
     /// at most 256 bytes.
     #[prost(bytes="vec", tag="2")]
     pub subscription_handle: ::prost::alloc::vec::Vec<u8>,
-    /// generation is the continuity generation of the stream.
+    /// generation is the continuity generation of the provider-resolved (P, S)
+    /// scope for this round (RFC 0006 §11.2: changes only on true provider
+    /// history loss or explicit shared rebase, never for local overflow,
+    /// retention pruning, or targeted revocation termination).
     #[prost(uint64, tag="3")]
     pub generation: u64,
     /// live_boundary_checkpoint is the checkpoint where replay met live. Opaque
@@ -505,6 +550,13 @@ pub struct RecoveryReplayComplete {
     pub live_boundary_checkpoint: ::prost::alloc::vec::Vec<u8>,
 }
 /// RecoveryCatchUpRequest triggers catch-up streaming over the existing connection.
+///
+/// Mode exclusion (RFC 0006 §11.3): a recovery round chooses Replay or
+/// CatchUp, never both concurrently. CatchUp has no new checkpoint request
+/// field: it streams from the start checkpoint already bound by Subscribe,
+/// and the retained acceptance and the round's completion are re-emitted
+/// verbatim on a bounded exact retry with a fresh RPC request ID, without
+/// rerunning application effects, moving the fixed boundary, or restarting.
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RecoveryCatchUpRequest {
@@ -529,7 +581,8 @@ pub struct RecoveryCatchUpAccepted {
     /// at most 256 bytes. Required.
     #[prost(bytes="vec", tag="2")]
     pub subscription_handle: ::prost::alloc::vec::Vec<u8>,
-    /// generation is the continuity generation of the stream. Required.
+    /// generation is the continuity generation of the provider-resolved (P, S)
+    /// scope for this round (RFC 0006 §11.2). Required.
     #[prost(uint64, tag="3")]
     pub generation: u64,
     /// catchup_boundary is the fixed boundary being approached. Opaque bytes, at
@@ -550,7 +603,13 @@ pub struct RecoverySnapshotOfferRequest {
     #[prost(bytes="vec", tag="2")]
     pub subscription_handle: ::prost::alloc::vec::Vec<u8>,
     /// generation is the continuity generation at offer time. Required.
-    /// Binds the offer to the current generation for supersede fencing.
+    /// Binds the offer to the current generation for supersede fencing, and the
+    /// host binds the issued snapshot handle X to (P, S, H, G, S0) (RFC 0006
+    /// §11.5). At most one distinct snapshot handle is offered under H; exact
+    /// offer retries under the active handle return the retained descriptor.
+    /// Superseding an offer retires H and requires a fresh Subscribe before a
+    /// new handle is issued, even when the new boundary equals the old S0 and
+    /// the generation is unchanged.
     #[prost(uint64, tag="3")]
     pub generation: u64,
 }
@@ -570,7 +629,12 @@ pub struct RecoverySnapshotDescriptor {
     #[prost(bytes="vec", tag="3")]
     pub snapshot_handle: ::prost::alloc::vec::Vec<u8>,
     /// boundary_checkpoint is the provider-proven boundary subsequent batches chain
-    /// from. Opaque bytes, at most 4096 bytes.
+    /// from. Opaque bytes, at most 4096 bytes. The host and provider coordinate a
+    /// recoverable binding of this boundary S0 to (P, S, G) and the snapshot
+    /// contents before descriptor exposure (RFC 0006 §11.5), so S0 stays
+    /// resumable with host validation even if the initiator durably installs and
+    /// then loses SnapshotConfirm or its response; that binding is independent of
+    /// per-handle reply caching.
     #[prost(bytes="vec", tag="4")]
     pub boundary_checkpoint: ::prost::alloc::vec::Vec<u8>,
     /// total_pages bounds pages in this offer. Valid range is 1 to 256.
@@ -602,7 +666,13 @@ pub struct RecoverySnapshotChunk {
     #[prost(bytes="vec", tag="5")]
     pub boundary_checkpoint: ::prost::alloc::vec::Vec<u8>,
 }
-/// RecoverySnapshotComplete marks transfer of all pages in the offer.
+/// RecoverySnapshotComplete is a local transfer/installation record derived by
+/// the initiator: the protocol defines NO wire transmission for completion —
+/// there is no request method, no result slot, and no RecoveryNotification arm
+/// for it (RFC 0006 §11.5). Transfer completion comes from complete index
+/// coverage 0..N-1 and bounded byte accounting; these counts describe that
+/// local record. No second result or unregistered Notification outcome is
+/// assumed.
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RecoverySnapshotComplete {
@@ -637,7 +707,10 @@ pub struct RecoverySnapshotInstalled {
     /// boundary_checkpoint is the confirmed boundary. Opaque bytes, at most 4096 bytes.
     #[prost(bytes="vec", tag="3")]
     pub boundary_checkpoint: ::prost::alloc::vec::Vec<u8>,
-    /// generation is the continuity generation after installation.
+    /// generation is the unchanged current generation of the provider-resolved
+    /// (P, S) scope (RFC 0006 §11.5): installation is application-local and does
+    /// not rebase the provider, does not increment G, and yields no replacement
+    /// checkpoint token; unrelated subscribers keep their own checkpoints.
     #[prost(uint64, tag="4")]
     pub generation: u64,
 }
@@ -682,15 +755,25 @@ pub struct RecoveryConfirmRequest {
     #[prost(uint64, tag="3")]
     pub generation: u64,
     /// checkpoint is the batch result checkpoint being confirmed. Opaque bytes,
-    /// non-empty, at most 4096 bytes. Required. Re-presenting the same bytes is
-    /// idempotent and MUST return confirmed without side effects or generation
-    /// change (SYN-URP-025).
+    /// non-empty, at most 4096 bytes. Required. Committable precondition (RFC
+    /// 0006 §11.6): host validation of an issued checkpoint is distinct from
+    /// accepting an unoffered Confirm on an active handle, so the host accepts a
+    /// Confirm only for checkpoint bytes issued as a committable batch result
+    /// for this handle and generation under its recoverable issued binding to
+    /// (P, S, G); other bytes MUST be rejected with FAILED_PRECONDITION without
+    /// advancing. Within that precondition the host may accept a valid
+    /// checkpoint without a previous confirmation record (resume after lost
+    /// acknowledgement), and re-presenting the same issued bytes with a fresh
+    /// RPC request ID is idempotent and MUST return confirmed without side
+    /// effects or generation change (SYN-URP-025).
     #[prost(bytes="vec", tag="4")]
     pub checkpoint: ::prost::alloc::vec::Vec<u8>,
 }
 /// RecoverySnapshotConfirmRequest confirms a snapshot boundary checkpoint
 /// (snapshot variant) on `/syntra.v1.UpdateRecovery/SnapshotConfirm`.
-/// Yields RecoverySnapshotInstalled with the new generation.
+/// Yields RecoverySnapshotInstalled carrying the unchanged current generation
+/// (RFC 0006 §11.5: installation is application-local and does not rebase the
+/// provider or change G).
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RecoverySnapshotConfirmRequest {
@@ -702,17 +785,21 @@ pub struct RecoverySnapshotConfirmRequest {
     /// at most 256 bytes. Required.
     #[prost(bytes="vec", tag="2")]
     pub subscription_handle: ::prost::alloc::vec::Vec<u8>,
-    /// generation is the continuity generation at confirm time (pre-install).
-    /// Required. MUST equal the current generation before a first install.
-    /// Draft retained-install retry exception (SYN-URP-025): after successful
-    /// installation, an exact duplicate for the same authorized subscription,
-    /// profile version, pre-install generation, and boundary bytes MAY carry
-    /// that pre-install generation only while its installed response is retained
-    /// and the current generation still equals that response's installed
-    /// generation. The host MUST return the original RecoverySnapshotInstalled
-    /// without reinstalling or advancing generation. Supersede, termination,
-    /// later continuity change, or retention expiry invalidates this exception;
-    /// other stale-generation requests MUST fail with FAILED_PRECONDITION.
+    /// generation is the continuity generation at confirm time — the current
+    /// generation G of the provider-resolved (P, S) scope. Required. It MUST
+    /// equal the current generation for a first install and for retained
+    /// retries. Same-generation retained retries (RFC 0006 §11.5): after
+    /// successful installation, an exact duplicate for the same authorized
+    /// subscription, profile version, CURRENT generation, and boundary bytes
+    /// MAY be retried with a fresh RPC request ID while the installed response
+    /// is retained, the generation is unchanged, and no supersede, termination,
+    /// later scoped continuity change, or reply-cache expiry has ended
+    /// eligibility. The host MUST return the original RecoverySnapshotInstalled
+    /// (same unchanged G) without reinstalling or advancing generation. There
+    /// is no pre-install-generation exception: on retry or cache expiry use the
+    /// reconnect path (fresh authenticated connection, renegotiation, fresh
+    /// handle and boundary per RFC 0006 §11.6), never a fabricated earlier
+    /// generation, repeated installation, or an inferred post-install token.
     #[prost(uint64, tag="3")]
     pub generation: u64,
     /// boundary_checkpoint is the offered boundary being confirmed. Opaque bytes,
@@ -738,7 +825,10 @@ pub struct RecoveryConfirmResponse {
     pub subscription_handle: ::prost::alloc::vec::Vec<u8>,
     /// confirmed_checkpoint is the persisted checkpoint. Opaque bytes, at most
     /// 4096 bytes. Required; echoes the request checkpoint on success including
-    /// idempotent retries.
+    /// idempotent retries. It records only the peer-acknowledged progress
+    /// observation (RFC 0006 §11.6): sending a Confirm does not acknowledge, and
+    /// a locally durable or merely sent checkpoint is tracked separately by the
+    /// initiator and may be newer or older than this response.
     #[prost(bytes="vec", tag="3")]
     pub confirmed_checkpoint: ::prost::alloc::vec::Vec<u8>,
     /// generation is the continuity generation of the stream. Required.
@@ -757,7 +847,11 @@ pub struct RecoveryBatch {
     /// at most 256 bytes.
     #[prost(bytes="vec", tag="2")]
     pub subscription_handle: ::prost::alloc::vec::Vec<u8>,
-    /// generation is the continuity generation of the stream.
+    /// generation is the continuity generation G of the provider-resolved (P, S)
+    /// scope for this batch (RFC 0006 §11.2). A changed G on new batches signals
+    /// true provider history loss or an explicit shared rebase; G is not
+    /// incremented for subscriber-local overflow, retention-window pruning, or
+    /// targeted revocation termination with a history-keeping policy.
     #[prost(uint64, tag="3")]
     pub generation: u64,
     /// predecessor_checkpoint is the checkpoint this batch continues from. Opaque
@@ -787,7 +881,11 @@ pub struct RecoveryBatchTrailer {
     /// at most 256 bytes.
     #[prost(bytes="vec", tag="2")]
     pub subscription_handle: ::prost::alloc::vec::Vec<u8>,
-    /// generation is the continuity generation of the stream.
+    /// generation is the continuity generation of the provider-resolved (P, S)
+    /// scope for this trailer (RFC 0006 §11.2). It fences outcomes by scope: it
+    /// is the OLD generation carried with next_generation on true provider
+    /// history loss or explicit shared rebase, and the CURRENT (unchanged)
+    /// generation on local-queue termination.
     #[prost(uint64, tag="3")]
     pub generation: u64,
     /// boundary_checkpoint is the catch-up or snapshot boundary. Opaque bytes, at
@@ -796,7 +894,9 @@ pub struct RecoveryBatchTrailer {
     pub boundary_checkpoint: ::prost::alloc::vec::Vec<u8>,
     /// terminate_reason carries the required machine-readable reason when the
     /// terminated outcome is selected. Opaque bytes, non-empty when terminated,
-    /// at most 256 bytes. Empty means no termination.
+    /// at most 256 bytes. Empty means no termination. ASCII `local-queue-
+    /// exhausted` denotes local queue exhaustion (mutually exclusive with
+    /// continuity-loss outcomes).
     #[prost(bytes="vec", tag="9")]
     pub terminate_reason: ::prost::alloc::vec::Vec<u8>,
     /// outcome selects the terminal outcome for the stream. Outcomes are mutually
@@ -813,8 +913,13 @@ pub mod recovery_batch_trailer {
     #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, Copy, PartialEq, ::prost::Oneof)]
     pub enum Outcome {
-        /// next_generation carries the new generation on continuity loss. Selected
-        /// only on continuity loss with a nonzero new generation.
+        /// next_generation carries the new generation Gnext of the provider-resolved
+        /// (P, S) scope on true provider history loss or an explicit shared rebase
+        /// (RFC 0006 §11.2/§11.4). Selected ONLY on that shared scoped continuity
+        /// change, with a nonzero new generation and the trailer's generation field
+        /// carrying the old G; never on subscriber-local saturation (the
+        /// terminated outcome at the current generation covers that), never on
+        /// ordinary retention-window pruning, and never through initiator-manufactured values.
         #[prost(uint64, tag="5")]
         NextGeneration(u64),
         /// catchup_complete is selected with true when the stream has reached live.
@@ -827,6 +932,10 @@ pub mod recovery_batch_trailer {
         /// terminated is selected with true when the host ends the targeted
         /// subscription. The trailer carries the typed terminal signal so the host
         /// can terminate one stream even when there is no outstanding invocation.
+        /// Subscriber-local saturation uses this outcome at the CURRENT generation
+        /// with terminate_reason = ASCII `local-queue-exhausted` and no
+        /// next_generation (RFC 0006 §11.4): local queue overflow does not rebase
+        /// the provider and does not invalidate other subscribers' checkpoints.
         #[prost(bool, tag="8")]
         Terminated(bool),
     }

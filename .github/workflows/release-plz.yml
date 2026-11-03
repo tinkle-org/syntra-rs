@@ -1,7 +1,7 @@
 name: Release-plz
 
-# Automated Release PRs and trusted-publishing releases for the five-crate
-# workspace. `release-pr` opens/updates a reviewed Release PR on pushes to
+# Automated Release PRs and trusted-publishing releases for public workspace
+# members. `release-pr` opens/updates a reviewed Release PR on pushes to
 # main; `release` publishes only when that Release PR merges (release_always
 # is false in release-plz.toml), so merging to main alone never publishes.
 # Per-crate tags use the default `{{ package }}-v{{ version }}` pattern, which
@@ -40,6 +40,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      SYNTRA_SDD_ROOT: ${{ github.workspace }}/../syntra-sdd
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -60,23 +62,46 @@ jobs:
         with:
           version: "1.59.0"
           github_token: ${{ github.token }}
+      - name: Install pinned candidate parser
+        run: python3 -m pip install -r scripts/requirements-evidence.txt
+      - name: Require and verify a committed candidate pin before publication
+        # A dirty worktree record deliberately fails here. Release-plz stays
+        # enabled; neither baseline HEAD nor local digests authorize publication.
+        run: |
+          candidate_revision="$(python3 -B scripts/protocol_contract.py --release-revision)"
+          git init "$SYNTRA_SDD_ROOT"
+          git -C "$SYNTRA_SDD_ROOT" remote add origin https://github.com/tinkle-org/syntra.git
+          git -C "$SYNTRA_SDD_ROOT" fetch origin "$candidate_revision"
+          python3 -B scripts/protocol_contract.py --release --upstream "$SYNTRA_SDD_ROOT"
       - name: Full validation plus release-profile checks
         run: |
+          cargo test --locked
           cargo test --locked --workspace
+          python3 scripts/cargo_contracts.py isolation
+          cargo test --locked -p syntra-transport --no-default-features --features tcp,websocket,reconnect,native-enrollment
+          cargo test --locked -p syntra-runtime --no-default-features --features file-store
           cargo test --locked -p syntra-ffi --no-default-features --features production
           cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
-          cargo check --locked -p syntra-core -p syntra-runtime -p syntra-ws -p syntra-web --target wasm32-unknown-unknown
+          cargo check --locked -p syntra-core -p syntra-runtime --target wasm32-unknown-unknown
+          cargo check --locked -p syntra-web --no-default-features --features browser-connection --target wasm32-unknown-unknown
+          cargo check --locked -p syntra-web --no-default-features --features browser-test-fixture --target wasm32-unknown-unknown
           python3 crates/syntra-ffi/tests/build_contract.py
           python3 scripts/check-generated.py
+          git -C "$SYNTRA_SDD_ROOT" fetch --depth=1 origin 8ede3810b29fbba4d0e6ae6751a0025ceedda140
           python3 scripts/check-upstream-pin.py
           cargo install --locked cargo-deny --version 0.20.2
           cargo install --locked cargo-audit --version 0.22.2
-          cargo deny --locked check advisories licenses sources
           cargo audit --deny warnings
+          cargo deny --locked check advisories licenses sources
+          cargo deny --locked --features syntra-transport/tcp,syntra-transport/websocket,syntra-transport/reconnect,syntra-transport/native-enrollment,syntra-runtime/file-store check advisories licenses sources
+          cargo deny --locked --features syntra-web/browser-connection --target wasm32-unknown-unknown check advisories licenses sources
           cargo build --locked --release -p syntra-ffi --no-default-features --features production
-          if command -v nm >/dev/null; then nm -D --defined-only target/release/libsyntra_ffi.so | grep -E "syntra_ffi_(client_open|host_open|abi_version)" || (echo "missing production symbols in release artifact" >&2; exit 1); fi
+          for symbol in syntra_client_open syntra_host_open syntra_abi_version; do
+            nm -D --defined-only target/release/libsyntra_ffi.so | grep -Eq "[[:space:]]${symbol}$" || (echo "missing production symbol: $symbol" >&2; exit 1)
+          done
+          if nm -D --defined-only target/release/libsyntra_ffi.so | grep -Eq "[[:space:]]syntra_(ffi_|v2_)"; then echo "obsolete ABI in production release artifact" >&2; exit 1; fi
           if nm -D --defined-only target/release/libsyntra_ffi.so 2>/dev/null | grep -q "syntra_open"; then echo "test-only syntra_open in production release artifact" >&2; exit 1; fi
-          for p in syntra-core syntra-runtime syntra-ws syntra-web syntra-ffi; do cargo package --locked -p "$p" --list; cargo package --locked -p "$p" --no-verify; done
+          python3 scripts/cargo_contracts.py package
 
   release-plz-release:
     name: Release-plz release

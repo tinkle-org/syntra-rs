@@ -9,9 +9,8 @@
 //! - every effective deadline is computed as an absolute `Instant`
 //!   BEFORE queue admission, so queueing can never silently consume the
 //!   caller's budget;
-//! - completion wins races: all `select!` sites are `biased` with the
-//!   completion branch first (cancel-vs-deadline ties prefer `CANCELLED`;
-//!   open tie-break B10 is recorded, not invented);
+//! - terminal selection is serialized and checks the absolute deadline before
+//!   every newly observed candidate; already-selected outcomes are immutable;
 //! - handshake timeout explicitly closes the core
 //!   (`fail_handshake_and_close`);
 //! - pending entries are removed on validation failure, send failure,
@@ -62,12 +61,49 @@ impl Default for ConnectionConfig {
     }
 }
 
+impl ConnectionConfig {
+    /// Persistent-profile capacity and finite timer bounds. Reduced capacities
+    /// below the protocol's 16-way floor are not a supported production mode.
+    pub fn validate(&self) -> Result<(), SyntraError> {
+        if !(16..=1024).contains(&self.max_outstanding)
+            || !(1..=1024).contains(&self.writer_capacity)
+            || !(1..=1024).contains(&self.notification_capacity)
+            || [
+                self.default_timeout,
+                self.max_rpc_timeout,
+                self.handshake_timeout,
+            ]
+            .iter()
+            .any(|value| value.is_zero() || *value > Duration::from_secs(86_400))
+        {
+            return Err(SyntraError::Protocol {
+                code: syntra_core::ErrorCode::InvalidArgument,
+                message: "invalid connection limits (RPC capacity 16..1024, queues 1..1024, positive timers at most 24h)".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+pub const DEFAULT_CLOSE_GRACE: Duration = Duration::from_secs(5);
+pub const MAX_CLOSE_GRACE: Duration = Duration::from_secs(30);
+
+pub fn validate_close_grace(grace: Duration) -> Result<(), SyntraError> {
+    if grace > MAX_CLOSE_GRACE {
+        return Err(SyntraError::Protocol {
+            code: syntra_core::ErrorCode::InvalidArgument,
+            message: "close grace must be 0..30 seconds".into(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod connection_config_tests {
     use super::ConnectionConfig;
 
     #[test]
-    fn default_max_outstanding_is_32_per_sntr_scw_012() {
+    fn default_max_outstanding_is_32() {
         assert_eq!(ConnectionConfig::default().max_outstanding, 32);
     }
 }
@@ -345,6 +381,7 @@ async fn wasm_sleep(d: Duration) {
 }
 
 /// Sleep until an absolute deadline (no-op when already past).
+#[cfg(target_arch = "wasm32")]
 pub(crate) async fn sleep_until(deadline: Instant) {
     loop {
         let now = Instant::now();
@@ -368,12 +405,17 @@ pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 /// browser microtask queue (`spawn_local`). The returned handle aborts
 /// the task on native; on wasm cancellation is cooperative only
 /// (documented: browser handlers MUST honor `CancelToken`).
-pub(crate) struct TaskHandle {
+#[derive(Clone)]
+pub(crate) struct TaskHandle(Arc<TaskInner>);
+
+struct TaskInner {
     scope: Arc<()>,
     #[cfg(not(target_arch = "wasm32"))]
-    inner: Option<tokio::task::JoinHandle<()>>,
+    inner: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     #[cfg(target_arch = "wasm32")]
-    done: oneshot::Receiver<()>,
+    done: StdMutex<Option<oneshot::Receiver<()>>>,
+    finished: AtomicBool,
+    failed: AtomicBool,
 }
 
 tokio::task_local! {
@@ -383,9 +425,18 @@ tokio::task_local! {
 }
 
 impl TaskHandle {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn from_native(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(Arc::new(TaskInner {
+            scope: Arc::new(()),
+            inner: StdMutex::new(Some(handle)),
+            finished: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+        }))
+    }
     pub(crate) fn is_current(&self) -> bool {
         TASK_SCOPE
-            .try_with(|scope| Arc::ptr_eq(scope, &self.scope))
+            .try_with(|scope| Arc::ptr_eq(scope, &self.0.scope))
             .unwrap_or(false)
     }
 
@@ -396,9 +447,79 @@ impl TaskHandle {
             return;
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(h) = &self.inner {
+        if let Some(h) = &*self.0.inner.lock().unwrap() {
             h.abort();
         }
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self
+            .0
+            .inner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|h| h.is_finished());
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut slot = self.0.done.lock().unwrap();
+            if let Some(done) = slot.as_mut() {
+                match done.try_recv() {
+                    Ok(()) => {
+                        slot.take();
+                        self.0.finished.store(true, Ordering::Release);
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        slot.take();
+                        self.0.failed.store(true, Ordering::Release);
+                        self.0.finished.store(true, Ordering::Release);
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                }
+            }
+            self.0.finished.load(Ordering::Acquire)
+        }
+    }
+
+    pub(crate) fn poll_join(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        use std::{future::Future, pin::Pin, task::Poll};
+        if self.is_current() {
+            return Poll::Pending;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut slot = self.0.inner.lock().unwrap();
+        #[cfg(target_arch = "wasm32")]
+        let mut slot = self.0.done.lock().unwrap();
+        let Some(handle) = slot.as_mut() else {
+            return Poll::Ready(());
+        };
+        match Pin::new(handle).poll(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(result) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                if result.as_ref().is_err_and(|e| !e.is_cancelled()) {
+                    self.0.failed.store(true, Ordering::Release);
+                }
+                #[cfg(target_arch = "wasm32")]
+                if result.is_err() {
+                    self.0.failed.store(true, Ordering::Release);
+                }
+            }
+        }
+        slot.take();
+        self.0.finished.store(true, Ordering::Release);
+        Poll::Ready(())
+    }
+
+    pub(crate) fn reap(&self) -> bool {
+        self.is_finished()
+            && self
+                .poll_join(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                .is_ready()
+    }
+    pub(crate) fn failed(&self) -> bool {
+        self.0.failed.load(Ordering::Acquire)
     }
 
     pub(crate) async fn join(self) {
@@ -407,21 +528,11 @@ impl TaskHandle {
         if self.is_current() {
             return;
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(h) = self.inner {
-            let _ = h.await;
-        }
-        #[cfg(target_arch = "wasm32")]
-        let _ = self.done.await;
+        std::future::poll_fn(|cx| self.poll_join(cx)).await;
     }
 
-    /// Join with a bounded wait. Native callers still `abort` first, so the
-    /// join completes immediately and the grace never fires (fast path
-    /// unchanged). On wasm `abort` is a no-op: a handler that ignores its
-    /// `CancelToken` would otherwise hang `close` forever, so the grace
-    /// bounds the wait and detaches best-effort (the `spawn_local` future
-    /// keeps running; its completion send is ignored). Dropping the losing
-    /// branch is the detach: no owned task is left joined.
+    /// Test-only bounded waiter; production ownership remains in TaskGroup.
+    #[cfg(test)]
     pub(crate) async fn join_bounded(self, grace: Duration) {
         tokio::select! {
             biased;
@@ -437,10 +548,12 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let scope = Arc::new(());
-    TaskHandle {
-        inner: Some(tokio::spawn(TASK_SCOPE.scope(scope.clone(), fut))),
+    TaskHandle(Arc::new(TaskInner {
+        inner: StdMutex::new(Some(tokio::spawn(TASK_SCOPE.scope(scope.clone(), fut)))),
         scope,
-    }
+        finished: AtomicBool::new(false),
+        failed: AtomicBool::new(false),
+    }))
 }
 
 /// Browser tasks run on the microtask queue (`spawn_local`), which does
@@ -453,11 +566,19 @@ where
 {
     let scope = Arc::new(());
     let (done_tx, done) = oneshot::channel();
+    let task = TaskHandle(Arc::new(TaskInner {
+        scope: scope.clone(),
+        done: StdMutex::new(Some(done)),
+        finished: AtomicBool::new(false),
+        failed: AtomicBool::new(false),
+    }));
+    let completion = task.clone();
     wasm_bindgen_futures::spawn_local(TASK_SCOPE.scope(scope.clone(), async move {
         fut.await;
         let _ = done_tx.send(());
+        completion.0.finished.store(true, Ordering::Release);
     }));
-    TaskHandle { scope, done }
+    task
 }
 
 /// Fill `buf` with cryptographic randomness (OS-backed on every target).
@@ -479,6 +600,13 @@ pub(crate) struct HandshakeDone {
 }
 
 pub(crate) struct Shared {
+    pub(crate) tasks: crate::shutdown::TaskGroup,
+    pub(crate) shutdown: StdMutex<Option<crate::shutdown::ShutdownState>>,
+    pub(crate) shutdown_requested: AtomicBool,
+    pub(crate) transport_closed: AtomicBool,
+    pub(crate) transport_tasks: std::sync::atomic::AtomicUsize,
+    pub clock: crate::elapsed::ElapsedClock,
+    pub(crate) suspended: AtomicBool,
     pub role: Role,
     pub state: RwLock<ConnectionState>,
     pub version: RwLock<Option<u32>>,
@@ -487,10 +615,16 @@ pub(crate) struct Shared {
     pub pending: PendingTable,
     /// Serializes RPC handoff with terminal selection and pending cleanup.
     pub(crate) emissions: StdMutex<crate::emission::Emissions>,
+    /// Allocation through FIFO enqueue is one ordered admission operation.
+    pub(crate) rpc_admission: AsyncMutex<()>,
     pub ids: RequestIdAllocator,
     pub writer: mpsc::Sender<Vec<u8>>,
     pub notif_tx: mpsc::Sender<Bytes>,
+    /// One immutable connection-owned recovery notification route. A closed
+    /// attachment is never replaced by another generation on this connection.
+    pub(crate) recovery_inbox: StdMutex<Option<Arc<crate::recovery::wire_client::RecoveryInbox>>>,
     pub handshake_tx: AsyncMutex<Option<oneshot::Sender<Result<HandshakeDone, SyntraError>>>>,
+    pub(crate) handshake_deadline: StdMutex<Option<Instant>>,
     pub config: ConnectionConfig,
     pub closed: AtomicBool,
     pub(crate) principal_withdrawn: AtomicBool,
@@ -529,10 +663,35 @@ impl Shared {
         proposed_min: u32,
         proposed_max: u32,
     ) -> (Arc<Self>, mpsc::Receiver<Bytes>) {
+        Self::new_with_clock(
+            role,
+            writer,
+            config,
+            proposed_min,
+            proposed_max,
+            crate::elapsed::ElapsedClock::new(),
+        )
+    }
+
+    pub(crate) fn new_with_clock(
+        role: Role,
+        writer: mpsc::Sender<Vec<u8>>,
+        config: ConnectionConfig,
+        proposed_min: u32,
+        proposed_max: u32,
+        clock: crate::elapsed::ElapsedClock,
+    ) -> (Arc<Self>, mpsc::Receiver<Bytes>) {
         let (notif_tx, notif_rx) = mpsc::channel(config.notification_capacity);
         let (closed_tx, _) = watch::channel(false);
         let (notification_loss_tx, _) = watch::channel((0, 0));
         let shared = Arc::new(Self {
+            tasks: crate::shutdown::TaskGroup::default(),
+            shutdown: StdMutex::new(None),
+            shutdown_requested: AtomicBool::new(false),
+            transport_closed: AtomicBool::new(false),
+            transport_tasks: std::sync::atomic::AtomicUsize::new(0),
+            clock,
+            suspended: AtomicBool::new(false),
             role,
             state: RwLock::new(ConnectionState::Connected),
             version: RwLock::new(None),
@@ -540,10 +699,13 @@ impl Shared {
             proposed_max,
             pending: PendingTable::new(config.max_outstanding),
             emissions: StdMutex::new(crate::emission::Emissions::new()),
+            rpc_admission: AsyncMutex::new(()),
             ids: RequestIdAllocator::new(),
             writer,
             notif_tx,
+            recovery_inbox: StdMutex::new(None),
             handshake_tx: AsyncMutex::new(None),
+            handshake_deadline: StdMutex::new(None),
             config,
             closed: AtomicBool::new(false),
             principal_withdrawn: AtomicBool::new(false),
@@ -609,6 +771,79 @@ impl Connection {
         self.shared.closed.load(Ordering::Acquire)
     }
 
+    pub(crate) fn lifecycle_blocked(&self) -> bool {
+        self.shared.suspended.load(Ordering::Acquire) || !self.shared.clock.is_continuous()
+    }
+
+    pub fn carrier_io_allowed(&self) -> bool {
+        !self.lifecycle_blocked() && !self.shared.transport_closed.load(Ordering::Acquire)
+    }
+
+    /// Linearize one synchronous, nonblocking carrier poll with suspend/close
+    /// attestation. The closure must not reenter Core, invoke app callbacks or
+    /// await. In particular never put ingest or prepare_outbound in this gate.
+    pub fn with_carrier_io<R>(&self, poll: impl FnOnce() -> R) -> Option<R> {
+        let _handoff = self.shared.emissions.lock().unwrap();
+        if !self.carrier_io_allowed() {
+            return None;
+        }
+        Some(poll())
+    }
+
+    pub(crate) fn handshake_expired(&self) -> bool {
+        self.shared
+            .handshake_deadline
+            .lock()
+            .unwrap()
+            .is_some_and(|deadline| self.shared.clock.now() >= deadline)
+    }
+
+    /// Fence admission and handoff synchronously before yielding to the platform.
+    /// Wake deliberately replaces the connection: downstream channel/authorization
+    /// clocks must never be guessed by the transport-independent Core runtime.
+    pub fn suspend(&self) {
+        let _gate = self.shared.emissions.lock().unwrap();
+        self.shared.suspended.store(true, Ordering::Release);
+    }
+
+    pub async fn platform_wake(&self) {
+        self.suspend();
+        self.shared.clock.wake();
+        self.on_transport_lost().await;
+    }
+
+    pub(crate) async fn accept_inbound(&self) -> bool {
+        if self.shared.transport_closed.load(Ordering::Acquire) {
+            self.on_transport_lost().await;
+            return false;
+        }
+        if !self.shared.clock.is_continuous() {
+            self.on_transport_lost().await;
+            return false;
+        }
+        if self.lifecycle_blocked() || self.is_closed() {
+            return false;
+        }
+        // Handshake expiry precedes decode/authentication of buffered bytes.
+        // RPC results retain their correlated gate so even a late credential
+        // rejection can withdraw authority while deadline wins its own outcome.
+        let state = self.state().await;
+        let expired = !matches!(
+            state,
+            ConnectionState::Active | ConnectionState::Closing | ConnectionState::Closed
+        ) && self
+            .shared
+            .handshake_deadline
+            .lock()
+            .unwrap()
+            .is_some_and(|deadline| self.shared.clock.now() >= deadline);
+        if expired {
+            self.expire_handshake().await;
+            return false;
+        }
+        true
+    }
+
     pub(crate) fn writer_is_fenced(&self) -> bool {
         self.shared.writer_fenced.load(Ordering::Acquire)
     }
@@ -647,7 +882,7 @@ impl Connection {
         // Close and queue admission linearize on state. No lifecycle lock
         // is held while waiting for channel capacity.
         let _state = self.shared.state.read().await;
-        if self.is_closed() || self.writer_is_fenced() {
+        if self.is_closed() || self.writer_is_fenced() || !self.carrier_io_allowed() {
             return Err(SyntraError::Closed("connection closed".to_string()));
         }
         permit.send(bytes);
@@ -656,7 +891,7 @@ impl Connection {
 
     pub(crate) async fn reserve_writer(&self) -> Result<mpsc::Permit<'_, Vec<u8>>, SyntraError> {
         let mut closed = self.subscribe_close();
-        if self.is_closed() || self.writer_is_fenced() {
+        if self.is_closed() || self.writer_is_fenced() || !self.carrier_io_allowed() {
             return Err(SyntraError::Closed("connection closed".to_string()));
         }
         tokio::select! {
@@ -748,36 +983,21 @@ impl Connection {
     pub(crate) async fn drain_until(&self, deadline: Instant, drained: impl Fn() -> bool) {
         let mut closed = self.subscribe_close();
         while !self.is_closed() {
+            if self.lifecycle_blocked() {
+                return;
+            }
             if drained() && self.shared.writer.capacity() == self.shared.writer.max_capacity() {
                 return;
             }
-            if Instant::now() >= deadline {
+            if self.shared.clock.now() >= deadline {
                 return;
             }
             tokio::select! {
                 biased;
                 _ = closed.changed() => return,
-                _ = sleep_until(deadline.min(Instant::now() + Duration::from_millis(1))) => {},
+                _ = self.shared.clock.sleep_until(deadline.min(self.shared.clock.now() + Duration::from_millis(1))) => {},
             }
         }
-    }
-
-    pub(crate) async fn send_worker_result(
-        &self,
-        bytes: Vec<u8>,
-        complete: impl FnOnce(),
-    ) -> Result<(), SyntraError> {
-        let permit = self.reserve_writer().await?;
-        let _state = self.shared.state.read().await;
-        if self.is_closed()
-            || self.writer_is_fenced()
-            || self.shared.principal_withdrawn.load(Ordering::Acquire)
-        {
-            return Err(SyntraError::Closed("connection closed".to_string()));
-        }
-        permit.send(bytes);
-        complete();
-        Ok(())
     }
 
     async fn finish_close(&self, failure: SyntraError, abrupt: bool, handshake_only: bool) {
@@ -823,11 +1043,10 @@ impl Connection {
         if next == ConnectionState::Closing {
             *state = ConnectionState::Closed;
         }
-        {
-            let mut emissions = self.shared.emissions.lock().unwrap();
-            self.shared.closed.store(true, Ordering::Release);
-            self.shared.pending.drain_transport_lost();
-            emissions.clear();
+        self.shared.closed.store(true, Ordering::Release);
+        self.shared.fail_all_rpcs();
+        if let Some(inbox) = self.shared.recovery_inbox.lock().unwrap().as_ref() {
+            inbox.close();
         }
         if let Some(tx) = waiter.take() {
             let _ = tx.send(Err(failure));
@@ -870,13 +1089,16 @@ impl Connection {
     /// Take the next notification payload (opaque application bytes).
     /// Returns None when the connection is closed and drained.
     pub async fn next_notification(&self) -> Option<Vec<u8>> {
+        if self.lifecycle_blocked() {
+            return None;
+        }
         let mut closed = self.subscribe_close();
         let mut rx = self.notif_rx.lock().await;
         if !self.is_closed() {
             tokio::select! {
                 biased;
                 _ = closed.changed() => {},
-                value = rx.recv() => return value.map(|b| b.to_vec()),
+                value = rx.recv() => return if self.lifecycle_blocked() { None } else { value.map(|b| b.to_vec()) },
             }
         }
         // Closing the receiver rejects future producers but preserves the

@@ -14,6 +14,9 @@
 //! (e.g. every N seconds or every M polls). Idle peers therefore converge
 //! without any new batch. Reconciliation never advances committed progress
 //! itself; it only emits `RecoveryNeeded` so the normal replay path runs.
+//! Observations from a different G cannot establish a provider loss/rebase;
+//! they are ignored. The caller explicitly updates the engine on provider
+//! loss and forgets retired-round observations (including equal-G rounds).
 
 use std::collections::HashMap;
 use web_time::{Duration, Instant};
@@ -68,8 +71,26 @@ impl CheckpointReconciler {
 
     /// Record the last observed (validated or completed) checkpoint for the
     /// stream. Called on every batch/replay page, including the final batch
-    /// of a stream that then goes idle.
-    pub fn note_observed(&mut self, checkpoint: ProfileCheckpoint) {
+    /// of a stream that then goes idle. Selection is against the engine's
+    /// current generation: a current-generation checkpoint always replaces
+    /// stored evidence, while a non-current checkpoint never clobbers
+    /// current-generation evidence. Among non-current checkpoints the
+    /// newest generation wins so a future stays available for when the
+    /// engine advances; `tick` discards retired generations and ignores
+    /// futures.
+    pub fn note_observed(&mut self, engine: &ProfileEngine, checkpoint: ProfileCheckpoint) {
+        if let Some(current) = engine.generation(&checkpoint.stream_selector) {
+            if checkpoint.generation == current {
+            } else if self
+                .observed
+                .get(&checkpoint.stream_selector)
+                .is_some_and(|previous| {
+                    previous.generation == current || previous.generation > checkpoint.generation
+                })
+            {
+                return;
+            }
+        }
         self.observed
             .insert(checkpoint.stream_selector.clone(), checkpoint);
     }
@@ -90,7 +111,7 @@ impl CheckpointReconciler {
     /// Reconcile up to `max_streams_per_tick` streams.
     ///
     /// For each tracked stream whose last observed result differs from the
-    /// engine's committed position (generation and cursor), emits
+    /// engine's committed cursor in the same generation, emits
     /// `RecoveryNeeded` from the committed cursor. Streams already converged
     /// emit nothing. The tick runs even when no batch arrived since the last
     /// tick, so a missing final update is discovered while peers are idle.
@@ -131,7 +152,11 @@ impl CheckpointReconciler {
                 Some(p) => p,
                 None => continue,
             };
-            if observed.generation == pos.generation && observed.result_cursor == pos.committed {
+            if observed.generation < pos.generation {
+                self.observed.remove(&selector);
+                continue;
+            }
+            if observed.generation != pos.generation || observed.result_cursor == pos.committed {
                 continue;
             }
             out.push(ProfileAction::RecoveryNeeded {
@@ -182,7 +207,7 @@ mod tests {
             checkpoint: batch.clone(),
         });
         assert!(matches!(offered[0], ProfileAction::CommitCheckpoint { .. }));
-        rec.note_observed(batch);
+        rec.note_observed(&engine, batch);
         let found = rec.tick(now, &engine, &store);
         assert_eq!(found.len(), 1);
         assert!(matches!(found[0], ProfileAction::RecoveryNeeded { .. }));
@@ -201,10 +226,75 @@ mod tests {
         });
         for s in [b"a".as_slice(), b"b".as_slice()] {
             engine.insert_stream(s.to_vec(), 7, b"c-0".to_vec());
-            rec.note_observed(cp(s, b"c-0", b"c-1"));
+            rec.note_observed(&engine, cp(s, b"c-0", b"c-1"));
         }
         let now = Instant::now();
         assert_eq!(rec.tick(now, &engine, &store).len(), 1);
         assert!(rec.tick(now, &engine, &store).is_empty());
+    }
+
+    #[test]
+    fn observations_cannot_infer_provider_loss_or_revive_retired_generation() {
+        let mut engine = ProfileEngine::new();
+        engine.insert_stream(b"s".to_vec(), 7, b"C".to_vec());
+        let store = MemoryStore::new();
+        let mut rec = CheckpointReconciler::new(ReconcilerConfig {
+            tick_interval: Duration::ZERO,
+            max_streams_per_tick: 1,
+        });
+        let mut future = cp(b"s", b"C", b"future");
+        future.generation = 8;
+        rec.note_observed(&engine, future.clone());
+        assert!(rec.tick(Instant::now(), &engine, &store).is_empty());
+        assert_eq!(engine.generation(b"s"), Some(7));
+        // A future-generation observation cannot suppress current-generation
+        // evidence: the current observation replaces it and still recovers.
+        let current = cp(b"s", b"C", b"stale");
+        rec.note_observed(&engine, current.clone());
+        assert_eq!(
+            rec.observed[b"s".as_slice()],
+            current,
+            "current G replaces future evidence"
+        );
+        assert_eq!(rec.tick(Instant::now(), &engine, &store).len(), 1);
+        engine.provider_loss(b"s", 8).unwrap();
+        // The retired-generation observation is discarded, not recovered.
+        assert!(rec.tick(Instant::now(), &engine, &store).is_empty());
+        assert!(!rec.observed.contains_key(b"s".as_slice()));
+        // Late observations from the retired generation never trigger recovery.
+        rec.note_observed(&engine, cp(b"s", b"C", b"stale"));
+        assert!(rec.tick(Instant::now(), &engine, &store).is_empty());
+        assert!(!rec.observed.contains_key(b"s".as_slice()));
+        // Future-generation observations are ignored until the engine advances.
+        let mut next_future = cp(b"s", b"C", b"next-future");
+        next_future.generation = 10;
+        rec.note_observed(&engine, next_future);
+        assert!(rec.tick(Instant::now(), &engine, &store).is_empty());
+        engine.provider_loss(b"s", 9).unwrap();
+        assert!(rec.tick(Instant::now(), &engine, &store).is_empty());
+    }
+
+    #[test]
+    fn current_generation_preserved_when_previous_remains_stored() {
+        let mut engine = ProfileEngine::new();
+        engine.insert_stream(b"s".to_vec(), 8, b"C".to_vec());
+        let store = MemoryStore::new();
+        let mut rec = CheckpointReconciler::new(ReconcilerConfig {
+            tick_interval: Duration::ZERO,
+            max_streams_per_tick: 8,
+        });
+        // A delayed previous-generation observation remains stored.
+        let mut prev = cp(b"s", b"C", b"prev-result");
+        prev.generation = 7;
+        rec.note_observed(&engine, prev);
+        // A current-generation checkpoint must still be preserved and the
+        // missing idle update detected on tick.
+        let mut cur = cp(b"s", b"C", b"c-43");
+        cur.generation = 8;
+        rec.note_observed(&engine, cur.clone());
+        assert_eq!(rec.observed[b"s".as_slice()], cur);
+        let found = rec.tick(Instant::now(), &engine, &store);
+        assert_eq!(found.len(), 1);
+        assert!(matches!(found[0], ProfileAction::RecoveryNeeded { .. }));
     }
 }

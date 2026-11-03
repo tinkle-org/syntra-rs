@@ -9,6 +9,10 @@
 //! contract a concrete adapter shape so drivers and tests share one
 //! atomicity rule.
 //!
+//! This legacy adapter stores a digest as a test witness, not application state.
+//! It is not the accepted wire client's persistence boundary: use `persistence`
+//! for atomic full-state + (P,S,G,C), or supply the declared application fence.
+//!
 //! Atomicity rule: `store_atomic` either durably records both the position
 //! and the effects digest, or records neither and returns an error. Partial
 //! writes must never become visible to `load`.
@@ -54,11 +58,11 @@ pub trait DurableStore: Send + Sync {
     ) -> Result<(), StoreError>;
 }
 
-/// In-memory store for drivers, embeds, and tests.
+/// Volatile in-memory store for local coordinator tests, not crash durability.
 ///
 /// `fail_next` injects exactly one persistence failure (the next
 /// `store_atomic` returns `Unavailable` and records nothing); `fail_always`
-/// fails every write. Both model a crashed disk without advancing state.
+/// fails every write. They simulate rejected writes only, not real disk crashes.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     positions: HashMap<Vec<u8>, CommittedPosition>,

@@ -1,21 +1,25 @@
-//! Generic synchronization and recovery boundary.
+//! Negotiated update/recovery runtime and generic coordination helpers.
 //!
-//! The core transports opaque `Notification` bytes and reports observable
-//! transport events. It does not interpret stream identity, checkpoint
-//! syntax, replay methods, or snapshot formats.
+//! Non-wire recovery helpers. The profile wire adapter owns connection/handle
+//! fencing and peer acknowledgements; these helpers track local persistence.
 //!
-//! This module defines application-supplied checkpoint metadata and the
-//! local actions a generic coordinator may emit. The application selects
-//! recovery RPCs, constructs payloads, performs requests, persists
-//! checkpoints, and installs snapshots.
+//! `wire` and `wire_client` bind accepted RFC 0006 payloads to the actual
+//! Host/Initiator, with connection/handle fencing and bounded ingress. The
+//! application supplies scoped provider history/issued-binding authority and
+//! full-state persistence through `persistence`; receipt is never durable commit.
+//! The older selector/numeric coordinators remain local helpers, not a second
+//! wire protocol or authority for checkpoint interpretation.
 
 pub mod cache;
 pub mod driver;
 pub mod engine;
+pub mod persistence;
 pub mod profile;
 pub mod reconcile;
 pub mod snapshot;
 pub mod store;
+pub mod wire;
+pub mod wire_client;
 
 pub use cache::DuplicateCache;
 pub use driver::{
@@ -36,7 +40,7 @@ pub use store::{DurableStore, MemoryStore, StoreError};
 pub struct StreamCheckpoint {
     /// Application-defined stream label, opaque to the core.
     pub stream: String,
-    /// Continuity epoch. Changes when an old checkpoint cannot continue.
+    /// Scoped provider continuity epoch, unchanged by retention misses.
     pub generation: u64,
     /// State required before applying the next batch.
     pub base: u64,
@@ -59,7 +63,12 @@ pub enum RecoveryInput {
     ContinuityLost { stream: String, committed: u64 },
     /// The application reports that continuation is expired or unavailable.
     ContinuationExpired { stream: String, committed: u64 },
-    /// The application installed a snapshot at the given checkpoint.
+    /// Explicit scoped provider history loss/rebase, not local queue loss.
+    ProviderLoss {
+        stream: String,
+        next_generation: u64,
+    },
+    /// The application validated/installed a provider-trusted snapshot in current G.
     SnapshotInstalled { checkpoint: StreamCheckpoint },
 }
 
@@ -78,7 +87,7 @@ pub enum RecoveryAction {
 
 /// Minimal coordinator over one stream's committed progress.
 ///
-/// The coordinator tracks the committed checkpoint only. The application
+/// The coordinator tracks committed progress and one pending offer. The application
 /// applies effects, persists checkpoints, and reports inputs.
 ///
 /// Snapshot gating: once [`RecoveryInput::ContinuationExpired`] reports a
@@ -86,17 +95,17 @@ pub enum RecoveryAction {
 /// [`RecoveryInput::BatchValidated`] inputs return
 /// [`RecoveryAction::SnapshotRequired`] instead of `CommitCheckpoint`, so
 /// committed progress cannot advance via the batch path until a snapshot
-/// with a new generation confirms via [`Self::confirm_persisted`].
+/// in the current generation confirms via [`Self::confirm_persisted`].
 /// [`RecoveryInput::SnapshotInstalled`] remains admissible while pending
-/// (it is the snapshot path). Generation changes happen only through
-/// snapshot confirms, which the application treats as its explicit
-/// continuity-epoch decision.
+/// (it is the provider-trusted snapshot path, which may jump to S0).
+/// Only explicit [`Self::provider_loss`] changes the generation.
 #[derive(Debug, Clone)]
 pub struct StreamRecovery {
     stream: String,
     generation: u64,
     committed: u64,
     snapshot_pending: bool,
+    pending: Option<(StreamCheckpoint, bool)>,
 }
 
 impl StreamRecovery {
@@ -106,6 +115,7 @@ impl StreamRecovery {
             generation,
             committed,
             snapshot_pending: false,
+            pending: None,
         }
     }
 
@@ -122,17 +132,29 @@ impl StreamRecovery {
         self.snapshot_pending
     }
 
+    /// Report true scoped provider loss/rebase. Invalidates the active numeric
+    /// cursor (reset to zero), pending offers and gates without changing the
+    /// external durable store. Ordinary retention/local loss and revocation
+    /// MUST NOT call this method; the caller re-establishes the scoped stream.
+    pub fn provider_loss(&mut self, next_generation: u64) -> Result<(), ProviderError> {
+        if next_generation <= self.generation {
+            return Err(ProviderError::StaleCheckpoint);
+        }
+        self.generation = next_generation;
+        self.committed = 0;
+        self.pending = None;
+        self.snapshot_pending = false;
+        Ok(())
+    }
+
     /// Observes coordinator inputs. A validated batch returns a
     /// `CommitCheckpoint` action without advancing `committed`; the caller
     /// advances via [`Self::confirm_persisted`] only after the checkpoint
     /// and its effects are durably persisted.
     ///
     /// Foreign streams are ignored (empty, no mutation), like `GapDetected`.
-    /// Same-generation snapshots must continue exactly from `committed`
-    /// (`base == committed`); new-generation snapshots may start from a
-    /// fresh base as their proven synchronization cut. Stale generations
-    /// and non-contiguous same-generation snapshots return
-    /// `RecoveryNeeded` instead of a committable action.
+    /// Batches must chain from `committed`; provider-trusted snapshots may
+    /// jump to S0 in current G. Neither observe nor confirm infers a rebase.
     pub fn observe(&mut self, input: RecoveryInput) -> Vec<RecoveryAction> {
         match input {
             RecoveryInput::BatchValidated { checkpoint } => {
@@ -148,12 +170,17 @@ impl StreamRecovery {
                 if checkpoint.generation != self.generation
                     || checkpoint.base != self.committed
                     || checkpoint.checkpoint < checkpoint.base
+                    || self
+                        .pending
+                        .as_ref()
+                        .is_some_and(|(cp, snapshot)| *cp != checkpoint || *snapshot)
                 {
                     return vec![RecoveryAction::RecoveryNeeded {
                         stream: self.stream.clone(),
                         committed: self.committed,
                     }];
                 }
+                self.pending = Some((checkpoint.clone(), false));
                 vec![RecoveryAction::CommitCheckpoint { checkpoint }]
             }
             RecoveryInput::GapDetected {
@@ -164,6 +191,7 @@ impl StreamRecovery {
                 if stream != self.stream {
                     return vec![];
                 }
+                self.pending = None;
                 vec![RecoveryAction::RecoveryNeeded {
                     stream: self.stream.clone(),
                     committed: self.committed,
@@ -176,6 +204,7 @@ impl StreamRecovery {
                 if stream != self.stream {
                     return vec![];
                 }
+                self.pending = None;
                 vec![RecoveryAction::RecoveryNeeded {
                     stream: self.stream.clone(),
                     committed: self.committed,
@@ -185,10 +214,11 @@ impl StreamRecovery {
                 if stream != self.stream {
                     return vec![];
                 }
-                if committed < self.committed {
+                if committed != self.committed {
                     return vec![];
                 }
                 self.snapshot_pending = true;
+                self.pending = None;
                 vec![RecoveryAction::SnapshotRequired {
                     stream: self.stream.clone(),
                     committed: self.committed,
@@ -198,31 +228,34 @@ impl StreamRecovery {
                 if checkpoint.stream != self.stream {
                     return vec![];
                 }
-                if self.snapshot_pending && checkpoint.generation == self.generation {
-                    return vec![RecoveryAction::SnapshotRequired {
-                        stream: self.stream.clone(),
-                        committed: self.committed,
-                    }];
-                }
-                if checkpoint.checkpoint < checkpoint.base {
+                if checkpoint.checkpoint < checkpoint.base
+                    || checkpoint.generation != self.generation
+                    || self
+                        .pending
+                        .as_ref()
+                        .is_some_and(|(cp, snapshot)| *cp != checkpoint || !*snapshot)
+                {
                     return vec![RecoveryAction::RecoveryNeeded {
                         stream: self.stream.clone(),
                         committed: self.committed,
                     }];
                 }
-                if checkpoint.generation < self.generation {
-                    return vec![RecoveryAction::RecoveryNeeded {
-                        stream: self.stream.clone(),
-                        committed: self.committed,
-                    }];
-                }
-                if checkpoint.generation == self.generation && checkpoint.base != self.committed {
-                    return vec![RecoveryAction::RecoveryNeeded {
-                        stream: self.stream.clone(),
-                        committed: self.committed,
-                    }];
-                }
+                self.pending = Some((checkpoint.clone(), true));
+                self.snapshot_pending = true;
                 vec![RecoveryAction::CommitCheckpoint { checkpoint }]
+            }
+            RecoveryInput::ProviderLoss {
+                stream,
+                next_generation,
+            } => {
+                if stream != self.stream {
+                    return vec![];
+                }
+                let _ = self.provider_loss(next_generation);
+                vec![RecoveryAction::RecoveryNeeded {
+                    stream: self.stream.clone(),
+                    committed: self.committed,
+                }]
             }
         }
     }
@@ -238,18 +271,8 @@ impl StreamRecovery {
     /// a checkpoint for another stream never triggers recovery of this
     /// stream.
     ///
-    /// Snapshot actions (a generation change) follow their own continuity
-    /// rules: only the stream and the checkpoint's internal consistency are
-    /// validated, so a snapshot whose base differs from the pre-snapshot
-    /// committed position is accepted. Same-generation checkpoints must
-    /// continue exactly from `committed`. Generations move forward only: a
-    /// confirmation from an older generation never rolls back newer
-    /// progress and instead reports the current position for recovery.
-    ///
-    /// While `snapshot_pending` is set (see [`Self::snapshot_pending`]),
-    /// same-generation confirmations are blocked with `SnapshotRequired`
-    /// instead of advancing, so only a new-generation snapshot confirm
-    /// clears the gate.
+    /// Only an exact pending offer can confirm. A provider-trusted snapshot
+    /// may jump from the old cursor and clear the gate, but never changes G.
     pub fn confirm_persisted(&mut self, checkpoint: &StreamCheckpoint) -> Vec<RecoveryAction> {
         if checkpoint.stream != self.stream {
             return vec![];
@@ -260,31 +283,38 @@ impl StreamRecovery {
                 committed: self.committed,
             }];
         }
-        if checkpoint.generation < self.generation {
+        if checkpoint.generation != self.generation {
             return vec![RecoveryAction::RecoveryNeeded {
                 stream: self.stream.clone(),
                 committed: self.committed,
             }];
         }
-        if self.snapshot_pending && checkpoint.generation == self.generation {
+        let is_snapshot = match &self.pending {
+            Some((offered, snapshot)) if offered == checkpoint => *snapshot,
+            _ => {
+                return vec![RecoveryAction::RecoveryNeeded {
+                    stream: self.stream.clone(),
+                    committed: self.committed,
+                }];
+            }
+        };
+        if self.snapshot_pending && !is_snapshot {
             return vec![RecoveryAction::SnapshotRequired {
                 stream: self.stream.clone(),
                 committed: self.committed,
             }];
         }
-        if checkpoint.generation != self.generation {
-            self.generation = checkpoint.generation;
-            self.committed = checkpoint.checkpoint;
-            self.snapshot_pending = false;
-            return vec![];
-        }
-        if checkpoint.base != self.committed {
+        if !is_snapshot && checkpoint.base != self.committed {
             return vec![RecoveryAction::RecoveryNeeded {
                 stream: self.stream.clone(),
                 committed: self.committed,
             }];
         }
         self.committed = checkpoint.checkpoint;
+        self.pending = None;
+        if is_snapshot {
+            self.snapshot_pending = false;
+        }
         vec![]
     }
 }
@@ -300,6 +330,41 @@ mod tests {
             base,
             checkpoint: at,
         }
+    }
+
+    #[test]
+    fn snapshot_never_manufactures_generation_or_confirms_without_offer() {
+        let mut r = StreamRecovery::new("s", 1, 40);
+        let current = checkpoint(0, 100);
+        assert!(!r.confirm_persisted(&current).is_empty());
+        let mut future = current.clone();
+        future.generation = 2;
+        assert!(matches!(
+            r.observe(RecoveryInput::SnapshotInstalled {
+                checkpoint: future.clone(),
+            })[0],
+            RecoveryAction::RecoveryNeeded { .. }
+        ));
+        assert!(!r.confirm_persisted(&future).is_empty());
+        assert_eq!(r.generation(), 1);
+        let _ = r.observe(RecoveryInput::SnapshotInstalled {
+            checkpoint: current.clone(),
+        });
+        assert_eq!(r.provider_loss(1), Err(ProviderError::StaleCheckpoint));
+        assert!(r.snapshot_pending());
+        r.provider_loss(2).unwrap();
+        assert!(!r.snapshot_pending());
+        assert!(!r.confirm_persisted(&current).is_empty());
+        assert!(!r.confirm_persisted(&future).is_empty());
+        assert!(matches!(
+            r.observe(RecoveryInput::SnapshotInstalled {
+                checkpoint: future.clone(),
+            })[0],
+            RecoveryAction::CommitCheckpoint { .. }
+        ));
+        assert!(r.confirm_persisted(&future).is_empty());
+        assert_eq!(r.generation(), 2);
+        assert_eq!(r.committed(), 100);
     }
 
     #[test]
@@ -383,7 +448,7 @@ mod tests {
         let mut r = StreamRecovery::new("s", 1, 40);
         let snap = StreamCheckpoint {
             stream: "s".to_string(),
-            generation: 2,
+            generation: 1,
             base: 0,
             checkpoint: 100,
         };
@@ -398,7 +463,7 @@ mod tests {
         assert_eq!(r.generation(), 1);
         let confirmed = r.confirm_persisted(&snap);
         assert!(confirmed.is_empty());
-        assert_eq!(r.generation(), 2);
+        assert_eq!(r.generation(), 1);
         assert_eq!(r.committed(), 100);
     }
 
@@ -415,6 +480,7 @@ mod tests {
         let _ = r.observe(RecoveryInput::BatchValidated {
             checkpoint: batch.clone(),
         });
+        r.provider_loss(2).unwrap();
         let _ = r.observe(RecoveryInput::SnapshotInstalled {
             checkpoint: snap.clone(),
         });
@@ -437,7 +503,7 @@ mod tests {
         let mut r = StreamRecovery::new("s", 1, 40);
         let snap = StreamCheckpoint {
             stream: "s".to_string(),
-            generation: 2,
+            generation: 1,
             base: 0,
             checkpoint: 100,
         };
@@ -475,19 +541,18 @@ mod tests {
         ));
         assert_eq!(r.committed(), 40);
 
-        // Same-generation confirm is blocked as well; only a new-generation
-        // snapshot confirm clears the gate.
+        // An unoffered batch confirm cannot clear the gate.
         let blocked_confirm = r.confirm_persisted(&batch);
         assert!(matches!(
             blocked_confirm[0],
-            RecoveryAction::SnapshotRequired { .. }
+            RecoveryAction::RecoveryNeeded { .. }
         ));
         assert_eq!(r.committed(), 40);
         assert!(r.snapshot_pending());
 
         let snap = StreamCheckpoint {
             stream: "s".to_string(),
-            generation: 2,
+            generation: 1,
             base: 0,
             checkpoint: 100,
         };
@@ -500,13 +565,13 @@ mod tests {
         ));
         assert!(r.confirm_persisted(&snap).is_empty());
         assert!(!r.snapshot_pending());
-        assert_eq!(r.generation(), 2);
+        assert_eq!(r.generation(), 1);
         assert_eq!(r.committed(), 100);
 
         // Gate cleared: batches commit again.
         let next = StreamCheckpoint {
             stream: "s".to_string(),
-            generation: 2,
+            generation: 1,
             base: 100,
             checkpoint: 103,
         };
@@ -520,7 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_installed_same_generation_blocked_while_gate_pending() {
+    fn snapshot_installed_same_generation_clears_gate_only_after_confirm() {
         let mut r = StreamRecovery::new("s", 1, 40);
         let expired = r.observe(RecoveryInput::ContinuationExpired {
             stream: "s".to_string(),
@@ -532,23 +597,25 @@ mod tests {
         ));
         assert!(r.snapshot_pending());
 
-        // Same-generation snapshot with base equal to committed would
-        // otherwise commit; the pending gate holds it instead.
-        let same_gen = checkpoint(40, 43);
-        let blocked = r.observe(RecoveryInput::SnapshotInstalled {
-            checkpoint: same_gen,
+        let same_gen = checkpoint(0, 100);
+        let offered = r.observe(RecoveryInput::SnapshotInstalled {
+            checkpoint: same_gen.clone(),
         });
         assert!(matches!(
-            blocked[0],
-            RecoveryAction::SnapshotRequired { committed: 40, .. }
+            offered[0],
+            RecoveryAction::CommitCheckpoint { .. }
         ));
         assert_eq!(r.committed(), 40);
         assert_eq!(r.generation(), 1);
         assert!(r.snapshot_pending());
+        assert!(r.confirm_persisted(&same_gen).is_empty());
+        assert!(!r.snapshot_pending());
+        assert_eq!(r.committed(), 100);
+        assert_eq!(r.generation(), 1);
     }
 
     #[test]
-    fn snapshot_installed_rejects_stale_and_noncontiguous() {
+    fn snapshot_installed_rejects_stale_but_allows_current_generation_jump() {
         let mut r = StreamRecovery::new("s", 2, 100);
 
         // Stale generation snapshot is not committable.
@@ -563,16 +630,23 @@ mod tests {
         assert_eq!(r.committed(), 100);
         assert_eq!(r.generation(), 2);
 
-        // Same-generation snapshot must continue exactly from committed.
+        // A provider-trusted same-generation snapshot need not chain from C.
         let gapped = StreamCheckpoint {
             stream: "s".to_string(),
             generation: 2,
             base: 90,
             checkpoint: 110,
         };
-        let actions = r.observe(RecoveryInput::SnapshotInstalled { checkpoint: gapped });
-        assert!(matches!(actions[0], RecoveryAction::RecoveryNeeded { .. }));
+        let actions = r.observe(RecoveryInput::SnapshotInstalled {
+            checkpoint: gapped.clone(),
+        });
+        assert!(matches!(
+            actions[0],
+            RecoveryAction::CommitCheckpoint { .. }
+        ));
         assert_eq!(r.committed(), 100);
+        assert!(r.confirm_persisted(&gapped).is_empty());
+        assert_eq!(r.committed(), 110);
 
         // Contiguous same-generation snapshot is committable.
         let contiguous = StreamCheckpoint {
