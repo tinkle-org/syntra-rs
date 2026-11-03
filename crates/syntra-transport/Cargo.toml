@@ -43,7 +43,7 @@ tokio = { version = "1", features = ["full", "test-util"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 futures-util = "0.3"
 # Locally generated test certificates only.
-rcgen = { version = "=0.13.2", default-features = false, features = ["crypto", "ring"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring"] }
 # TLS 1.2 exists only to construct deliberately incompatible test peers.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
