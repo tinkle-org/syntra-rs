@@ -12,8 +12,9 @@ runtime scheduling and socket policy. Encryption is integral to the protocol. Se
 The implementation is experimental and unpublished, with no published previous
 version. No formal conformance, independent interoperability or independent
 security-review verdict is claimed. The current candidate is recorded in
-[`protocol-contract.json`](protocol-contract.json); it describes a worktree, not
-a release or specification freeze. See
+[`protocol-contract.json`](protocol-contract.json); it pins `committed-candidate`
+inputs, not a release or specification freeze. Its `source.worktree_observation`
+retains the earlier dirty-worktree state as historical information only. See
 [input provenance](CONTRIBUTING.md#input-provenance-and-authority) for the separate
 11-input upstream lock, source credit and exact Git/offline checks.
 
