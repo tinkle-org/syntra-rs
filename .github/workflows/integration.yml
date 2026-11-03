@@ -20,7 +20,7 @@ env:
 
 jobs:
   integration:
-    name: SC1 containers (TCP + WS)
+    name: protected channel containers (TCP + WS fixtures)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -42,5 +42,7 @@ jobs:
             cargo-registry-${{ runner.os }}-1.88.0-
       - name: Docker info
         run: docker info
-      - name: SC1 container integration
-        run: cargo test -p syntra-integration --test sc1_containers -- --ignored --nocapture
+      - name: Container integration harnesses
+        # Cargo expands the quoted glob, so a harness rename does not leave a
+        # stale selector; no matching integration target is still an error.
+        run: cargo test --locked -p syntra-integration --test '*' -- --ignored --nocapture

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Docker-based SC1 TCP/WebSocket connectivity tests; not part of published libraries"
+description = "Docker-based Syntra 1.0 TCP/WebSocket connectivity tests; not published or a conformance verdict"
 
 [[bin]]
 name = "peer"
@@ -14,9 +14,7 @@ path = "src/bin/peer.rs"
 [dependencies]
 syntra-core = { path = "../syntra-core", version = "1.0.0-rc.1" }
 syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.1" }
-syntra-secure-channel = { path = "../syntra-secure-channel", version = "1.0.0-rc.1" }
-syntra-sc1-transport = { path = "../syntra-sc1-transport", version = "1.0.0-rc.1", features = ["development-carriers"] }
-syntra-ws = { path = "../syntra-ws", version = "1.0.0-rc.1" }
+syntra-transport = { path = "../syntra-transport", version = "1.0.0-rc.1", default-features = false, features = ["tcp", "websocket"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

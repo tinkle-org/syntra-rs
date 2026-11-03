@@ -1,28 +1,44 @@
-"""Reproduce and verify vendored Syntra inputs, without floating refs or network.
+"""Verify pinned Syntra inputs, without floating refs or network.
 
-Check offline: python3 scripts/check-upstream-pin.py
-Compare with Git objects: python3 scripts/check-upstream-pin.py --upstream ../syntra
-Refresh: python3 scripts/upstream_snapshot.py --sync --upstream ../syntra
+Default: python3 scripts/check-upstream-pin.py (SYNTRA_SDD_ROOT or ../syntra Git objects)
+Local digest-only: python3 scripts/check-upstream-pin.py --offline
 
-The explicit sync command generates snapshots and their SHA-256 inventory from
-committed Git blobs, never from the source worktree. Review pin, inventory and
-snapshot changes together. A digest inventory detects drift, not RFC acceptance
-or conformance; --upstream additionally verifies the inventory against Git.
+Both entry points check local proto and selected test assets without writes.
+Default verification also checks the explicitly scoped implementation inputs
+against exact committed Git blobs, never the source worktree. These digests
+detect input drift, not RFC acceptance or conformance.
 """
 
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
 
 
+# Direct execution must also avoid creating bytecode caches on import.
+sys.dont_write_bytecode = True
+
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "https://github.com/tinkle-org/syntra"
 REVISION = "8ede3810b29fbba4d0e6ae6751a0025ceedda140"
-SNAPSHOT_ROOTS = ("proto", "conformance")
+SCOPE = "implementation-inputs"
+REQUIRED_INPUTS = (
+    "conformance/test-vectors/protobuf/vectors.yaml",
+    "conformance/test-vectors/tcp/byte-vectors.yaml",
+    "conformance/test-vectors/websocket/fixtures.yaml",
+    "proto/syntra/v1/capabilities.proto",
+    "proto/syntra/v1/envelope.proto",
+    "proto/syntra/v1/errors.proto",
+    "proto/syntra/v1/events.proto",
+    "proto/syntra/v1/handshake.proto",
+    "proto/syntra/v1/recovery_profile.proto",
+    "proto/syntra/v1/rpc.proto",
+    "proto/syntra/v1/session.proto",
+)
 LOCK = "upstream.lock.json"
 
 
@@ -31,48 +47,9 @@ def digest(content):
 
 
 def snapshot_path(name):
-    path = PurePosixPath(name)
-    if (
-        not isinstance(name, str)
-        or path.is_absolute()
-        or path.as_posix() != name
-        or ".." in path.parts
-        or path.name == ".DS_Store"
-        or "__pycache__" in path.parts
-        or len(path.parts) < 2
-        or path.parts[0] not in SNAPSHOT_ROOTS
-    ):
+    if not isinstance(name, str) or name not in REQUIRED_INPUTS:
         raise ValueError(f"out-of-scope snapshot path: {name!r}")
-    return path
-
-
-def local_path(root, name):
-    path = snapshot_path(name)
-    current = root
-    for part in path.parts:
-        current = current / part
-        if current.is_symlink():
-            raise ValueError(f"snapshot symlink is not permitted: {name}")
-    return current
-
-
-def local_files(root):
-    result = {}
-    for name in SNAPSHOT_ROOTS:
-        directory = root / name
-        if directory.is_symlink() or not directory.is_dir():
-            raise ValueError(f"missing or symlinked snapshot root: {name}")
-        for path in sorted(directory.rglob("*")):
-            relative = path.relative_to(root).as_posix()
-            if path.is_symlink():
-                raise ValueError(f"snapshot symlink is not permitted: {relative}")
-            # OS/Python cache artifacts are not snapshot inputs. No source,
-            # manifest, result or documentation file is otherwise exempted.
-            if path.name == ".DS_Store" or "__pycache__" in path.parts:
-                continue
-            if path.is_file():
-                result[relative] = path.read_bytes()
-    return result
+    return PurePosixPath(name)
 
 
 def inventory(contents):
@@ -86,15 +63,26 @@ def lock_path(root):
     return path
 
 
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
 def read_lock(root):
-    lock = json.loads(lock_path(root).read_text(encoding="utf-8"))
+    lock = json.loads(lock_path(root).read_text(encoding="utf-8"), object_pairs_hook=unique)
     if not isinstance(lock, dict):
         raise ValueError("snapshot lock must be a JSON object")
     if (
-        lock.get("format_version") != 1
+        set(lock) != {"format_version", "scope", "repository", "revision", "sha256"}
+        or type(lock.get("format_version")) is not int
+        or lock.get("format_version") != 2
+        or lock.get("scope") != SCOPE
         or lock.get("repository") != REPOSITORY
         or lock.get("revision") != REVISION
-        or lock.get("roots") != list(SNAPSHOT_ROOTS)
     ):
         raise ValueError("snapshot lock identity does not match the reviewed pin")
     entries = lock.get("sha256")
@@ -104,9 +92,9 @@ def read_lock(root):
         snapshot_path(name)
         if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
             raise ValueError(f"invalid snapshot digest: {name}")
-    for prefix in SNAPSHOT_ROOTS:
-        if not any(name.startswith(prefix + "/") for name in entries):
-            raise ValueError(f"snapshot lock omits root: {prefix}")
+    missing = set(REQUIRED_INPUTS) - entries.keys()
+    if missing:
+        raise ValueError("snapshot lock omits required inputs: " + ", ".join(sorted(missing)))
     return entries
 
 
@@ -120,9 +108,12 @@ def compare(expected, actual, label):
 
 
 def git(upstream, *args):
+    # Missing partial-clone objects must fail locally; replacement refs must not
+    # substitute different bytes for an explicitly pinned object.
     return subprocess.run(
         ["git", "-C", str(upstream), *args], check=True, capture_output=True,
         timeout=30,
+        env={**os.environ, "GIT_NO_LAZY_FETCH": "1", "GIT_NO_REPLACE_OBJECTS": "1"},
     ).stdout
 
 
@@ -130,8 +121,8 @@ def from_git(upstream):
     resolved = git(upstream, "rev-parse", "--verify", f"{REVISION}^{{commit}}")
     if resolved.decode("ascii").strip() != REVISION:
         raise ValueError("upstream commit did not resolve to the reviewed full SHA")
-    tree = git(upstream, "ls-tree", "-rz", REVISION, "--", *SNAPSHOT_ROOTS)
-    result = {}
+    tree = git(upstream, "ls-tree", "-rz", REVISION, "--", *REQUIRED_INPUTS)
+    blobs = {}
     for record in tree.split(b"\0"):
         if not record:
             continue
@@ -141,92 +132,34 @@ def from_git(upstream):
         snapshot_path(name)
         if mode != b"100644" or kind != b"blob":
             raise ValueError(f"snapshot requires regular non-executable blobs: {name}")
-        result[name] = git(upstream, "cat-file", "blob", blob.decode("ascii"))
-    for prefix in SNAPSHOT_ROOTS:
-        if not any(name.startswith(prefix + "/") for name in result):
-            raise ValueError(f"upstream tree omits root: {prefix}")
-    return result
+        if name in blobs:
+            raise ValueError(f"duplicate upstream input: {name}")
+        if not re.fullmatch(rb"[0-9a-f]{40}", blob):
+            raise ValueError(f"invalid upstream blob ID: {name}")
+        blobs[name] = blob.decode("ascii")
+    missing = set(REQUIRED_INPUTS) - blobs.keys()
+    if missing:
+        raise ValueError("upstream tree omits required inputs: " + ", ".join(sorted(missing)))
+    return {name: git(upstream, "cat-file", "blob", blob) for name, blob in blobs.items()}
 
 
-def verify(root=ROOT, upstream=None):
-    expected = read_lock(root)
-    compare(expected, inventory(local_files(root)), "snapshot content/inventory drift")
-    if upstream is not None:
-        compare(expected, inventory(from_git(upstream)), "upstream Git provenance drift")
-    return len(expected)
-
-
-def sync(root, upstream):
-    # Read/validate everything before touching destination files. Do not erase
-    # locally modified snapshots or silently delete inputs removed upstream.
-    destination_lock = lock_path(root)
-    source = from_git(upstream)
-    existing = local_files(root)
-    if (root / LOCK).exists():
-        verify(root)
-    else:
-        changed = git(root, "diff", "HEAD", "--name-only", "--", *SNAPSHOT_ROOTS)
-        if changed.strip():
-            raise ValueError("refusing initial sync over locally modified snapshot files")
-        tracked = {
-            name.decode("utf-8") for name in
-            git(root, "ls-files", "-z", "--", *SNAPSHOT_ROOTS).split(b"\0") if name
-        }
-        untracked = existing.keys() - tracked
-        if untracked:
-            raise ValueError("refusing initial sync over untracked conflicts: " +
-                             ", ".join(sorted(untracked)))
-    extra = existing.keys() - source.keys()
-    if extra:
-        raise ValueError("review removed/local snapshot inputs first: " + ", ".join(sorted(extra)))
-    destinations = {name: local_path(root, name) for name in source}
-    lock = {
-        "format_version": 1,
-        "repository": REPOSITORY,
-        "revision": REVISION,
-        "roots": list(SNAPSHOT_ROOTS),
-        "sha256": inventory(source),
-    }
-    lock_bytes = (json.dumps(lock, indent=2) + "\n").encode("utf-8")
-    if destination_lock.exists() and (
-        source != existing or destination_lock.read_bytes() != lock_bytes
-    ):
-        # A working-tree lock edited together with its files is not an
-        # independent overwrite authorization. Require clean Git state when
-        # replacing an existing snapshot; exact no-op reproduction is safe.
-        changed = git(root, "status", "--porcelain", "--untracked-files=all",
-                      "--", *SNAPSHOT_ROOTS, LOCK)
-        if changed.strip():
-            raise ValueError("refusing sync over locally modified snapshots or lock")
-    for name, content in source.items():
-        if existing.get(name) != content:
-            destination = destinations[name]
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(content)
-    if not destination_lock.exists() or destination_lock.read_bytes() != lock_bytes:
-        destination_lock.write_bytes(lock_bytes)
-    return verify(root, upstream)
-
-
-def main(sync_allowed=False):
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--upstream", type=Path, help="local authoritative Git checkout")
-    if sync_allowed:
-        parser.add_argument("--sync", action="store_true", help="explicitly regenerate snapshots")
+    parser.add_argument("--offline", action="store_true", help="digest-only local proto/test-asset check; no Git provenance")
     args = parser.parse_args()
-    if getattr(args, "sync", False):
-        if args.upstream is None:
-            parser.error("--sync requires --upstream; no network or floating ref is used")
-        count = sync(ROOT, args.upstream)
-    else:
-        count = verify(ROOT, args.upstream)
-    provenance = "; verified against upstream Git blobs" if args.upstream else "; offline digest check"
-    print(f"Syntra {REVISION}: {count} snapshot files match{provenance}.")
+    if args.offline and args.upstream is not None:
+        parser.error("--offline cannot be combined with --upstream")
+    from sdd_inputs import verify_inputs
+    result, _ = verify_inputs(ROOT, args.upstream, offline=args.offline)
+    print(f"Syntra {REVISION}: {result['local_proto_files']} proto files and "
+          f"{result['test_assets']} test assets match; {result['provenance']}; "
+          f"{result['upstream_files']} scoped upstream implementation inputs (not local copies).")
     return 0
 
 
 if __name__ == "__main__":
     try:
-        sys.exit(main(sync_allowed=True))
+        sys.exit(main())
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         sys.exit(f"Upstream snapshot check failed: {error}")

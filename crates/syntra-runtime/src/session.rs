@@ -5,10 +5,10 @@
 //! (principal bound); it ends when the connection closes. No state
 //! survives except application-defined durable state outside Syntra.
 //!
-//! What this module does NOT do (open blockers, recorded not invented):
-//! - resumption across connections (blocker 2): `resume()` always fails
-//!   with `UNAUTHENTICATED` documenting SNTR-SESS-006; any resumption
-//!   needs an approved RFC capability, which does not exist in v1;
+//! Session boundaries:
+//! - cross-connection resumption is rejected: `resume()` always fails with
+//!   `UNAUTHENTICATED` (SNTR-SESS-006). Each connection requires a fresh
+//!   handshake and authentication;
 //! - `connection_id` is a per-connection diagnostic, never an
 //!   authenticator, resume token, or session handle (SNTR-SESS-002).
 //!   `SessionManager` keys sessions by it only to scope them to the
@@ -199,11 +199,9 @@ impl SessionManager {
         self.inner.lock().unwrap().len()
     }
 
-    /// Resumption is not available in default v1 (SNTR-SESS-006; open
-    /// blocker 2). Always fails; a future RFC capability would define
-    /// the token format, lifetime, rotation, replay window, restored
-    /// state, and revocation transport. Callers MUST start a fresh
-    /// handshake with a fresh credential instead.
+    /// Reject cross-connection resumption with `UNAUTHENTICATED`
+    /// (SNTR-SESS-006). No token restores a session. Callers MUST start a
+    /// fresh handshake with a fresh credential instead.
     pub fn resume(&self, _token: &[u8]) -> Result<Session, SyntraError> {
         Err(SyntraError::Handshake {
             code: ErrorCode::Unauthenticated,

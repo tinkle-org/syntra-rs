@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
-description = "Syntra v1 protocol core: Frame codec, envelope validation, version negotiation, request-id rules. No transport, no application semantics."
+description = "Syntra 1.0 protocol core: bounded envelopes, validation, message state, authenticated Noise establishment and protected records. No network I/O or application semantics."
 
 [dependencies]
 prost.workspace = true
@@ -16,11 +16,38 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 futures-util.workspace = true
+zeroize = { version = "1", features = ["alloc"] }
+getrandom = "0.3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Snow 0.10.0's std feature activates ring/std (not ring?/std), even without
+# its ring resolver.
+snow = { version = "=0.10.0", default-features = false, features = ["std", "default-resolver", "use-getrandom", "use-curve25519", "use-chacha20poly1305", "use-sha2"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The same Noise suites/primitives, through the pure-Rust DefaultResolver.
+# no_std + alloc in Snow avoids linking unused native ring RSA exports into WASM.
+snow = { version = "=0.10.0", default-features = false, features = ["default-resolver", "use-getrandom", "use-curve25519", "use-chacha20poly1305", "use-sha2"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }
+web-time = "1"
+js-sys = "0.3"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
 
 [dev-dependencies]
 prost.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
 
 [[bench]]
 name = "frame_codec"
+harness = false
+
+[[bench]]
+name = "channel"
 harness = false

@@ -1,6 +1,8 @@
-//! Phase 3 local acceptance probes, NOT full CONF verdicts. Real authenticated
+//! Local acceptance probes, NOT full CONF verdicts. Real authenticated
 //! core endpoints and registered recovery service; no fake peer. All captured
-//! bytes are public fixtures. Real process-crash cuts belong to recovery_persistence.
+//! bytes are public fixtures. Retained memory exercises store-boundary protocol
+//! behavior by default; `file-store` uses native files for the same scenarios.
+//! Real process-crash cuts belong to recovery_persistence with `file-store`.
 #[path = "recovery_wire/support.rs"]
 mod support;
 
@@ -299,9 +301,9 @@ async fn local_acceptance_initial_empty_never_replays_and_acceptance_is_not_comp
 }
 
 #[tokio::test]
-async fn local_acceptance_file_replay_pages_fixed_boundary_durable_gate_and_lost_completion() {
-    let disk = Disk::new();
-    let store = disk.seeded(0).await;
+async fn local_acceptance_replay_pages_fixed_boundary_durable_gate_and_lost_completion() {
+    let fixture = StoreFixture::new();
+    let store = fixture.seeded(0).await;
     let source = Source::new(3);
     let service = source.service(RecoveryLimits::default());
     let b = Bridge::new(Some(service.clone())).await;
@@ -363,7 +365,7 @@ async fn local_acceptance_file_replay_pages_fixed_boundary_durable_gate_and_lost
     assert_eq!(requests[1].1, requests[2].1);
     drop(c);
     b.finish().await;
-    let reopened = disk.open().await;
+    let reopened = fixture.open().await;
     let loaded = tokio::task::spawn_blocking(move || reopened.load(&scope(A)).unwrap().unwrap())
         .await
         .unwrap();
@@ -814,12 +816,12 @@ async fn local_acceptance_permission_denial_is_targeted_unauthenticated_revokes_
 /// Injects only the client store boundary, not a protocol peer. Unknown writes
 /// really commit the full record; precommit failure leaves the previous record.
 struct CutStore {
-    disk: FileRecoveryStore,
+    store: FixtureStore,
     unknown: bool,
 }
 impl RecoveryPersistence for CutStore {
     fn load(&self, s: &PersistenceScope) -> Result<Option<DurableRecord>, PersistenceError> {
-        self.disk.load(s)
+        self.store.load(s)
     }
     fn commit(
         &mut self,
@@ -828,7 +830,7 @@ impl RecoveryPersistence for CutStore {
         r: DurableRecord,
     ) -> Result<(), PersistenceError> {
         if self.unknown {
-            self.disk.commit(s, expected, r)?;
+            self.store.commit(s, expected, r)?;
             Err(PersistenceError::CommitUnknown)
         } else {
             Err(PersistenceError::Unavailable)
@@ -839,9 +841,9 @@ impl RecoveryPersistence for CutStore {
 #[tokio::test]
 async fn local_acceptance_failed_and_unknown_commit_never_confirm_fresh_connection_loads_record() {
     for unknown in [false, true] {
-        let disk = Disk::new();
+        let fixture = StoreFixture::new();
         let store = CutStore {
-            disk: disk.seeded(0).await,
+            store: fixture.seeded(0).await,
             unknown,
         };
         let source = Source::new(1);
@@ -886,7 +888,7 @@ async fn local_acceptance_failed_and_unknown_commit_never_confirm_fresh_connecti
         // Reconstruct issued history without the old source or service cache,
         // including the CommitUnknown branch which never sent any Confirm.
         let fresh = Bridge::new(Some(Source::new(1).service(RecoveryLimits::default()))).await;
-        let mut c = fresh.client(disk.open().await, RecoveryLimits::default());
+        let mut c = fresh.client(fixture.open().await, RecoveryLimits::default());
         negotiate(&mut c).await;
         let restored = bounded(c.subscribe(A.to_vec(), A.to_vec(), SubscribeIntent::ResumeDurable))
             .await
@@ -900,8 +902,8 @@ async fn local_acceptance_failed_and_unknown_commit_never_confirm_fresh_connecti
 }
 
 #[tokio::test]
-async fn local_acceptance_wire_lost_ack_file_reopen_host_restart_reconstructs_issued_bindings() {
-    let disk = Disk::new();
+async fn local_acceptance_wire_lost_ack_store_reopen_host_restart_reconstructs_issued_bindings() {
+    let fixture = StoreFixture::new();
     let source = Source::new(1);
     let b = Bridge::new(Some(source.service(RecoveryLimits::default()))).await;
     let limits = RecoveryLimits {
@@ -910,7 +912,7 @@ async fn local_acceptance_wire_lost_ack_file_reopen_host_restart_reconstructs_is
         reply_ttl: Duration::from_secs(5),
         ..RecoveryLimits::default()
     };
-    let mut c = b.client(disk.seeded(0).await, limits);
+    let mut c = b.client(fixture.seeded(0).await, limits);
     negotiate(&mut c).await;
     let s = subscribe(&mut c, A, SubscribeIntent::ResumeDurable).await;
     bounded(c.replay_page(&s.subscription_handle))
@@ -964,7 +966,7 @@ async fn local_acceptance_wire_lost_ack_file_reopen_host_restart_reconstructs_is
     // Fresh Source + fresh RecoveryService: no connection/reply cache survives.
     let reconstructed = Source::new(1);
     let fresh = Bridge::new(Some(reconstructed.service(RecoveryLimits::default()))).await;
-    let mut c = fresh.client(disk.open().await, RecoveryLimits::default());
+    let mut c = fresh.client(fixture.open().await, RecoveryLimits::default());
     negotiate(&mut c).await;
     let resumed = bounded(c.subscribe(A.to_vec(), A.to_vec(), SubscribeIntent::ResumeDurable))
         .await
@@ -1138,13 +1140,12 @@ async fn local_acceptance_raw_paged_retry_marker_binding_and_confirm_offered_ord
 }
 
 #[tokio::test]
-async fn local_acceptance_file_snapshot_replaces_old_generation_only_with_current_g_and_full_state()
-{
-    let disk = Disk::new();
+async fn local_acceptance_snapshot_replaces_old_generation_only_with_current_g_and_full_state() {
+    let fixture = StoreFixture::new();
     let source = Source::new(2);
     source.generation[0].store(19, Ordering::SeqCst);
     let b = Bridge::new(Some(source.service(RecoveryLimits::default()))).await;
-    let mut c = b.client(disk.seeded(0).await, RecoveryLimits::default());
+    let mut c = b.client(fixture.seeded(0).await, RecoveryLimits::default());
     negotiate(&mut c).await;
     let subscription = bounded(c.subscribe(
         A.to_vec(),
@@ -1172,7 +1173,7 @@ async fn local_acceptance_file_snapshot_replaces_old_generation_only_with_curren
     assert!(b.trace.requests(wire::CONFIRM).is_empty());
     drop(c);
     b.finish().await;
-    let store = disk.open().await;
+    let store = fixture.open().await;
     let (loaded, wrong_p, wrong_s) = bounded(tokio::task::spawn_blocking(move || {
         (
             store.load(&scope(A)).unwrap().unwrap(),

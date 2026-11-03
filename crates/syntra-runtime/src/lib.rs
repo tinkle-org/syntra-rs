@@ -7,24 +7,33 @@
 //! - [`SessionManager`] / [`Principal`] / [`Authenticator`] — generic
 //!   auth hooks. No user, account, or chat types exist here.
 //!
-//! Sessions are connection-bound only (SNTR-SESS-003): the session
-//! lifetime equals the connection lifetime, and resumption across
-//! connections is unavailable in v1 (SNTR-SESS-006; open blocker 2 —
-//! recorded, not invented).
+//! Serialized-frame interfaces are an internal embedding boundary, not an
+//! unencrypted Syntra connection mode. External drivers must compose this runtime
+//! with Syntra's encrypted establishment and record layer, plus carrier security.
 //!
-//! Accepted baseline: local pre-ACTIVE failures/native close, permanent
-//! request-ID non-reuse in emission order, received-order host high-water
-//! admission, and deadline-first serialized terminal selection. Recovery and
-//! mobile platform integration have their own implementation/evidence gates.
+//! Sessions are connection-bound only (SNTR-SESS-003): the session
+//! lifetime equals the connection lifetime. Cross-connection resumption is
+//! rejected with `UNAUTHENTICATED`; each connection requires a fresh handshake
+//! (SNTR-SESS-006).
+//!
+//! Pre-`ACTIVE` failures expose local typed errors and close the connection
+//! without an error frame. Request IDs are never reused within a connection,
+//! allocation follows emission order, host high-water admission follows receive
+//! order, and serialized terminal selection checks elapsed deadlines first.
 
 pub mod connection;
+pub mod elapsed;
 mod emission;
 pub mod host;
 pub mod initiator;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod lifecycle_tests;
 pub mod policy;
 pub mod recovery;
 pub mod reliable;
 pub mod session;
+pub mod shutdown;
+pub use shutdown::{ShutdownBudget, ShutdownPhase, ShutdownReport};
 
 pub use connection::{
     validate_close_grace, CancelToken, Connection, ConnectionConfig, DEFAULT_CLOSE_GRACE,
@@ -57,6 +66,8 @@ pub async fn sleep_for(d: std::time::Duration) {
 /// Wires an [`Initiator`] to a [`Host`] with bounded channels and
 /// background pumps (host<->initiator), exactly like a transport adapter
 /// would, minus the sockets. Returns the initiator and the shared host.
+/// This local helper omits encrypted establishment and record protection; it
+/// does not implement an externally usable Syntra connection.
 /// Remote teardown propagates like a real transport: when either side
 /// closes, both pumps end and the surviving peer observes transport loss
 /// (`UNAVAILABLE` to in-flight waiters, handshake waiters fail) —
@@ -79,10 +90,47 @@ fn bridge_pair(
     host_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> [crate::connection::TaskHandle; 2] {
     let (to_host, to_initiator) = bridge_pumps(initiator, host, init_rx, host_rx);
-    [
-        crate::connection::spawn_task(to_host),
-        crate::connection::spawn_task(to_initiator),
-    ]
+    let remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(2));
+    let retirement = || BridgeRetirement {
+        remaining: remaining.clone(),
+        initiator: initiator.clone(),
+        host: std::sync::Arc::downgrade(host),
+    };
+    let a = retirement();
+    let first = crate::connection::spawn_task(async move {
+        let _retirement = a;
+        to_host.await;
+    });
+    let b = retirement();
+    let second = crate::connection::spawn_task(async move {
+        let _retirement = b;
+        to_initiator.await;
+    });
+    for task in [&first, &second] {
+        initiator.retain_runtime_task(task.clone());
+        host.retain_runtime_task(task.clone());
+    }
+    [first, second]
+}
+
+struct BridgeRetirement {
+    remaining: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    initiator: Initiator,
+    host: std::sync::Weak<Host>,
+}
+impl Drop for BridgeRetirement {
+    fn drop(&mut self) {
+        if self
+            .remaining
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.initiator.acknowledge_transport_closed();
+            if let Some(host) = self.host.upgrade() {
+                host.acknowledge_transport_closed();
+            }
+        }
+    }
 }
 
 fn bridge_pumps(

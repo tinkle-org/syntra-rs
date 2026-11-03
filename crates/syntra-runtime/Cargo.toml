@@ -9,6 +9,11 @@ homepage.workspace = true
 documentation.workspace = true
 description = "Syntra v1 connection runtime: initiator + host engines and connection-bound session manager over transport-agnostic byte channels. No Tinkle types."
 
+[features]
+default = []
+# Opt-in native filesystem snapshots; custom persistence remains available without it.
+file-store = ["dep:fs2"]
+
 [dependencies]
 syntra-core = { path = "../syntra-core", version = "1.0.0-rc.1" }
 prost.workspace = true
@@ -23,7 +28,8 @@ web-time = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 getrandom = "0.3"
-fs2 = "=0.4.3"
+fs2 = { version = "=0.4.3", optional = true }
+libc = "0.2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }

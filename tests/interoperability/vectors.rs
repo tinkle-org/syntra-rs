@@ -1,11 +1,12 @@
 //! Deterministic interoperability vectors.
 //!
 //! Byte-level constants transcribed from
-//! `conformance/test-vectors/websocket/` (`fixtures.yaml`, `vectors.md`).
-//! Transport-independence proof (SNTR-WIRE-901): the same logical
-//! `Frame` sequences here run over loopback, WS, and any future profile
-//! with only adapter changes — no TCP length prefix inside WS messages,
-//! one complete binary message per `Frame`.
+//! pinned upstream `conformance/test-vectors/websocket/fixtures.yaml`.
+//! scripts/conformance_evidence.py verifies these transcriptions against the
+//! exact upstream Git blobs, not a deleted/vendored document directory.
+//! Constants alone are neither execution nor a transport-independence proof
+//! (SNTR-WIRE-901). Live adapter tests have their own execution scope: no TCP
+//! length prefix inside WS messages, one complete binary message per `Frame`.
 
 /// A CONNECTED-state hello with anonymous credentials from the
 /// no-length-prefix proof (VEC-WS-009, same protobuf as tcp/V1).

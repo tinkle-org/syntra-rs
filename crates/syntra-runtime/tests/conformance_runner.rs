@@ -1,8 +1,11 @@
-//! Shared conformance runner — async Rust leg (pairing `rust-async`).
+//! Supplemental local scenarios — async Rust byte-pump leg.
 //!
 //! Exercises selected loopback/manual byte-pump cases described in
-//! `conformance/runner/scenarios.yaml`. Recovery tests run separately;
-//! this file does not certify every scenario or the full manifest matrix.
+//! historical scenario descriptions, not a manifest-driven CONF executor.
+//! No `conformance/runner/scenarios.yaml` exists at the accepted upstream pin.
+//! Recovery tests run separately; these are not formal conformance verdicts or
+//! independent Rust/Go interoperability. The corpus copy's committed origin is
+//! checked by scripts/check-upstream-pin.py before the evidence runner uses it.
 //!
 //! Fault injection is deterministic: a seeded counter decides drop/duplicate/
 //! truncate faults, so the same seed replays the same pattern.
@@ -764,7 +767,7 @@ async fn sc_wire_vectors_decode() {
 }
 
 fn corpus_hex(id: &str) -> String {
-    let text = include_str!("../../../conformance/test-vectors/protobuf/vectors.yaml");
+    let text = include_str!("../../../tests/interoperability/fixtures/protobuf-vectors.yaml");
     let marker = format!("  - id: {id}");
     let mut selected = false;
     let mut found = Vec::new();

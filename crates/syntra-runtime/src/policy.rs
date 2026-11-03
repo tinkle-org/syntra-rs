@@ -52,16 +52,10 @@ pub enum AuthzDecision {
 /// - Wire `request_id` reuse with a different token MUST NOT complete the
 ///   newer call; only the matching token completes its own slot.
 ///
-/// Integration note: the production C ABI (`syntra-ffi::production`)
-/// correlates dispatch/completion by wire `request_id` only
-/// (`host_take_pending` / `host_answer`). `CompletionToken` is the
-/// embedding-layer contract for disambiguating late/duplicate completions
-/// when `request_id` values are reused; it is intentionally not plumbed
-/// through the stable C ABI in v1. Threading tokens through the ABI would
-/// change `host_take_pending` / `host_answer` signatures (an ABI break)
-/// and is out of scope for this change, which is limited to this module.
-/// Until such wiring lands, embeddings must keep a `(request_id -> token)`
-/// side table and resolve completions by token per the rules above.
+/// The production C ABI uses owner/generation-bound opaque dispatch tokens,
+/// not wire request IDs, for foreign completion. Other embeddings must provide
+/// equivalent token-based routing and retain execution ownership until external
+/// work has actually stopped, even after its protocol result has expired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CompletionToken(u64);
 

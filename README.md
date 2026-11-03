@@ -1,35 +1,21 @@
 # Syntra Rust
 
-Rust implementation of Syntra v1 with generated Protobuf types, bounded
-codecs, client/host runtimes, negotiated update/recovery with full-state
-persistence adapters, local reliable-session helpers, and
-experimental SC1 channels over native WSS, with opt-in development carriers.
+Embeddable Rust implementation of Syntra 1.0 with an integral Noise-based
+encryption layer, bounded Protobuf codecs, client/host runtimes, negotiated
+update/recovery and full-state persistence adapters. Native and browser drivers
+compose the same encryption kernel and message runtime with platform I/O.
 
-Extracted from [`tinkle-org/syntra`](https://github.com/tinkle-org/syntra) at
-[`2a91da7fdb96f3e75badf07614c14e4f85c9ba1c`](https://github.com/tinkle-org/syntra/commit/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c).
-See [MIGRATION.md](MIGRATION.md) for provenance and the path mapping.
+The `syntra_core::secure_channel` module owns cryptographic state, separate from
+runtime scheduling and socket policy. Encryption is integral to the protocol. See
+[CONNECTION.md](CONNECTION.md) for current architecture and embedding boundaries.
 
-The accepted SDD alignment target is
-[`8ede3810b29fbba4d0e6ae6751a0025ceedda140`](https://github.com/tinkle-org/syntra/commit/8ede3810b29fbba4d0e6ae6751a0025ceedda140)
-(upstream PR #20, RFCs 0001–0010 with the recorded dispositions).
-`upstream.lock.json` pins byte-identical schema and conformance inputs, including
-42 registered SC1 cases (`CONF-SCW-001…042`) and 17 recovery cases.
-This is an implementation target, not a claim of completed alignment or a formal
-specification freeze. [Phase 2](docs/phase2-core-rpc.md) implements the new
-Core/RPC parser, ID, deadline, bounds and execution-accounting contracts.
-[Phase 3](docs/phase3-update-recovery.md) adds the optional negotiated recovery
-runtime on the actual Core and SC1/WSS paths; [the SDD matrix](docs/sdd-alignment.md)
-records the remaining phases and evidence.
-The implementation remains experimental; formal conformance has not been
-executed and no conformance verdict is claimed.
-Read [SC1.md](SC1.md) for the wire format and source-backed API sketch,
-and [AUDIT.md](AUDIT.md) for recorded results and historical evidence.
-The core `Frame` schema and baseline `syntra-ws` framing/endpoints remain
-unchanged; custom runtime writers must adopt the emission-gate contract below.
-Schema and fixture provenance is in [MIGRATION.md](MIGRATION.md). Copied upstream
-documents retain their original wording and relative links; resolve those links
-in the pinned upstream tree. Neither stale copied status notes nor local tests
-override accepted owner specifications.
+The implementation is experimental and unpublished, with no published previous
+version. No formal conformance, independent interoperability or independent
+security-review verdict is claimed. The current candidate is recorded in
+[`protocol-contract.json`](protocol-contract.json); it describes a worktree, not
+a release or specification freeze. See
+[input provenance](CONTRIBUTING.md#input-provenance-and-authority) for the separate
+11-input upstream lock, source credit and exact Git/offline checks.
 
 Use **Rust 1.88.0** for production builds and current verification. The
 crate MSRV floor is **1.88**; it is a build compatibility constraint, not a
@@ -45,7 +31,8 @@ security-patched toolchain. Current dependency pins are:
 | `tungstenite` / `tokio-tungstenite` | 0.26 |
 | `rustls` | 0.23 |
 
-There are no releases yet; future releases use repository-root `vX.Y.Z` tags.
+Cargo package release configuration is in [release-plz.toml](release-plz.toml).
+Protocol specification releases and package releases are separate.
 
 ## Default: native async workspace
 
@@ -59,42 +46,40 @@ cargo build --locked
 cargo test --locked
 ```
 
-Root `default-members` excludes `syntra-integration`. Explicit `--workspace`
-includes it and intentionally enables the transport's development carriers
-through that crate's dependency. CI separately tests isolated WSS-only defaults
-and explicit development features; a workspace run alone does not prove default
-feature isolation.
+The workspace has six members. The four root `default-members` are `syntra-core`,
+`syntra-runtime`, `syntra-transport` and `syntra-ffi`, excluding only
+`syntra-web` and `syntra-integration`. Explicit `--workspace` includes them and
+enables the transport's `tcp` and `websocket` features through the integration dependency.
+CI separately checks socket-free defaults and explicit carrier features;
+a workspace run alone does not prove default feature isolation.
 
 ## Workspace and scope
 
 | Crate | APIs / source |
 |---|---|
-| `syntra-core` | Envelope codec, validation, handshake and protocol state |
+| `syntra-core` | Envelope codec, validation, handshake and protocol state; integral encryption in `syntra_core::secure_channel`: `Context`, `ClientHandshake`, `respond`, `Channel`, `Secret32`, `KeyStore`; no sockets or message-runtime dependency |
 | `syntra-runtime` | Transport-independent `Initiator`/`Host`, sessions, RPC correlation, notifications, recovery drivers |
-| `syntra-secure-channel` | Socket-free SC1: `Context`, `ClientHandshake`, `respond`, `Channel`, `Secret32`, `KeyStore` |
-| `syntra-ws` | Native WS/WSS adapters (binary-only, one message per `Frame`) |
-| `syntra-sc1-transport` | Experimental, unpublished native SC1: WSS `websocket`, opt-in `ReconnectingClient`, carrier-neutral `pump`, development `tcp` and loopback WS |
-| `syntra-web` | Browser-facing WASM client; native fixtures for tests |
+| `syntra-transport` | Native record driver, optional `tcp`/`websocket` carriers, `reconnect` helper and `native-enrollment` reference |
+| `syntra-web` | Browser-facing WASM client and protected WSS driver; same encryption kernel and runtime |
 | `syntra-ffi` | Native C ABI with explicit production and test-fixture modes |
-| `syntra-integration` | Migrated Docker SC1 carrier fixtures (not published; container execution outstanding) |
+| `syntra-integration` | Unpublished fixture peer and Docker carrier integration tests |
 
-`Transport` adapters exchange exactly one serialized `Frame` per pump step in
-each direction. The supplied SC1 adapters add encrypted record framing and
-bounded socket I/O. Upstream's production TLS baseline remains in effect;
-this experimental implementation does not supersede it.
+Runtime byte channels exchange serialized `Frame` values inside the embedder.
+Supplied connection drivers compose them with encrypted record framing and
+bounded I/O. The plaintext frame boundary is not an unencrypted Syntra mode.
+WSS additionally requires a verified TLS connection; it does not replace Syntra encryption.
 
-`syntra-sc1-transport` replaces the prerelease `syntra-tcp` and
-`syntra-ws-sc1` crates. Its default feature set is empty (`default = []`);
-the default carrier API exposes WSS only. `development-carriers` adds the
-restricted-development `tcp` module and plaintext loopback WS. The public
-`syntra_sc1_transport::pump` has no dependency on that TCP module. This is an
-intentional prerelease source/API/wire break; legacy aliases and fallback are
-not supported. Baseline `syntra-ws` remains a separate Frame-per-message adapter.
+`syntra-transport` has empty default features (`default = []`), exposing the native
+carrier-neutral `pump` without socket dependencies. Select `tcp` or `websocket`
+explicitly; the latter provides WSS and loopback-only WS dials. Neither feature
+disables encryption. The driver requires native Tokio scheduling; browser
+applications use `syntra-web`. Native encrypted TCP is a supported production
+carrier; WS is restricted to loopback development use. Carrier fallback is not supported.
 
 Credential verification is host-owned. `Authenticator` verifies opaque hello
 bytes and returns a `Principal`; `AllowAnonymous` and static-token helpers
-are test/example conveniences, not credential verifiers. For SC1,
-`AuthenticatorFactory::create(&VerifiedIdentity)` receives freshly confirmed
+are test/example conveniences, not credential verifiers. After encrypted
+establishment, `AuthenticatorFactory::create(&VerifiedIdentity)` receives freshly confirmed
 channel context and constructs the application's `Authenticator`, which still
 verifies the explicit hello credential. Same-principal binding, current validity
 and periodic revocation checks are host contracts, not a supplied identity system.
@@ -108,50 +93,56 @@ the principal, settles other calls and closes the connection.
 
 ### Dial and call
 
-Use `syntra_sc1_transport::websocket::connect` for native WSS. Supply a
-`ClientConfig` whose context binds `Carrier::SecureWebSocket`, an authenticated
-Noise server pin and exact provisioned scope. The client is ready to call when
+Enable `syntra-transport`'s `websocket` feature and use
+`syntra_transport::websocket::connect` for native WSS. Supply a
+`syntra_core::secure_channel::ClientConfig` whose context binds
+`Carrier::SecureWebSocket`, an authenticated Noise server pin and exact provisioned
+scope. The client is ready to call when
 the connection succeeds:
 
 ```rust,ignore
-let client = syntra_sc1_transport::websocket::connect(
-    "wss://example.service/syntra/v1/sc1/ws", security, credential, runtime, limits,
+let client = syntra_transport::websocket::connect(
+    "wss://example.service/syntra/1.0/ws", security, credential, runtime, limits,
 ).await?;
 let result = client.conn.call("/example.Service/Method", b"hello".to_vec(), 1000).await?;
 client.close().await;
 ```
 
-The [SC1 API sketch](SC1.md#api-sketch) documents `connect_with_roots`,
-`TlsServerSettings::new` and `accept_tls_stream`. The canonical endpoint is
-`/syntra/v1/sc1/ws`, with exactly the `syntra.sc1.v1` subprotocol. WSS requires
-verified TLS 1.3 as well as the Noise pin; TCP/WS are never automatic fallback.
-The opt-in `ReconnectingClient` owns a bounded reconnect loop with explicit
-`ReconnectConfig` and pause/network/wake controls. Its status receiver returns
-owned current-state snapshots, and calls/results are fenced by connection
+The [connection guide](CONNECTION.md#records-and-carriers) describes
+`connect_with_roots`, `TlsServerSettings::new` and `accept_tls_stream`.
+The canonical endpoint is
+`/syntra/1.0/ws`, with exactly the `syntra.1.0` subprotocol. WSS requires
+a verified TLS 1.3 connection as well as the Noise pin; TCP/WS are never automatic fallback.
+The opt-in `reconnect` feature's `ReconnectingClient` owns a bounded reconnect
+loop with explicit `ReconnectConfig` and pause/network/wake controls. Its status
+receiver returns owned current-state snapshots, and calls/results are fenced by connection
 generation. `CoreReady` is not recovery readiness, and mutations are never
-automatically replayed. See [the client usage contract](SC1.md#reconnecting-client)
+automatically replayed. See [the client source contract](crates/syntra-transport/src/client.rs)
 for fresh connector inputs, retry budgets, failure classification and shutdown.
 
 Dialing has a **15-second total connection attempt budget**, including
-socket/TLS/upgrade, SC1 and core readiness. On the responder, SC1 establishment
-and the client's encrypted-hello confirmation share a five-second channel limit.
+socket/TLS/upgrade, Noise and message readiness. On the responder, Noise
+establishment and the client's encrypted-hello confirmation share a five-second
+channel limit.
 The returned client's lifetime is independent of the dial future: always close it.
 These low-level connect functions do not reconnect. Reconnect is opt-in through
 the client wrapper; neither path automatically replays RPCs or weakens the carrier.
 
-The development `tcp::Listener::bind(address, maximum_connections)` acquires
+The `tcp` feature's `tcp::Listener::bind(address, maximum_connections)` acquires
 admission before accepting; new accept calls backpressure when the limit is
 reached. Close is abortive by default and bounded; `close_gracefully` shares one
 absolute grace deadline across runtime drain and carrier flush. See
-[SC1.md](SC1.md#limits-cancellation-and-ownership) for ownership, budgets
+[CONNECTION.md](CONNECTION.md#budgets-emission-and-lifecycle) for ownership, budgets
 and the adapter-owned graceful protocol.
 
 After hello/ready, each host connection uses an asynchronous FIFO writer.
 Queued plus active writes are bounded by the runtime writer capacity;
 saturation terminates the connection with `RESOURCE_EXHAUSTED`. Each write
 defaults to a ten-second timeout for one frame's complete record sequence.
-Shutdown poisons cipher state, joins I/O and runs transport-loss teardown so
-pending calls settle as unknown outcomes.
+Shutdown retires cipher state and runs transport-loss teardown so pending calls
+settle as unknown outcomes. Use `shutdown_transport` and the runtime shutdown
+report to distinguish joined completion from retained incomplete work; see
+[connection ownership](CONNECTION.md#budgets-emission-and-lifecycle).
 
 Custom initiator writers must pass each **original `Vec<u8>`** dequeued from
 the byte-pump receiver, without cloning or reallocating, to
@@ -160,7 +151,7 @@ carrier handoff/encryption. `None` skips a stale item; `Some(bytes)` carries
 the live request with floored positive remaining milliseconds. Finish that
 unit in order or abort the carrier. Never re-gate fragments or ciphertext.
 The receiver still yields one serialized `Frame` per `Vec`; see
-[SC1.md](SC1.md#runtime-emission-gate) for the handoff contract.
+[CONNECTION.md](CONNECTION.md#budgets-emission-and-lifecycle) for the handoff contract.
 
 Application payload schemas, identity systems, messenger subscriptions,
 presence, JSON gateways, service discovery and gRPC clients are outside the
@@ -169,16 +160,16 @@ planned; HTTP is used for the WebSocket upgrade. UDP is deferred.
 Reliable-session helpers do not claim exactly-once effects or make arbitrary
 RPC retries safe. Recovery cursors and payloads stay opaque. The accepted
 update/recovery binding is explicitly configured and negotiated as described below;
-legacy local helpers do not themselves supply wire behavior or durable effects.
+local helpers do not themselves supply wire behavior or durable effects.
 
 ### Negotiated update/recovery
 
 Configure `Host::configure_recovery(service)` while CONNECTED, before hello.
-For SC1/WSS, wrap the existing factory with
+For the native protected record driver, wrap the existing factory with
 `RecoveryAuthenticatorFactory::new(base, service)`; the accept path configures
 the service before consuming the encrypted hello. The service binds the actual
 Core principal and invokes the application's bounded `RecoverySource` policy.
-With no configured service, profile calls return `UNIMPLEMENTED` and Core
+With no configured service, recovery calls return `UNIMPLEMENTED` and Core
 interoperability remains available.
 
 `recovery::wire_client::RecoveryClient::new` attaches one immutable inbox to its
@@ -191,19 +182,23 @@ explicit demultiplexing, not a failed-decode fallback.
 
 Applications supply recoverable source-side issued checkpoint/snapshot bindings
 and full-state persistence under `(principal, stable stream, generation, checkpoint)`.
-`recovery::persistence::FileRecoveryStore` is a native single-writer full-record
-reference with atomic replacement and uncertainty reporting, not encrypted credential
+`recovery::persistence::FileRecoveryStore`, available on native targets with
+`syntra-runtime/file-store`, is a single-writer full-record reference with atomic
+replacement and uncertainty reporting, not encrypted credential
 storage or a production source/history database. A digest or memory store is not
-durable-effect evidence. See [the Phase 3 contract](docs/phase3-update-recovery.md)
-for API ownership, limits, failure handling and storage assumptions. Automatic
-recovered-service reconnect, ABI v2, mobile/browser integration and formal
-conformance remain later-phase work.
+durable-effect evidence. See [the persistence source contract](crates/syntra-runtime/src/recovery/persistence.rs)
+for ownership and storage assumptions. The browser exposes an explicit Rust
+recovery attachment without a supplied durable browser store; the native ABI has
+a separate [typed recovery-client contract](crates/syntra-ffi/include/syntra_recovery.h).
+Neither binding makes automatic mutation replay safe or establishes formal conformance.
+The recovery service's `profile_version` fields version this negotiated extension;
+they do not select a different encryption protocol.
 
-### Resource and compatibility behavior
+### Resource bounds and validation
 
 - `ConnectionConfig::default().max_outstanding` is 32. Validated runtime
   constructors require 16..=1024, with writer/notification capacities 1..=1024
-  (both default 256). Use `try_new*` for fallible construction; legacy `new*`
+  (both default 256). Use `try_new*` for fallible construction; `new*`
   constructors panic on invalid configuration. Stricter execution/principal
   admission quotas are separate from the supported Core concurrency floor.
 - A serialized frame is limited to 1 MiB, including envelope overhead. A
@@ -212,17 +207,17 @@ conformance remain later-phase work.
   The absolute call budget starts before readiness/writer queue waiting.
 - The initiator's bounded notification queue drops the newest notification and
   counts losses when saturated. Host output has bounded writer backpressure
-  and separately charged terminal-output slots. Negotiated recovery now has
-  per-H data/control routing before this generic queue. Remaining generic/mobile
-  shutdown and lifecycle guarantees still have their own later-phase gates.
-- SC1 limits ciphertext records to 65,535 bytes and plaintext to 65,519
+  and separately charged terminal-output slots. Negotiated recovery has
+  per-H data/control routing before this generic queue. Platform lifecycle and
+  shutdown need separate verification at each embedding boundary.
+- Syntra encryption limits ciphertext records to 65,535 bytes and plaintext to 65,519
   bytes; the encrypted frame stream may span records. Lifetime is at most 24
-  hours or 2^32 records per direction. SC1 `Limits::validate` also validates the
+  hours or 2^32 records per direction. Transport `Limits::validate` also validates the
   shared runtime configuration. Default factories share a process-wide budget
   of 1024 live executions across connections/replacements; custom factories
   can return a retained host/principal budget. External work must retain its
   execution lease until it stops. See
-  [SC1.md](SC1.md) for exact clocks, cancellation requirements and
+  [CONNECTION.md](CONNECTION.md) and the source contracts for clocks, cancellation requirements and
   revocation checks.
 - Unknown metadata alongside a known body is tolerated. Metadata alone, with
   no body, yields `INVALID_ARGUMENT`. Body tags are 10–15, 16–17 remain
@@ -233,20 +228,21 @@ conformance remain later-phase work.
 - Request IDs are permanently non-reused and ordered at FIFO enqueue/emission;
   host high-water violations close without an offending-ID result. Pending
   terminal gates check the deadline first; previously selected outcomes stay
-  terminal. The exact migration and bounds are in [Phase 2](docs/phase2-core-rpc.md).
+  terminal. See the [core](crates/syntra-core/src/lib.rs) and
+  [runtime](crates/syntra-runtime/src/lib.rs) source contracts.
 
 ## Native FFI
 
 Default `syntra-ffi` builds export no Syntra C ABI. Select the production
 frame-pump ABI explicitly; its header is
 [`syntra_production.h`](crates/syntra-ffi/include/syntra_production.h).
-Production FFI keeps its own protocol state machine behind the C ABI and is
-not the async runtime behind a different entry point; runtime fixes do not
-automatically reach it. The test-fixture loopback ABI is a separate build
-for tests only.
-
-This production ABI is not automatically an SC1 SDK; the consolidated native
-transport does not add SC1 to the FFI state machine.
+Production FFI uses the shared Initiator/Host runtime and typed recovery client.
+It exposes a low-level plaintext frame boundary, not a complete protected Syntra
+connection. The embedding driver must supply Syntra encrypted establishment,
+record protection and the selected carrier's security and ordered I/O.
+`SYNTRA_CAP_RECORD_PROTECTION` remains unset. TLS alone does not complete this
+interface's Syntra implementation. The test-fixture loopback ABI is a separate
+build for tests only.
 
 ```sh
 cargo build --locked -p syntra-ffi --no-default-features
@@ -266,12 +262,14 @@ expected FFI WASM rejection in all three modes.
 
 ```sh
 rustup target add --toolchain 1.88.0 wasm32-unknown-unknown
-cargo check --locked -p syntra-core -p syntra-runtime -p syntra-ws -p syntra-web --target wasm32-unknown-unknown
+cargo check --locked -p syntra-core -p syntra-runtime --target wasm32-unknown-unknown
+cargo check --locked -p syntra-web --no-default-features --features browser-connection --target wasm32-unknown-unknown
 ```
 
 `syntra-ffi` is native-only. Compilation checks do not run a browser;
 the opt-in [real-browser fixture](crates/syntra-web/tests/browser.md)
-documents the separate browser procedure. Browser SC1 is not implemented.
+documents protected browser connection checks and their limitations. Browser TLS
+and buffering controls differ from native WSS; compilation is not browser execution.
 
 ### Go native sibling
 
@@ -305,21 +303,30 @@ Generated files are committed under
 Rust plugin **`neoeinstein-prost:v0.4.0` revision 1**, as pinned in
 `buf.gen.yaml`. The eight logical schema paths have explicit mappings to
 this module. The `.proto` snapshots intentionally retain their original
-options, including the deferred `go_package` migration; do not rewrite them by
-hand. Check all schema/suite bytes offline with
-`python3 scripts/check-upstream-pin.py`; add `--upstream ../syntra` to compare
-with the exact committed Git blobs. The explicit refresh procedure is in
-[MIGRATION.md](MIGRATION.md#accepted-sdd-snapshot-and-alignment-target).
+options; do not rewrite them by hand. Check local schema/test-asset digests with
+`python3 scripts/check-upstream-pin.py --offline`. For provenance verification,
+use `--upstream ../syntra` or set `SYNTRA_SDD_ROOT`; the local Git object database
+must contain the exact pinned upstream commit. No network fetch is performed.
+See [CONTRIBUTING.md](CONTRIBUTING.md#input-provenance-and-authority) for the
+scoped implementation inputs, candidate transformations and review requirements.
 
 ```sh
 buf generate --template buf.gen.yaml
 python3 scripts/check-generated.py
-python3 scripts/check-upstream-pin.py
+python3 scripts/check-upstream-pin.py --offline
 ```
 
 The drift script uses Python's standard library and generates into a
 temporary directory, then compares filenames and bytes. It requires Buf and
 access to its remote plugin service, but no local `protoc`.
+
+Unified implementation evidence is produced by
+`scripts/conformance_evidence.py`, optionally with `--candidate-agreement offline`
+or `--candidate-agreement worktree` and supplemental `--run-local` lanes. See
+[implementation evidence](CONTRIBUTING.md#implementation-evidence) for commands,
+the exact Git-input requirement and result interpretation. Candidate agreement,
+fixture transcription checks and local test execution have distinct scopes;
+formal conformance remains `NOT_EXECUTED` in this report.
 
 Run from the repository root:
 
@@ -337,18 +344,3 @@ generation drift and security jobs; the scheduled lane adds native compat
 and coverage. See [CONTRIBUTING.md](CONTRIBUTING.md),
 [crates/syntra-integration/README.md](crates/syntra-integration/README.md)
 and [BENCHMARKS.md](BENCHMARKS.md).
-
-The latest alignment run on `feature/sc1-v1-acceptance-alignment` records
-377 workspace tests passed, 0 failed and 2 ignored (Docker/browser).
-Isolated transport runs passed 52 tests in the WSS-only configuration and 60
-with development carriers. Clippy exited successfully with 43 unique warnings;
-formatting and upstream-pin checks passed. Earlier explicit FFI/WASM, security, generation
-and benchmark checks were not rerun for alignment.
-See [AUDIT.md](AUDIT.md#current-recorded-verification) for exact results and
-[implementation status](docs/implementation-status.md) for the Rust backlog.
-Docker and the container suite were not executed; no Docker availability
-check was recorded for this run. Browser execution also remains unverified.
-Formal conformance, independent pure-Go/Rust
-interoperability in both roles and modes, recovery and mobile validation, and
-independent human review remain release requirements. Upstream acceptance is
-complete.

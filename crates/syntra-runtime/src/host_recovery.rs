@@ -143,6 +143,7 @@ impl Host {
                 stop.clone(),
                 revoked.clone(),
             );
+            self.conn.shared.tasks.register(worker.clone());
             attachment.binding = Some(Binding {
                 session,
                 stop,
@@ -182,8 +183,11 @@ impl Host {
             .and_then(|a| a.binding.as_mut())
             .and_then(|b| b.worker.take());
         if let Some(worker) = worker {
-            worker
-                .join_bounded(deadline.saturating_duration_since(now()))
+            let _ = self
+                .conn
+                .shared
+                .clock
+                .timeout_until(deadline, worker.join())
                 .await;
         }
     }

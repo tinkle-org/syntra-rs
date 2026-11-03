@@ -1,12 +1,13 @@
-# release-plz configuration for the five-crate syntra-rs workspace.
+# Rust package release automation for the syntra-rs workspace.
 #
 # The crates share `workspace.package.version` and are tagged per-crate as
 # `syntra-<crate>-vX.Y.Z`, which matches release-plz's default
 # `{{ package }}-v{{ version }}` tag pattern. Publishing uses each crate's
 # default features only: `syntra-ffi` defaults to no ABI, so `cargo publish`
 # never enables the `production` or `test-fixture` features and never passes
-# `--all-features`. Dependency order is resolved topologically
-# (`core -> runtime -> ws/web -> ffi`).
+# `--all-features`. Dependency order is resolved topologically. Packages with
+# `publish = false` are excluded. Protocol specification releases are separate
+# from Cargo package releases and do not change this Release-plz workflow.
 [workspace]
 # Only publish when the Release PR merges, never on every push to main.
 release_always = false

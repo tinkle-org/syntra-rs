@@ -1,39 +1,20 @@
-//! Native loopback client API tests. These are NOT browser tests.
-//!
-//! On native targets `connect` wires the in-memory loopback
-//! with neutral fixtures so the registry/call/notify/close contract is
-//! testable without a browser.
-//!
-//! `JsValue` error construction is unsupported natively. Typed polling
-//! regressions live in lib.rs; browser rejection paths use browser.html
-//! with configured real WSS fixtures, not a fictitious loopback URL.
-
+//! Native support checks only. Protected browser connection behavior is exercised
+//! by connection-browser.html, never by silently substituting a native loopback.
 #![cfg(not(target_arch = "wasm32"))]
 
 #[tokio::test]
-async fn connect_call_close_round_trip() {
-    // The registry is process-global and tests run in parallel, so this
-    // test asserts per-id behavior only (no global counts).
-    let id = syntra_web::connect("loopback://test".to_string(), vec![])
-        .await
-        .expect("connect");
-    let out = syntra_web::call(id, "/example.Echo/Echo".to_string(), b"web".to_vec(), 2000)
-        .await
-        .expect("call");
-    assert_eq!(out, b"web");
-    assert!(syntra_web::close(id).await);
-    // Second close reports unknown (no JsValue involved).
-    assert!(!syntra_web::close(id).await);
-    assert!(!syntra_web::close(424242).await);
+async fn unknown_close_does_not_create_a_fixture_client() {
+    assert!(!syntra_web::close(424242).await.unwrap());
+    assert_eq!(syntra_web::client_count(), 0);
 }
 
-#[tokio::test]
-async fn notify_poll_timeout_is_none() {
-    let id = syntra_web::connect("loopback://test".to_string(), vec![])
-        .await
-        .expect("connect");
-    // No notifications sent: bounded wait resolves None.
-    let got = syntra_web::poll_notify(id, 100).await.expect("poll");
-    assert!(got.is_none());
-    assert!(syntra_web::close(id).await);
+#[cfg(feature = "browser-connection")]
+#[test]
+fn support_discloses_protected_authentication_and_browser_limitations() {
+    let support = syntra_web::connection_support();
+    assert!(support.contains("syntra.1.0"));
+    assert!(support.contains("NK and NKpsk0 authentication"));
+    assert!(support.contains("UNSUPPORTED:"));
+    assert!(support.contains("Syntra 1.0; NK and NKpsk0 authentication; syntra.1.0 context;"));
+    assert!(support.contains("encrypted hello; ordered records;"));
 }

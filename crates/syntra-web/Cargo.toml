@@ -1,5 +1,6 @@
 [package]
 name = "syntra-web"
+publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,20 +8,47 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
-description = "Browser client for Syntra v1 (connect/call/notify/close JS-facing API over syntra-ws)."
+description = "Pinned, protected Syntra 1.0 browser client with a JS-facing connect/call/notify/close API."
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["browser-connection"]
+# Without this feature there is no connect API, never a plaintext fallback.
+browser-connection = []
+# Browser-only synthetic peer exports. Never enable in production artifacts.
+browser-test-fixture = ["browser-connection"]
+# Explicit native test server only; not part of browser artifacts/default builds.
+wss-test-fixture = ["browser-connection", "dep:syntra-transport", "dep:rustls"]
+
 [dependencies]
 syntra-core = { path = "../syntra-core", version = "1.0.0-rc.1" }
 syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.1" }
-syntra-ws = { path = "../syntra-ws", version = "1.0.0-rc.1" }
+thiserror.workspace = true
+url.workspace = true
+zeroize = { version = "1", features = ["alloc"] }
 tokio.workspace = true
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 tracing = "0.1"
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+web-time = "1"
+web-sys = { version = "0.3", features = ["WebSocket", "BinaryType", "MessageEvent", "Event", "EventTarget", "Window", "Document"] }
+
 [dev-dependencies]
 tokio.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+syntra-transport = { path = "../syntra-transport", version = "1.0.0-rc.1", default-features = false, features = ["websocket"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { workspace = true, features = ["net", "signal"] }
+
+[[example]]
+name = "browser_wss_fixture"
+required-features = ["wss-test-fixture"]

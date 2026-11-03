@@ -93,6 +93,22 @@ impl Drop for PendingGuard<'_> {
 }
 
 impl Shared {
+    pub(crate) fn expire_rpcs(&self) {
+        let mut entries = self.emissions.lock().unwrap();
+        let now = self.clock.now();
+        let expired: Vec<_> = entries
+            .iter()
+            .filter_map(|(&id, entry)| (now >= entry.state.deadline).then_some(id))
+            .collect();
+        for id in expired {
+            let entry = entries.remove(&id).unwrap();
+            self.fail_entry(
+                id,
+                entry,
+                SyntraError::DeadlineExceeded("RPC expired".into()),
+            );
+        }
+    }
     pub(crate) fn admit_rpc(
         &self,
         id: u64,
@@ -108,6 +124,12 @@ impl Shared {
         SyntraError,
     > {
         let mut entries = self.emissions.lock().unwrap();
+        if self.suspended.load(std::sync::atomic::Ordering::Acquire) || !self.clock.is_continuous()
+        {
+            return Err(SyntraError::Unavailable(
+                "elapsed continuity or lifecycle unavailable".into(),
+            ));
+        }
         let rx = self.pending.insert(id, method.to_string())?;
         let state = Arc::new(EmissionState {
             deadline,
@@ -133,10 +155,14 @@ impl Shared {
         ))
     }
 
-    pub(crate) fn complete_rpc(&self, id: u64, result: RpcResult) {
+    pub(crate) fn complete_rpc(&self, id: u64, result: RpcResult) -> bool {
         let mut entries = self.emissions.lock().unwrap();
+        if self.suspended.load(std::sync::atomic::Ordering::Acquire) || !self.clock.is_continuous()
+        {
+            return false;
+        }
         if let Some(entry) = entries.remove(&id) {
-            if now() >= entry.state.deadline {
+            if self.clock.now() >= entry.state.deadline {
                 self.fail_entry(
                     id,
                     entry,
@@ -145,11 +171,13 @@ impl Shared {
             } else {
                 self.pending.complete(id, result);
             }
+            return true;
         }
+        false
     }
 
     fn fail_entry(&self, id: u64, entry: QueuedRpc, candidate: SyntraError) {
-        let selected = if now() >= entry.state.deadline {
+        let selected = if self.clock.now() >= entry.state.deadline {
             SyntraError::DeadlineExceeded("RPC expired".into())
         } else {
             candidate
@@ -181,12 +209,30 @@ impl Shared {
     }
 
     pub(crate) fn prepare_outbound(&self, bytes: Vec<u8>) -> Option<Vec<u8>> {
+        let mut entries = self.emissions.lock().unwrap();
+        if self.closed.load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .transport_closed
+                .load(std::sync::atomic::Ordering::Acquire)
+            || self.suspended.load(std::sync::atomic::Ordering::Acquire)
+            || !self.clock.is_continuous()
+        {
+            return None;
+        }
         let mut frame = Frame::decode(bytes.as_slice()).ok()?;
+        if matches!(frame.body, Some(Body::Hello(_)))
+            && self
+                .handshake_deadline
+                .lock()
+                .unwrap()
+                .is_some_and(|deadline| self.clock.now() >= deadline)
+        {
+            return None;
+        }
         let Some(Body::Request(request)) = &mut frame.body else {
             // Handshake and control units are not RPC queue entries.
             return Some(bytes);
         };
-        let mut entries = self.emissions.lock().unwrap();
         let entry = entries.get_mut(&frame.request_id)?;
         if !matches!(entry.phase, EmissionPhase::Queued(address) if address == bytes.as_ptr() as usize)
         {
@@ -198,7 +244,7 @@ impl Shared {
         let remaining = entry
             .state
             .deadline
-            .saturating_duration_since(now())
+            .saturating_duration_since(self.clock.now())
             .as_millis();
         let failure = if remaining == 0 {
             Some(SyntraError::DeadlineExceeded("queued RPC expired".into()))

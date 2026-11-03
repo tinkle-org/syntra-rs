@@ -1,17 +1,20 @@
 #ifndef SYNTRA_FIXTURE_H
 #define SYNTRA_FIXTURE_H
 
-/* TEST FIXTURE ONLY. No supported production native or browser ABI exists.
+/* TEST FIXTURE ONLY. Production native ABI is in syntra_production.h, not here.
  * Default Rust builds export none of these functions. To use the fixture:
  *   cargo build -p syntra-ffi --features test-fixture
  *   compile the C test with -DSYNTRA_TEST_FIXTURE
  * Do not distribute that artifact as a production Syntra transport.
  * syntra_open always creates an in-process echo/get-put host, not a network
- * peer. There is NO API here to attach syntra-ws or another real transport.
+ * peer. There is NO API here to attach a network connection driver.
  * ABI version checks describe fixture layout, not transport support.
  */
 #ifndef SYNTRA_TEST_FIXTURE
-#error "syntra.h is test-only: define SYNTRA_TEST_FIXTURE and enable Cargo test-fixture; no production FFI is available"
+#error "syntra.h is test-only: define SYNTRA_TEST_FIXTURE and enable Cargo test-fixture; use syntra_production.h for production"
+#endif
+#ifdef SYNTRA_PRODUCTION_H
+#error "fixture and production headers describe mutually exclusive ABI modes"
 #endif
 #if defined(__wasm__)
 #error "syntra-ffi does not support WASM: the blocking fixture ABI is native-only"

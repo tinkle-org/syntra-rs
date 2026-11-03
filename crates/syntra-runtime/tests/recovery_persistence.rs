@@ -1,6 +1,6 @@
-//! Source-inclusion persistence contracts, including native test-only crash cuts.
-//! The public runtime's FileRecoveryStore/client integration is additionally
-//! exercised through tests/recovery_wire.rs; these copies expose no fault API.
+//! Source-inclusion persistence contracts. With `file-store`, native test-only
+//! crash cuts and filesystem contracts also run. The public store/client boundary
+//! is exercised through tests/recovery_wire.rs; these copies expose no fault API.
 #[path = "../src/recovery/persistence.rs"]
 mod persistence;
 
@@ -229,7 +229,7 @@ fn memory_count_state_and_total_byte_limits() {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "file-store", not(target_arch = "wasm32")))]
 mod native {
     use super::*;
     use persistence::FileRecoveryStore;
