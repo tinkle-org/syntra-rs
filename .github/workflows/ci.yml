@@ -106,7 +106,7 @@ jobs:
         run: python3 -B scripts/protocol_contract.py --offline --run-rust --output "$RUNNER_TEMP/candidate-rust-agreement"
       - name: Preserve candidate agreement scope and exact command logs
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: candidate-rust-agreement
           path: ${{ runner.temp }}/candidate-rust-agreement
@@ -176,7 +176,7 @@ jobs:
       - name: Unified Syntra implementation evidence (no formal conformance claim)
         run: python3 -B scripts/conformance_evidence.py --candidate-agreement offline --output "$RUNNER_TEMP/syntra-evidence"
       - name: Upload implementation evidence (not a conformance declaration)
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: syntra-implementation-evidence
           path: ${{ runner.temp }}/syntra-evidence
@@ -220,7 +220,7 @@ jobs:
           --output "$RUNNER_TEMP/manifest-cases"
       - name: Preserve implementation evidence and supplemental observations
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: syntra-implementation-wss-evidence
           path: ${{ runner.temp }}/manifest-cases
