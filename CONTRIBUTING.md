@@ -3,9 +3,9 @@
 Run commands from the repository root. **Rust 1.88.0 is the toolchain**;
 the crate MSRV floor of **1.88** is an API/build compatibility constraint,
 not a secure-runtime recommendation. Production binaries must be built with
-a security-patched toolchain. Current pins are `prost =0.13.5`,
+a security-patched toolchain. Current pins are `prost =0.14.4`,
 `snow =0.10.0`, `getrandom 0.3`, `tokio 1`, `tungstenite`/`tokio-tungstenite`
-0.26 and `rustls 0.23`. Keep dependency versions and checksums consistent
+0.30 and `rustls 0.23`. Keep dependency versions and checksums consistent
 unless updating them is part of the change.
 
 Read [CONNECTION.md](CONNECTION.md) for Syntra 1.0 encryption and connection
@@ -206,11 +206,13 @@ updates together; do not edit pinned bytes or their hashes just to make checks p
 
 The separate v2 [`protocol-contract.json`](protocol-contract.json) records the
 current Syntra 1.0 candidate's domain, carrier bindings and context layout. Its
-source observation truthfully records the sibling's baseline HEAD, branch and
-dirty state, with `kind: worktree-not-release` and no candidate commit. The
-baseline HEAD is not a committed candidate. Release-pin verification cannot pass
-until the actual candidate bytes are committed and that real commit is verified
-and recorded; a successful agreement check does not authorize publication.
+`committed-candidate` record pins upstream commit
+`3f7e8ea037fefcc5c86101d23e7722c83e28a0d3`, whose four machine-input blobs match
+the previously recorded bytes exactly. The original baseline HEAD, branch and
+dirty state remain in `source.worktree_observation` as historical provenance;
+the baseline HEAD is not the candidate commit. Release-pin verification checks
+the actual committed blobs, not the current upstream worktree. A successful
+agreement check does not authorize publication or freeze the candidate SDD.
 
 The candidate context fixture is a **derived** artifact at
 [`syntra-1.0-context.json`](tests/interoperability/fixtures/syntra-1.0-context.json).
@@ -226,13 +228,18 @@ carrier bindings of one protocol, not selectable transport profiles.
 
 ```sh
 python3 -B scripts/protocol_contract.py --offline
-python3 -B scripts/protocol_contract.py --worktree --upstream ../syntra
+python3 -B scripts/protocol_contract.py --release --upstream ../syntra
 ```
 
 Offline candidate agreement checks the recorded local semantic artifacts and
-compiled source encoding probe without verifying external bytes. Worktree mode
-also verifies the recorded external machine-input bytes, transformations and
-HEAD/branch/dirty identity. Neither mode runs a complete crate or carrier suite.
+compiled source encoding probe without verifying external bytes. Release mode
+also verifies the exact candidate commit, baseline ancestry, machine-input Git
+blobs and derived transformations. Neither mode runs a complete crate or carrier
+suite. For a future uncommitted candidate, `--record-worktree` explicitly records
+its bytes and `--worktree` verifies that observation; publication stays blocked.
+Once those exact bytes are committed, use `--record-commit FULL_SHA --upstream
+PATH` to verify them before promoting the record. Do not change its kind or
+revision by hand to bypass failed verification.
 The separate `--run-rust --output NEW_EXTERNAL_DIRECTORY` option adds five exact
 supplemental Rust regressions with command logs. Candidate fixtures and
 implementation checks must not be presented as execution of the pinned upstream
@@ -250,7 +257,7 @@ selection or full-suite inventory mode. Install the parser from
 
 ```sh
 python3 -B scripts/conformance_evidence.py --upstream ../syntra --candidate-agreement offline
-python3 -B scripts/conformance_evidence.py --upstream ../syntra --candidate-agreement worktree
+python3 -B scripts/conformance_evidence.py --upstream ../syntra --candidate-agreement release
 ```
 
 Here `offline` applies only to candidate agreement: the evidence runner still
@@ -316,3 +323,21 @@ use the per-package release process in [release-plz.toml](release-plz.toml),
 independently of upstream protocol specification releases.
 There is no published previous package version. Release-plz manages future
 per-package changelogs when preparing releases.
+
+On pushes to `main`, Release-plz opens or updates a release PR. With
+`release_always = false`, publication is attempted only when a release PR merges,
+and requires the committed candidate pin and release validation to pass. The
+release job publishes Cargo packages, creates immutable per-package tags, and
+creates matching GitHub Releases with changelog notes. `git_release_type = "auto"`
+marks `1.0.0-rc.x` releases as prereleases. Keep GitHub Releases and crates.io
+versions aligned through this one job rather than creating a second release
+workflow.
+
+`crates-io-publish` is the protected GitHub Actions environment used by the job,
+not a package registry or an alternative to the repository's Releases page.
+Trusted publishing uses the job's `id-token: write` permission and requires a
+publisher configured on crates.io for each package. New crates need an initial
+manual publication before trusted publishing can publish later versions; merging
+a release PR alone does not bootstrap a new crate. See the
+[Release-plz quickstart](https://release-plz.dev/docs/github/quickstart) and
+[release command](https://release-plz.dev/docs/usage/release).
