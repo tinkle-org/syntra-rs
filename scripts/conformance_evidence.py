@@ -177,8 +177,8 @@ def main():
     parser.add_argument("--upstream", type=Path, help="defaults to SYNTRA_SDD_ROOT or ../syntra")
     parser.add_argument("--run-local", action="append", choices=sorted(LOCAL_LANES.keys() | NATIVE_LOCAL_LANES.keys() | set(SUPPLEMENTAL_SCENARIOS)), default=[],
                         help="repeat supplemental local validation lanes")
-    parser.add_argument("--candidate-agreement", choices=("offline", "worktree"),
-                        help="verify the current unified contract via protocol_contract")
+    parser.add_argument("--candidate-agreement", choices=("offline", "worktree", "release"),
+                        help="verify the current unified contract via protocol_contract; release verifies committed candidate blobs, not publication authorization")
     parser.add_argument("--output", type=Path, help="NEW artifact directory, never overwrites evidence")
     args = parser.parse_args()
     if args.run_local and not args.output:
