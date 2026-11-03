@@ -16,8 +16,8 @@ pipe cases do not measure WSS, TLS or the reconnecting client. See
 [CONNECTION.md](CONNECTION.md) for encryption and connection guidance. These local
 harnesses do not establish operational budgets or real-device/network results.
 Retain the implementation revision and dirty-worktree state with measurements.
-The [candidate record](protocol-contract.json) is `worktree-not-release`; benchmark
-success does not promote it or satisfy the formal-conformance gate in
+The [candidate record](protocol-contract.json) pins committed candidate inputs;
+benchmark success does not authorize publication or satisfy the formal-conformance gate in
 [implementation evidence](CONTRIBUTING.md#implementation-evidence).
 
 ## Cases and accounting

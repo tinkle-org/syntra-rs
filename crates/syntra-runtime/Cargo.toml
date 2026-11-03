@@ -14,6 +14,10 @@ default = []
 # Opt-in native filesystem snapshots; custom persistence remains available without it.
 file-store = ["dep:fs2"]
 
+[[example]]
+name = "file_store_pid_namespace"
+required-features = ["file-store"]
+
 [dependencies]
 syntra-core = { path = "../syntra-core", version = "1.0.0-rc.1" }
 prost.workspace = true

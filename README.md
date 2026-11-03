@@ -12,8 +12,9 @@ runtime scheduling and socket policy. Encryption is integral to the protocol. Se
 The implementation is experimental and unpublished, with no published previous
 version. No formal conformance, independent interoperability or independent
 security-review verdict is claimed. The current candidate is recorded in
-[`protocol-contract.json`](protocol-contract.json); it describes a worktree, not
-a release or specification freeze. See
+[`protocol-contract.json`](protocol-contract.json); it pins `committed-candidate`
+inputs, not a release or specification freeze. Its `source.worktree_observation`
+retains the earlier dirty-worktree state as historical information only. See
 [input provenance](CONTRIBUTING.md#input-provenance-and-authority) for the separate
 11-input upstream lock, source credit and exact Git/offline checks.
 
@@ -322,7 +323,8 @@ access to its remote plugin service, but no local `protoc`.
 
 Unified implementation evidence is produced by
 `scripts/conformance_evidence.py`, optionally with `--candidate-agreement offline`
-or `--candidate-agreement worktree` and supplemental `--run-local` lanes. See
+or `--candidate-agreement release` and supplemental `--run-local` lanes. The
+release mode verifies committed candidate inputs, not publication authorization. See
 [implementation evidence](CONTRIBUTING.md#implementation-evidence) for commands,
 the exact Git-input requirement and result interpretation. Candidate agreement,
 fixture transcription checks and local test execution have distinct scopes;

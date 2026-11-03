@@ -26,6 +26,11 @@ class CandidateTests(unittest.TestCase):
         self.root.mkdir()
         self.upstream.mkdir()
         self.record = candidate.parse_json((candidate.ROOT / candidate.LOCK).read_bytes())
+        # Synthetic worktree cases must not depend on the checked-in record's
+        # release state. Live-record validation below still uses candidate.ROOT.
+        self.record["kind"] = "worktree-not-release"
+        self.record["source"].update(dirty=True, candidate_revision=None)
+        self.record["source"].pop("worktree_observation", None)
         contexts = (candidate.ROOT / candidate.FIXTURE).read_bytes()
         self.contexts = contexts
         plan = candidate.parse_json(contexts)
@@ -330,6 +335,88 @@ class CandidateTests(unittest.TestCase):
                 return value.replace(b"100644", mode.encode()) if args[0] == "ls-tree" else value
             with self.subTest(mode=mode), mock.patch.object(candidate, "git", side_effect=read), self.assertRaisesRegex(ValueError, "regular nonexecutable"):
                 candidate.record_commit("1" * 40, self.root, self.upstream)
+
+    def fixture_git(self, *args):
+        return subprocess.run(
+            ["git", "-c", "user.name=Syntra fixture", "-c", "user.email=syntra-fixture@example.invalid",
+             "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false", *args],
+            cwd=self.upstream, check=True, capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+
+    def fixture_commit(self, message):
+        self.fixture_git("add", "--all")
+        self.fixture_git("commit", "-m", message)
+        return self.fixture_git("rev-parse", "HEAD")
+
+    def matching_git_candidate(self):
+        self.fixture_git("init", "--initial-branch=candidate", "--object-format=sha1")
+        name = candidate.INPUTS["contract"]
+        self.write(self.upstream, name, b"baseline input\n")
+        baseline = self.fixture_commit("Baseline fixture")
+        self.write(self.upstream, name, self.source[name])
+        revision = self.fixture_commit("Matching candidate fixture")
+        self.record["source"].update(baseline_git_head=baseline, branch="candidate")
+        self.observation = {key: self.record["source"][key] for key in ("baseline_git_head", "branch", "dirty")}
+        self.save()
+        return revision
+
+    def local_candidate_artifacts(self):
+        return {name: (self.root / name).read_bytes()
+                for name in (candidate.LOCK, candidate.FIXTURE, "upstream.lock.json")}
+
+    def test_real_git_promotion_preserves_dirty_observation_fixture_and_accepted_lock(self):
+        revision = self.matching_git_candidate()
+        before = self.local_candidate_artifacts()
+        record = candidate.record_commit(revision, self.root, self.upstream)
+        expected = copy.deepcopy(self.record)
+        expected.update(kind="committed-candidate", recorded_utc=record["recorded_utc"])
+        expected["source"].update(candidate_revision=revision, dirty=False,
+                                  worktree_observation=self.observation)
+        self.assertEqual(record, expected)
+        self.assertEqual(candidate.load_record(self.root), expected)
+        self.assertEqual(candidate.release_revision(record), revision)
+        for name in (candidate.FIXTURE, "upstream.lock.json"):
+            self.assertEqual((self.root / name).read_bytes(), before[name])
+        contexts, observed = candidate.external_source(record, self.upstream, "release")
+        self.assertEqual(contexts, candidate.parse_json(self.contexts))
+        self.assertEqual(observed, {"candidate_revision": revision, "kind": "exact_committed_git_blobs"})
+
+    def test_real_git_changed_input_cannot_be_rescued_by_matching_worktree_or_rewrite_record(self):
+        revision = self.matching_git_candidate()
+        record = candidate.record_commit(revision, self.root, self.upstream)
+        before = self.local_candidate_artifacts()
+        name = candidate.INPUTS["contract"]
+        self.write(self.upstream, name, self.source[name] + b"\n")
+        changed = self.fixture_commit("Changed candidate input")
+        self.write(self.upstream, name, self.source[name])
+        with self.assertRaisesRegex(ValueError, "byte drift"):
+            candidate.record_commit(changed, self.root, self.upstream)
+        changed_record = copy.deepcopy(record)
+        changed_record["source"]["candidate_revision"] = changed
+        with self.assertRaisesRegex(ValueError, "byte drift"):
+            candidate.external_source(changed_record, self.upstream, "release")
+        # Moving HEAD to the bad descendant does not invalidate the original pin.
+        contexts, observed = candidate.external_source(record, self.upstream, "release")
+        self.assertEqual(contexts, candidate.parse_json(self.contexts))
+        self.assertEqual(observed["candidate_revision"], revision)
+        self.assertEqual(self.local_candidate_artifacts(), before)
+        self.assertEqual((self.upstream / name).read_bytes(), self.source[name])
+
+    def test_real_git_dirty_or_missing_worktree_inputs_do_not_affect_release_blob_proof(self):
+        revision = self.matching_git_candidate()
+        for name in self.source:
+            (self.upstream / name).unlink()
+        name = candidate.INPUTS["contract"]
+        dirty = b"uncommitted bytes must not be used or rewritten\n"
+        self.write(self.upstream, name, dirty)
+        record = candidate.record_commit(revision, self.root, self.upstream)
+        before = self.local_candidate_artifacts()
+        contexts, observed = candidate.external_source(record, self.upstream, "release")
+        self.assertEqual(contexts, candidate.parse_json(self.contexts))
+        self.assertEqual(observed, {"candidate_revision": revision, "kind": "exact_committed_git_blobs"})
+        self.assertEqual(self.local_candidate_artifacts(), before)
+        self.assertEqual((self.upstream / name).read_bytes(), dirty)
+        self.assertTrue(all(not (self.upstream / other).exists() for other in self.source if other != name))
 
     def test_rust_control_zero_or_ignored_tests_do_not_pass(self):
         for text, expected in (("test result: ok. 0 passed; 0 failed; 0 ignored;", "NOT_EXECUTED"),

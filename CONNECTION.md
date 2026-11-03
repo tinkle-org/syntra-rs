@@ -8,9 +8,10 @@ Encryption is integral to every connection.
 This guide describes the current worktree. The v2 candidate contract in
 [`protocol-contract.json`](protocol-contract.json) records source provenance,
 domain, carrier bindings and context layout, with raw source hashes separate from
-derived artifact hashes. Its `CARRIER` bindings describe one protocol. The recorded
-source is dirty and remains `worktree-not-release`; its baseline HEAD is not a
-candidate release commit. See
+derived artifact hashes. Its `CARRIER` bindings describe one protocol. The record
+pins the exact candidate inputs at upstream commit
+`3f7e8ea037fefcc5c86101d23e7722c83e28a0d3` and preserves the earlier dirty-worktree
+observation separately; the baseline HEAD is not the candidate commit. See
 [CONTRIBUTING.md](CONTRIBUTING.md#input-provenance-and-authority) for the separate
 pinned upstream inputs. No formal conformance, independent
 interoperability or independent security-review verdict is claimed here.

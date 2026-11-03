@@ -60,7 +60,7 @@ class ReportTests(unittest.TestCase):
     def test_current_candidate_verification_adds_only_current_contract_carriers(self):
         agreement = {"verdict": "PASS", "kind": "encoding_agreement", "publication_authorized": False}
         carriers = {"SYNTRA-1.0-TCP": {}, "SYNTRA-1.0-WS": {}, "SYNTRA-1.0-WSS": {}}
-        for mode in ("offline", "worktree"):
+        for mode in ("offline", "worktree", "release"):
             with self.subTest(mode=mode), \
                     mock.patch.object(protocol_contract, "verify_candidate", return_value=agreement) as verify, \
                     mock.patch.object(protocol_contract, "load_record", return_value={"contract": {"carriers": carriers}}):
@@ -130,6 +130,22 @@ class ReportTests(unittest.TestCase):
                         evidence.main()
                 self.assertFalse(output.exists())
                 run.assert_not_called()
+
+    def test_release_candidate_failure_never_falls_back_to_offline_or_runs_lanes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "evidence"
+            arguments = ["conformance_evidence.py", "--candidate-agreement", "release",
+                         "--run-local", "corpus", "--output", str(output)]
+            with mock.patch.object(sys, "argv", arguments), \
+                    mock.patch.object(evidence, "implementation_identity", return_value=self.identity), \
+                    mock.patch.object(evidence, "verify_inputs", return_value=(self.provenance, self.source)), \
+                    mock.patch.object(protocol_contract, "verify_candidate", side_effect=ValueError("release pin blocked")) as verify, \
+                    mock.patch.object(evidence, "run_local") as run:
+                with self.assertRaisesRegex(ValueError, "release pin blocked"):
+                    evidence.main()
+            verify.assert_called_once_with(evidence.ROOT, None, "release")
+            self.assertFalse(output.exists())
+            run.assert_not_called()
 
 
 class CliTests(unittest.TestCase):
