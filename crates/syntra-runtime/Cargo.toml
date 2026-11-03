@@ -27,7 +27,7 @@ tracing.workspace = true
 tokio.workspace = true
 futures-util.workspace = true
 subtle = "2.6"
-sha2 = "0.10"
+sha2 = "0.11"
 web-time = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
