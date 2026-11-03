@@ -314,6 +314,9 @@ mod native {
                 .err(),
                 Some(PersistenceError::OverLimit)
             );
+            // An open rejected after acquiring the lock must release ownership
+            // too, so a subsequent valid open can succeed immediately.
+            drop(FileRecoveryStore::open(&directory.0, limits).unwrap());
         }
     }
 

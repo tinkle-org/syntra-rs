@@ -1,7 +1,7 @@
 {
   "format_version": 2,
-  "kind": "worktree-not-release",
-  "recorded_utc": "2026-11-03T15:52:46.909519+00:00",
+  "kind": "committed-candidate",
+  "recorded_utc": "2026-11-03T17:54:50+00:00",
   "accepted_base": {
     "repository": "https://github.com/tinkle-org/syntra",
     "revision": "8ede3810b29fbba4d0e6ae6751a0025ceedda140",
@@ -14,13 +14,18 @@
     "repository": "https://github.com/tinkle-org/syntra",
     "baseline_git_head": "5ac9b70008280334966daf67c3f8a38dd06e374b",
     "branch": "feat/syntra-1.0-embeddable",
-    "dirty": true,
-    "candidate_revision": null,
+    "dirty": false,
+    "candidate_revision": "3f7e8ea037fefcc5c86101d23e7722c83e28a0d3",
     "files": {
       "compatibility/syntra-1.0.json": "6d5cd0684e54af7e3b2f50f131e061910bc0a43b60419e9b8777b078c58deb31",
       "conformance/test-vectors/connection/context-vectors.json": "6f4352389f1715166bdce5eabb18730ea06ddcf44f04ee6093b8e6c85e88670a",
       "conformance/test-vectors/connection/context-vectors.yaml": "89b32f5cf0c8a6b278c7731a318274877063feb8ba7f5e31c3f6a44175839050",
       "conformance/profiles.yaml": "3c1e5bb989eb9510da3ba4223384d35f519a4b6735b1312a4b139a252376c7c4"
+    },
+    "worktree_observation": {
+      "baseline_git_head": "5ac9b70008280334966daf67c3f8a38dd06e374b",
+      "branch": "feat/syntra-1.0-embeddable",
+      "dirty": true
     }
   },
   "contract": {

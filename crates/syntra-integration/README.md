@@ -35,7 +35,8 @@ Record the peer revision, dirty-worktree state and actual carrier/mode results
 when executing the suite.
 The [unified implementation-evidence runner](../../CONTRIBUTING.md#implementation-evidence)
 has separate supplemental lanes; it does not run this Docker suite. Preserve each
-result's execution scope, including the candidate's `worktree-not-release` status.
+result's execution scope and candidate provenance. The candidate record now pins
+committed inputs; that pin does not turn fixture execution into formal conformance.
 
 ## Running the fixture suite
 
