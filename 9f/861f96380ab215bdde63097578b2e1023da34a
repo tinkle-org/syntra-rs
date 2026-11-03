@@ -1,0 +1,36 @@
+crates/syntra-runtime/Cargo.toml
+  s_ebf64ecf44240c::t_a34bed5367ccb2 17-20
+crates/syntra-runtime/examples/file_store_pid_namespace.rs
+  s_ebf64ecf44240c::t_b92ae0ebaada09 18,86-89
+  s_ebf64ecf44240c::t_a34bed5367ccb2 1-17,19-85,90-162
+crates/syntra-runtime/src/recovery/persistence_file.rs
+  s_87028cb7ccdea0::t_f918b8797fce15 826,828-849
+  s_87028cb7ccdea0::t_e8f8d77e5aafea 12-15,53,92-93,95,114-116,118-119,171,773,803-807,809-812,817-825
+  s_87028cb7ccdea0::t_6f17d2adfa97c4 80-81
+  s_87028cb7ccdea0::t_a8cae402df13da 16-18,65-79,82-91,94,99-101,105,117,808,813-816
+  s_87028cb7ccdea0::t_df24de0e2a6156 827
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9f861f96380ab215bdde63097578b2e1023da34a",
+  "prompts": {},
+  "sessions": {
+    "s_87028cb7ccdea0": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e5d795292ffe489581DU7idtTu",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    },
+    "s_ebf64ecf44240c": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e5d331e30ffei01vIVLp6j7ZBW",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}
