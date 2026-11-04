@@ -3,8 +3,8 @@
 use std::sync::Arc;
 use syntra_core::secure_channel::{Carrier, Mode, Secret32, ServerConfig};
 use syntra_core::ErrorCode;
+use syntra_net::{tcp, websocket, HostHandle, Limits};
 use syntra_runtime::{ConnectionConfig, FnHandler, HandlerOutcome, StaticToken};
-use syntra_transport::{tcp, websocket, HostHandle, Limits};
 
 fn hex_to_32(s: &str) -> [u8; 32] {
     let s = s.trim();

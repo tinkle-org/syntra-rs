@@ -2,17 +2,16 @@
 members = [
     "crates/syntra-core",
     "crates/syntra-runtime",
-    "crates/syntra-transport",
+    "crates/syntra-net",
     "crates/syntra-ffi",
-    "crates/syntra-web",
     "crates/syntra-integration",
 ]
-# Default builds select embeddable protocol libraries. Platform adapters and
-# reference peers are exercised by explicit integration lanes.
+# Default builds select the protocol libraries, native I/O and FFI surface.
+# The reference peer is exercised by explicit integration lanes.
 default-members = [
     "crates/syntra-core",
     "crates/syntra-runtime",
-    "crates/syntra-transport",
+    "crates/syntra-net",
     "crates/syntra-ffi",
 ]
 resolver = "2"

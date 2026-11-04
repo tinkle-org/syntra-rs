@@ -14,19 +14,33 @@ and its verification; see [input provenance](#input-provenance-and-authority).
 The implementation remains experimental and unpublished; formal conformance has
 not been executed and independent security review remains outstanding.
 
-`syntra-transport` has an empty default feature set: the native carrier-neutral
-record driver is available without socket dependencies. Select `tcp` or `websocket`
-explicitly for native carriers; `websocket` includes WSS and loopback-only WS
-dials, both carrying protected records. Reconnection requires the separate
-`reconnect` feature. `native-enrollment` is also explicitly opt-in.
+`syntra-net` has an empty default feature set: the native carrier-neutral
+record driver is available without socket dependencies. `tcp` supplies TCP I/O;
+`websocket` supplies framing/upgrade, loopback WS and the trusted application TLS
+provider boundary without a production TLS implementation dependency. `tls-rustls`
+adds optional rustls WSS convenience APIs. `reconnect` supplies reconnection;
+`managed` enables TCP/reconnect and owns runtime/client/listener lifecycle.
+Add `websocket` for managed loopback WS and application-provider WSS listeners.
+The TCP-gated `routes` module composes explicit allowlisted endpoints with fresh
+per-attempt inputs. `proxy` enables TCP with SOCKS5/HTTP CONNECT, forward metadata
+helpers and proxied TCP/WSS routes.
+`http` independently enables Draft RFC0013 candidate HTTP/HTTPS connections with
+Noise, hello/ready and RPC, a bounded listener/association registry and raw
+codec/pair APIs. It enables `syntra-core/http-candidate`, `getrandom` and the
+application TLS boundary without implying `websocket` or a TLS implementation.
+With `managed,http`, `Network::listen_http`/`listen_https` own the inline listener
+run; routes support direct, SOCKS5/CONNECT and real plain-HTTP forward paths.
+This is implementation-candidate capability under active resource review, not
+registered, approved or shippable accepted-spec support. RFC0013 authority and
+the active contract/pins are unchanged; no conformance claim follows from tests.
+`native-enrollment` is explicitly opt-in. See the [feature table](README.md#workspace-and-scope).
 
 Keep the ownership boundaries: `syntra-core` owns framing and record protection
-through `syntra_core::secure_channel`, `syntra-runtime` owns sessions, `syntra-transport`
-owns native I/O, and `syntra-web` owns the browser-local driver. The browser's
-default `browser-connection` feature exposes protected WSS with provisioned
-Noise pins and encrypted ClientHello; it has no plaintext connect API. See
-[browser procedures](crates/syntra-web/tests/browser.md) for separate build,
-synthetic-carrier and real WSS checks. FFI features require their own checks.
+through `syntra_core::secure_channel`, `syntra-runtime` owns sessions, and
+`syntra-net` owns native I/O. Core and runtime remain portable to WASM, with
+platform I/O supplied by the embedder. `syntra-ffi` owns the native ABI and
+`syntra-integration` supplies the Docker fixture peer. FFI features require their
+own checks.
 
 ## Checks
 
@@ -36,36 +50,80 @@ cargo fmt --all -- --check
 cargo test --locked
 cargo test --locked --workspace
 cargo test --locked -p syntra-runtime --no-default-features --features file-store
-cargo test --locked -p syntra-transport --no-default-features
-cargo test --locked -p syntra-transport --no-default-features --features tcp
-cargo test --locked -p syntra-transport --no-default-features --features websocket
-cargo test --locked -p syntra-transport --no-default-features --features tcp,websocket,reconnect
-cargo bench --locked -p syntra-transport --no-default-features --features tcp --bench pipe -- --test
+cargo test --locked -p syntra-net --no-default-features
+cargo test --locked -p syntra-net --no-default-features --features tcp
+cargo test --locked -p syntra-net --no-default-features --features http
+cargo test --locked -p syntra-net --no-default-features --features managed,http,proxy --test http_connections --test network_http --test routes
+cargo test --locked -p syntra-net --no-default-features --features managed,http,websocket,proxy --test http_connections --test network_http --test routes
+cargo test --locked -p syntra-core --no-default-features --test http_candidate_context
+cargo test --locked -p syntra-core --no-default-features --features http-candidate --test http_candidate_context
+cargo test --locked -p syntra-net --no-default-features --features websocket
+cargo test --locked -p syntra-net --no-default-features --features tls-rustls --test wss
+cargo test --locked -p syntra-net --no-default-features --features tcp,tls-rustls,reconnect
+cargo test --locked -p syntra-net --no-default-features --features managed
+cargo test --locked -p syntra-net --no-default-features --features managed,websocket,proxy --test network_websocket --test routes
+cargo test --locked -p syntra-net --no-default-features --features managed,tls-rustls,proxy --test network_websocket --test routes
+cargo test --locked -p syntra-net --no-default-features --features proxy
+cargo test --locked -p syntra-net --no-default-features --features tls-rustls,native-enrollment
+cargo bench --locked -p syntra-net --no-default-features --features tcp --bench pipe -- --test
 python3 scripts/cargo_contracts.py isolation
+python3 scripts/cargo_contracts.py websocket
+python3 scripts/cargo_contracts.py managed-websocket
+python3 scripts/cargo_contracts.py http
+python3 -B -m unittest discover -s scripts/tests -p 'test_*.py' -v
+python3 -B scripts/protocol_contract.py --offline
 cargo clippy --locked --workspace --all-targets -- --no-deps
 cargo test --locked -p syntra-ffi --no-default-features --features production
 cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
 python3 crates/syntra-ffi/tests/build_contract.py
 cargo check --locked -p syntra-core -p syntra-runtime --target wasm32-unknown-unknown
-cargo check --locked -p syntra-web --no-default-features --features browser-connection --target wasm32-unknown-unknown
-cargo check --locked -p syntra-web --no-default-features --features browser-test-fixture --target wasm32-unknown-unknown
+cargo check --locked -p syntra-core --no-default-features --features http-candidate --lib --target wasm32-unknown-unknown
+python3 crates/syntra-net/tests/target_contract.py
+sh crates/syntra-core/tests/run-kernel-browser.sh
 git diff --check
 ```
 
 Root builds/tests without package selectors or `--workspace` use
-the four `default-members` (`syntra-core`, `syntra-runtime`, `syntra-transport`,
-`syntra-ffi`), excluding only `syntra-web` and `syntra-integration` from
-the six-member workspace. `--workspace` includes those members and unifies the
-integration crate's `tcp` and `websocket` features into `syntra-transport`.
+the four `default-members` (`syntra-core`, `syntra-runtime`, `syntra-net`,
+`syntra-ffi`). The five-member workspace additionally includes
+`syntra-integration`; `--workspace` unifies its `tcp` and `websocket` features into
+`syntra-net`.
 Keep the isolated default and explicit carrier/reconnect invocations separate;
 workspace success alone does not establish socket-free default isolation.
-The isolation script checks normal dependency graphs on host and WASM targets.
-Native transport driver APIs require Tokio; WASM applications use `syntra-web`.
-The transport's native features must be disabled on WASM.
+The isolation lane checks normal/build dependency graphs on host and WASM targets.
+The websocket lane selects only `websocket`; managed-websocket checks the
+managed/WebSocket/proxy composition and its TCP/reconnect requirements. Both
+reject production TLS dependencies and unification of `syntra-net/http` or
+`syntra-core/http-candidate`; defaults reject these features too. The http lane
+requires both HTTP feature gates, checking standalone, managed/proxy and mixed
+WebSocket compositions. It rejects TLS implementations and state stores, and
+rejects WebSocket dependencies in the non-WebSocket graphs. Dev dependencies
+supplying test certificates/TLS peers are excluded from all graph checks.
+The target contract compiles each native feature independently, checks native
+WASM rejection and portable core candidate compilation, and requires nonzero
+passing tests in `http_records`, `http_connections`, `network_http`, HTTP unit
+tests, `tls_provider`, `wss`, `recovery_wss`, `network` and `proxy`.
+It also runs `network_websocket` and `routes` with both `managed,websocket,proxy`
+and `managed,tls-rustls,proxy`. Provider WSS is exercised in both; the first has
+no production TLS implementation dependency. Convenience WSS selectors need
+`tls-rustls`; recovery WSS also needs `reconnect`. Compilation or a zero-test
+result is not execution. Candidate HTTP connection/listener/routes run separately
+with `managed,http,proxy` and `managed,http,websocket,proxy`; three exact proxy/
+forward regressions require the named single-test execution proof in both modes.
+Core `http_candidate_context` runs without the feature to prove rejection and
+with it to check the fixture hash, golden contexts and full Noise prologue.
+Raw codec/record tests alone remain lower-level evidence; full-RPC tests are
+implementation evidence, not registration, completed review or conformance.
+Low-level native driver APIs require Tokio; managed networking owns its runtime.
+WASM embedders compose core/runtime with
+platform I/O.
+The net crate's native features must be disabled on WASM.
 
 Install the `wasm32-unknown-unknown` target for this toolchain first. The
-FFI contract also requires Python 3, `nm` and a C compiler. Run the relevant
-focused tests while iterating. The container suite is ignored by workspace
+FFI contract also requires Python 3, `nm` and a C compiler. The kernel browser
+runner requires `wasm-bindgen-test-runner` matching Cargo.lock and a browser/WebDriver;
+set `NO_HEADLESS=1` for an interactive browser. It exercises kernel tests, not a
+carrier. Run the relevant focused tests while iterating. The container suite is ignored by workspace
 runs; follow its own tooling instructions and record the actual peer
 revision. A same-implementation container round trip does not establish
 independent cross-language Syntra interoperability.
@@ -164,7 +222,7 @@ manifest). Preserve source provenance when updating schemas and fixtures.
 
 ## Input provenance and authority
 
-Original Rust source extraction credit:
+Rust source attribution:
 [`tinkle-org/syntra` at `2a91da7fdb96f3e75badf07614c14e4f85c9ba1c`](https://github.com/tinkle-org/syntra/commit/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c).
 
 [`upstream.lock.json`](upstream.lock.json) identifies the reviewed source repository
@@ -207,10 +265,7 @@ updates together; do not edit pinned bytes or their hashes just to make checks p
 The separate v2 [`protocol-contract.json`](protocol-contract.json) records the
 current Syntra 1.0 candidate's domain, carrier bindings and context layout. Its
 `committed-candidate` record pins upstream commit
-`3f7e8ea037fefcc5c86101d23e7722c83e28a0d3`, whose four machine-input blobs match
-the previously recorded bytes exactly. The original baseline HEAD, branch and
-dirty state remain in `source.worktree_observation` as historical provenance;
-the baseline HEAD is not the candidate commit. Release-pin verification checks
+`3f7e8ea037fefcc5c86101d23e7722c83e28a0d3`. Release-pin verification checks
 the actual committed blobs, not the current upstream worktree. A successful
 agreement check does not authorize publication or freeze the candidate SDD.
 
@@ -321,8 +376,7 @@ Open ordinary Rust implementation issues and pull requests in
 [`tinkle-org/syntra-rs`](https://github.com/tinkle-org/syntra-rs). Cargo packages
 use the per-package release process in [release-plz.toml](release-plz.toml),
 independently of upstream protocol specification releases.
-There is no published previous package version. Release-plz manages future
-per-package changelogs when preparing releases.
+Release-plz manages per-package changelogs when preparing releases.
 
 On pushes to `main`, Release-plz opens or updates a release PR. With
 `release_always = false`, publication is attempted only when a release PR merges,

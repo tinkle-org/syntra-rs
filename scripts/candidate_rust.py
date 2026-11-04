@@ -11,10 +11,9 @@ from sdd_inputs import regular_file
 
 KERNEL = "crates/syntra-core/src/secure_channel/mod.rs"
 NATIVE_FIXTURES = "crates/syntra-core/tests/fixtures/syntra_1_0_context.rs"
-BROWSER_FIXTURES = "crates/syntra-web/tests/connection_records.rs"
-BROWSER_JS = "crates/syntra-web/tests/connection-browser.js"
-NATIVE_WS = "crates/syntra-transport/src/websocket.rs"
-BROWSER_WS = "crates/syntra-web/src/connection.rs"
+RECORD_FIXTURES = "crates/syntra-core/tests/connection_records.rs"
+NATIVE_WS = "crates/syntra-net/src/websocket.rs"
+NATIVE_TLS = "crates/syntra-net/src/tls.rs"
 CONSTANTS = (
     "PROTOCOL", "DOMAIN", "AEAD_TAG_BYTES", "NOISE_MESSAGE_BYTES", "MIN_SCOPE_BYTES",
     "MAX_SCOPE_BYTES", "MODE_OFFSET", "CARRIER_OFFSET", "SERVER_KEY_ID_OFFSET",
@@ -85,7 +84,7 @@ def probe(root, contexts, negatives, layout):
     """
     text = regular_file(root, KERNEL).decode()
     native = regular_file(root, NATIVE_FIXTURES).decode()
-    browser = regular_file(root, BROWSER_FIXTURES).decode()
+    records = regular_file(root, RECORD_FIXTURES).decode()
     code = ["#![allow(dead_code)]", "use std::mem::size_of;", "#[derive(Debug)] enum Error { Invalid }"]
     code += [const(text, name) for name in CONSTANTS]
     for name in ("Mode", "Carrier", "Context"):
@@ -133,14 +132,24 @@ def probe(root, contexts, negatives, layout):
         code.append(f'let mut bad = vec![{values}]; bad.extend_from_slice(&[0; NOISE_MESSAGE_BYTES]);')
         code.append('println!("{{\\\"kind\\\":\\\"negative\\\",\\\"id\\\":{:?},\\\"rejected\\\":{}}}", '
                     + json.dumps(row["id"]) + ', Context::parse_first(&bad).is_err());')
+    # This probe deliberately compiles without http-candidate. Candidate codes
+    # must not enter the active three-carrier parser through copied source.
+    base = next(row for row in contexts if row["mode"] == 1 and row["carrier"] == 1)
+    for carrier in (4, 5):
+        invalid = bytearray.fromhex(base["context_hex"])
+        invalid[layout["carrier"][0]] = carrier
+        values = ','.join(str(byte) for byte in invalid)
+        code.append(f'let mut bad = vec![{values}]; bad.extend_from_slice(&[0; NOISE_MESSAGE_BYTES]);')
+        code.append('println!("{{\\\"kind\\\":\\\"default_candidate_rejection\\\",\\\"carrier\\\":{},\\\"rejected\\\":{}}}", '
+                    + str(carrier) + ', Context::parse_first(&bad).is_err());')
     code.append('for f in independent::CONTEXTS { println!("{{\\\"kind\\\":\\\"independent\\\",\\\"id\\\":{:?},'
                 '\\\"mode\\\":{},\\\"carrier\\\":{},\\\"server_key_id\\\":{},\\\"epoch\\\":{},'
                 '\\\"handle_hex\\\":{:?},\\\"scope\\\":{:?},\\\"context_hex\\\":{:?},'
                 '\\\"prologue_hex\\\":{:?},\\\"context_bytes\\\":{},\\\"m1_bytes\\\":{}}}", '
                 'f.id, f.mode, f.carrier, f.server_key_id, f.epoch, f.handle_hex, f.scope, '
                 'f.context_hex, f.prologue_hex, f.context_bytes, f.m1_bytes); }')
-    expected = one(r'let expected\s*=\s*(b"(?:\\.|[^"\\])*")\s*;', browser, BROWSER_FIXTURES)[1]
-    code.append('println!("{{\\\"kind\\\":\\\"browser_fixture\\\",\\\"hex\\\":{:?}}}", hex(' + expected + '));')
+    expected = one(r'let expected\s*=\s*(b"(?:\\.|[^"\\])*")\s*;', records, RECORD_FIXTURES)[1]
+    code.append('println!("{{\\\"kind\\\":\\\"record_fixture\\\",\\\"hex\\\":{:?}}}", hex(' + expected + '));')
     code.append("}")
     with tempfile.TemporaryDirectory(prefix="syntra-candidate-probe-") as directory:
         source, binary = Path(directory) / "probe.rs", Path(directory) / "probe"
@@ -153,10 +162,10 @@ def probe(root, contexts, negatives, layout):
 
 
 def binding_sources(root, contract):
-    """Fail-closed source guards, not a claim that TLS/browser scenarios ran."""
+    """Fail-closed source guards, not a claim that TLS scenarios ran."""
     native = regular_file(root, NATIVE_WS).decode()
-    browser = regular_file(root, BROWSER_WS).decode()
-    for text, endpoint in ((native, "ENDPOINT_PATH"), (browser, "ENDPOINT")):
+    provider = regular_file(root, NATIVE_TLS).decode()
+    for text, endpoint in ((native, "ENDPOINT_PATH"),):
         for name, value in ((endpoint, contract["websocket_endpoint"]), ("SUBPROTOCOL", contract["websocket_subprotocol"])):
             literal = one(r'(?m)^pub const ' + name + r': &str = ("[^"\n]+");', text, name)[1]
             if json.loads(literal) != value:
@@ -172,6 +181,9 @@ def binding_sources(root, contract):
         "TLS 1.3 only": '.with_protocol_versions(&[&rustls::version::TLS13])',
         "negotiated TLS 1.3": 'protocol_version()!=Some(rustls::ProtocolVersion::TLSv1_3)',
         "exact native endpoint": 'parsed.path()!=ENDPOINT_PATH',
+        "provider client role and authority": 'tls::validate(&metadata,&authority,TlsRole::Client)?;',
+        "provider server role and authority": 'tls::validate(&metadata,authority,TlsRole::Server)?;',
+        "provider retains original budget": 'let(stream,metadata,budget)=stream.into_parts();',
     }
     normalized = compact(native)
     for label, guard in guards.items():
@@ -179,40 +191,35 @@ def binding_sources(root, contract):
             raise ValueError(f"reviewed transport binding guard changed/missing: {label}")
     if normalized.count(guards["TLS 1.3 only"]) != 2:
         raise ValueError("both client and server must retain reviewed TLS 1.3-only builders")
-    normalized = compact(browser)
-    for guard in ('endpoint.scheme()!="wss"', 'config.context.carrier!=Carrier::SecureWebSocket', 'endpoint.path()!=ENDPOINT'):
-        if guard not in normalized:
-            raise ValueError(f"reviewed browser binding guard changed/missing: {guard}")
+    provider_guards = {
+        "provider authority": 'metadata.authority!=*authority',
+        "provider role": 'metadata.role!=role',
+        "provider TLS 1.3": 'metadata.protocol_version!=0x0304',
+        "provider HTTP/1.1 ALPN": 'metadata.alpn.as_deref()!=Some(b"http/1.1".as_slice())',
+        "provider disables early data": 'metadata.early_data!=EarlyData::Disabled',
+        "provider result checked": 'validate(&result.metadata,&authority,role)?;',
+        "provider I/O deadline gate": 'inner:result.stream,budget:budget.io.clone(),',
+    }
+    normalized_provider = compact(provider)
+    for label, guard in provider_guards.items():
+        if guard not in normalized_provider:
+            raise ValueError(f"reviewed TLS provider binding guard changed/missing: {label}")
     return {"kind": "source_guard_agreement_not_carrier_execution", "native_guards": sorted(guards),
-            "browser": "WSS context only; browser TLS enforcement remains host/deployment-owned"}
+            "provider_guards": sorted(provider_guards),
+            "provider_trust": "trusted application implementation; metadata is not proof of certificate validation"}
 
 
-def browser_fixture_bounds(root, contract):
-    """Check independently handwritten browser expectations, without running JS."""
-    js = regular_file(root, BROWSER_JS).decode()
-    rust = regular_file(root, BROWSER_FIXTURES).decode()
+def record_fixture_bounds(root, contract):
+    """Check handwritten kernel record expectations, without executing a carrier."""
+    rust = regular_file(root, RECORD_FIXTURES).decode()
     layout = contract["context_layout"]
     def numbers(pattern, text, label):
         return tuple(int(value) for value in one(pattern, text, label).groups())
-    extent = numbers(r"data.length >= (\d+) && data.length <= (\d+)", js, "JS M1 extent")
-    if list(extent) != layout["m1_bytes"]:
-        raise ValueError("independent browser JS M1 bounds disagree")
-    domain = one(r"decode\(data.slice\(0, (\d+)\)\) === '([^']+)'", js, "JS domain")
-    if int(domain[1]) != layout["domain"][1] or domain[2] != contract["domain_ascii"]:
-        raise ValueError("independent browser JS context domain disagrees")
-    mode = one(r"data\[(\d+)\] === \(returningMode \? 2 : 1\)", js, "JS mode offset")
-    carrier = one(r"data\[(\d+)\] === (\d+)", js, "JS carrier offset")
-    if int(mode[1]) != layout["mode"][0] or (int(carrier[1]), int(carrier[2])) != (layout["carrier"][0], 3):
-        raise ValueError("independent browser JS field offsets disagree")
-    for pattern, expected in ((r"assert\(url === 'wss://fixture.invalid([^']+)'", contract["websocket_endpoint"]),
-                              (r"assert\(protocol === '([^']+)'", contract["websocket_subprotocol"])):
-        if one(pattern, js, "JS binding")[1] != expected:
-            raise ValueError("independent browser JS binding disagrees")
-    if numbers(r"\((\d+)\.\.=(\d+)\)\.contains\(&first.len\(\)\)", rust, "Rust browser M1 extent") != tuple(layout["m1_bytes"]):
-        raise ValueError("independent browser Rust M1 bounds disagree")
-    if int(one(r'assert_eq!\(encoded.len\(\), (\d+) \+ b"example.service".len\(\)\);', rust, "browser context prefix")[1]) != layout["scope"][0]:
-        raise ValueError("independent browser Rust context-prefix length disagrees")
-    offsets = numbers(r"returning\[(\d+)\] = 2;\s*returning\[(\d+)\] = 1;\s*returning\[(\d+)\.\.(\d+)\].fill\(7\);", rust, "browser returning context")
+    if numbers(r"\((\d+)\.\.=(\d+)\)\.contains\(&first.len\(\)\)", rust, "Rust record M1 extent") != tuple(layout["m1_bytes"]):
+        raise ValueError("independent record Rust M1 bounds disagree")
+    if int(one(r'assert_eq!\(encoded.len\(\), (\d+) \+ b"example.service".len\(\)\);', rust, "record context prefix")[1]) != layout["scope"][0]:
+        raise ValueError("independent record Rust context-prefix length disagrees")
+    offsets = numbers(r"returning\[(\d+)\] = 2;\s*returning\[(\d+)\] = 1;\s*returning\[(\d+)\.\.(\d+)\].fill\(7\);", rust, "record returning context")
     if offsets != (layout["mode"][0], layout["epoch"][1] - 1, *layout["handle"]):
-        raise ValueError("independent browser Rust returning offsets disagree")
-    return {"kind": "handwritten_expectation_agreement_not_browser_execution", "sources": [BROWSER_FIXTURES, BROWSER_JS]}
+        raise ValueError("independent record Rust returning offsets disagree")
+    return {"kind": "handwritten_expectation_agreement_not_carrier_execution", "sources": [RECORD_FIXTURES]}

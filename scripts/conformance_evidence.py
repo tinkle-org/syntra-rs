@@ -147,8 +147,8 @@ def run_local(lane, output_dir, root=ROOT):
         return execute_supplemental(lane, output_dir, local_verdict, root)
     if lane in NATIVE_LOCAL_LANES:
         test = NATIVE_LOCAL_LANES[lane]
-        command = ["cargo", "test", "--locked", "-p", "syntra-transport", "--no-default-features",
-                   "--features", "websocket,native-enrollment", "--lib", test]
+        command = ["cargo", "test", "--locked", "-p", "syntra-net", "--no-default-features",
+                   "--features", "tls-rustls,native-enrollment", "--lib", test]
     else:
         test = LOCAL_LANES[lane]
         command = ["cargo", "test", "--locked", "-p", "syntra-runtime", "--no-default-features",

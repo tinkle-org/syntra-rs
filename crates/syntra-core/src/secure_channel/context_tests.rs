@@ -132,7 +132,7 @@ fn malformed_contexts_reject_before_lookup_and_noise() {
     bad[MODE_OFFSET] = 0;
     cases.push(("zero mode", bad));
     let mut bad = bootstrap.clone();
-    bad[CARRIER_OFFSET] = 4;
+    bad[CARRIER_OFFSET] = 255;
     cases.push(("unknown carrier", bad));
     let mut bad = bootstrap.clone();
     bad[HANDLE_OFFSET - 1] = 1;
@@ -190,7 +190,7 @@ fn malformed_fields_and_every_truncation_reject_without_lookup() {
             bad[MODE_OFFSET] = mode;
             assert_rejected_before_lookup(&server, &wrapper(bad), "invalid mode");
         }
-        for carrier in [0, 4, 255] {
+        for carrier in [0, 6, 255] {
             let mut bad = bytes.clone();
             bad[CARRIER_OFFSET] = carrier;
             assert_rejected_before_lookup(&server, &wrapper(bad), "invalid carrier");
@@ -209,6 +209,21 @@ fn malformed_fields_and_every_truncation_reject_without_lookup() {
     let mut bad = hex(fixtures::CONTEXTS[2].context_hex);
     bad[SCOPE_LEN_OFFSET..SCOPE_OFFSET].copy_from_slice(&u16::MAX.to_be_bytes());
     assert_rejected_before_lookup(&server, &wrapper(bad), "oversized claimed scope");
+    assert_eq!(store.0.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(not(feature = "http-candidate"))]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn default_rejects_candidate_carriers_before_lookup_and_noise() {
+    let (server, store) = rejecting_server();
+    for fixture in &fixtures::CONTEXTS {
+        for carrier in [4, 5] {
+            let mut bad = hex(fixture.context_hex);
+            bad[CARRIER_OFFSET] = carrier;
+            assert_rejected_before_lookup(&server, &wrapper(bad), "candidate carrier");
+        }
+    }
     assert_eq!(store.0.load(Ordering::SeqCst), 0);
 }
 

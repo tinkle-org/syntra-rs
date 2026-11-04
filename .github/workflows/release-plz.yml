@@ -78,13 +78,15 @@ jobs:
           cargo test --locked
           cargo test --locked --workspace
           python3 scripts/cargo_contracts.py isolation
-          cargo test --locked -p syntra-transport --no-default-features --features tcp,websocket,reconnect,native-enrollment
+          python3 scripts/cargo_contracts.py websocket
+          python3 scripts/cargo_contracts.py managed-websocket
+          python3 scripts/cargo_contracts.py http
+          cargo test --locked -p syntra-net --no-default-features --features managed,proxy,tls-rustls,native-enrollment,http
           cargo test --locked -p syntra-runtime --no-default-features --features file-store
           cargo test --locked -p syntra-ffi --no-default-features --features production
           cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
           cargo check --locked -p syntra-core -p syntra-runtime --target wasm32-unknown-unknown
-          cargo check --locked -p syntra-web --no-default-features --features browser-connection --target wasm32-unknown-unknown
-          cargo check --locked -p syntra-web --no-default-features --features browser-test-fixture --target wasm32-unknown-unknown
+          python3 crates/syntra-net/tests/target_contract.py
           python3 crates/syntra-ffi/tests/build_contract.py
           python3 scripts/check-generated.py
           git -C "$SYNTRA_SDD_ROOT" fetch --depth=1 origin 8ede3810b29fbba4d0e6ae6751a0025ceedda140
@@ -93,8 +95,8 @@ jobs:
           cargo install --locked cargo-audit --version 0.22.2
           cargo audit --deny warnings
           cargo deny --locked check advisories licenses sources
-          cargo deny --locked --features syntra-transport/tcp,syntra-transport/websocket,syntra-transport/reconnect,syntra-transport/native-enrollment,syntra-runtime/file-store check advisories licenses sources
-          cargo deny --locked --features syntra-web/browser-connection --target wasm32-unknown-unknown check advisories licenses sources
+          cargo deny --locked --features syntra-net/http,syntra-net/managed,syntra-net/proxy,syntra-net/tls-rustls,syntra-net/native-enrollment,syntra-runtime/file-store check advisories licenses sources
+          cargo deny --locked --target wasm32-unknown-unknown check advisories licenses sources
           cargo build --locked --release -p syntra-ffi --no-default-features --features production
           for symbol in syntra_client_open syntra_host_open syntra_abi_version; do
             nm -D --defined-only target/release/libsyntra_ffi.so | grep -Eq "[[:space:]]${symbol}$" || (echo "missing production symbol: $symbol" >&2; exit 1)

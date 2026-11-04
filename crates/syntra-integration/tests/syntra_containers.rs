@@ -1,7 +1,7 @@
 use syntra_core::secure_channel::{generate_server_key, Carrier, ClientConfig, Context, Mode};
 use syntra_core::ErrorCode;
+use syntra_net::{tcp, websocket, Limits};
 use syntra_runtime::ConnectionConfig;
-use syntra_transport::{tcp, websocket, Limits};
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::{AsyncBuilder, AsyncRunner},
@@ -50,7 +50,7 @@ async fn syntra_tcp_and_ws_over_containers() -> Result<(), Box<dyn std::error::E
 WORKDIR /work
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release -p syntra-integration --bin peer
+RUN cargo build --locked --release -p syntra-integration --bin peer
 FROM debian:bookworm-slim
 COPY --from=builder /work/target/release/peer /usr/local/bin/peer
 EXPOSE 7001 7002
@@ -69,16 +69,12 @@ ENTRYPOINT ["/usr/local/bin/peer"]
             "./crates/syntra-runtime",
         )
         .with_file(
-            format!("{workspace}/crates/syntra-transport"),
-            "./crates/syntra-transport",
+            format!("{workspace}/crates/syntra-net"),
+            "./crates/syntra-net",
         )
         .with_file(
             format!("{workspace}/crates/syntra-ffi"),
             "./crates/syntra-ffi",
-        )
-        .with_file(
-            format!("{workspace}/crates/syntra-web"),
-            "./crates/syntra-web",
         )
         .with_file(
             format!("{workspace}/crates/syntra-integration"),
