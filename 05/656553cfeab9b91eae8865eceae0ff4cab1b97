@@ -1,0 +1,48 @@
+crates/syntra-integration/README.md
+  s_1fcc59ff3fdc84::t_7ab386b9df2efc 54-57,71-73,85-88,90-110
+crates/syntra-integration/tests/syntra_containers.rs
+  s_1fcc59ff3fdc84::t_a70bebb9725822 1-3,8-21,23-30,32-83,114-138,140-147,149-158,160-175,180-202,204-206,211-214,216-220,241-245,253,257-258,265-275,278-279,382
+  s_e0aef281fb39a5::t_b84806404960ac 22,31,84,111,139,148,159,203,215,238,387,406,432,465,477,484,491,514,529,539
+  s_1fcc59ff3fdc84::t_183804ed2e7894 176-179,209,259-264,392-399,412-417,437-439,445-447,458-460,520-525,544-548,551-554,557-559
+  s_1fcc59ff3fdc84::t_4bf35fb91c616e 85-110,276,450-451,495-497,504-508
+  s_1fcc59ff3fdc84::t_9343996dec3179 427-428,435,440-441
+  s_1fcc59ff3fdc84::t_7ab386b9df2efc 112-113,207-208,210,277,385-386,388-391,400-405,407-411,418-426,429-431,433-434,436,442-444,448-449,452-457,461-464,466-476,478-483,485-490,492-494,498-503,509-513,515-519,526-528,530-538,540-543,549-550,555-556,560-561
+scripts/tests/test_cargo_contracts.py
+  s_e0aef281fb39a5::t_57e398593354b5 249,263
+.dockerignore
+  s_1fcc59ff3fdc84::t_7ab386b9df2efc 6,8,11
+  s_1fcc59ff3fdc84::t_a70bebb9725822 1-5,7,9-10,12
+  s_1fcc59ff3fdc84::t_00043c496d3090 13-15
+  s_1fcc59ff3fdc84::t_8fb3826a9c3580 16-19
+crates/syntra-net/README.md
+  s_e0aef281fb39a5::t_57e398593354b5 38-39,45-53
+  s_e0aef281fb39a5::t_e14be225263291 54
+crates/syntra-integration/Dockerfile
+  s_1fcc59ff3fdc84::t_a70bebb9725822 1-9
+Cargo.lock
+  s_1fcc59ff3fdc84::t_825c8f498f820f 697,1088-1089,1093-1094,1096,1273,1325,1433
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "05656553cfeab9b91eae8865eceae0ff4cab1b97",
+  "prompts": {},
+  "sessions": {
+    "s_1fcc59ff3fdc84": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e53acaf1dffeD1CDHWAswAn6jo",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    },
+    "s_e0aef281fb39a5": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e564903a8ffe5HCFQu7v1uhI62",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}
