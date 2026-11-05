@@ -182,6 +182,80 @@ pub struct Listener {
     admission: Arc<tokio::sync::Semaphore>,
 }
 
+/// Internal stage boundary; public accept APIs still return the original error.
+#[derive(Debug)]
+pub(crate) enum AcceptError {
+    Retryable(std::io::Error),
+    Terminal(Error),
+}
+
+impl AcceptError {
+    pub(crate) fn socket_accept(error: std::io::Error) -> Self {
+        use std::io::ErrorKind;
+        // Unknown errors fail closed. Some retryable accept errors lack a stable
+        // ErrorKind, so recognize native resource limits and pending network errors.
+        let mut resource = false;
+        #[cfg(unix)]
+        {
+            // ENOMEM, ENFILE, EMFILE.
+            resource |= matches!(error.raw_os_error(), Some(12 | 23 | 24));
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // ENONET, EPROTO, ENOPROTOOPT, EOPNOTSUPP, ENOBUFS, EHOSTDOWN.
+            resource |= matches!(error.raw_os_error(), Some(64 | 71 | 92 | 95 | 105 | 112));
+        }
+        #[cfg(any(
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))]
+        {
+            // ENOBUFS.
+            resource |= error.raw_os_error() == Some(55);
+        }
+        #[cfg(windows)]
+        {
+            // WSAEMFILE, WSAENOBUFS.
+            resource |= matches!(error.raw_os_error(), Some(10024 | 10055));
+        }
+        if resource
+            || matches!(
+                error.kind(),
+                ErrorKind::ConnectionAborted
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionRefused
+                    | ErrorKind::Interrupted
+                    | ErrorKind::WouldBlock
+                    | ErrorKind::TimedOut
+                    | ErrorKind::OutOfMemory
+                    | ErrorKind::NetworkDown
+                    | ErrorKind::NetworkUnreachable
+                    | ErrorKind::HostUnreachable
+            )
+        {
+            Self::Retryable(error)
+        } else {
+            Self::Terminal(Error::Io(error))
+        }
+    }
+
+    fn into_error(self) -> Error {
+        match self {
+            Self::Retryable(error) => Error::Io(error),
+            Self::Terminal(error) => error,
+        }
+    }
+}
+
+impl From<Error> for AcceptError {
+    fn from(error: Error) -> Self {
+        Self::Terminal(error)
+    }
+}
+
 impl Listener {
     pub async fn bind(
         address: impl tokio::net::ToSocketAddrs,
@@ -206,14 +280,31 @@ impl Listener {
     /// releases the permit; completing it carries the permit into the
     /// connection lifetime via the returned handle.
     pub async fn accept_socket(&self) -> Result<AdmittedStream, Error> {
+        self.accept_socket_classified()
+            .await
+            .map_err(AcceptError::into_error)
+    }
+
+    pub(crate) async fn accept_socket_classified(&self) -> Result<AdmittedStream, AcceptError> {
+        self.accept_socket_with(self.socket.accept(), |socket| socket.set_nodelay(true))
+            .await
+    }
+
+    pub(crate) async fn accept_socket_with(
+        &self,
+        raw_socket: impl std::future::Future<
+                Output = std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>,
+            > + Send,
+        configure: impl FnOnce(&tokio::net::TcpStream) -> std::io::Result<()> + Send,
+    ) -> Result<AdmittedStream, AcceptError> {
         let permit = self
             .admission
             .clone()
             .acquire_owned()
             .await
             .map_err(|_| Error::Closed)?;
-        let (socket, _) = self.socket.accept().await?;
-        socket.set_nodelay(true)?;
+        let (socket, _) = raw_socket.await.map_err(AcceptError::socket_accept)?;
+        configure(&socket).map_err(AcceptError::Retryable)?;
         Ok(AdmittedStream {
             socket,
             _permit: permit,
@@ -288,6 +379,102 @@ mod tests {
     };
     use syntra_core::secure_channel::{generate_server_key, Context as ChannelContext, Mode};
     use syntra_runtime::elapsed::{ElapsedClock, ElapsedSource};
+
+    #[test]
+    fn accept_error_classification_preserves_stage_and_public_io_error() {
+        use std::io::ErrorKind;
+        for kind in [
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::Interrupted,
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut,
+            ErrorKind::OutOfMemory,
+            ErrorKind::NetworkDown,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::HostUnreachable,
+        ] {
+            let error = AcceptError::socket_accept(kind.into());
+            assert!(matches!(error, AcceptError::Retryable(_)), "{kind:?}");
+            assert!(matches!(error.into_error(), Error::Io(e) if e.kind() == kind));
+            assert!(matches!(
+                AcceptError::from(Error::Io(kind.into())),
+                AcceptError::Terminal(_)
+            ));
+        }
+        for kind in [
+            ErrorKind::InvalidInput,
+            ErrorKind::PermissionDenied,
+            ErrorKind::Unsupported,
+            ErrorKind::NotConnected,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                matches!(
+                    AcceptError::socket_accept(kind.into()),
+                    AcceptError::Terminal(_)
+                ),
+                "{kind:?}"
+            );
+        }
+        #[cfg(unix)]
+        for code in [12, 23, 24] {
+            assert!(matches!(
+                AcceptError::socket_accept(std::io::Error::from_raw_os_error(code)),
+                AcceptError::Retryable(_)
+            ));
+        }
+        #[cfg(unix)]
+        // EBADF is a broken listener, not temporary descriptor exhaustion.
+        assert!(matches!(
+            AcceptError::socket_accept(std::io::Error::from_raw_os_error(9)),
+            AcceptError::Terminal(_)
+        ));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        for code in [64, 71, 92, 95, 105, 112] {
+            let error = AcceptError::socket_accept(std::io::Error::from_raw_os_error(code));
+            assert!(matches!(error, AcceptError::Retryable(_)), "errno {code}");
+            assert!(matches!(error.into_error(), Error::Io(e) if e.raw_os_error() == Some(code)));
+        }
+        #[cfg(windows)]
+        for code in [10024, 10055] {
+            assert!(matches!(
+                AcceptError::socket_accept(std::io::Error::from_raw_os_error(code)),
+                AcceptError::Retryable(_)
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_accept_setup_failure_and_cancellation_release_local_admission() {
+        use futures_util::FutureExt;
+        let listener = Listener::bind("127.0.0.1:0", 1).await.unwrap();
+        let mut peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let result = listener
+            .accept_socket_with(listener.socket.accept(), |_| {
+                Err(std::io::ErrorKind::Other.into())
+            })
+            .await;
+        assert!(matches!(result, Err(AcceptError::Retryable(_))));
+        assert_eq!(listener.admission.available_permits(), 1);
+        assert_eq!(
+            peer.read_u8().await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        let mut accepting = Box::pin(listener.accept_socket());
+        assert!(accepting.as_mut().now_or_never().is_none());
+        assert_eq!(listener.admission.available_permits(), 0);
+        drop(accepting);
+        assert_eq!(listener.admission.available_permits(), 1);
+        listener.admission.close();
+        assert!(matches!(
+            listener.accept_socket().now_or_never(),
+            Some(Err(Error::Closed))
+        ));
+        assert_eq!(listener.admission.available_permits(), 1);
+    }
 
     struct Source(AtomicU64);
     impl ElapsedSource for Source {

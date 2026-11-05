@@ -219,6 +219,259 @@ fn transport_terminal_retains_first_security_failure_over_generic_loss_and_clean
     }
 }
 
+struct ReadRacePause {
+    entered: oneshot::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+impl ReadRacePause {
+    fn new() -> (Self, oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, waiting) = oneshot::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        (
+            Self {
+                entered,
+                resume: resumed,
+            },
+            waiting,
+            resume,
+        )
+    }
+
+    fn wait(self) {
+        let _ = self.entered.send(());
+        // Closing the coordinator's sender releases this barrier, including on panic.
+        assert!(self.resume.recv().is_err());
+    }
+}
+
+struct BufferedRaceRead {
+    record: Option<Vec<u8>>,
+    pause: Option<ReadRacePause>,
+}
+
+impl Future for BufferedRaceRead {
+    type Output = Result<Vec<u8>, Error>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::task::Poll::Ready(Ok(self.record.take().unwrap()))
+    }
+}
+
+impl Drop for BufferedRaceRead {
+    fn drop(&mut self) {
+        // authorized_io drops the completed future outside Core's raw-poll gate,
+        // before read_frames can decrypt the buffered record.
+        if let Some(pause) = self.pause.take() {
+            pause.wait();
+        }
+    }
+}
+
+struct RaceReader {
+    record: Option<Vec<u8>>,
+    before_decrypt: Option<ReadRacePause>,
+    after_decrypt: Option<ReadRacePause>,
+}
+
+impl RecordReader for RaceReader {
+    fn read_record(&mut self, _: usize) -> impl Future<Output = Result<Vec<u8>, Error>> + Send {
+        BufferedRaceRead {
+            record: self.record.take(),
+            pause: self.before_decrypt.take(),
+        }
+    }
+}
+
+impl Drop for RaceReader {
+    fn drop(&mut self) {
+        // A decrypt failure has returned, but the task has not recorded its category.
+        if let Some(pause) = self.after_decrypt.take() {
+            pause.wait();
+        }
+    }
+}
+
+struct RaceWriter(Option<oneshot::Sender<()>>);
+
+impl RecordWriter for RaceWriter {
+    async fn write_record(&mut self, _: &[u8]) -> Result<(), Error> {
+        panic!("race fixture has no outbound frames")
+    }
+
+    async fn shutdown(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+impl Drop for RaceWriter {
+    fn drop(&mut self) {
+        if let Some(dropped) = self.0.take() {
+            let _ = dropped.send(());
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pump_local_teardown_closed_channel_read_is_retryable() {
+    let (mut sender, channel) = channels();
+    let record = sender.encrypt(&frame_plaintext(&[1]).unwrap()).unwrap();
+    let (pause, waiting, resume) = ReadRacePause::new();
+    let (writer_dropped, dropped) = oneshot::channel();
+    let (output, outbound) = mpsc::channel(1);
+    let (conn, _runtime_outbound) = Initiator::new(ConnectionConfig::default());
+    let mut pump = spawn_pump(
+        RaceReader {
+            record: Some(record),
+            before_decrypt: Some(pause),
+            after_decrypt: None,
+        },
+        RaceWriter(Some(writer_dropped)),
+        PumpState {
+            channel,
+            receive: ReceiveState::default(),
+            peer: Peer::Client(conn.clone()),
+            outbound,
+            limits: Limits::default(),
+            end: Instant::now() + Duration::from_secs(10),
+            authorization: None,
+            policy_jobs: None,
+        },
+    )
+    .unwrap();
+    timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    conn.suspend();
+    assert!(!pump.peer.delivery_open());
+    // End the writer independently of the close watch so it closes the shared
+    // channel before the owner can cancel it or the buffered read can resume.
+    drop(output);
+    timeout(Duration::from_secs(2), dropped)
+        .await
+        .unwrap()
+        .unwrap();
+    conn.close().await;
+    drop(resume);
+    assert_eq!(
+        pump.shutdown_transport(Duration::from_secs(1))
+            .await
+            .unwrap(),
+        TransportShutdown::Complete
+    );
+    assert_eq!(pump.terminal.get(), Some(TransportFailure::Closed));
+    assert!(!pump.terminal.get().unwrap().terminal());
+    assert_eq!(conn.shutdown_report().transport_tasks, 0);
+    assert!(conn.shutdown_report().transport_closed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pump_local_teardown_keeps_decrypt_failures_terminal() {
+    for invalid_tag in [true, false] {
+        let (mut sender, channel) = channels();
+        let mut record = sender.encrypt(&frame_plaintext(&[1]).unwrap()).unwrap();
+        if invalid_tag {
+            *record.last_mut().unwrap() ^= 1;
+        } else {
+            record.truncate(16);
+        }
+        let (pause, waiting, resume) = ReadRacePause::new();
+        let (writer_dropped, dropped) = oneshot::channel();
+        let (output, outbound) = mpsc::channel(1);
+        let (conn, _runtime_outbound) = Initiator::new(ConnectionConfig::default());
+        let mut pump = spawn_pump(
+            RaceReader {
+                record: Some(record),
+                before_decrypt: None,
+                after_decrypt: Some(pause),
+            },
+            RaceWriter(Some(writer_dropped)),
+            PumpState {
+                channel,
+                receive: ReceiveState::default(),
+                peer: Peer::Client(conn.clone()),
+                outbound,
+                limits: Limits::default(),
+                end: Instant::now() + Duration::from_secs(10),
+                authorization: None,
+                policy_jobs: None,
+            },
+        )
+        .unwrap();
+        timeout(Duration::from_secs(2), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        conn.suspend();
+        drop(output);
+        timeout(Duration::from_secs(2), dropped)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pump.terminal.get(), Some(TransportFailure::Closed));
+        conn.close().await;
+        drop(resume);
+        assert_eq!(
+            pump.shutdown_transport(Duration::from_secs(1))
+                .await
+                .unwrap(),
+            TransportShutdown::Complete
+        );
+        assert_eq!(pump.terminal.get(), Some(TransportFailure::Channel));
+        assert!(pump.terminal.get().unwrap().terminal());
+        assert_eq!(conn.shutdown_report().transport_tasks, 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pump_closed_channel_without_local_teardown_remains_terminal() {
+    let (mut sender, mut channel) = channels();
+    let record = sender.encrypt(&frame_plaintext(&[1]).unwrap()).unwrap();
+    channel.close();
+    let (conn, outbound) = Initiator::new(ConnectionConfig::default());
+    let (output, _outgoing) = mpsc::channel(1);
+    let mut pump = spawn_pump(
+        RaceReader {
+            record: Some(record),
+            before_decrypt: None,
+            after_decrypt: None,
+        },
+        QueueWriter {
+            records: output,
+            gate: Arc::new(Gate::default()),
+        },
+        PumpState {
+            channel,
+            receive: ReceiveState::default(),
+            peer: Peer::Client(conn.clone()),
+            outbound,
+            limits: Limits::default(),
+            end: Instant::now() + Duration::from_secs(10),
+            authorization: None,
+            policy_jobs: None,
+        },
+    )
+    .unwrap();
+    timeout(
+        Duration::from_secs(2),
+        wait_closed(&mut conn.subscribe_close()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        pump.shutdown_transport(Duration::from_secs(1))
+            .await
+            .unwrap(),
+        TransportShutdown::Complete
+    );
+    assert_eq!(pump.terminal.get(), Some(TransportFailure::Channel));
+    assert_eq!(conn.shutdown_report().transport_tasks, 0);
+}
+
 struct CloseOnDropReader(Initiator);
 impl RecordReader for CloseOnDropReader {
     async fn read_record(&mut self, _: usize) -> Result<Vec<u8>, Error> {

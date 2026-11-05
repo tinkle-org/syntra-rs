@@ -21,8 +21,10 @@ REGRESSIONS = (
     ("tls-rustls", ("--test", "wss")),
     ("tls-rustls,reconnect", ("--test", "recovery_wss")),
     ("managed", ("--test", "network")),
+    ("managed", ("--lib", "network::tests::")),
     ("proxy", ("--test", "proxy")),
     ("managed,websocket,proxy", ("--test", "network_websocket")),
+    ("managed,websocket,proxy", ("--lib", "network::tests::")),
     ("managed,websocket,proxy", ("--test", "routes")),
     ("managed,tls-rustls,proxy", ("--test", "network_websocket")),
     ("managed,tls-rustls,proxy", ("--test", "routes")),
@@ -77,6 +79,15 @@ CANDIDATE_BUDGET_SECURITY_TESTS = (
     "websocket::tests::active_loss::protected_ws_malformed_frame_blocks_ordinary_supervisor",
     "websocket::tests::active_loss::protected_provider_wss_malformed_frame_blocks_ordinary_supervisor",
 )
+MANAGED_SHUTDOWN_TESTS = (
+    "client::tests::close_outcome_distinguishes_pending_waits_from_joined_errors",
+    "client::tests::close_timeout_and_cancelled_close_retain_the_owner_join",
+    "client::tests::local_pump_panic_stops_replacement_and_keeps_shutdown_failure_visible",
+    "client::tests::managed_joined_pump_failure_is_reported_once",
+    "client::tests::managed_healthy_close_has_no_failure",
+    "client::tests::managed_pending_close_wait_is_not_reported_as_failure",
+    "network::tests::ordinary_and_budget_clients_share_registration_controls_and_owned_shutdown",
+)
 HTTP_PROXY_TESTS = (
     "candidate::proxied::socks_connect_and_real_forward_http_https_encrypted_rpc_both_modes",
     "candidate::proxied::proxy_target_authority_kind_allowlist_and_debug_are_checked_before_inputs",
@@ -108,6 +119,21 @@ def check(*arguments):
 
 
 class TargetContract(unittest.TestCase):
+    def test_managed_shutdown_regressions_execute_exactly(self):
+        for test in MANAGED_SHUTDOWN_TESTS:
+            with self.subTest(test=test):
+                command = ["cargo", "test", "--locked", "-p", "syntra-net", "--no-default-features",
+                           "--features", "managed", "--lib", test,
+                           "--", "--exact", "--color", "never"]
+                print("$ " + " ".join(command), flush=True)
+                result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True,
+                                        timeout=300, check=False)
+                output = result.stdout + result.stderr
+                print(output, end="", flush=True)
+                self.assertEqual(result.returncode, 0, output)
+                self.assertRegex(output, rf"(?m)^test {re.escape(test)} \.\.\. ok$", output)
+                self.assertIn("test result: ok. 1 passed; 0 failed; 0 ignored;", output)
+
     def test_candidate_budget_security_regressions_execute_exactly(self):
         # These library tests are not selected by the integration-test targets.
         for test in CANDIDATE_BUDGET_SECURITY_TESTS:

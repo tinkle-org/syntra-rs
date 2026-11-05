@@ -13,7 +13,7 @@
 //! synchronous callback can therefore keep an explicitly reported owner alive.
 
 use crate::client::{
-    CallError, GenerationValue, LifecycleStatus, ReconnectConfig, ReconnectingClient,
+    CallError, CloseOutcome, GenerationValue, LifecycleStatus, ReconnectConfig, ReconnectingClient,
 };
 #[cfg(feature = "http")]
 use crate::http;
@@ -542,10 +542,16 @@ impl Network {
                     match Arc::try_unwrap(active) {
                         Ok(mut reconnect) => {
                             loop {
-                                match reconnect.close().await {
-                                    Ok(()) => break,
-                                    Err(Error::Timeout) => {}
-                                    Err(_) => lock(&network.state).report.failed_supervisors += 1,
+                                match reconnect.close_outcome().await {
+                                    CloseOutcome::Pending => {}
+                                    CloseOutcome::Complete(Ok(())) => break,
+                                    CloseOutcome::Complete(Err(_)) => {
+                                        let mut state = lock(&network.state);
+                                        state.report.failed_supervisors =
+                                            state.report.failed_supervisors.saturating_add(1);
+                                        let _ = network.events.send(NetworkEvent::SupervisorFailed);
+                                        break;
+                                    }
                                 }
                                 tokio::time::sleep(Duration::from_millis(10)).await;
                             }
@@ -1135,7 +1141,9 @@ trait Acceptor: Send + Sync + 'static {
     type Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static;
     fn settings(&self) -> &ServerSettings;
     fn local_addr(&self) -> Result<SocketAddr, Error>;
-    fn accept_socket(&self) -> impl Future<Output = Result<Option<Self::Stream>, Error>> + Send;
+    fn accept_socket(
+        &self,
+    ) -> impl Future<Output = Result<Option<Self::Stream>, tcp::AcceptError>> + Send;
     fn establish(
         &self,
         stream: Self::Stream,
@@ -1155,8 +1163,8 @@ impl Acceptor for TcpAcceptor {
     fn local_addr(&self) -> Result<SocketAddr, Error> {
         self.listener.local_addr()
     }
-    async fn accept_socket(&self) -> Result<Option<Self::Stream>, Error> {
-        self.listener.accept_socket().await.map(Some)
+    async fn accept_socket(&self) -> Result<Option<Self::Stream>, tcp::AcceptError> {
+        self.listener.accept_socket_classified().await.map(Some)
     }
     fn establish(
         &self,
@@ -1194,25 +1202,13 @@ impl Acceptor for WebSocketAcceptor {
     fn local_addr(&self) -> Result<SocketAddr, Error> {
         Ok(self.socket.local_addr()?)
     }
-    async fn accept_socket(&self) -> Result<Option<Self::Stream>, Error> {
-        let permit = self
-            .local_admission
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::Closed)?;
-        let (socket, peer) = self.socket.accept().await?;
-        if matches!(self.tls, WebSocketTls::Loopback)
-            && !loopback_socket(self.socket.local_addr()?, peer)
-        {
-            // Reject this socket without stopping the listening service.
-            return Ok(None);
-        }
-        socket.set_nodelay(true)?;
-        Ok(Some(WebSocketSocket {
-            socket,
-            _permit: permit,
-        }))
+    async fn accept_socket(&self) -> Result<Option<Self::Stream>, tcp::AcceptError> {
+        self.accept_socket_with(
+            self.socket.accept(),
+            || self.local_addr(),
+            |socket| socket.set_nodelay(true),
+        )
+        .await
     }
     fn establish(
         &self,
@@ -1257,6 +1253,33 @@ impl Acceptor for WebSocketAcceptor {
                 }
             }
         }
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl WebSocketAcceptor {
+    async fn accept_socket_with(
+        &self,
+        raw_socket: impl Future<Output = std::io::Result<(tokio::net::TcpStream, SocketAddr)>> + Send,
+        binding: impl FnOnce() -> Result<SocketAddr, Error> + Send,
+        configure: impl FnOnce(&tokio::net::TcpStream) -> std::io::Result<()> + Send,
+    ) -> Result<Option<WebSocketSocket>, tcp::AcceptError> {
+        let permit = self
+            .local_admission
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Closed)?;
+        let (socket, peer) = raw_socket.await.map_err(tcp::AcceptError::socket_accept)?;
+        if matches!(self.tls, WebSocketTls::Loopback) && !loopback_socket(binding()?, peer) {
+            // Reject this socket without stopping the listening service.
+            return Ok(None);
+        }
+        configure(&socket).map_err(tcp::AcceptError::Retryable)?;
+        Ok(Some(WebSocketSocket {
+            socket,
+            _permit: permit,
+        }))
     }
 }
 
@@ -1360,7 +1383,7 @@ struct Accepted<S> {
 async fn accept_admitted<A: Acceptor>(
     acceptor: &A,
     state: Arc<ServerState>,
-) -> Result<Option<Accepted<A::Stream>>, Error> {
+) -> Result<Option<Accepted<A::Stream>>, tcp::AcceptError> {
     let Some(stream) = acceptor.accept_socket().await? else {
         return Ok(None);
     };
@@ -1381,7 +1404,8 @@ async fn accept_admitted<A: Acceptor>(
         .await
     {
         Ok(Ok(permit)) => permit,
-        _ => return Ok(None),
+        Ok(Err(_)) => return Err(Error::Closed.into()),
+        Err(_) => return Ok(None),
     };
     Ok(Some(Accepted {
         permit,
@@ -1399,6 +1423,7 @@ async fn serve<A: Acceptor>(
     let mut controls = state.controls.subscribe();
     let mut tasks = JoinSet::new();
     let mut next_id = 0u64;
+    let mut retry_not_before = None;
     // The pending accept owns its socket and shared-admission queue position.
     // Joining a different connection must not cancel either. Only a lifecycle
     // update or listener shutdown discards an unfinished admission.
@@ -1423,7 +1448,10 @@ async fn serve<A: Acceptor>(
             result = tasks.join_next(), if !tasks.is_empty() => {
                 if result.is_some_and(|r| r.is_err()) { lock(&state.status).failed_tasks += 1; }
             }
-            accepted = &mut accepting, if !current.paused && !current.offline => {
+            _ = tokio::time::sleep_until(retry_not_before.unwrap_or_else(tokio::time::Instant::now)), if retry_not_before.is_some() => {
+                retry_not_before = None;
+            }
+            accepted = &mut accepting, if !current.paused && !current.offline && retry_not_before.is_none() => {
                 accepting.as_mut().set(accept_admitted(&acceptor, state.clone()));
                 let Accepted { permit, stream, budget } = match accepted {
                     Ok(Some(accepted)) => accepted,
@@ -1432,7 +1460,14 @@ async fn serve<A: Acceptor>(
                         let _ = network.events.send(NetworkEvent::ConnectionRejected(address));
                         continue;
                     }
-                    Err(_) => { lock(&state.status).failed_tasks += 1; break; }
+                    Err(tcp::AcceptError::Retryable(error)) => {
+                        // Reservations and any failed socket are already dropped.
+                        // Keep controls and connection jobs live during the delay.
+                        tracing::warn!(%error, "listener accept/setup failed; retrying");
+                        retry_not_before = Some(tokio::time::Instant::now() + Duration::from_millis(100));
+                        continue;
+                    }
+                    Err(tcp::AcceptError::Terminal(_)) => { lock(&state.status).failed_tasks += 1; break; }
                 };
                 let Some(id) = next_id.checked_add(1) else { break; };
                 next_id = id;
@@ -1546,6 +1581,662 @@ async fn retire_host(host: &mut HostHandle, grace: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt;
+    use std::{
+        collections::VecDeque,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    fn accept_settings() -> ServerSettings {
+        use syntra_core::secure_channel::{generate_server_key, Mode, VerifiedIdentity};
+        use syntra_runtime::{AllowAnonymous, AuthError, Authenticator, FnHandler, HandlerOutcome};
+        let (private_key, _) = generate_server_key().unwrap();
+        ServerSettings {
+            admission: Admission::new(2).unwrap(),
+            security: Arc::new(ServerConfig {
+                mode: Mode::Bootstrap,
+                carrier: Carrier::Tcp,
+                server_key_id: 1,
+                scope: b"accept-retry".to_vec(),
+                private_key,
+                store: None,
+            }),
+            authenticator: Arc::new(
+                |_: &VerifiedIdentity| -> Result<Arc<dyn Authenticator>, AuthError> {
+                    Ok(Arc::new(AllowAnonymous))
+                },
+            ),
+            handler: Arc::new(FnHandler(|_, bytes, _| async {
+                HandlerOutcome::Payload(bytes)
+            })),
+            runtime: ConnectionConfig::default(),
+            limits: Limits::default(),
+        }
+    }
+
+    fn accept_state() -> (Arc<ServerState>, Arc<Shared>) {
+        let (controls, _) = watch::channel(Controls::default());
+        let state = Arc::new(ServerState {
+            controls,
+            hosts: Mutex::new(BTreeMap::new()),
+            status: Mutex::new(ServerStatus::default()),
+        });
+        let (changed, _) = watch::channel(Controls::default());
+        let (events, _) = broadcast::channel(16);
+        let (jobs, _) = mpsc::channel(1);
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State {
+                controls: Controls::default(),
+                services: Vec::new(),
+                report: ShutdownReport::default(),
+            }),
+            completed: Condvar::new(),
+            changed,
+            jobs,
+            admission: Arc::new(Semaphore::new(1)),
+            events,
+            grace: Duration::from_secs(1),
+        });
+        (state, shared)
+    }
+
+    struct RetryAcceptor {
+        settings: ServerSettings,
+        calls: Arc<AtomicUsize>,
+        outcomes: Mutex<VecDeque<Result<Option<tokio::io::DuplexStream>, tcp::AcceptError>>>,
+    }
+    impl Acceptor for RetryAcceptor {
+        type Stream = tokio::io::DuplexStream;
+        fn settings(&self) -> &ServerSettings {
+            &self.settings
+        }
+        fn local_addr(&self) -> Result<SocketAddr, Error> {
+            Ok("127.0.0.1:1".parse().unwrap())
+        }
+        async fn accept_socket(&self) -> Result<Option<Self::Stream>, tcp::AcceptError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let next = lock(&self.outcomes).pop_front();
+            match next {
+                Some(next) => next,
+                None => std::future::pending().await,
+            }
+        }
+        // An async method would borrow self, but the acceptor requires a 'static future.
+        #[allow(clippy::manual_async_fn)]
+        fn establish(
+            &self,
+            mut stream: Self::Stream,
+            _: EstablishmentBudget,
+        ) -> impl Future<Output = Result<HostHandle, Error>> + Send + 'static {
+            async move {
+                use tokio::io::AsyncReadExt;
+                stream.read_u8().await?;
+                Err(Error::Framing)
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn managed_accept_retries_after_100ms_without_spinning() {
+        let (state, shared) = accept_state();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (stream, _peer) = tokio::io::duplex(16);
+        let acceptor = RetryAcceptor {
+            settings: accept_settings(),
+            calls: calls.clone(),
+            outcomes: Mutex::new(VecDeque::from([
+                Err(tcp::AcceptError::socket_accept(
+                    std::io::ErrorKind::ConnectionAborted.into(),
+                )),
+                Ok(Some(stream)),
+            ])),
+        };
+        let mut run = Box::pin(serve(
+            acceptor,
+            state.clone(),
+            shared,
+            "127.0.0.1:1".parse().unwrap(),
+        ));
+        assert!(
+            run.as_mut().now_or_never().is_none(),
+            "transient accept must not stop listener"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_millis(99)).await;
+        assert!(run.as_mut().now_or_never().is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(run.as_mut().now_or_never().is_none());
+        assert_eq!(lock(&state.status).admitted, 1);
+        state.apply(Controls {
+            stopped: true,
+            ..Default::default()
+        });
+        run.await;
+        assert!(lock(&state.status).stopped);
+        assert_eq!(lock(&state.status).failed_tasks, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn managed_accept_terminal_errors_stop_once_without_retry() {
+        for error in [
+            Error::Closed.into(),
+            Error::Configuration.into(),
+            // The same kind is retryable only at the raw accept boundary.
+            Error::Io(std::io::ErrorKind::ConnectionAborted.into()).into(),
+            tcp::AcceptError::socket_accept(std::io::ErrorKind::PermissionDenied.into()),
+            tcp::AcceptError::socket_accept(std::io::ErrorKind::InvalidInput.into()),
+            tcp::AcceptError::socket_accept(std::io::ErrorKind::Other.into()),
+        ] {
+            let (state, shared) = accept_state();
+            let mut events = shared.events.subscribe();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let acceptor = RetryAcceptor {
+                settings: accept_settings(),
+                calls: calls.clone(),
+                outcomes: Mutex::new(VecDeque::from([Err(error), Ok(None)])),
+            };
+            let now = tokio::time::Instant::now();
+            serve(
+                acceptor,
+                state.clone(),
+                shared.clone(),
+                "127.0.0.1:1".parse().unwrap(),
+            )
+            .now_or_never()
+            .expect("terminal failure must finish immediately");
+            assert_eq!(tokio::time::Instant::now(), now);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(lock(&state.status).stopped);
+            assert_eq!(lock(&state.status).failed_tasks, 1);
+            assert_eq!(lock(&shared.state).report.failed_supervisors, 1);
+            assert!(matches!(
+                events.try_recv().unwrap(),
+                NetworkEvent::ListenerStopped(_)
+            ));
+            assert!(events.try_recv().is_err());
+        }
+    }
+
+    #[derive(Default)]
+    struct SocketFaults {
+        sockets: Mutex<VecDeque<std::io::Result<(tokio::net::TcpStream, SocketAddr)>>>,
+        calls: AtomicUsize,
+        fail_setup: std::sync::atomic::AtomicBool,
+    }
+    impl SocketFaults {
+        async fn accept(&self) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let next = lock(&self.sockets).pop_front();
+            match next {
+                Some(next) => next,
+                None => std::future::pending().await,
+            }
+        }
+        fn configure(&self, socket: &tokio::net::TcpStream) -> std::io::Result<()> {
+            if self.fail_setup.swap(false, Ordering::SeqCst) {
+                Err(std::io::ErrorKind::Other.into())
+            } else {
+                socket.set_nodelay(true)
+            }
+        }
+    }
+    trait InjectAccept: Acceptor {
+        fn injected(
+            &self,
+            faults: &SocketFaults,
+        ) -> impl Future<Output = Result<Option<Self::Stream>, tcp::AcceptError>> + Send;
+    }
+    impl InjectAccept for TcpAcceptor {
+        async fn injected(
+            &self,
+            faults: &SocketFaults,
+        ) -> Result<Option<Self::Stream>, tcp::AcceptError> {
+            self.listener
+                .accept_socket_with(faults.accept(), |socket| faults.configure(socket))
+                .await
+                .map(Some)
+        }
+    }
+    #[cfg(feature = "websocket")]
+    impl InjectAccept for WebSocketAcceptor {
+        async fn injected(
+            &self,
+            faults: &SocketFaults,
+        ) -> Result<Option<Self::Stream>, tcp::AcceptError> {
+            self.accept_socket_with(
+                faults.accept(),
+                || self.local_addr(),
+                |socket| faults.configure(socket),
+            )
+            .await
+        }
+    }
+    struct InjectedAcceptor<A> {
+        inner: A,
+        faults: Arc<SocketFaults>,
+    }
+    impl<A: InjectAccept> Acceptor for InjectedAcceptor<A> {
+        type Stream = A::Stream;
+        fn settings(&self) -> &ServerSettings {
+            self.inner.settings()
+        }
+        fn local_addr(&self) -> Result<SocketAddr, Error> {
+            self.inner.local_addr()
+        }
+        async fn accept_socket(&self) -> Result<Option<Self::Stream>, tcp::AcceptError> {
+            self.inner.injected(&self.faults).await
+        }
+        fn establish(
+            &self,
+            stream: Self::Stream,
+            budget: EstablishmentBudget,
+        ) -> impl Future<Output = Result<HostHandle, Error>> + Send + 'static {
+            self.inner.establish(stream, budget)
+        }
+    }
+    async fn accepted_pair() -> (tokio::net::TcpStream, (tokio::net::TcpStream, SocketAddr)) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        (peer, listener.accept().await.unwrap())
+    }
+    fn resource_error() -> std::io::Error {
+        #[cfg(unix)]
+        {
+            std::io::Error::from_raw_os_error(24)
+        }
+        #[cfg(windows)]
+        {
+            std::io::Error::from_raw_os_error(10024)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            std::io::ErrorKind::OutOfMemory.into()
+        }
+    }
+    fn poll_listener(run: Pin<&mut impl Future<Output = ()>>) {
+        assert!(
+            run.now_or_never().is_none(),
+            "listener stopped unexpectedly"
+        );
+    }
+    fn assert_socket_released(status: &ServerState, admission: &Admission) {
+        assert_eq!(admission.available(), admission.maximum);
+        let status = lock(&status.status);
+        assert_eq!(status.waiting_admission, 0);
+        assert_eq!(status.admitted, 0);
+        assert_eq!(status.failed_tasks, 0);
+        assert!(!status.stopped);
+    }
+
+    async fn socket_setup_retry_controls_and_child<A: InjectAccept>(inner: A) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut rejected_peer, rejected) = accepted_pair().await;
+        let (mut peer, accepted) = accepted_pair().await;
+        let faults = Arc::new(SocketFaults::default());
+        faults.fail_setup.store(true, Ordering::SeqCst);
+        lock(&faults.sockets).extend([
+            Ok(rejected),
+            Err(std::io::ErrorKind::ConnectionAborted.into()),
+            Err(resource_error()),
+            Ok(accepted),
+            Err(resource_error()),
+        ]);
+        let admission = inner.settings().admission.clone();
+        let address = inner.local_addr().unwrap();
+        let (state, shared) = accept_state();
+        let acceptor = InjectedAcceptor {
+            inner,
+            faults: faults.clone(),
+        };
+        let mut run = Box::pin(serve(acceptor, state.clone(), shared.clone(), address));
+        poll_listener(run.as_mut());
+        assert_socket_released(&state, &admission);
+        assert_eq!(
+            rejected_peer.read_u8().await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(faults.calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_millis(99)).await;
+        poll_listener(run.as_mut());
+        state.apply(Controls {
+            revision: 1,
+            paused: true,
+            ..Default::default()
+        });
+        poll_listener(run.as_mut());
+        state.apply(Controls {
+            revision: 2,
+            offline: true,
+            ..Default::default()
+        });
+        poll_listener(run.as_mut());
+        state.apply(Controls {
+            revision: 3,
+            ..Default::default()
+        });
+        poll_listener(run.as_mut());
+        assert_eq!(
+            faults.calls.load(Ordering::SeqCst),
+            1,
+            "controls must not erase backoff"
+        );
+        state.apply(Controls {
+            revision: 4,
+            paused: true,
+            ..Default::default()
+        });
+        tokio::time::advance(Duration::from_millis(1)).await;
+        poll_listener(run.as_mut());
+        assert_eq!(
+            faults.calls.load(Ordering::SeqCst),
+            1,
+            "pause must block accept after delay"
+        );
+        state.apply(Controls {
+            revision: 5,
+            offline: true,
+            ..Default::default()
+        });
+        poll_listener(run.as_mut());
+        assert_eq!(faults.calls.load(Ordering::SeqCst), 1);
+        state.apply(Controls {
+            revision: 6,
+            ..Default::default()
+        });
+        poll_listener(run.as_mut());
+        assert_eq!(faults.calls.load(Ordering::SeqCst), 2);
+        assert_socket_released(&state, &admission);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        poll_listener(run.as_mut());
+        assert_eq!(faults.calls.load(Ordering::SeqCst), 3);
+        assert_socket_released(&state, &admission);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        poll_listener(run.as_mut());
+        assert_eq!(faults.calls.load(Ordering::SeqCst), 5);
+        assert_eq!(lock(&state.status).admitted, 1);
+        let now = tokio::time::Instant::now();
+        // Invalid setup bytes release the existing child while accept is delayed.
+        peer.write_all(b"\0\0\r\n\r\n").await.unwrap();
+        for _ in 0..10_000 {
+            tokio::task::yield_now().await;
+            poll_listener(run.as_mut());
+            if lock(&state.status).completed == 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            lock(&state.status).completed,
+            1,
+            "child must progress during backoff"
+        );
+        assert_eq!(tokio::time::Instant::now(), now);
+        assert_eq!(faults.calls.load(Ordering::SeqCst), 5);
+        assert_socket_released(&state, &admission);
+        state.apply(Controls {
+            revision: 7,
+            stopped: true,
+            ..Default::default()
+        });
+        run.as_mut()
+            .now_or_never()
+            .expect("stop must interrupt backoff");
+        assert_eq!(tokio::time::Instant::now(), now);
+        assert!(lock(&state.status).stopped);
+        assert_eq!(lock(&shared.state).report.failed_supervisors, 0);
+    }
+
+    async fn test_tcp_acceptor(maximum: usize) -> TcpAcceptor {
+        TcpAcceptor {
+            listener: tcp::Listener::bind("127.0.0.1:0", maximum).await.unwrap(),
+            settings: accept_settings(),
+        }
+    }
+    #[cfg(feature = "websocket")]
+    async fn test_ws_acceptor(maximum: usize) -> WebSocketAcceptor {
+        let mut settings = accept_settings();
+        Arc::get_mut(&mut settings.security).unwrap().carrier = Carrier::WebSocket;
+        WebSocketAcceptor {
+            socket: tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            local_admission: Arc::new(Semaphore::new(maximum)),
+            tls: WebSocketTls::Loopback,
+            settings,
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn managed_tcp_setup_and_accept_failures_retry_with_controls_and_child_progress() {
+        socket_setup_retry_controls_and_child(test_tcp_acceptor(2).await).await;
+    }
+    #[cfg(feature = "websocket")]
+    #[tokio::test(start_paused = true)]
+    async fn managed_ws_setup_and_accept_failures_retry_with_controls_and_child_progress() {
+        socket_setup_retry_controls_and_child(test_ws_acceptor(2).await).await;
+    }
+
+    fn client_security(settings: &mut ServerSettings) -> ClientConfig {
+        use syntra_core::secure_channel::{generate_server_key, Context};
+        let (private_key, public) = generate_server_key().unwrap();
+        let server = Arc::get_mut(&mut settings.security).unwrap();
+        server.private_key = private_key;
+        ClientConfig {
+            context: Context {
+                mode: server.mode,
+                carrier: server.carrier,
+                server_key_id: server.server_key_id,
+                scope: server.scope.clone(),
+                handle: [0; 8],
+                epoch: 0,
+            },
+            server_public_key: public,
+            authorization_key: None,
+        }
+    }
+
+    async fn without_advancing_time<F: Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        for _ in 0..10_000 {
+            if let Some(result) = future.as_mut().now_or_never() {
+                return result;
+            }
+            // Keep this task runnable so paused time cannot jump to the retry.
+            tokio::task::yield_now().await;
+        }
+        panic!("I/O did not progress without advancing time");
+    }
+
+    async fn live_host_during_backoff<A: InjectAccept>(
+        inner: A,
+        accepted: (tokio::net::TcpStream, SocketAddr),
+        connect: impl Future<Output = Result<ClientHandle, Error>>,
+    ) {
+        let faults = Arc::new(SocketFaults::default());
+        lock(&faults.sockets).extend([Ok(accepted), Err(resource_error())]);
+        let address = inner.local_addr().unwrap();
+        let admission = inner.settings().admission.clone();
+        let (state, shared) = accept_state();
+        let acceptor = InjectedAcceptor {
+            inner,
+            faults: faults.clone(),
+        };
+        let run = tokio::spawn(serve(acceptor, state.clone(), shared.clone(), address));
+        let now = tokio::time::Instant::now();
+        let client = without_advancing_time(connect).await.unwrap();
+        assert_eq!(lock(&state.status).ready, 1);
+        assert_eq!(faults.calls.load(Ordering::SeqCst), 2);
+        let response =
+            without_advancing_time(client.conn.call("/test.Service/Echo", vec![7, 8, 9], 1000))
+                .await
+                .unwrap();
+        assert_eq!(response, vec![7, 8, 9]);
+        assert_eq!(tokio::time::Instant::now(), now);
+        assert_eq!(faults.calls.load(Ordering::SeqCst), 2);
+        state.apply(Controls {
+            stopped: true,
+            ..Default::default()
+        });
+        without_advancing_time(run).await.unwrap();
+        client.close().await;
+        assert_eq!(admission.available(), admission.maximum);
+        assert_eq!(lock(&shared.state).report.failed_supervisors, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn managed_tcp_live_host_rpc_progresses_during_accept_backoff() {
+        let mut acceptor = test_tcp_acceptor(2).await;
+        let security = client_security(&mut acceptor.settings);
+        let (peer, accepted) = accepted_pair().await;
+        live_host_during_backoff(
+            acceptor,
+            accepted,
+            tcp::connect_stream(
+                peer,
+                security,
+                vec![],
+                ConnectionConfig::default(),
+                Limits::default(),
+            ),
+        )
+        .await;
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test(start_paused = true)]
+    async fn managed_ws_live_host_rpc_progresses_during_accept_backoff() {
+        let mut acceptor = test_ws_acceptor(2).await;
+        let security = client_security(&mut acceptor.settings);
+        let (peer, accepted) = accepted_pair().await;
+        live_host_during_backoff(
+            acceptor,
+            accepted,
+            websocket::connect_stream_with_budget(
+                peer,
+                "ws://127.0.0.1/syntra/1.0/ws",
+                security,
+                vec![],
+                ConnectionConfig::default(),
+                Limits::default(),
+                EstablishmentBudget::new(
+                    crate::pump::default_elapsed_clock(),
+                    Duration::from_secs(15),
+                )
+                .unwrap(),
+            ),
+        )
+        .await;
+    }
+
+    async fn socket_admission_cancellation_and_closure<A: InjectAccept>(inner: A) {
+        use tokio::io::AsyncReadExt;
+        let admission = inner.settings().admission.clone();
+        let held = admission
+            .permits
+            .clone()
+            .acquire_many_owned(admission.maximum as u32)
+            .await
+            .unwrap();
+        let (state, shared) = accept_state();
+        let faults = Arc::new(SocketFaults::default());
+        let acceptor = InjectedAcceptor {
+            inner,
+            faults: faults.clone(),
+        };
+        let (mut peer, accepted) = accepted_pair().await;
+        lock(&faults.sockets).push_back(Ok(accepted));
+        let mut accepting = Box::pin(accept_admitted(&acceptor, state.clone()));
+        assert!(accepting.as_mut().now_or_never().is_none());
+        assert_eq!(lock(&state.status).waiting_admission, 1);
+        drop(accepting);
+        assert_eq!(lock(&state.status).waiting_admission, 0);
+        assert_eq!(
+            admission.available(),
+            0,
+            "cancellation must not release another owner's permits"
+        );
+        assert_eq!(
+            peer.read_u8().await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        drop(held);
+
+        // A pending raw accept also owns local admission; dropping it must release it.
+        let mut accepting = Box::pin(accept_admitted(&acceptor, state.clone()));
+        assert!(accepting.as_mut().now_or_never().is_none());
+        drop(accepting);
+        let (mut peer, accepted) = accepted_pair().await;
+        lock(&faults.sockets).push_back(Ok(accepted));
+        let accepted = accept_admitted(&acceptor, state.clone())
+            .now_or_never()
+            .expect("both local and shared admission must be reusable")
+            .unwrap()
+            .unwrap();
+        assert_eq!(admission.available(), admission.maximum - 1);
+        drop(accepted);
+        assert_eq!(
+            peer.read_u8().await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert_socket_released(&state, &admission);
+
+        let (mut peer, accepted) = accepted_pair().await;
+        lock(&faults.sockets).push_back(Ok(accepted));
+        admission.permits.close();
+        let address = acceptor.local_addr().unwrap();
+        let calls = faults.calls.load(Ordering::SeqCst);
+        serve(acceptor, state.clone(), shared.clone(), address)
+            .now_or_never()
+            .expect("closed shared admission must stop without delay");
+        assert_eq!(faults.calls.load(Ordering::SeqCst), calls + 1);
+        assert_eq!(
+            peer.read_u8().await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(lock(&state.status).waiting_admission, 0);
+        assert_eq!(lock(&state.status).failed_tasks, 1);
+        assert_eq!(lock(&shared.state).report.failed_supervisors, 1);
+        assert!(lock(&state.status).stopped);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn managed_tcp_admission_cancellation_releases_socket_and_closed_shared_is_terminal() {
+        socket_admission_cancellation_and_closure(test_tcp_acceptor(1).await).await;
+    }
+    #[cfg(feature = "websocket")]
+    #[tokio::test(start_paused = true)]
+    async fn managed_ws_admission_cancellation_releases_socket_and_closed_shared_is_terminal() {
+        socket_admission_cancellation_and_closure(test_ws_acceptor(1).await).await;
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test(start_paused = true)]
+    async fn managed_ws_listener_address_failure_and_closed_local_admission_are_terminal() {
+        use tokio::io::AsyncReadExt;
+        let acceptor = test_ws_acceptor(1).await;
+        let (mut peer, accepted) = accepted_pair().await;
+        let result = acceptor
+            .accept_socket_with(
+                async { Ok(accepted) },
+                || Err(Error::Io(std::io::ErrorKind::ConnectionAborted.into())),
+                |_| panic!("local_addr failure must precede accepted-socket setup"),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(tcp::AcceptError::Terminal(Error::Io(_)))
+        ));
+        assert_eq!(acceptor.local_admission.available_permits(), 1);
+        assert_eq!(acceptor.settings.admission.available(), 2);
+        assert_eq!(
+            peer.read_u8().await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        acceptor.local_admission.close();
+        assert!(matches!(
+            acceptor.accept_socket().now_or_never(),
+            Some(Err(tcp::AcceptError::Terminal(Error::Closed)))
+        ));
+        assert_eq!(acceptor.local_admission.available_permits(), 1);
+    }
 
     #[test]
     fn ordinary_and_budget_clients_share_registration_controls_and_owned_shutdown() {

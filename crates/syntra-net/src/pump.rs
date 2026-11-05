@@ -1547,6 +1547,7 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
         let read_terminal = owner_terminal.clone();
         let reader_abort = tasks.spawn(async move {
             let _panic_guard = TransportPanicGuard(read_terminal.clone());
+            let ingest_peer = read_peer.clone();
             let result = read_frames(
                 reader,
                 read_channel,
@@ -1559,7 +1560,7 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
                     authorization: read_authorization.clone(),
                 },
                 move |frame, received_at| {
-                    let peer = read_peer.clone();
+                    let peer = ingest_peer.clone();
                     let authorization = read_authorization.clone();
                     let clock = read_clock.clone();
                     async move {
@@ -1577,6 +1578,15 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
                 },
             )
             .await;
+            let result = result.map_err(|error| match error {
+                // Local teardown can close the cipher before a buffered read resumes.
+                Error::Channel(syntra_core::secure_channel::Error::Closed)
+                    if !read_peer.delivery_open() =>
+                {
+                    Error::Closed
+                }
+                error => error,
+            });
             read_terminal.result(&result);
             (Direction::Read, result)
         });

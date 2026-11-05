@@ -324,6 +324,13 @@ pub struct ReconnectingClient {
     close_timeout: Duration,
 }
 
+/// Whether a close wait retained its owner or consumed the owner's final result.
+#[derive(Debug)]
+pub(crate) enum CloseOutcome {
+    Pending,
+    Complete(Result<(), Error>),
+}
+
 type RecoveryFactory = Arc<
     dyn Fn(
             Initiator,
@@ -750,14 +757,23 @@ impl ReconnectingClient {
         }
     }
 
-    /// Signal stop and join the sole owner within `close_timeout`. On timeout the
-    /// join handle stays owned, so another close can finish joining. Cancelling
-    /// this future also retains ownership. `Timeout` means shutdown incomplete,
-    /// never success. Drop signals the same owner to complete asynchronous teardown.
+    /// Signal stop and join the sole owner within `close_timeout`. If the wait
+    /// expires, the join handle stays owned so another close can finish joining.
+    /// Cancelling this future also retains ownership. A joined owner can itself
+    /// return `Timeout` after failed or overdue teardown; that result is not a
+    /// successful shutdown, even though the owner has finished. Drop signals the
+    /// same owner to complete asynchronous teardown.
     pub async fn close(&mut self) -> Result<(), Error> {
+        match self.close_outcome().await {
+            CloseOutcome::Pending => Err(Error::Timeout),
+            CloseOutcome::Complete(result) => result,
+        }
+    }
+
+    pub(crate) async fn close_outcome(&mut self) -> CloseOutcome {
         self.stop();
         let Some(owner) = self.owner.as_mut() else {
-            return Ok(());
+            return CloseOutcome::Complete(Ok(()));
         };
         match self
             .shared
@@ -767,13 +783,13 @@ impl ReconnectingClient {
         {
             Ok(result) => {
                 self.owner = None;
-                result.map_err(|_| Error::Closed)?
+                CloseOutcome::Complete(result.unwrap_or(Err(Error::Closed)))
             }
             Err(_) => {
                 self.shared
                     .status
                     .send_replace(LifecycleStatus::ShutdownIncomplete);
-                Err(Error::Timeout)
+                CloseOutcome::Pending
             }
         }
     }
@@ -1945,6 +1961,74 @@ mod tests {
         client.close().await.unwrap();
         assert_eq!(finished.load(Ordering::SeqCst), 1);
         assert!(client.owner.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_outcome_distinguishes_pending_waits_from_joined_errors() {
+        let mut client =
+            ReconnectingClient::new(config(), stalled(Arc::new(Meter::default()))).unwrap();
+        client.close().await.unwrap();
+        let release = Arc::new(Notify::new());
+        client.owner = Some(tokio::spawn({
+            let release = release.clone();
+            async move {
+                release.notified().await;
+                Ok(())
+            }
+        }));
+        for _ in 0..2 {
+            assert!(matches!(
+                client.close_outcome().await,
+                CloseOutcome::Pending
+            ));
+            assert!(client.owner.is_some());
+            assert_eq!(client.status(), LifecycleStatus::ShutdownIncomplete);
+        }
+        let mut closing = Box::pin(client.close_outcome());
+        assert!(futures_util::poll!(&mut closing).is_pending());
+        drop(closing);
+        assert!(client.owner.is_some());
+        release.notify_one();
+        assert!(matches!(
+            client.close_outcome().await,
+            CloseOutcome::Complete(Ok(()))
+        ));
+        assert!(client.owner.is_none());
+
+        // Exercise both the internal distinction and the unchanged public result.
+        for public in [false, true] {
+            for result in 0..4 {
+                client.owner = Some(tokio::spawn(async move {
+                    match result {
+                        0 => Ok(()),
+                        1 => Err(Error::Timeout),
+                        2 => Err(Error::Configuration),
+                        _ => panic!("reconnect owner panic fixture"),
+                    }
+                }));
+                settle().await;
+                let completed = if public {
+                    client.close().await
+                } else {
+                    match client.close_outcome().await {
+                        CloseOutcome::Complete(completed) => completed,
+                        CloseOutcome::Pending => panic!("finished owner must be joined"),
+                    }
+                };
+                match result {
+                    0 => assert!(completed.is_ok()),
+                    1 => assert!(matches!(completed, Err(Error::Timeout))),
+                    2 => assert!(matches!(completed, Err(Error::Configuration))),
+                    _ => assert!(matches!(completed, Err(Error::Closed))),
+                }
+                assert!(client.owner.is_none());
+                assert!(matches!(
+                    client.close_outcome().await,
+                    CloseOutcome::Complete(Ok(()))
+                ));
+                assert_eq!(client.status(), LifecycleStatus::ShutdownIncomplete);
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -3186,6 +3270,228 @@ mod tests {
         assert_eq!(pairs.live_clients.load(Ordering::SeqCst), 0);
         assert!(client.close().await.is_err());
         pairs.cleanup().await;
+    }
+
+    #[cfg(feature = "managed")]
+    fn managed_close_case(budget_aware: bool, fail_pump: bool) {
+        use crate::network::{Network, NetworkConfig, NetworkEvent};
+        let external = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let pairs = Pairs::new();
+        let captured = Arc::new(Mutex::new(None));
+        let mut network = Network::new(NetworkConfig::default()).unwrap();
+        let mut events = network.events();
+        let connect = {
+            let pairs = pairs.clone();
+            let captured = captured.clone();
+            move |budget: Option<EstablishmentBudget>| {
+                let pairs = pairs.clone();
+                let captured = captured.clone();
+                async move {
+                    let handle = match budget {
+                        Some(budget) => pairs.connect_with_budget(budget).await?,
+                        None => pairs.connect().await?,
+                    };
+                    *captured.lock().unwrap() = Some(handle.conn.clone());
+                    Ok(handle)
+                }
+            }
+        };
+        let operation = if budget_aware {
+            network.client_with_budget(config(), move |budget| connect(Some(budget)))
+        } else {
+            network.client(config(), move || connect(None))
+        }
+        .unwrap();
+        let managed = operation.wait(Duration::from_secs(5)).unwrap().unwrap();
+        let failures = external.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut status = managed.subscribe_status();
+                while !matches!(status.snapshot(), LifecycleStatus::CoreReady(_)) {
+                    status.changed().await.unwrap();
+                }
+                if fail_pump {
+                    pairs.fault.store(3, Ordering::SeqCst);
+                    pairs.notify(0, vec![1]).await;
+                } else {
+                    managed.stop();
+                }
+                let mut failures = 0;
+                loop {
+                    match events.recv().await.unwrap() {
+                        NetworkEvent::SupervisorFailed => failures += 1,
+                        NetworkEvent::ClientStopped => break,
+                        _ => {}
+                    }
+                }
+                pairs.cleanup().await;
+                failures
+            })
+            .await
+            .unwrap()
+        });
+        let core = captured.lock().unwrap().as_ref().unwrap().shutdown_report();
+        let report = network.shutdown(Duration::from_secs(5));
+        assert!(report.complete);
+        assert_eq!(report.pending_operations, 0);
+        assert_eq!(core.phase, syntra_runtime::ShutdownPhase::Complete);
+        assert_eq!(core.owned_tasks, 0);
+        assert_eq!(core.transport_tasks, 0);
+        assert_eq!(core.failed_tasks > 0, fail_pump);
+        assert_eq!(pairs.dials.load(Ordering::SeqCst), 1);
+        assert_eq!(pairs.live_clients.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            managed.status(),
+            if fail_pump {
+                LifecycleStatus::ShutdownIncomplete
+            } else {
+                LifecycleStatus::Stopped
+            }
+        );
+        assert_eq!(report.failed_supervisors, usize::from(fail_pump));
+        assert_eq!(failures, usize::from(fail_pump));
+        assert_eq!(network.shutdown(Duration::from_secs(1)), report);
+        assert_eq!(network.report(), report);
+        while let Ok(event) = events.try_recv() {
+            assert_ne!(event, NetworkEvent::SupervisorFailed);
+        }
+    }
+
+    #[cfg(feature = "managed")]
+    #[test]
+    fn managed_joined_pump_failure_is_reported_once() {
+        for budget_aware in [false, true] {
+            managed_close_case(budget_aware, true);
+        }
+    }
+
+    #[cfg(feature = "managed")]
+    #[test]
+    fn managed_healthy_close_has_no_failure() {
+        for budget_aware in [false, true] {
+            managed_close_case(budget_aware, false);
+        }
+    }
+
+    #[cfg(feature = "managed")]
+    #[test]
+    fn managed_pending_close_wait_is_not_reported_as_failure() {
+        use crate::network::{Network, NetworkConfig, NetworkEvent};
+        let external = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let pairs = Pairs::new();
+        let mut network = Network::new(NetworkConfig::default()).unwrap();
+        let mut events = network.events();
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let held = Arc::new(Mutex::new(Some(held)));
+        let captured = Arc::new(Mutex::new(None));
+        let mut settings = config();
+        settings.close_timeout = Duration::from_millis(20);
+        let managed = network
+            .client_with_budget(settings, {
+                let pairs = pairs.clone();
+                let captured = captured.clone();
+                move |budget| {
+                    let pairs = pairs.clone();
+                    let held = held.clone();
+                    let captured = captured.clone();
+                    async move {
+                        let handle = pairs.connect_with_budget(budget).await?;
+                        let held = held.lock().unwrap().take().unwrap();
+                        handle.conn.register_transport_tasks(1).unwrap();
+                        // This additional carrier task stays live until released.
+                        // The test retains and joins it before acknowledging it;
+                        // a dropped sender also releases it during unwinding.
+                        let task = tokio::spawn(async move {
+                            let _ = held.await;
+                        });
+                        *captured.lock().unwrap() = Some((handle.conn.clone(), task));
+                        Ok(handle)
+                    }
+                }
+            })
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        external.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut status = managed.subscribe_status();
+                while !matches!(status.snapshot(), LifecycleStatus::CoreReady(_)) {
+                    status.changed().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        });
+        let (conn, task) = captured.lock().unwrap().take().unwrap();
+        let pending = network.shutdown(Duration::from_millis(80));
+        external.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                // Wait for the actual teardown deadline, not a scheduling guess.
+                loop {
+                    let report = conn.shutdown_report();
+                    if report.phase == syntra_runtime::ShutdownPhase::ShutdownIncomplete {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        let still_pending = network.report();
+        let status = managed.status();
+        let mut premature_events = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            premature_events.push(event);
+        }
+        release.send(()).unwrap();
+        let failures = external.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                task.await.unwrap();
+                conn.acknowledge_transport_task_joined().unwrap();
+                let mut failures = 0;
+                loop {
+                    match events.recv().await.unwrap() {
+                        NetworkEvent::SupervisorFailed => failures += 1,
+                        NetworkEvent::ClientStopped => break,
+                        _ => {}
+                    }
+                }
+                pairs.cleanup().await;
+                failures
+            })
+            .await
+            .unwrap()
+        });
+        let report = network.shutdown(Duration::from_secs(5));
+        assert!(!pending.complete);
+        assert!(!still_pending.complete);
+        assert_eq!(still_pending.pending_operations, 1);
+        assert_eq!(pending.failed_supervisors, 0);
+        assert_eq!(still_pending.failed_supervisors, 0);
+        assert_eq!(status, LifecycleStatus::ShutdownIncomplete);
+        assert!(!premature_events.contains(&NetworkEvent::SupervisorFailed));
+        assert!(!premature_events.contains(&NetworkEvent::ClientStopped));
+        assert!(report.complete);
+        assert_eq!(report.pending_operations, 0);
+        // Only the joined owner's final overdue-teardown error is counted.
+        assert_eq!(report.failed_supervisors, 1);
+        assert_eq!(failures, 1);
+        assert_eq!(network.shutdown(Duration::from_secs(1)), report);
+        assert_eq!(managed.status(), LifecycleStatus::ShutdownIncomplete);
+        let core = conn.shutdown_report();
+        assert_eq!(core.phase, syntra_runtime::ShutdownPhase::Complete);
+        assert_eq!(core.failed_tasks, 0);
+        assert_eq!(core.owned_tasks, 0);
+        assert_eq!(core.transport_tasks, 0);
+        assert_eq!(pairs.dials.load(Ordering::SeqCst), 1);
+        assert_eq!(pairs.live_clients.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(start_paused = true)]

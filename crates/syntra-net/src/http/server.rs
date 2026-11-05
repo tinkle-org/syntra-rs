@@ -293,21 +293,21 @@ impl State {
         let mut r = lock(&self.registry);
         r.sources
             .retain(|_, b| !b.expired(now, a.source_opens_per_second, a.source_open_burst));
-        if !r.global.take(now, a.opens_per_second, a.open_burst) {
-            return Err(Rejection::Rate);
-        }
         if !r.sources.contains_key(&source) && r.sources.len() == a.source_entries {
             return Err(Rejection::Unavailable);
         }
-        if r.sources
+        if !r
+            .sources
             .entry(source)
             .or_insert_with(|| Bucket::new(a.source_open_burst, now))
             .take(now, a.source_opens_per_second, a.source_open_burst)
         {
-            Ok(())
-        } else {
-            Err(Rejection::Rate)
+            return Err(Rejection::Rate);
         }
+        if !r.global.take(now, a.opens_per_second, a.open_burst) {
+            return Err(Rejection::Rate);
+        }
+        Ok(())
     }
 }
 
@@ -1405,6 +1405,77 @@ mod tests {
                 syntra_runtime::HandlerOutcome::Payload(bytes)
             })),
         )
+    }
+
+    #[tokio::test]
+    async fn source_rate_rejections_preserve_global_tokens_for_other_sources() {
+        let mut config = config();
+        config.admission.open_burst = 3;
+        config.admission.source_open_burst = 1;
+        let (handle, run) = bind(config).await.unwrap();
+        let now = std::time::Instant::now();
+        let source = "127.0.0.1".parse().unwrap();
+        assert_eq!(handle.state.rate(source, now), Ok(()));
+        for _ in 0..100 {
+            assert_eq!(handle.state.rate(source, now), Err(Rejection::Rate));
+        }
+        for source in ["127.0.0.2", "127.0.0.3"] {
+            assert_eq!(handle.state.rate(source.parse().unwrap(), now), Ok(()));
+        }
+        assert_eq!(
+            handle.state.rate("127.0.0.4".parse().unwrap(), now),
+            Err(Rejection::Rate)
+        );
+        handle.stop();
+        assert!(run.await.stopped);
+    }
+
+    #[tokio::test]
+    async fn full_source_registry_preserves_unavailable_and_global_tokens() {
+        let mut config = config();
+        config.admission.source_entries = 1;
+        config.admission.open_burst = 2;
+        config.admission.source_open_burst = 3;
+        let (handle, run) = bind(config).await.unwrap();
+        let now = std::time::Instant::now();
+        let source = "127.0.0.1".parse().unwrap();
+        let other = "127.0.0.2".parse().unwrap();
+        assert_eq!(handle.state.rate(source, now), Ok(()));
+        for _ in 0..3 {
+            assert_eq!(handle.state.rate(other, now), Err(Rejection::Unavailable));
+        }
+        assert_eq!(handle.state.rate(source, now), Ok(()));
+        assert_eq!(handle.state.rate(other, now), Err(Rejection::Unavailable));
+        assert_eq!(handle.state.rate(source, now), Err(Rejection::Rate));
+        assert_eq!(lock(&handle.state.registry).sources.len(), 1);
+        assert_eq!(
+            handle.state.rate(other, now + Duration::from_secs(1)),
+            Ok(())
+        );
+        handle.stop();
+        assert!(run.await.stopped);
+    }
+
+    #[tokio::test]
+    async fn global_rate_rejection_still_consumes_the_admitted_source_token() {
+        let mut config = config();
+        config.admission.open_burst = 1;
+        config.admission.opens_per_second = 10;
+        config.admission.source_open_burst = 1;
+        config.admission.source_opens_per_second = 1;
+        let (handle, run) = bind(config).await.unwrap();
+        let now = std::time::Instant::now();
+        let source = "127.0.0.2".parse().unwrap();
+        assert_eq!(handle.state.rate("127.0.0.1".parse().unwrap(), now), Ok(()));
+        assert_eq!(handle.state.rate(source, now), Err(Rejection::Rate));
+        let refilled = now + Duration::from_millis(100);
+        assert_eq!(handle.state.rate(source, refilled), Err(Rejection::Rate));
+        assert_eq!(
+            handle.state.rate("127.0.0.3".parse().unwrap(), refilled),
+            Ok(())
+        );
+        handle.stop();
+        assert!(run.await.stopped);
     }
 
     #[test]
