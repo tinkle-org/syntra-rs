@@ -12,10 +12,10 @@ name = "peer"
 path = "src/bin/peer.rs"
 
 [dependencies]
-syntra-core = { path = "../syntra-core", version = "1.0.0-rc.1" }
-syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.1" }
+syntra-core = { path = "../syntra-core", version = "1.0.0-rc.2" }
+syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.2" }
 # TCP and loopback WS fixtures; production graph needs no TLS implementation.
-syntra-net = { path = "../syntra-net", version = "1.0.0-rc.1", default-features = false, features = ["tcp", "websocket"] }
+syntra-net = { path = "../syntra-net", version = "1.0.0-rc.2", default-features = false, features = ["tcp", "websocket"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
