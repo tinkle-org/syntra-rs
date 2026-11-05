@@ -1,0 +1,55 @@
+crates/syntra-net/src/network.rs
+  s_175558ca3ae634::t_69514f8b83c702 1897,1899-1902,1966-1973,1975-1976
+  s_175558ca3ae634::t_57585429d7b7be 2045-2061
+  s_175558ca3ae634::t_02c6825f269270 2062-2073,2075-2077
+  s_175558ca3ae634::t_39c3f1398f1348 2078-2098
+scripts/tests/test_release_workflow.py
+  s_e0aef281fb39a5::t_fbedc66391e59f 49-52,56-61
+  s_e0aef281fb39a5::t_8fcf57214bc670 1-48,53-55,62-90
+scripts/cargo_contracts.py
+  s_e0aef281fb39a5::t_85502bf03d4a78 177-179
+CONTRIBUTING.md
+  s_e0aef281fb39a5::t_fbedc66391e59f 403-408
+  s_e0aef281fb39a5::t_1e7447a711d7e6 381-385
+  s_e0aef281fb39a5::t_5504f6ebb5816d 429-435
+  s_e0aef281fb39a5::t_85502bf03d4a78 395-402,409-417,419-420,427-428
+  s_e0aef281fb39a5::t_8950d8a1a1456e 436-437
+.github/workflows/release-plz.yml
+  s_e0aef281fb39a5::t_85502bf03d4a78 25-27,35,81,85-86,91-92,95-96,102-103,107-108,115-116,123-124
+  s_e0aef281fb39a5::t_fbedc66391e59f 37-39
+  s_141024b4ebb76e::t_892e51618dee50 36
+scripts/tests/test_cargo_contracts.py
+  s_e0aef281fb39a5::t_85502bf03d4a78 260,263-267
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2b066acd5860ef74a472d3f3a0f69c33848310ae",
+  "prompts": {},
+  "sessions": {
+    "s_141024b4ebb76e": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e5648fbe3ffePaFV5y4GAxYoJV",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    },
+    "s_175558ca3ae634": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e56443d37ffeuQekIXQzcNrOj5",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    },
+    "s_e0aef281fb39a5": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e564903a8ffe5HCFQu7v1uhI62",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}
