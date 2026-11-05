@@ -257,9 +257,14 @@ class PackagingTests(unittest.TestCase):
         with mock.patch.object(contracts, "workspace_packages", return_value=packages), \
                 mock.patch.object(contracts, "cargo") as cargo, mock.patch("builtins.print"):
             contracts.package_workspace()
-        self.assertEqual(cargo.call_count, 4)
+        self.assertEqual(cargo.call_count, 2)
         self.assertEqual({call.args[0][3] for call in cargo.call_args_list}, {"syntra-core", "syntra-net"})
         self.assertTrue(all("--locked" in call.args[0] for call in cargo.call_args_list))
+        # New workspace versions need not already exist on crates.io. Archive
+        # lockfile resolution belongs to ordered publication, not contents CI.
+        for call in cargo.call_args_list:
+            self.assertEqual(call.args[0], ["package", "--locked", "-p", call.args[0][3], "--list"])
+            self.assertFalse(call.kwargs["capture"])
 
     def test_empty_publish_set_is_not_a_pass(self):
         with mock.patch.object(contracts, "workspace_packages", return_value={}), self.assertRaises(ValueError):

@@ -174,10 +174,12 @@ def package_workspace(root=ROOT):
     if not publishable:
         raise ValueError("no publishable workspace packages selected")
     # Unpublished test support must never be forced into release packaging.
+    # List contents only: even --no-verify archives resolve registry dependencies
+    # for their lockfiles, before the new workspace versions have been published.
+    # Release-plz verifies packaged builds in dependency order during publishing.
     print(json.dumps({"kind": "package_contents_not_build_verification", "packages": publishable}), flush=True)
     for name in publishable:
         cargo(["package", "--locked", "-p", name, "--list"], root, capture=False)
-        cargo(["package", "--locked", "-p", name, "--no-verify"], root, capture=False)
 
 
 def main():

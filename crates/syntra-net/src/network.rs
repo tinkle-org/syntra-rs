@@ -1894,8 +1894,12 @@ mod tests {
         let mut run = Box::pin(serve(acceptor, state.clone(), shared.clone(), address));
         poll_listener(run.as_mut());
         assert_socket_released(&state, &admission);
+        // Waiting for real socket EOF must not spend the initial retry delay.
         assert_eq!(
-            rejected_peer.read_u8().await.unwrap_err().kind(),
+            without_advancing_time(rejected_peer.read_u8())
+                .await
+                .unwrap_err()
+                .kind(),
             std::io::ErrorKind::UnexpectedEof
         );
         assert_eq!(faults.calls.load(Ordering::SeqCst), 1);
@@ -1959,14 +1963,17 @@ mod tests {
         assert_eq!(lock(&state.status).admitted, 1);
         let now = tokio::time::Instant::now();
         // Invalid setup bytes release the existing child while accept is delayed.
-        peer.write_all(b"\0\0\r\n\r\n").await.unwrap();
-        for _ in 0..10_000 {
-            tokio::task::yield_now().await;
-            poll_listener(run.as_mut());
-            if lock(&state.status).completed == 1 {
-                break;
+        without_advancing_time(async {
+            peer.write_all(b"\0\0\r\n\r\n").await.unwrap();
+            loop {
+                tokio::task::yield_now().await;
+                poll_listener(run.as_mut());
+                if lock(&state.status).completed == 1 {
+                    break;
+                }
             }
-        }
+        })
+        .await;
         assert_eq!(
             lock(&state.status).completed,
             1,
@@ -2035,15 +2042,60 @@ mod tests {
     }
 
     async fn without_advancing_time<F: Future>(future: F) -> F::Output {
-        let mut future = std::pin::pin!(future);
-        for _ in 0..10_000 {
-            if let Some(result) = future.as_mut().now_or_never() {
-                return result;
+        let now = tokio::time::Instant::now();
+        // A live blocking task inhibits paused-clock auto-advance while real
+        // socket/worker wakeups drive progress, without a scheduler poll quota.
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let mut watchdog = tokio::task::spawn_blocking(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(5));
+        });
+        let result = tokio::select! {
+            biased;
+            result = future => result,
+            _ = &mut watchdog => panic!("I/O did not progress without advancing time"),
+        };
+        // Dropping the sender also releases the worker on cancellation/panic.
+        drop(done);
+        watchdog.await.expect("I/O watchdog worker");
+        assert_eq!(tokio::time::Instant::now(), now);
+        result
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_without_advancing_time_is_not_limited_by_poll_count() {
+        let mut polls = 0;
+        without_advancing_time(std::future::poll_fn(|cx| {
+            polls += 1;
+            if polls > 10_000 {
+                Poll::Ready(())
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
             }
-            // Keep this task runnable so paused time cannot jump to the retry.
-            tokio::task::yield_now().await;
-        }
-        panic!("I/O did not progress without advancing time");
+        }))
+        .await;
+        assert_eq!(polls, 10_001);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_without_advancing_time_waits_for_external_wakeup() {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = send.send(9);
+        });
+        let response = without_advancing_time(async {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                    panic!("protocol time advanced while waiting for external work");
+                }
+                result = receive => result.unwrap(),
+            }
+        })
+        .await;
+        assert_eq!(response, 9);
+        worker.join().unwrap();
     }
 
     async fn live_host_during_backoff<A: InjectAccept>(
