@@ -1,0 +1,22 @@
+crates/syntra-net/src/client.rs
+  s_c3b6b88f085723::t_a7a4c236c7148c 1524-1534,1537-1540
+  s_c3b6b88f085723::t_44eca8babc4f87 1487-1505,1510-1517,1519-1521,1523,1541-1563,1646-1649
+  s_c3b6b88f085723::t_69746bd8445522 1584,1592,1634,1643,1650,1671,1673
+  s_c3b6b88f085723::t_5b856d78fe59ba 1522
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "16ec252e881434265f80fc87964f9c017dd79e68",
+  "prompts": {},
+  "sessions": {
+    "s_c3b6b88f085723": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e5689b882ffemw64kjJIXReHR2",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}
