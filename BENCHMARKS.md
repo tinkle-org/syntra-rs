@@ -9,7 +9,7 @@ throughput. Root benchmarks require no Docker. Session cases exercise the
 linked Tokio runtime; channel and transport cases exercise local Syntra 1.0
 record protection.
 
-Transport cases live in the unpublished `syntra-net`. Its `pipe` bench
+Transport cases live in `syntra-net`. Its `pipe` bench
 requires `tcp` and uses in-memory duplex I/O. Default features enable no socket
 carrier. `websocket` supplies framing/upgrade without a production TLS
 implementation; `tls-rustls` adds optional WSS convenience APIs. `managed`,

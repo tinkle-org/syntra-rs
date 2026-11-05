@@ -1,0 +1,19 @@
+# Only inputs for the unpublished integration peer; never send the whole worktree.
+**
+!Cargo.toml
+!Cargo.lock
+!crates/
+crates/**
+!crates/*/
+crates/*/**
+!crates/*/Cargo.toml
+!crates/*/src/
+crates/*/src/**
+!crates/*/src/**/*.rs
+# Cargo parses explicitly declared targets even when building only the peer.
+!crates/*/benches/
+crates/*/benches/**
+!crates/*/benches/**/*.rs
+!crates/*/examples/
+crates/*/examples/**
+!crates/*/examples/**/*.rs
