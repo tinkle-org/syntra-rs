@@ -1,0 +1,29 @@
+scripts/tests/test_release_workflow.py
+  s_e0aef281fb39a5::t_fc1ac74cd9d7be 22,28,33-35,55-60,67-88,90-98
+  s_e0aef281fb39a5::t_fe4b8a651b8518 89
+  s_e0aef281fb39a5::t_cff3abe72dad10 99
+.github/workflows/release-plz.yml
+  s_e0aef281fb39a5::t_fc1ac74cd9d7be 3,25-30,46-47,56,60-66,70,73-79,84-86,162,174,187,193
+  s_e0aef281fb39a5::t_83b1d74f62c2f5 7
+  s_e0aef281fb39a5::t_fe4b8a651b8518 80-83
+CONTRIBUTING.md
+  s_e0aef281fb39a5::t_fc1ac74cd9d7be 403,408-410,423-427,435-437,440-443
+  s_e0aef281fb39a5::t_83b1d74f62c2f5 438-439
+  s_e0aef281fb39a5::t_fe4b8a651b8518 444-446
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "53af2036c20d1279d5cb281a7f691a977c9b649c",
+  "prompts": {},
+  "sessions": {
+    "s_e0aef281fb39a5": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e564903a8ffe5HCFQu7v1uhI62",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}
