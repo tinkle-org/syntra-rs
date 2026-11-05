@@ -400,12 +400,14 @@ PR checks can require approval under GitHub's Actions policy. Approve the runs
 after reviewing the diff; if no runs were created with the built-in token,
 close and reopen the PR as a maintainer to trigger them.
 
-Both Release-plz jobs use only GitHub's built-in `GITHUB_TOKEN`.
+Both Release-plz jobs use only GitHub's built-in `GITHUB_TOKEN` for GitHub access.
 `RELEASE_PLZ_TOKEN` must never exist as a repository, organization, or environment
 secret available to this repository, and must never be referenced as a credential
 in its workflows. Do not add a PAT to bypass generated-PR workflow approval;
 maintainers approve or retrigger the checks as described above. Cargo publication
-uses crates.io trusted publishing through OIDC, not a PAT. See the
+uses the separate crates.io API token in the `CARGO_REGISTRY_TOKEN` Actions secret,
+exposed only to the gated publication step, never to PR preparation or validation.
+This is not a GitHub PAT. See the
 [Release-plz token guidance](https://release-plz.dev/docs/github/token).
 
 Prepublication package validation lists contents without generating archive
@@ -418,10 +420,11 @@ runtime, then FFI. `syntra-net` and `syntra-integration` remain unpublished.
 not a package registry or an alternative to the repository's Releases page.
 Configure its required reviewers and deployment branch restrictions in GitHub;
 the workflow's environment reference does not create those protections.
-Trusted publishing uses the job's `id-token: write` permission and requires a
-publisher configured on crates.io for each package. New crates need an initial
-manual publication before trusted publishing can publish later versions; merging
-a release PR alone does not bootstrap a new crate. See the
+The crates.io token must belong to an account authorized to publish these crates
+and permit publishing updates for core, runtime, and FFI. Restrict its crate scope
+and lifetime; rotate it before expiry. No OIDC permission or trusted-publisher
+configuration is required in this token-based workflow. Never log the token or
+put its value in a command, file, PR, or commit. See the
 [Release-plz quickstart](https://release-plz.dev/docs/github/quickstart) and
 [release command](https://release-plz.dev/docs/usage/release).
 
@@ -429,9 +432,18 @@ After merging, monitor the Release-plz run for that merge commit and verify that
 each eligible crate version, immutable tag, and GitHub prerelease agree. For a
 transient runner, registry, or credential failure, resolve the external cause
 and rerun the failed merge run after reviewing its revision. A rerun uses the
-original source and workflow; it cannot pick up a later source fix. Fix source
-or workflow defects through a reviewed PR and prepare a new release PR for the
-corrected revision, accounting for any package versions already published.
+original source and workflow; it cannot pick up a later source fix. After a
+reviewed workflow-only fix, use the Release-plz workflow's manual Run workflow
+action on `main`, with `release_commit` set to the full lowercase SHA of the
+original release-PR squash merge. This retry verifies that the commit is on
+`main` and belongs to a merged release-plz PR, reruns all validation on that exact
+commit, then publishes from the same revision with the current workflow. It
+does not prepare another release PR or bypass `release_always = false`.
+For implementation fixes, prepare a new release PR for the corrected revision,
+accounting for any package versions already published.
+After a partial publication, inspect every crate version, tag, and GitHub Release
+before retrying: an already-published package can be skipped rather than having
+missing GitHub metadata repaired automatically.
 Never move existing tags or try to overwrite a published version. There is
 deliberately no workflow-wide concurrency group that could replace a queued
 merge run; only release-PR updates are serialized.

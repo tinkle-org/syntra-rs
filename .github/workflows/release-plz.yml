@@ -1,9 +1,10 @@
 name: Release-plz
 
-# Automated Release PRs and trusted-publishing releases for public workspace
+# Automated Release PRs and crates.io releases for public workspace
 # members. `release-pr` opens/updates a reviewed Release PR on pushes to
 # main; `release` publishes only when that Release PR merges (release_always
 # is false in release-plz.toml), so merging to main alone never publishes.
+# Manual retries select an already merged release-PR commit and revalidate it.
 # Per-crate tags use the default `{{ package }}-v{{ version }}` pattern, which
 # matches the required immutable `syntra-<crate>-vX.Y.Z` scheme.
 #
@@ -21,6 +22,12 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      release_commit:
+        description: Full SHA of a merged release-PR commit on main to retry
+        required: true
+        type: string
 
 # Do not serialize the whole workflow: GitHub replaces older pending runs even
 # with cancel-in-progress: false, which can discard the release-PR merge event.
@@ -36,7 +43,8 @@ env:
 
 # Use only the built-in GITHUB_TOKEN for both Release-plz jobs. RELEASE_PLZ_TOKEN
 # must never be configured or referenced as a credential in this repository.
-# Maintainers approve/retrigger generated PR checks; crates.io publishing uses OIDC.
+# Maintainers approve/retrigger generated PR checks. CARGO_REGISTRY_TOKEN is a
+# separate crates.io credential, exposed only to the gated publication step.
 
 jobs:
   validate-release:
@@ -45,14 +53,37 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      pull-requests: read
     env:
       SYNTRA_SDD_ROOT: ${{ github.workspace }}/../syntra-sdd
     steps:
+      - name: Validate manual retry input
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "release_commit must be a full lowercase commit SHA" >&2; exit 1; }
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.release_commit || github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Require a merged release PR on main for manual retry
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
+        run: |
+          git merge-base --is-ancestor "$RELEASE_COMMIT" origin/main
+          if git rev-parse --verify "${RELEASE_COMMIT}^2" >/dev/null 2>&1; then
+            echo "manual retries require a squash-merged release commit, not a merge commit" >&2
+            exit 1
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_COMMIT}/pulls" \
+            --jq 'any(.[]; .merged_at != null and .base.ref == "main" and .merge_commit_sha == env.RELEASE_COMMIT and (.head.ref | startswith("release-plz-")))' \
+            | python3 -c 'import sys; sys.exit(0 if sys.stdin.read().strip() == "true" else "commit must be the merge of a release-plz PR on main")'
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
@@ -128,11 +159,10 @@ jobs:
     needs: [validate-release]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    if: github.repository_owner == 'tinkle-org'
+    if: github.repository_owner == 'tinkle-org' && github.ref == 'refs/heads/main'
     permissions:
       contents: write
       pull-requests: read
-      id-token: write
     environment: crates-io-publish
     # Tooling lane: stable rustc, not the 1.88.0 crate pin (see header).
     env:
@@ -141,6 +171,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.release_commit || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Install Rust toolchain
@@ -153,12 +184,13 @@ jobs:
           command: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   release-plz-pr:
     name: Release-plz PR
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    if: github.repository_owner == 'tinkle-org'
+    if: github.repository_owner == 'tinkle-org' && github.event_name == 'push'
     permissions:
       contents: write
       pull-requests: write
