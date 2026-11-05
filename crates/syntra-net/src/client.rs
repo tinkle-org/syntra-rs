@@ -1484,20 +1484,83 @@ mod tests {
             }
         }
 
+        async fn loopback_progress<T>(future: impl Future<Output = T>) -> T {
+            // A live blocking task inhibits Tokio's paused-clock auto-advance.
+            // Use a wall-clock watchdog so socket/worker wakeups can drive the
+            // future without a poll quota or advancing protocol deadlines.
+            let (done, wait) = std::sync::mpsc::channel::<()>();
+            let mut watchdog = tokio::task::spawn_blocking(move || {
+                let _ = wait.recv_timeout(Duration::from_secs(5));
+            });
+            let result = tokio::select! {
+                biased;
+                result = future => result,
+                _ = &mut watchdog => panic!("expected loopback progress within wall-clock watchdog"),
+            };
+            // Dropping the sender also releases the worker on cancellation/panic.
+            drop(done);
+            watchdog.await.expect("loopback watchdog worker");
+            result
+        }
+
         async fn status(
             client: &ReconnectingClient,
             predicate: impl Fn(&LifecycleStatus) -> bool,
         ) -> LifecycleStatus {
-            // Keep the virtual scheduler runnable while real loopback I/O settles;
-            // only the fault injection below advances the attempt past its cutoff.
-            for _ in 0..20_000 {
-                let status = client.status();
-                if predicate(&status) {
-                    return status;
+            let mut rx = client.subscribe_status();
+            loopback_progress(async {
+                loop {
+                    let status = rx.snapshot();
+                    if predicate(&status) {
+                        return status;
+                    }
+                    rx.changed().await.expect("owner status");
                 }
+            })
+            .await
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn status_wait_has_no_poll_quota_and_preserves_paused_time() {
+            let mut client = ReconnectingClient::new_with_budget(config(), |_| async {
+                std::future::pending::<Result<ClientHandle, Error>>().await
+            })
+            .unwrap();
+            let before = Instant::now();
+            let mut waiting = Box::pin(status(&client, |s| matches!(s, LifecycleStatus::Paused)));
+            // Keep the requested publication behind more polls than the old
+            // helper allowed, without relying on socket or worker scheduling.
+            for _ in 0..20_001 {
+                assert!(futures_util::poll!(&mut waiting).is_pending());
                 tokio::task::yield_now().await;
             }
-            panic!("expected HTTP lifecycle state, got {:?}", client.status());
+            client.pause();
+            assert_eq!(waiting.await, LifecycleStatus::Paused);
+            assert_eq!(Instant::now(), before);
+            client.close().await.unwrap();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn loopback_wait_does_not_auto_advance_to_a_protocol_timer() {
+            let (send, receive) = tokio::sync::oneshot::channel();
+            let worker = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = send.send(9);
+            });
+            let before = Instant::now();
+            let response = loopback_progress(async {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                        panic!("protocol time advanced while waiting for external work");
+                    }
+                    result = receive => result.unwrap(),
+                }
+            })
+            .await;
+            assert_eq!(response, 9);
+            assert_eq!(Instant::now(), before);
+            worker.join().unwrap();
         }
 
         #[tokio::test(start_paused = true)]
@@ -1518,6 +1581,7 @@ mod tests {
                     RecoveryLimits::default(),
                 )
                 .unwrap();
+                let before = Instant::now();
                 let final_status = status(&client, |s| {
                     matches!(
                         s,
@@ -1525,6 +1589,7 @@ mod tests {
                     )
                 })
                 .await;
+                assert_eq!(Instant::now() - before, Duration::from_secs(3));
                 assert!(probe.armed.load(Ordering::SeqCst));
                 assert!(probe.advanced.load(Ordering::SeqCst));
                 assert_eq!(probe.partial.load(Ordering::SeqCst), 1);
@@ -1566,6 +1631,7 @@ mod tests {
                     ReconnectingClient::new_with_budget(config(), connect)
                 }
                 .unwrap();
+                let before = Instant::now();
                 status(&client, |s| {
                     if recovery {
                         matches!(s, LifecycleStatus::RecoveryNegotiated(_))
@@ -1574,19 +1640,14 @@ mod tests {
                     }
                 })
                 .await;
+                assert_eq!(Instant::now(), before);
                 assert!(!probe.completion.lock().unwrap().as_ref().unwrap().pending());
                 tokio::time::advance(Duration::from_secs(3)).await;
-                let mut call = Box::pin(client.call("/test.Service/Echo", vec![9], 1000));
-                let mut response = None;
-                for _ in 0..20_000 {
-                    if let Poll::Ready(result) = futures_util::poll!(&mut call) {
-                        response = Some(result);
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-                assert_eq!(response.unwrap().unwrap().value, vec![9]);
-                drop(call);
+                let response = loopback_progress(client.call("/test.Service/Echo", vec![9], 1000))
+                    .await
+                    .unwrap();
+                assert_eq!(response.value, vec![9]);
+                assert_eq!(Instant::now() - before, Duration::from_secs(3));
                 client.close().await.unwrap();
                 assert_eq!(probe.dropped.load(Ordering::SeqCst), 2);
                 server.stop();
@@ -1607,7 +1668,9 @@ mod tests {
                 Some(factory),
             )
             .unwrap();
+            let before = Instant::now();
             status(&client, |s| matches!(s, LifecycleStatus::CoreReady(_))).await;
+            assert_eq!(Instant::now(), before);
             assert!(probe.completion.lock().unwrap().as_ref().unwrap().pending());
             assert!(matches!(
                 client.call("/test.Service/Echo", vec![7], 1000).await,
