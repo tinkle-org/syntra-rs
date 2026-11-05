@@ -1,0 +1,19 @@
+crates/syntra-net/src/http/server.rs
+  s_f5f21c4ed3d2a6::t_8246c16d403007 65-70
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "30affac0a1686eab3e8506cf70dcefa44be39c11",
+  "prompts": {},
+  "sessions": {
+    "s_f5f21c4ed3d2a6": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e5c10511cffeZuLHoQtdqoSn8U",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}
