@@ -378,6 +378,11 @@ use the per-package release process in [release-plz.toml](release-plz.toml),
 independently of upstream protocol specification releases.
 Release-plz manages per-package changelogs when preparing releases.
 
+Make implementation and workflow changes on feature branches, never by pushing
+directly to `main`. Open a pull request and wait for its current revision's CI
+and Integration checks to pass before squash-merging. The same check requirement
+applies to the generated release PR, including approving its workflow runs.
+
 On pushes to `main`, Release-plz opens or updates a release PR. With
 `release_always = false`, publication is attempted only when a release PR merges,
 and requires the committed candidate pin and release validation to pass. The
@@ -387,11 +392,46 @@ marks `1.0.0-rc.x` releases as prereleases. Keep GitHub Releases and crates.io
 versions aligned through this one job rather than creating a second release
 workflow.
 
-`crates-io-publish` is the protected GitHub Actions environment used by the job,
+Before merging an RC release PR, check its version and changelogs, including any
+reported API breaks. Keep the `-rc.N` suffix until a stable release is intended;
+do not create tags or GitHub Releases manually. Require CI and Integration to
+pass on the current release PR revision, not only on its base branch. Generated
+PR checks can require approval under GitHub's Actions policy. Approve the runs
+after reviewing the diff; if no runs were created with the built-in token,
+close and reopen the PR as a maintainer to trigger them.
+
+Both Release-plz jobs use only GitHub's built-in `GITHUB_TOKEN`.
+`RELEASE_PLZ_TOKEN` must never exist as a repository, organization, or environment
+secret available to this repository, and must never be referenced as a credential
+in its workflows. Do not add a PAT to bypass generated-PR workflow approval;
+maintainers approve or retrigger the checks as described above. Cargo publication
+uses crates.io trusted publishing through OIDC, not a PAT. See the
+[Release-plz token guidance](https://release-plz.dev/docs/github/token).
+
+Prepublication package validation lists contents without generating archive
+lockfiles that would require the new dependency versions to exist on crates.io
+already. It does not prove packaged compilation. Release-plz keeps Cargo's
+publication verification enabled and publishes in dependency order: core,
+runtime, then FFI. `syntra-net` and `syntra-integration` remain unpublished.
+
+`crates-io-publish` is the GitHub Actions environment used by the job,
 not a package registry or an alternative to the repository's Releases page.
+Configure its required reviewers and deployment branch restrictions in GitHub;
+the workflow's environment reference does not create those protections.
 Trusted publishing uses the job's `id-token: write` permission and requires a
 publisher configured on crates.io for each package. New crates need an initial
 manual publication before trusted publishing can publish later versions; merging
 a release PR alone does not bootstrap a new crate. See the
 [Release-plz quickstart](https://release-plz.dev/docs/github/quickstart) and
 [release command](https://release-plz.dev/docs/usage/release).
+
+After merging, monitor the Release-plz run for that merge commit and verify that
+each eligible crate version, immutable tag, and GitHub prerelease agree. For a
+transient runner, registry, or credential failure, resolve the external cause
+and rerun the failed merge run after reviewing its revision. A rerun uses the
+original source and workflow; it cannot pick up a later source fix. Fix source
+or workflow defects through a reviewed PR and prepare a new release PR for the
+corrected revision, accounting for any package versions already published.
+Never move existing tags or try to overwrite a published version. There is
+deliberately no workflow-wide concurrency group that could replace a queued
+merge run; only release-PR updates are serialized.
