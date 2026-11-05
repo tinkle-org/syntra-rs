@@ -1,0 +1,45 @@
+crates/syntra-net/LICENSE
+  s_68a37f2855a565::t_6fec9937ea97f2 1-201
+README.md
+  s_e0aef281fb39a5::t_93a9778adcee2a 12-13,37-41,72-79
+  s_e0aef281fb39a5::t_c3ff36f3aced0d 80
+scripts/tests/test_cargo_contracts.py
+  s_68a37f2855a565::t_6fec9937ea97f2 268
+  s_e0aef281fb39a5::t_93a9778adcee2a 8,248-267,269-279
+crates/syntra-net/README.md
+  s_e0aef281fb39a5::t_93a9778adcee2a 1-69
+crates/syntra-net/Cargo.toml
+  s_e0aef281fb39a5::t_93a9778adcee2a 7-10,13-18
+  s_e0aef281fb39a5::t_3d1077a2304a5d 19
+CONTRIBUTING.md
+  s_e0aef281fb39a5::t_93a9778adcee2a 14,416-417,419-427,434-437
+  s_e0aef281fb39a5::t_616180cc868f0a 418
+.github/workflows/ci.yml
+  s_e0aef281fb39a5::t_93a9778adcee2a 284
+BENCHMARKS.md
+  s_e0aef281fb39a5::t_93a9778adcee2a 12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d04ee5ad0f3ca501c0cd28991fd57d3ec52731c8",
+  "prompts": {},
+  "sessions": {
+    "s_68a37f2855a565": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e53cb741affezLc97D15hN66za",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    },
+    "s_e0aef281fb39a5": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e564903a8ffe5HCFQu7v1uhI62",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "oscarlaw <oscarlaw2010@gmail.com>"
+    }
+  }
+}
