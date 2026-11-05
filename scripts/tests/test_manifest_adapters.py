@@ -113,7 +113,7 @@ class AdapterTests(unittest.TestCase):
 
     def run_fake(self, text, returncode=0, artifact=True, tamper=None):
         def run(command, **kwargs):
-            for arg in ('--exact', '--ignored', 'websocket,native-enrollment', 'syntra-transport', 'supplemental_scenario'):
+            for arg in ('--exact', '--ignored', 'tls-rustls,native-enrollment', 'syntra-net', 'supplemental_scenario'):
                 self.assertIn(arg, command)
             self.assertEqual(kwargs['env']['RUSTUP_TOOLCHAIN'], '1.88.0')
             request = json.loads(Path(kwargs['env']['SYNTRA_SUPPLEMENTAL_REQUEST']).read_text())
@@ -264,8 +264,8 @@ class LiveExecutionProtocolTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('SYNTRA_LIVE_ADAPTER_PROTOCOL') == '1',
                          'opt-in real Cargo execution protocol check (native-enrollment graph)')
     def test_real_zero_ignored_and_single_test_proofs(self):
-        prefix = ['cargo', 'test', '--locked', '-p', 'syntra-transport', '--no-default-features',
-                  '--features', 'websocket,native-enrollment', '--test', 'manifest_cases']
+        prefix = ['cargo', 'test', '--locked', '-p', 'syntra-net', '--no-default-features',
+                  '--features', 'tls-rustls,native-enrollment', '--test', 'manifest_cases']
         for name, expected in [('_no_such_supplemental_scenario_', 'NOT_EXECUTED'),
                                ('supplemental_scenario', 'SKIP'),
                                ('supplemental_error_vocabulary', 'PASS')]:
@@ -281,7 +281,7 @@ class LifecycleScopeTests(unittest.TestCase):
     def test_partial_enrollment_probes_remain_supplemental(self):
         for lane, name in evidence.NATIVE_LOCAL_LANES.items():
             def run(command, **kwargs):
-                self.assertIn('websocket,native-enrollment', command)
+                self.assertIn('tls-rustls,native-enrollment', command)
                 self.assertIn('--lib', command)
                 self.assertIn('--no-default-features', command)
                 kwargs['stdout'].write(f'test {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;')

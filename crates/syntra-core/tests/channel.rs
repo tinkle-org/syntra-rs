@@ -107,6 +107,10 @@ fn carrier_context_cannot_be_reinterpreted() {
                     Carrier::Tcp => 1,
                     Carrier::WebSocket => 2,
                     Carrier::SecureWebSocket => 3,
+                    #[cfg(feature = "http-candidate")]
+                    Carrier::Http => 4,
+                    #[cfg(feature = "http-candidate")]
+                    Carrier::Https => 5,
                 };
                 // Matching the public carrier to server policy cannot change
                 // the prologue authenticated by the original Noise M1.

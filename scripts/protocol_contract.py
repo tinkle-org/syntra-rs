@@ -25,8 +25,8 @@ import sys
 
 sys.dont_write_bytecode = True
 
-from candidate_rust import (BROWSER_FIXTURES, BROWSER_JS, BROWSER_WS, KERNEL, NATIVE_FIXTURES, NATIVE_WS,
-                            binding_sources, browser_fixture_bounds, probe)
+from candidate_rust import (KERNEL, NATIVE_FIXTURES, NATIVE_WS, NATIVE_TLS, RECORD_FIXTURES,
+                            binding_sources, record_fixture_bounds, probe)
 from sdd_inputs import regular_file, sdd_root
 from upstream_snapshot import ROOT, REPOSITORY, REVISION, SCOPE, digest, git, read_lock
 
@@ -50,7 +50,7 @@ NEGATIVE_MUTATIONS = frozenset((
     "bootstrap-epoch", "returning-handle", "empty-scope", "oversize-scope",
     "truncated", "trailing", "invalid-utf8", "scope-byte-length",
 ))
-RUST_INPUTS = (KERNEL, NATIVE_FIXTURES, BROWSER_FIXTURES, BROWSER_JS, NATIVE_WS, BROWSER_WS,
+RUST_INPUTS = (KERNEL, NATIVE_FIXTURES, RECORD_FIXTURES, NATIVE_WS, NATIVE_TLS,
                "crates/syntra-core/src/handshake.rs", "crates/syntra-core/src/frame.rs",
                "proto/syntra/v1/envelope.proto", "scripts/manifest_adapters.py",
                "scripts/candidate_rust.py", "scripts/protocol_contract.py")
@@ -387,6 +387,10 @@ def validate_rust(root, contract, contexts):
                 f"Rust/context fixture disagreement: {row['id']}")
     rejected = {row["id"]: row["rejected"] for row in result if row["kind"] == "negative"}
     require(set(rejected) == {row["id"] for row in negatives} and all(rejected.values()), "compiled Rust parser accepted a negative fixture")
+    candidate_rejected = {row["carrier"]: row["rejected"] for row in result
+                          if row["kind"] == "default_candidate_rejection"}
+    require(candidate_rejected == {4: True, 5: True},
+            "default Rust parser must reject candidate HTTP/HTTPS codes 4/5")
     independent = [row for row in result if row["kind"] == "independent"]
     require(len(independent) >= 4 and len({row["id"] for row in independent}) == len(independent),
             "independent Rust fixture coverage is missing/duplicated")
@@ -395,17 +399,18 @@ def validate_rust(root, contract, contexts):
         fields = set(row) - {"id", "kind"}
         require(any(row["id"] == want["id"] and all(row[key] == want[key] for key in fields) for want in rows),
                 "independent Rust fixture disagrees with derived SDD context bytes/ID")
-    browser = [row for row in result if row["kind"] == "browser_fixture"]
-    require(len(browser) == 1 and any(row["carrier"] == 3 and row["context_hex"] == browser[0]["hex"] for row in rows),
-            "independent browser context literal disagrees")
+    records = [row for row in result if row["kind"] == "record_fixture"]
+    require(len(records) == 1 and any(row["carrier"] == 3 and row["context_hex"] == records[0]["hex"] for row in rows),
+            "independent WSS context literal disagrees")
     from manifest_adapters import IMPLEMENTATION_WIRE_CONTRACT
     require(IMPLEMENTATION_WIRE_CONTRACT == {"domain": contract["domain_ascii"], "ws_path": contract["websocket_endpoint"],
                                             "subprotocol": contract["websocket_subprotocol"]}, "evidence candidate identity is stale")
     return {"kind": "compiled_source_encoding_agreement_not_full_crate_or_carrier_execution", "contexts": len(rows),
              "negative_parser_recipes": len(negatives), "negative_recipe_coverage": coverage,
+             "default_candidate_carriers_rejected": sorted(candidate_rejected),
              "independent_native_fixtures": len(independent),
-            "independent_browser_literals": len(browser), "derived_constants": got,
-            "bindings": binding_sources(root, contract), "browser_fixture_bounds": browser_fixture_bounds(root, contract)}
+             "independent_wss_literals": len(records), "derived_constants": got,
+             "bindings": binding_sources(root, contract), "record_fixture_bounds": record_fixture_bounds(root, contract)}
 
 
 def verify_candidate(root=ROOT, upstream=None, mode="offline"):
@@ -440,14 +445,14 @@ def run_rust_agreement(output, root=ROOT):
     output.mkdir(parents=False)
     lanes = [
         ("kernel-contexts", ["-p", "syntra-core", "--lib"], "secure_channel::context_tests::four_candidate_context_and_prologue_fixtures"),
-        ("native-binding", ["-p", "syntra-transport", "--no-default-features", "--features", "websocket", "--test", "wss"],
+        ("native-binding", ["-p", "syntra-net", "--no-default-features", "--features", "tls-rustls", "--test", "wss"],
          "invalid_endpoints_and_carrier_mismatches_do_not_open_socket"),
-        ("native-tls13", ["-p", "syntra-transport", "--no-default-features", "--features", "websocket", "--test", "wss"],
+        ("native-tls13", ["-p", "syntra-net", "--no-default-features", "--features", "tls-rustls", "--test", "wss"],
          "wss_server_rejects_tls12_client_before_authentication"),
-        ("loopback-ws", ["-p", "syntra-transport", "--no-default-features", "--features", "websocket", "--test", "websocket"],
+        ("loopback-ws", ["-p", "syntra-net", "--no-default-features", "--features", "websocket", "--test", "websocket"],
          "ws_rejects_non_loopback_and_secure_carrier"),
-        ("browser-context", ["-p", "syntra-web", "--no-default-features", "--features", "browser-connection", "--test", "connection_records"],
-         "browser_wss_context_uses_candidate_syntra_1_0_bytes"),
+        ("wss-context", ["-p", "syntra-core", "--test", "connection_records"],
+         "wss_context_uses_candidate_syntra_1_0_bytes"),
     ]
     results = []
     for lane, selector, test in lanes:

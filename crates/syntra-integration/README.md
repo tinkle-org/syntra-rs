@@ -7,11 +7,19 @@ test package. Its current harness is `tests/syntra_containers.rs`. Maintain
 the peer and its tests together; a successful run is same-implementation
 connectivity evidence, not a conformance verdict.
 
-The peer and tests use `syntra_transport::{tcp, websocket}`. Core owns message
+The peer and tests use `syntra_net::{tcp, websocket}`. Core owns message
 mechanics and record protection through `syntra_core::secure_channel`; runtime
 scheduling and native I/O remain separate responsibilities. Transport defaults enable no
-sockets; this package explicitly selects `tcp` and `websocket`. Reconnection
-requires a separate `reconnect` opt-in and is not exercised here.
+sockets; this package explicitly selects `tcp` and `websocket` for framing/upgrade,
+with no production TLS implementation dependency. `tls-rustls` is the optional
+rustls WSS convenience feature. Managed networking (`managed`), proxy helpers
+(`proxy`) and reconnection (`reconnect`) have separate net-crate regressions.
+`network_websocket` covers managed loopback WS/application-provider WSS listeners;
+`routes` covers explicit allowlisted endpoint composition. CI selects both
+`managed,websocket,proxy` and `managed,tls-rustls,proxy` for those targets.
+Candidate HTTP/HTTPS uses `http_connections`, `network_http` and `routes` with
+`managed,http,proxy`, plus a separate `managed,http,websocket,proxy` combination.
+These are native test lanes, outside this TCP/WS Docker fixture.
 
 The WS endpoint is `/syntra/1.0/ws` (`websocket::ENDPOINT_PATH`) with exact
 subprotocol `syntra.1.0`. The harness dials mapped ports on `127.0.0.1` to meet
@@ -21,13 +29,16 @@ encryption and connection guidance. Native encrypted TCP is also a production
 carrier; the WS dial restriction applies specifically to WS.
 
 The four root `default-members` are `syntra-core`, `syntra-runtime`,
-`syntra-transport` and `syntra-ffi`, excluding only `syntra-web` and
-`syntra-integration` from the six-member workspace. Explicit `--workspace` includes
-them and unifies this package's carrier features into `syntra-transport`. Test the transport's
+`syntra-net` and `syntra-ffi`. The five-member workspace additionally includes
+`syntra-integration`; explicit `--workspace` unifies this package's carrier features
+into `syntra-net`. Test the net crate's
 `--no-default-features` configuration separately for default isolation.
-WSS tests in `crates/syntra-transport/tests/wss.rs` are outside this Docker
-suite and require `websocket`. Protected browser WSS has its own
-[procedures](../syntra-web/tests/browser.md). TCP/WS fixture results do not
+WSS tests in `crates/syntra-net/tests/wss.rs` are outside this Docker
+suite and require `tls-rustls`; `recovery_wss` also needs `reconnect`.
+The `tls_provider` suite uses `websocket` with a real test TLS provider supplied
+through dev dependencies. The provider is trusted application code responsible
+for real certificate chain/hostname/time/current-policy checks; metadata checks
+alone do not establish that it performed TLS. TCP/WS fixture results do not
 establish TLS, browser, independent cryptographic-vector or cross-language
 interoperability coverage.
 
@@ -35,7 +46,7 @@ Record the peer revision, dirty-worktree state and actual carrier/mode results
 when executing the suite.
 The [unified implementation-evidence runner](../../CONTRIBUTING.md#implementation-evidence)
 has separate supplemental lanes; it does not run this Docker suite. Preserve each
-result's execution scope and candidate provenance. The candidate record now pins
+result's execution scope and candidate provenance. The candidate record pins
 committed inputs; that pin does not turn fixture execution into formal conformance.
 
 ## Running the fixture suite
@@ -72,7 +83,7 @@ container. Mapped endpoints are rediscovered rather than assumed stable.
 
 ## Fixture targets
 
-The adapters are `syntra_transport::tcp` and `syntra_transport::websocket`,
+The adapters are `syntra_net::tcp` and `syntra_net::websocket`,
 using shared transport handles and runtime `Initiator`/`Host` sessions.
 The opt-in reconnecting client's lifecycle contract is documented in
 [CONNECTION.md](../../CONNECTION.md). This container fixture does not exercise
@@ -94,8 +105,17 @@ This list describes test code, not a recorded current Docker execution:
 - Closing the client after the suite; the peer is torn down with the
   container.
 
-HTTP/HTTPS are not protocol test targets; HTTP is used only as the WS
-upgrade mechanism. UDP and browser connections are excluded. This suite does not
+The separate `http` opt-in supplies candidate HTTP/HTTPS Noise/hello-ready/RPC
+connections and a bounded listener/association registry, alongside raw codec/pair
+APIs. `managed,http` owns the listener run through `ManagedHttpServer`; candidate
+routes include direct, SOCKS5/CONNECT and real HTTP forward requests. HTTPS uses
+application TLS on both streams without a production TLS implementation dependency.
+Raw `http_records` tests remain distinct from the full-connection lanes.
+RFC0013 is Draft upstream; this candidate remains under resource review, without
+carrier registration, approval, accepted-spec shipping status or conformance claims.
+HTTP also supports WS upgrade and CONNECT tunneling. `HttpForwardTarget` alone is
+metadata; the explicit candidate `Route::HttpForward` sends forward requests.
+UDP and browser connections are excluded. This suite does not
 yet cover packet-level tampering, malformed-record fuzzing, enrollment
 revocation, automatic reconnection/backoff, or exhaustive fault
 combinations. A container round trip through the same Noise library is not

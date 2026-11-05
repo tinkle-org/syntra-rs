@@ -45,6 +45,12 @@ jobs:
             cargo-registry-${{ runner.os }}-1.88.0-
       - name: Default dependency isolation (host + WASM, no dev/test graph)
         run: python3 scripts/cargo_contracts.py isolation
+      - name: WebSocket-only production graph excludes TLS implementations and HTTP opt-in
+        run: python3 scripts/cargo_contracts.py websocket
+      - name: Managed WebSocket/routes production graph excludes TLS implementations and HTTP opt-in
+        run: python3 scripts/cargo_contracts.py managed-websocket
+      - name: HTTP candidate provider-only production graphs
+        run: python3 scripts/cargo_contracts.py http
       - name: Candidate offline agreement (not external SDD provenance)
         run: python3 -B scripts/protocol_contract.py --offline
       - name: Locked default-members tests
@@ -53,7 +59,7 @@ jobs:
         run: cargo test --locked --workspace
       - name: Explicit native transport and storage features
         run: |
-          cargo test --locked -p syntra-transport --no-default-features --features tcp,websocket,reconnect,native-enrollment
+          cargo test --locked -p syntra-net --no-default-features --features managed,proxy,tls-rustls,native-enrollment,http
           cargo test --locked -p syntra-runtime --no-default-features --features file-store
       - name: Production + fixture FFI (separate, no --all-features)
         run: |
@@ -62,10 +68,8 @@ jobs:
           python3 crates/syntra-ffi/tests/build_contract.py
       - name: WASM baseline (core, runtime and record-protection kernel)
         run: cargo check --locked -p syntra-core -p syntra-runtime --target wasm32-unknown-unknown
-      - name: Browser production compile
-        run: cargo check --locked -p syntra-web --no-default-features --features browser-connection --target wasm32-unknown-unknown
-      - name: Browser fixture compile (not a production artifact)
-        run: cargo check --locked -p syntra-web --no-default-features --features browser-test-fixture --target wasm32-unknown-unknown
+      - name: Native feature entry points, nonzero regression execution and WASM rejection
+        run: python3 crates/syntra-net/tests/target_contract.py
 
   compat-macos:
     name: native compat (macOS)
@@ -84,7 +88,10 @@ jobs:
         run: |
           cargo test --locked
           cargo test --locked --workspace
-          cargo test --locked -p syntra-transport --no-default-features --features tcp,websocket,reconnect,native-enrollment
+          cargo test --locked -p syntra-net --no-default-features --features http
+          cargo test --locked -p syntra-net --no-default-features --features managed,http,proxy --test http_connections --test network_http --test routes
+          cargo test --locked -p syntra-net --no-default-features --features managed,websocket,proxy --test network_websocket --test routes
+          cargo test --locked -p syntra-net --no-default-features --features managed,proxy,tls-rustls,native-enrollment,http
           cargo test --locked -p syntra-runtime --no-default-features --features file-store
           cargo test --locked -p syntra-ffi --no-default-features --features production
           cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
@@ -108,7 +115,10 @@ jobs:
         run: |
           cargo test --locked
           cargo test --locked --workspace
-          cargo test --locked -p syntra-transport --no-default-features --features tcp,websocket,reconnect,native-enrollment
+          cargo test --locked -p syntra-net --no-default-features --features http
+          cargo test --locked -p syntra-net --no-default-features --features managed,http,proxy --test http_connections --test network_http --test routes
+          cargo test --locked -p syntra-net --no-default-features --features managed,websocket,proxy --test network_websocket --test routes
+          cargo test --locked -p syntra-net --no-default-features --features managed,proxy,tls-rustls,native-enrollment,http
           cargo test --locked -p syntra-runtime --no-default-features --features file-store
           cargo test --locked -p syntra-ffi --no-default-features --features production
           cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
@@ -159,9 +169,7 @@ jobs:
       - name: cargo-audit full
         run: cargo audit --deny warnings
       - name: Optional native carrier, enrollment and file-store policy
-        run: cargo deny --locked --features syntra-transport/tcp,syntra-transport/websocket,syntra-transport/reconnect,syntra-transport/native-enrollment,syntra-runtime/file-store check advisories licenses sources
-      - name: Browser production dependency policy
-        run: cargo deny --locked --features syntra-web/browser-connection --target wasm32-unknown-unknown check advisories licenses sources
-      - name: Browser fixture dependency policy (not a production artifact)
-        run: cargo deny --locked --features syntra-web/browser-test-fixture --target wasm32-unknown-unknown check advisories licenses sources
+        run: cargo deny --locked --features syntra-net/http,syntra-net/managed,syntra-net/proxy,syntra-net/tls-rustls,syntra-net/native-enrollment,syntra-runtime/file-store check advisories licenses sources
+      - name: Portable WASM dependency policy
+        run: cargo deny --locked --target wasm32-unknown-unknown check advisories licenses sources
       # This workflow runs dependency checks, not fuzz or sanitizer campaigns.

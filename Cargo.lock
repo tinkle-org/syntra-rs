@@ -2599,12 +2599,40 @@ version = "1.0.0-rc.1"
 dependencies = [
  "futures-util",
  "syntra-core",
+ "syntra-net",
  "syntra-runtime",
- "syntra-transport",
  "testcontainers",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "syntra-net"
+version = "1.0.0-rc.1"
+dependencies = [
+ "criterion",
+ "fs2",
+ "futures-util",
+ "getrandom 0.3.4",
+ "httparse",
+ "prost",
+ "rcgen",
+ "rusqlite",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "syntra-core",
+ "syntra-runtime",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tracing",
+ "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -2628,54 +2656,6 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-time",
-]
-
-[[package]]
-name = "syntra-transport"
-version = "1.0.0-rc.1"
-dependencies = [
- "criterion",
- "fs2",
- "futures-util",
- "httparse",
- "prost",
- "rcgen",
- "rusqlite",
- "rustls",
- "rustls-native-certs",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "syntra-core",
- "syntra-runtime",
- "thiserror",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "tracing",
- "url",
- "zeroize",
-]
-
-[[package]]
-name = "syntra-web"
-version = "1.0.0-rc.1"
-dependencies = [
- "getrandom 0.3.4",
- "js-sys",
- "rustls",
- "syntra-core",
- "syntra-runtime",
- "syntra-transport",
- "thiserror",
- "tokio",
- "tracing",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "web-time",
- "zeroize",
 ]
 
 [[package]]
@@ -2852,7 +2832,6 @@ dependencies = [
  "futures-util",
  "log",
  "rustls",
- "rustls-native-certs",
  "rustls-pki-types",
  "tokio",
  "tokio-rustls",

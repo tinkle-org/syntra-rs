@@ -9,6 +9,11 @@ homepage.workspace = true
 documentation.workspace = true
 description = "Syntra 1.0 protocol core: bounded envelopes, validation, message state, authenticated Noise establishment and protected records. No network I/O or application semantics."
 
+[features]
+default = []
+# Draft RFC0013 context bindings only; not public carrier registration or I/O.
+http-candidate = []
+
 [dependencies]
 prost.workspace = true
 bytes.workspace = true

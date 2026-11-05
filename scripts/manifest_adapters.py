@@ -249,8 +249,8 @@ def execute_supplemental(identifier, output, execution_proof, root=ROOT):
             raise FileExistsError(f"refusing existing supplemental artifact: {path.name}")
     with request_path.open("x", encoding="utf-8") as stream:
         json.dump(request, stream, indent=2)
-    command = ["cargo", "test", "--locked", "-p", "syntra-transport", "--no-default-features",
-               "--features", "websocket,native-enrollment", "--test", "manifest_cases", "supplemental_scenario", "--",
+    command = ["cargo", "test", "--locked", "-p", "syntra-net", "--no-default-features",
+               "--features", "tls-rustls,native-enrollment", "--test", "manifest_cases", "supplemental_scenario", "--",
                "--exact", "--ignored", "--show-output", "--color", "never"]
     execution = {"command":command, "RUSTUP_TOOLCHAIN":"1.88.0", "artifacts":{},
                  "scope":{"iut":"native host", "peer":"raw harness, not client IUT", "mode":"bootstrap",

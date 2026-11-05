@@ -4,6 +4,13 @@
 //! Native and browser drivers compose this kernel with the message runtime as
 //! integral layers of the same Syntra protocol.
 //! Experimental and unpublished; no independent interoperability verdict is claimed here.
+//!
+//! The explicitly opt-in `http-candidate` feature adds Draft RFC0013 HTTP/HTTPS
+//! context bindings (codes 4/5) to this same kernel and exact-context Noise
+//! prologue. RFC0013 remains pending-adoption: these bindings are not registered
+//! in the accepted public upstream registry. This feature supplies no HTTP I/O,
+//! TLS verification or alternate encryption protocol. Without it, only carrier
+//! codes 1/2/3 are accepted, even when candidate sources are present.
 #![deny(unsafe_code)]
 
 use std::fmt;
@@ -225,6 +232,13 @@ pub enum Carrier {
     WebSocket,
     /// Secure WebSocket (WSS), context carrier code 3.
     SecureWebSocket,
+    /// Draft RFC0013 HTTP binding, candidate code 4; pending upstream adoption.
+    #[cfg(feature = "http-candidate")]
+    Http,
+    /// Draft RFC0013 HTTPS binding, candidate code 5; pending upstream adoption.
+    /// The carrier owner must supply verified TLS; this enum does not prove TLS.
+    #[cfg(feature = "http-candidate")]
+    Https,
 }
 impl Carrier {
     fn code(self) -> u8 {
@@ -232,6 +246,10 @@ impl Carrier {
             Self::Tcp => 1,
             Self::WebSocket => 2,
             Self::SecureWebSocket => 3,
+            #[cfg(feature = "http-candidate")]
+            Self::Http => 4,
+            #[cfg(feature = "http-candidate")]
+            Self::Https => 5,
         }
     }
 }
@@ -284,6 +302,10 @@ impl Context {
             1 => Carrier::Tcp,
             2 => Carrier::WebSocket,
             3 => Carrier::SecureWebSocket,
+            #[cfg(feature = "http-candidate")]
+            4 => Carrier::Http,
+            #[cfg(feature = "http-candidate")]
+            5 => Carrier::Https,
             _ => return Err(Error::Invalid),
         };
         let n =

@@ -9,10 +9,15 @@ throughput. Root benchmarks require no Docker. Session cases exercise the
 linked Tokio runtime; channel and transport cases exercise local Syntra 1.0
 record protection.
 
-Transport cases live in the unpublished `syntra-transport`. Its `pipe` bench
+Transport cases live in the unpublished `syntra-net`. Its `pipe` bench
 requires `tcp` and uses in-memory duplex I/O. Default features enable no socket
-carrier; native `tcp`, `websocket` and `reconnect` are separate opt-ins. These
-pipe cases do not measure WSS, TLS or the reconnecting client. See
+carrier. `websocket` supplies framing/upgrade without a production TLS
+implementation; `tls-rustls` adds optional WSS convenience APIs. `managed`,
+`proxy`, `reconnect` and candidate `http` HTTP/HTTPS connections are
+explicit opt-ins. Pipe timings cover no managed WS/WSS listeners, route selection,
+HTTP/HTTPS connections or raw adapters, TLS/provider composition, managed runtime,
+proxies or reconnect behavior. Candidate full-RPC tests are separate from these
+timings and do not establish RFC0013 adoption, completed review or conformance. See
 [CONNECTION.md](CONNECTION.md) for encryption and connection guidance. These local
 harnesses do not establish operational budgets or real-device/network results.
 Retain the implementation revision and dirty-worktree state with measurements.
@@ -36,7 +41,7 @@ benchmark success does not authorize publication or satisfy the formal-conforman
   record, and returning-mode warm record encrypt/decrypt pairs at 64, 1,024
   and 65,519 plaintext bytes. Nonces advance without reset; payload comparison
   happens inside timing. See the setup/allocation boundaries below.
-- `syntra-transport/pipe` measures preallocated u16 carrier-prefix and u32
+- `syntra-net/pipe` measures preallocated u16 carrier-prefix and u32
   frame-prefix writes without socket or crypto work, plus serial encrypted
   echo RPCs over in-memory duplex streams. Handshake and fixture allocation
   are outside timing for header cases; establishment and echo payload
@@ -87,13 +92,13 @@ These selectors execute the three benchmark harnesses:
 ```sh
 cargo bench --locked -p syntra-core --bench frame_codec -- --test
 cargo bench --locked -p syntra-core --bench channel -- --test
-cargo bench --locked -p syntra-transport --no-default-features --features tcp --bench pipe -- --test
+cargo bench --locked -p syntra-net --no-default-features --features tcp --bench pipe -- --test
 ```
 
 To smoke-test every benchmark in the workspace:
 
 ```sh
-cargo bench --locked --workspace --features syntra-transport/tcp -- --test
+cargo bench --locked --workspace --features syntra-net/tcp -- --test
 ```
 
 ## Benchmark workflow
@@ -107,7 +112,7 @@ harness):
 ```sh
 cargo bench --locked -p syntra-core --bench frame_codec -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
 cargo bench --locked -p syntra-core --bench channel -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
-cargo bench --locked -p syntra-transport --no-default-features --features tcp --bench pipe -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
+cargo bench --locked -p syntra-net --no-default-features --features tcp --bench pipe -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
 ```
 
 The artifact records raw samples, source revision and toolchain. Timing is

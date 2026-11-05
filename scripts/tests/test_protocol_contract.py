@@ -437,14 +437,14 @@ class CandidateTests(unittest.TestCase):
         expected = [
             ("kernel-contexts", ["-p", "syntra-core", "--lib"],
              "secure_channel::context_tests::four_candidate_context_and_prologue_fixtures"),
-            ("native-binding", ["-p", "syntra-transport", "--no-default-features", "--features", "websocket", "--test", "wss"],
+            ("native-binding", ["-p", "syntra-net", "--no-default-features", "--features", "tls-rustls", "--test", "wss"],
              "invalid_endpoints_and_carrier_mismatches_do_not_open_socket"),
-            ("native-tls13", ["-p", "syntra-transport", "--no-default-features", "--features", "websocket", "--test", "wss"],
+            ("native-tls13", ["-p", "syntra-net", "--no-default-features", "--features", "tls-rustls", "--test", "wss"],
              "wss_server_rejects_tls12_client_before_authentication"),
-            ("loopback-ws", ["-p", "syntra-transport", "--no-default-features", "--features", "websocket", "--test", "websocket"],
+            ("loopback-ws", ["-p", "syntra-net", "--no-default-features", "--features", "websocket", "--test", "websocket"],
              "ws_rejects_non_loopback_and_secure_carrier"),
-            ("browser-context", ["-p", "syntra-web", "--no-default-features", "--features", "browser-connection", "--test", "connection_records"],
-             "browser_wss_context_uses_candidate_syntra_1_0_bytes"),
+            ("wss-context", ["-p", "syntra-core", "--test", "connection_records"],
+             "wss_context_uses_candidate_syntra_1_0_bytes"),
         ]
 
         def run(command, **kwargs):
@@ -487,6 +487,7 @@ class RustAgreementTests(unittest.TestCase):
         self.assertEqual(candidate_rust.NATIVE_FIXTURES, "crates/syntra-core/tests/fixtures/syntra_1_0_context.rs")
         self.assertIn(candidate_rust.KERNEL, candidate.RUST_INPUTS)
         self.assertIn(candidate_rust.NATIVE_FIXTURES, candidate.RUST_INPUTS)
+        self.assertIn(candidate_rust.NATIVE_TLS, candidate.RUST_INPUTS)
 
     def test_current_candidate_paths_do_not_rewrite_accepted_base_keys(self):
         self.assertEqual(candidate.INPUTS["contexts"], "conformance/test-vectors/connection/context-vectors.json")
@@ -508,6 +509,16 @@ class RustAgreementTests(unittest.TestCase):
         self.assertEqual(report["agreement"]["negative_parser_recipes"], 36)
         self.assertEqual(report["agreement"]["independent_native_fixtures"], 4)
         self.assertFalse(report["publication_authorized"])
+        self.assertEqual(report["agreement"]["default_candidate_carriers_rejected"], [4, 5])
+
+    def test_default_source_probe_cannot_silently_enable_http_candidate(self):
+        def read(root, name):
+            value = (root / name).read_bytes()
+            if name == candidate_rust.KERNEL:
+                value = value.replace(b'#[cfg(feature = "http-candidate")]\n', b'')
+            return value
+        with mock.patch.object(candidate_rust, "regular_file", side_effect=read), self.assertRaises(ValueError):
+            candidate.verify_candidate(mode="offline")
 
     def test_negative_coverage_requires_reviewed_recipes_not_an_arbitrary_count(self):
         record = candidate.load_record()
@@ -616,12 +627,27 @@ class RustAgreementTests(unittest.TestCase):
         with mock.patch.object(candidate_rust, "regular_file", side_effect=read), self.assertRaisesRegex(ValueError, "native WSS carrier"):
             candidate_rust.binding_sources(root, record["contract"])
 
-    def test_browser_independent_bounds_drift_is_detected(self):
+    def test_record_independent_bounds_drift_is_detected(self):
         root = candidate.ROOT
         def read(where, name):
-            return (root / name).read_bytes().replace(b"data.length >= 83", b"data.length >= 84")
-        with mock.patch.object(candidate_rust, "regular_file", side_effect=read), self.assertRaisesRegex(ValueError, "JS M1 bounds"):
-            candidate_rust.browser_fixture_bounds(root, candidate.load_record()["contract"])
+            return (root / name).read_bytes().replace(b"(83..=337)", b"(84..=337)")
+        with mock.patch.object(candidate_rust, "regular_file", side_effect=read), self.assertRaisesRegex(ValueError, "Rust M1 bounds"):
+            candidate_rust.record_fixture_bounds(root, candidate.load_record()["contract"])
+
+    def test_provider_binding_guard_drift_is_detected_without_trusting_metadata(self):
+        for original, changed, label in (
+            (b"metadata.authority != *authority", b"false", "provider authority"),
+            (b"metadata.role != role", b"false", "provider role"),
+            (b"metadata.protocol_version != 0x0304", b"false", "provider TLS 1.3"),
+            (b'metadata.alpn.as_deref() != Some(b"http/1.1".as_slice())', b"false", "provider HTTP/1.1 ALPN"),
+            (b"metadata.early_data != EarlyData::Disabled", b"false", "provider disables early data"),
+        ):
+            def read(root, name):
+                value = (root / name).read_bytes()
+                return value.replace(original, changed) if name == candidate_rust.NATIVE_TLS else value
+            with self.subTest(label=label), mock.patch.object(candidate_rust, "regular_file", side_effect=read), \
+                    self.assertRaisesRegex(ValueError, label):
+                candidate_rust.binding_sources(candidate.ROOT, candidate.load_record()["contract"])
 
 
 if __name__ == "__main__":
