@@ -62,6 +62,12 @@ fn host_memory() -> Arc<Semaphore> {
 /// maximum-sized runtime frames, terminal slots and carrier copies are reserved
 /// before M1/lookup, not misreported as an item-count byte cap. Application-owned
 /// handler/store/TLS allocations need independent bounded provider policies.
+///
+/// Shared across all candidate HTTP/HTTPS listeners in this process are caps of
+/// 128 associations, 32 association handshakes, 288 socket reservations (including
+/// pending accepts), and 32 concurrent TLS handshakes. Raising local quotas does
+/// not raise these caps; other listeners consume the same shared capacity.
+/// Aggregate byte reservations also share the [`MAX_HOST_BUFFER_BYTES`] cap.
 #[derive(Clone, Debug)]
 pub struct ServerLimits {
     pub associations: usize,
