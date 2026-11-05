@@ -4,8 +4,18 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
+repository.workspace = true
+documentation = "https://docs.rs/syntra-net"
+readme = "README.md"
+publish = ["crates-io"]
 description = "Syntra native networking, protected connections and managed client/server lifecycle"
+
+[package.metadata.docs.rs]
+# Document native APIs without changing consumer defaults. HTTP and cross-carrier
+# APIs remain explicitly labelled candidates in their module documentation.
+features = ["tcp", "websocket", "tls-rustls", "reconnect", "managed", "proxy", "native-enrollment", "http", "cross-carrier-candidate"]
+default-target = "x86_64-unknown-linux-gnu"
+targets = []
 
 [features]
 default = []

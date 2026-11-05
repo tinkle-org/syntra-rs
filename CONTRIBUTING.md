@@ -11,7 +11,7 @@ unless updating them is part of the change.
 Read [CONNECTION.md](CONNECTION.md) for Syntra 1.0 encryption and connection
 guidance. Keep pinned upstream inputs distinct from the candidate implementation
 and its verification; see [input provenance](#input-provenance-and-authority).
-The implementation remains experimental and unpublished; formal conformance has
+The implementation remains experimental despite RC publication; formal conformance has
 not been executed and independent security review remains outstanding.
 
 `syntra-net` has an empty default feature set: the native carrier-neutral
@@ -413,15 +413,28 @@ This is not a GitHub PAT. See the
 Prepublication package validation lists contents without generating archive
 lockfiles that would require the new dependency versions to exist on crates.io
 already. It does not prove packaged compilation. Release-plz keeps Cargo's
-publication verification enabled and publishes in dependency order: core,
-runtime, then FFI. `syntra-net` and `syntra-integration` remain unpublished.
+publication verification enabled and publishes in dependency order: core, then
+runtime, then its dependents net and FFI. Net and FFI do not depend on each other.
+Only `syntra-integration` remains non-publishable: it is a fixture peer and test suite,
+not a downstream library. The public set is derived from package metadata; no
+separate net publishing workflow or hard-coded package list is needed.
+
+Net's first registry publication must come from a new reviewed release PR that
+includes its publishable manifest and package documentation. Do not retry an
+older release commit where it was still marked `publish = false`, or move an
+existing core/runtime/FFI tag to include it. Release-plz can retain an unpublished
+crate's current RC version; inspect the generated shared-version and dependency
+diff rather than assuming every package needs another bump.
 
 `crates-io-publish` is the GitHub Actions environment used by the job,
 not a package registry or an alternative to the repository's Releases page.
 Configure its required reviewers and deployment branch restrictions in GitHub;
 the workflow's environment reference does not create those protections.
 The crates.io token must belong to an account authorized to publish these crates
-and permit publishing updates for core, runtime, and FFI. Restrict its crate scope
+and permit publishing updates for core, runtime, net, and FFI. The first net
+upload also requires permission to create the `syntra-net` crate (`publish-new`)
+and an available crate name; a token restricted to the three existing crates is
+not sufficient. Subsequent net uploads use `publish-update`. Restrict its crate scope
 and lifetime; rotate it before expiry. No OIDC permission or trusted-publisher
 configuration is required in this token-based workflow. Never log the token or
 put its value in a command, file, PR, or commit. See the

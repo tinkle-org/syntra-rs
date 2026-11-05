@@ -5,6 +5,7 @@ from pathlib import Path
 import runpy
 import subprocess
 import sys
+import tomllib
 import unittest
 from unittest import mock
 
@@ -244,6 +245,38 @@ class DependencyIsolationTests(unittest.TestCase):
 
 
 class PackagingTests(unittest.TestCase):
+    def test_real_workspace_publishes_libraries_but_not_integration_fixtures(self):
+        workspace = tomllib.loads((contracts.ROOT / "Cargo.toml").read_text())["workspace"]
+        packages = {}
+        for member in workspace["members"]:
+            manifest = tomllib.loads((contracts.ROOT / member / "Cargo.toml").read_text())
+            package = manifest["package"]
+            packages[package["name"]] = package
+        self.assertEqual({name for name, package in packages.items()
+                          if package.get("publish") not in (False, [])},
+                         {"syntra-core", "syntra-runtime", "syntra-net", "syntra-ffi"})
+        self.assertIs(packages["syntra-integration"]["publish"], False)
+        self.assertEqual(packages["syntra-net"]["publish"], ["crates-io"])
+
+    def test_network_package_documents_tcp_without_changing_consumer_defaults(self):
+        root = contracts.ROOT / "crates/syntra-net"
+        manifest = tomllib.loads((root / "Cargo.toml").read_text())
+        package = manifest["package"]
+        self.assertEqual(package["repository"], {"workspace": True})
+        self.assertEqual(package["documentation"], "https://docs.rs/syntra-net")
+        self.assertTrue((root / package["readme"]).is_file())
+        self.assertEqual((root / "LICENSE").read_bytes(), (contracts.ROOT / "LICENSE").read_bytes())
+        self.assertEqual(manifest["features"]["default"], [])
+        docs = package["metadata"]["docs"]["rs"]
+        self.assertIn("tcp", docs["features"])
+        self.assertEqual(docs["default-target"], "x86_64-unknown-linux-gnu")
+        self.assertEqual(docs["targets"], [])
+        dependencies = manifest["target"]["cfg(not(target_arch = \"wasm32\"))"]["dependencies"]
+        version = tomllib.loads((contracts.ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"]
+        for name in ("syntra-core", "syntra-runtime"):
+            self.assertEqual(dependencies[name]["version"], version)
+            self.assertEqual(dependencies[name]["path"], "../" + name)
+
     def test_selects_workspace_members_not_registry_dependencies(self):
         metadata = {"workspace_members": ["core"], "packages": [
             {"id": "core", "name": "syntra-core", "publish": None}, {"id": "dep", "name": "dep"}]}

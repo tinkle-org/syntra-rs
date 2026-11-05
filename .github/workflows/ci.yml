@@ -281,7 +281,7 @@ jobs:
           toolchain: "1.88.0"
       - name: Cargo package contents (non-publishing)
         # Metadata determines public members; publish=false test support stays
-        # excluded. --no-verify checks archives, not packaged compilation.
+        # excluded. --list checks contents, not archives or packaged compilation.
         run: python3 scripts/cargo_contracts.py package
       - name: Rustdoc (no deps, warnings informational)
         run: cargo doc --locked --workspace --no-deps

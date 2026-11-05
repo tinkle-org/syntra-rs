@@ -9,7 +9,8 @@ The `syntra_core::secure_channel` module owns cryptographic state, separate from
 runtime scheduling and socket policy. Encryption is integral to the protocol. See
 [CONNECTION.md](CONNECTION.md) for current architecture and embedding boundaries.
 
-The implementation is experimental and unpublished. No formal conformance,
+The implementation is experimental and distributed as release-candidate crates.
+No formal conformance,
 independent interoperability or independent
 security-review verdict is claimed. The current candidate is recorded in
 [`protocol-contract.json`](protocol-contract.json); it pins `committed-candidate`
@@ -33,6 +34,11 @@ security-patched toolchain. Current dependency pins are:
 
 Cargo package release configuration is in [release-plz.toml](release-plz.toml).
 Protocol specification releases and package releases are separate.
+The public package set is `syntra-core`, `syntra-runtime`, `syntra-net` and
+`syntra-ffi`; `syntra-integration` remains unpublished test infrastructure.
+Each package is released separately on crates.io, not as a workspace bundle.
+Enabling net publication here still requires a reviewed release PR and its first
+successful upload before downstream registry dependencies can resolve it.
 
 ## Default: native async workspace
 
@@ -62,6 +68,15 @@ a workspace run alone does not prove default feature isolation.
 | `syntra-net` | Native record driver, TCP/WebSocket I/O, trusted application TLS composition, optional rustls WSS, managed networking, explicit routes/proxies, candidate HTTP/HTTPS connections and enrollment reference |
 | `syntra-ffi` | Native C ABI with explicit production and test-fixture modes |
 | `syntra-integration` | Unpublished fixture peer and Docker carrier integration tests |
+
+For downstream native TCP use, depend on `syntra-net` with `default-features = false`
+and `features = ["tcp"]` when the application owns a Tokio runtime, or select
+`features = ["managed"]` for the library-owned runtime/reconnect lifecycle.
+See the [package README](crates/syntra-net/README.md) for the dependency declaration,
+first-publication status, security inputs and native/WASM boundaries. Pin compatible
+RC versions together when also using core/runtime types directly. Existing
+`syntra-ws` consumers must migrate their connection configuration and lifecycle;
+publishing a new crate does not change downstream dependencies automatically.
 
 Runtime byte channels exchange serialized `Frame` values inside the embedder.
 Supplied connection drivers compose them with encrypted record framing and
