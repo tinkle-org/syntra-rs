@@ -35,11 +35,22 @@ For a library-owned runtime and reconnect lifecycle, select `managed` instead;
 it includes `tcp` and `reconnect`. Do not add a second reconnect owner if the
 embedding application already supervises connections. The packaged
 [`managed_tcp` example](examples/managed_tcp.rs) demonstrates a loopback encrypted
-echo with explicit local provisioning:
+echo with explicit local provisioning. From the extracted `syntra-net` package
+directory (or `crates/syntra-net` in a source checkout), run:
 
 ```sh
 cargo run --no-default-features --features managed --example managed_tcp
 ```
+
+From the repository workspace root, select the package explicitly:
+
+```sh
+cargo run -p syntra-net --no-default-features --features managed --example managed_tcp
+```
+
+A downstream application cannot run this example through its `syntra-net`
+dependency. Obtain the package sources and run it there; adding a dependency
+does not make its example targets part of the application's package.
 
 These demo credentials and generated keys are not deployment configuration.
 Downstream migrations from the older `syntra-ws` package need explicit connection,

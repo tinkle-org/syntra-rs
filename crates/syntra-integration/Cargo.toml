@@ -22,7 +22,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
-testcontainers = { version = "0.28" }
 futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }

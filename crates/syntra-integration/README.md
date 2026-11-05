@@ -51,7 +51,10 @@ committed inputs; that pin does not turn fixture execution into formal conforman
 
 ## Running the fixture suite
 
-This is a separate test crate with a **running Docker daemon** requirement.
+This is a separate test crate requiring the **Docker CLI and a running local
+Docker daemon**. The harness invokes the CLI directly; it has no Testcontainers
+dependency. Remote Docker hosts are not supported: mapped ports are dialed on
+the local loopback interface.
 The root library retains its own toolchain and has no Testcontainers/Docker
 dependency. The fixture peer builds from the current worktree, including
 uncommitted production changes.
@@ -65,6 +68,9 @@ export RUSTUP_TOOLCHAIN=1.88.0
 cargo test -p syntra-integration --no-run
 cargo build -p syntra-integration --bin peer
 
+# Run port/readiness and injected CLI/cleanup regressions without Docker:
+cargo test --locked -p syntra-integration --test syntra_containers
+
 # Run the fixture suite (without the require variable, unavailable Docker skips):
 cargo test -p syntra-integration --test syntra_containers -- --ignored --nocapture
 
@@ -76,10 +82,32 @@ The optional-Docker path returns success after printing its skip message;
 a green Cargo result on that path is not proof that containers ran.
 
 The fixture image builds with the pinned `rust:1.88-bookworm` builder from
-the repository root context (`Dockerfile` is inline in the test via
-`GenericBuildableImage`), then reuses the built peer for TCP and WS groups.
+the repository root context using this crate's `Dockerfile`, then reuses the
+built peer for TCP and WS groups. The root `.dockerignore` whitelists only
+workspace manifests, the lockfile and crate Rust sources; `.git`, `target`,
+environment files and other local files are excluded from the context.
 Each test opens its own connections. Peers are torn down with the
-container. Mapped endpoints are rediscovered rather than assumed stable.
+container. The CLI creates a uniquely named container before starting it and
+publishes both ports dynamically on `127.0.0.1` only. Mapped endpoints are
+rediscovered rather than assumed stable. Both actual `peer tcp ready on ...`
+and `peer ws ready on ...` log lines are required before protocol checks.
+
+Docker commands have a 10-second budget (image build: 10 minutes); readiness
+has one 30-second budget. Timed-out CLI children are killed, with a bounded
+kill/reap wait. Cleanup ownership starts before `docker create`, including
+create/start errors and assertion panics. Successful tests await forced removal;
+on failure/unwind the guard collects the last 100 log lines and attempts forced
+removal on a separate, joined executor. Cleanup failures are reported with the
+container name, never silently treated as success. An unreachable daemon or
+external process termination can prevent cleanup; inspect/remove the reported
+container manually in that case. The generated private key is inherited by
+`docker create` through an environment-variable name, not placed in argv, and
+is redacted from diagnostics. As with other Docker environment provisioning,
+daemon administrators can inspect container configuration.
+
+Non-Docker regressions exercise strict loopback port parsing, both readiness
+markers and (on Unix) injected command failures, timeout, redaction, explicit
+removal and panic cleanup. They do not stand in for real Docker execution.
 
 ## Fixture targets
 

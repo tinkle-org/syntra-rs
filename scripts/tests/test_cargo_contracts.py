@@ -246,6 +246,7 @@ class DependencyIsolationTests(unittest.TestCase):
 
 class PackagingTests(unittest.TestCase):
     def test_real_workspace_publishes_libraries_but_not_integration_fixtures(self):
+        """Require four public library packages while keeping Docker fixtures private."""
         workspace = tomllib.loads((contracts.ROOT / "Cargo.toml").read_text())["workspace"]
         packages = {}
         for member in workspace["members"]:
@@ -259,6 +260,7 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(packages["syntra-net"]["publish"], ["crates-io"])
 
     def test_network_package_documents_tcp_without_changing_consumer_defaults(self):
+        """Check net's distribution metadata, native docs, and aligned dependency versions."""
         root = contracts.ROOT / "crates/syntra-net"
         manifest = tomllib.loads((root / "Cargo.toml").read_text())
         package = manifest["package"]
