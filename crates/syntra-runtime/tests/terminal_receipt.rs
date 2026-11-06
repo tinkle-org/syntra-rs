@@ -8,6 +8,7 @@ use syntra_runtime::{
     RequestContext, StaticToken,
 };
 
+/// Count context-hook admission after confirming unsupported-driver refusal.
 struct Retire(Arc<AtomicUsize>);
 impl Handler for Retire {
     fn handle(&self, _: String, _: Vec<u8>, _: CancelToken) -> HandlerFut {
@@ -31,6 +32,7 @@ impl Handler for Retire {
     }
 }
 
+/// AllowAll forwards the actual context; a raw loopback driver cannot retire.
 #[tokio::test]
 async fn raw_driver_refuses_and_allow_all_forwards_context() {
     let effects = Arc::new(AtomicUsize::new(0));

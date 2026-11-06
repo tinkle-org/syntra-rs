@@ -850,6 +850,7 @@ impl Connection {
         self.shared.writer_fenced.load(Ordering::Acquire)
     }
 
+    /// Whether a terminal reservation has stopped new ordinary outbound admission.
     pub(crate) fn terminal_fenced(&self) -> bool {
         self.shared.terminal_fenced.load(Ordering::Acquire)
     }

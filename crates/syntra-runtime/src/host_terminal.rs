@@ -67,7 +67,9 @@ pub trait Authority: Send + Sync {
     /// Future construction/polls must be nonblocking. Independently spawned
     /// storage work remains the adapter's accounted-for cleanup responsibility.
     fn observe(&self, transition: Option<Transition>) -> BoxFuture<'_, Observation>;
-    /// Conditionally commit expected revision plus private owner atomically.
+    /// Own the application mutation: conditionally commit expected revision,
+    /// withdrawal, private owner, and every fixed-receipt condition in the same
+    /// transaction. The handler must not mutate after awaiting `retire`.
     /// Return carries no proof; errors/uncertainty must be observable as Unknown.
     fn commit(&self, transition: Transition, lease: ExecutionLease) -> BoxFuture<'_, ()>;
 }
@@ -82,7 +84,9 @@ pub struct Policy {
     /// Adapter bound to this verified connection's scope/enrollment authority.
     pub authority: Arc<dyn Authority>,
     /// Maximum time for each authoritative read and its start-based freshness
-    /// bound, 1..=250 ms. Idle refresh runs at half this bound.
+    /// bound, 100..=250 ms. Idle refresh runs at half this bound. The 100 ms
+    /// minimum leaves a 50 ms renewal margin for coarse timers and scheduling;
+    /// it is not a scheduling guarantee or permission to use expired evidence.
     /// Reads must finish before both prior freshness and the operation cutoff.
     pub read_timeout: Duration,
 }
@@ -109,6 +113,7 @@ pub struct RequestContext {
     lease: Option<ExecutionLease>,
 }
 impl RequestContext {
+    /// Bind an admitted call to its host, method, and original deadline.
     pub(super) fn new(
         host: Weak<Host>,
         id: u64,
@@ -125,15 +130,19 @@ impl RequestContext {
             lease: None,
         }
     }
+    /// Keep actual application execution accounted for while the context survives.
     pub(super) fn with_lease(mut self, lease: ExecutionLease) -> Self {
         self.lease = Some(lease);
         self
     }
 
-    /// Fence/quiesce, conditionally transition, and return the fixed handler
-    /// outcome. Return this outcome promptly: this does not await its own output.
+    /// Fence/quiesce, invoke `Authority::commit` for the application transaction,
+    /// verify its owned evidence, and return the fixed handler outcome AFTER
+    /// commit. Return it promptly without further mutation or waiting for output.
     /// A retained SDK owner closes on loss/deadline even if this waiter is dropped.
     /// Expected revision zero or u64::MAX is refused before mutation or fencing.
+    /// Before reservation, a valid connection can carry a normal refusal result.
+    /// After reservation, failure keeps ordinary output fenced and closes instead.
     pub async fn retire(&self, expected_revision: u64) -> Result<HandlerOutcome, Refused> {
         let host = self.host.upgrade().ok_or(Refused::Unavailable)?;
         let coordinator = host
@@ -212,6 +221,7 @@ impl RequestContext {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+/// Sticky local lifecycle; only exact owned evidence advances receipt eligibility.
 enum Phase {
     Active,
     Reserved,
@@ -221,6 +231,7 @@ enum Phase {
     Finished,
     Aborted,
 }
+/// One reservation's immutable identity/output and start-based authority deadline.
 struct State {
     phase: Phase,
     claim: Option<Transition>,
@@ -270,6 +281,7 @@ pub struct Coordinator {
     io_gate: Mutex<()>,
 }
 impl Coordinator {
+    /// Any reservation or terminal state suppresses unstarted ordinary output.
     pub(super) fn fenced(&self) -> bool {
         self.state.lock().unwrap().phase != Phase::Active
     }
@@ -353,6 +365,7 @@ impl Coordinator {
         drop(s);
         Some(poll())
     }
+    /// Check local freshness and cutoff without I/O or renewal; exact ties deny.
     fn valid(&self, s: &State) -> bool {
         self.clock.is_continuous()
             && !matches!(s.phase, Phase::Aborted | Phase::Finished)
@@ -366,6 +379,7 @@ impl Coordinator {
         self.changed.notify_waiters();
     }
 
+    /// Validate and pre-encode once, then install a fresh private operation owner.
     fn reserve(
         &self,
         id: u64,
@@ -522,6 +536,7 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Cross the whole-frame barrier, retain commit work, and verify owned proof.
     async fn perform(
         &self,
         lease: ExecutionLease,
@@ -574,6 +589,7 @@ impl Coordinator {
             }
         }
     }
+    /// Mirror first-terminal selection; mismatched or failed outcomes abort.
     pub(super) fn select(&self, id: u64, outcome: &HandlerOutcome) {
         let mut s = self.state.lock().unwrap();
         if s.phase == Phase::Active || s.id != id {
@@ -589,6 +605,7 @@ impl Coordinator {
             self.changed.notify_waiters();
         }
     }
+    /// Transfer only the exact selected frame and its charge to the sole writer.
     pub(super) fn emit(&self, id: u64, bytes: Vec<u8>, charge: execution::BudgetPermit) {
         let s = self.state.lock().unwrap();
         if s.id != id {
@@ -640,6 +657,7 @@ impl Coordinator {
         self.state.lock().unwrap().phase = Phase::Finished;
         self.changed.notify_waiters();
     }
+    /// Retain cleanup ownership until completion, sticky denial, or original cutoff.
     async fn wait_end(&self) {
         loop {
             let changed = self.changed.notified();
@@ -667,7 +685,7 @@ impl Host {
     #[doc(hidden)]
     pub fn install_terminal_tcp(&self, policy: Policy) -> Result<Arc<Coordinator>, Refused> {
         if cfg!(target_arch = "wasm32")
-            || policy.read_timeout < Duration::from_millis(1)
+            || policy.read_timeout < Duration::from_millis(100)
             || policy.read_timeout > Duration::from_millis(250)
             || syntra_core::validate_method(&policy.method).is_err()
             || policy.payload.len() > 1024
@@ -718,6 +736,29 @@ impl Host {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    /// Reject impractical timer budgets before publishing a coordinator or authority read.
+    #[tokio::test(start_paused = true)]
+    async fn policy_requires_timer_and_scheduler_margin() {
+        for millis in [0, 1, 20, 50, 99, 100, 250, 251] {
+            let (host, _) = Host::new(
+                ConnectionConfig::default(),
+                Arc::new(crate::AllowAnonymous),
+                Arc::new(super::super::FnHandler(|_, p, _| async {
+                    HandlerOutcome::Payload(p)
+                })),
+            );
+            let result = host.install_terminal_tcp(Policy {
+                method: "/example.Authority/Retire".into(),
+                payload: b"retired".to_vec(),
+                authority: Arc::new(Fixture(Mutex::new(0))),
+                read_timeout: Duration::from_millis(millis),
+            });
+            assert_eq!(result.is_ok(), (100..=250).contains(&millis), "{millis} ms");
+            assert_eq!(host.terminal_coordinator().is_some(), result.is_ok());
+            host.close().await;
+        }
+    }
+    /// Select active, owned, denied, unknown, or changed-revision evidence in memory.
     struct Fixture(Mutex<usize>);
     impl Authority for Fixture {
         fn observe(&self, claim: Option<Transition>) -> BoxFuture<'_, Observation> {
@@ -747,6 +788,7 @@ mod tests {
             Box::pin(async {})
         }
     }
+    /// Install a fresh coordinator without enabling an unsupported wire driver.
     async fn coordinator() -> (Arc<Host>, Arc<Coordinator>, Arc<Fixture>) {
         let (host, _rx) = Host::new(
             ConnectionConfig::default(),
@@ -767,6 +809,7 @@ mod tests {
         c.refresh().await.unwrap();
         (host, c, authority)
     }
+    /// Reserve the fixture's fixed call with a deadline in the coordinator's domain.
     fn reserve(c: &Coordinator, seconds: u64) -> Result<(), Refused> {
         c.reserve(
             123,
@@ -776,6 +819,7 @@ mod tests {
             Principal::new("fixture"),
         )
     }
+    /// Reservation and teardown share the original non-renewable five-second cap.
     #[tokio::test(start_paused = true)]
     async fn original_five_second_budget_and_teardown_tail_cannot_renew() {
         let (host, c, _) = coordinator().await;
@@ -788,6 +832,7 @@ mod tests {
         assert!(!c.raw_allowed());
         host.close().await;
     }
+    /// A short RPC deadline either refuses preflight or wins over the global cap.
     #[tokio::test(start_paused = true)]
     async fn request_deadline_wins_and_short_budget_refuses_preflight() {
         let (host, c, _) = coordinator().await;
@@ -808,6 +853,7 @@ mod tests {
         assert_eq!(c.cutoff(), Some(start + Duration::from_millis(750)));
         host.close().await;
     }
+    /// Equal public request IDs on different hosts never share an operation owner.
     #[tokio::test]
     async fn owned_evidence_is_exact_private_reservation_not_public_request_id() {
         let (h1, c1, a1) = coordinator().await;
@@ -826,6 +872,7 @@ mod tests {
         h1.close().await;
         h2.close().await;
     }
+    /// Later owned proof cannot clear denial, uncertainty, or clock discontinuity.
     #[tokio::test]
     async fn hard_denial_unknown_and_clock_loss_are_sticky() {
         for failure in [2, 3, 4] {
@@ -843,6 +890,7 @@ mod tests {
             host.close().await;
         }
     }
+    /// Cancellation selection wins over a later successful commit observation.
     #[tokio::test]
     async fn cancelled_selection_is_not_replaced_by_late_commit() {
         let (host, c, a) = coordinator().await;
@@ -857,6 +905,7 @@ mod tests {
         assert!(!c.raw_allowed());
         host.close().await;
     }
+    /// Only one exact frame can consume a grant, retaining its output charge.
     #[tokio::test]
     async fn typed_output_is_single_use_and_wrong_bytes_never_consume() {
         let (host, c, a) = coordinator().await;
@@ -891,6 +940,7 @@ mod tests {
         assert_eq!(c.consume(&wrong), Err(Refused::Unavailable));
         host.close().await;
     }
+    /// Published denial prevents the very first carrier poll after success selection.
     #[tokio::test]
     async fn fresh_denial_after_selection_wins_before_first_raw_poll() {
         let (host, c, a) = coordinator().await;
@@ -915,6 +965,7 @@ mod tests {
         host.close().await;
     }
 
+    /// Late wire cancellation preserves selection, but explicit close still denies I/O.
     #[tokio::test]
     async fn late_wire_cancel_and_internal_selection_token_do_not_abort_selected_receipt() {
         let (host, c, a) = coordinator().await;
@@ -950,6 +1001,7 @@ mod tests {
         );
     }
 
+    /// Identical result bytes do not transfer a grant between connection generations.
     #[tokio::test]
     async fn another_generation_cannot_consume_same_public_result_bytes() {
         let (h1, c1, a1) = coordinator().await;
@@ -975,6 +1027,7 @@ mod tests {
         h2.close().await;
     }
 
+    /// Exact freshness expiry is sticky even without an intervening I/O poll.
     #[tokio::test(start_paused = true)]
     async fn missed_authority_freshness_is_sticky_even_before_any_io_poll() {
         let (host, c, a) = coordinator().await;
@@ -999,6 +1052,7 @@ mod tests {
         }
     }
 
+    /// Strictly newer, non-adjacent owned revisions permit one immutable receipt.
     #[tokio::test(start_paused = true)]
     async fn owned_revision_jump_7_to_11_allows_one_successful_receipt() {
         let (host, c, authority) = coordinator().await;
@@ -1024,6 +1078,7 @@ mod tests {
         host.close().await;
     }
 
+    /// Any change to the first owned revision aborts across all output phases.
     #[tokio::test(start_paused = true)]
     async fn owned_revision_change_11_to_12_same_owner_aborts_stickily_in_every_phase() {
         for phase in [Phase::Committed, Phase::Selected, Phase::Consumed] {
@@ -1063,6 +1118,7 @@ mod tests {
         }
     }
 
+    /// Owned evidence must advance beyond the conditionally replaced active revision.
     #[tokio::test(start_paused = true)]
     async fn owned_revision_equal_or_lower_than_expected_is_rejected() {
         for mode in [7, 8] {
@@ -1191,16 +1247,19 @@ mod tests {
         host.close().await;
     }
 
+    /// Zero expected revision refuses before fencing or invoking commit.
     #[tokio::test(start_paused = true)]
     async fn expected_revision_zero_preflight_rejects_without_authority_commit() {
         invalid_expected_revision_preflight(0).await;
     }
 
+    /// Exhausted expected revision refuses before fencing or invoking commit.
     #[tokio::test(start_paused = true)]
     async fn expected_revision_max_preflight_rejects_without_authority_commit() {
         invalid_expected_revision_preflight(u64::MAX).await;
     }
 
+    /// Expired ordinary output fails before encryption can consume a nonce.
     #[tokio::test(start_paused = true)]
     async fn invalid_active_ordinary_start_aborts_without_consuming_a_nonce() {
         let (host, c, _) = coordinator().await;
@@ -1216,6 +1275,7 @@ mod tests {
         host.close().await;
     }
 
+    /// A valid reservation suppresses ordinary starts without poisoning its own grant.
     #[tokio::test(start_paused = true)]
     async fn valid_fenced_ordinary_start_does_not_consume_a_nonce_or_abort() {
         let (host, c, _) = coordinator().await;
@@ -1252,6 +1312,7 @@ mod tests {
             panic!("refresh tests never commit")
         }
     }
+    /// Initialize one successful read before independently controlling queued reads.
     async fn queued_coordinator() -> (Arc<Host>, Arc<Coordinator>, Arc<QueuedAuthority>) {
         let (host, _) = Host::new(
             ConnectionConfig::default(),
@@ -1277,6 +1338,7 @@ mod tests {
         (host, c, authority)
     }
 
+    /// Queue wait never substitutes for the actual serialized observation start.
     #[tokio::test(start_paused = true)]
     async fn queued_refresh_uses_current_freshness_and_its_actual_read_start() {
         let (host, c, authority) = queued_coordinator().await;
@@ -1308,6 +1370,7 @@ mod tests {
         host.close().await;
     }
 
+    /// Expiry during serialization wait prevents even constructing a fresh read.
     #[tokio::test(start_paused = true)]
     async fn queued_refresh_rechecks_expiry_before_constructing_an_authority_read() {
         let (host, c, authority) = queued_coordinator().await;
@@ -1323,6 +1386,7 @@ mod tests {
         host.close().await;
     }
 
+    /// Completion at the exact current freshness deadline cannot renew evidence.
     #[tokio::test(start_paused = true)]
     async fn queued_refresh_cannot_renew_at_current_freshness_deadline() {
         let (host, c, authority) = queued_coordinator().await;
@@ -1346,6 +1410,7 @@ mod tests {
         host.close().await;
     }
 
+    /// A queued observer cannot overtake denial or construct a replacement read.
     #[tokio::test(start_paused = true)]
     async fn denial_before_queued_acquisition_cannot_start_a_read_or_renew() {
         let (host, c, authority) = queued_coordinator().await;
@@ -1369,6 +1434,7 @@ mod tests {
         host.close().await;
     }
 
+    /// Both initial queue wait and late observation remain bounded and fail sticky.
     #[tokio::test(start_paused = true)]
     async fn queued_refresh_preserves_initial_wait_bound_and_late_success_is_sticky() {
         let (host, c, authority) = queued_coordinator().await;

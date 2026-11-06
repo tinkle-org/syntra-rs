@@ -259,6 +259,7 @@ async fn closed(host: &Host) {
     .unwrap();
 }
 
+/// The actual recovery attachment closes before the conditional terminal transition.
 #[tokio::test]
 async fn terminal_reservation_retires_actual_recovery_attachment_before_transition() {
     use crate::terminal::{
@@ -512,11 +513,13 @@ async fn reservation_dispatch_linearization(profile: bool) {
     host.close().await;
 }
 
+/// Reservation cannot cross the worker's final check/application-hook construction gap.
 #[tokio::test]
 async fn terminal_fence_waits_for_application_hook_construction() {
     reservation_dispatch_linearization(false).await;
 }
 
+/// Reservation waits for an already-checked prepared recovery dispatch to complete.
 #[tokio::test]
 async fn terminal_fence_waits_for_prepared_recovery_dispatch() {
     reservation_dispatch_linearization(true).await;

@@ -368,9 +368,12 @@ they do not select a different encryption protocol.
 Native TCP supports a default-disabled terminal result for an authorized
 self-withdrawing operation. `AuthenticatorFactory::terminal_receipt(identity)`
 supplies a per-verified-binding fixed policy and complete typed authority adapter.
-`Handler::handle_with_context` calls `context.retire(expected_revision).await`
-before mutation and returns its `HandlerOutcome` promptly; it must not wait for
-its own output. A selected outcome, complete local writing, peer observation,
+`Handler::handle_with_context` calls `context.retire(expected_revision).await`.
+`Authority::commit` owns the conditional application mutation, withdrawal, private
+owner, and every receipt condition in the same transaction. On success, `retire`
+verifies owned evidence and returns AFTER commit; the handler returns that
+`HandlerOutcome` promptly, without further mutation or waiting for its own output.
+A selected outcome, complete local writing, peer observation,
 and joined cleanup are different facts. Loss is unknown and never automatically
 retried or replayed.
 

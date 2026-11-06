@@ -900,6 +900,7 @@ async fn authorized_io<T>(
     authorized_io_inner(io, clock, deadline, peer, authorization, None).await
 }
 
+/// Gate each raw poll; an optional receipt consumes its exact grant only once.
 async fn authorized_io_inner<T>(
     io: impl Future<Output = Result<T, Error>>,
     clock: &ElapsedClock,
@@ -1504,6 +1505,7 @@ struct ReaderTask {
     terminal: TransportTerminal,
 }
 
+/// Run authenticated input and publish fatal receipt denial before returning to its owner.
 async fn run_reader<R: RecordReader>(
     reader: R,
     state: ReaderTask,

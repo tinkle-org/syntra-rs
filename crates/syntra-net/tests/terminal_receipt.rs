@@ -24,12 +24,14 @@ struct EventTrace {
     events: Mutex<Vec<(Duration, &'static str, usize)>>,
 }
 impl EventTrace {
+    /// Start bounded diagnostics in a separate real-time domain.
     fn new() -> Self {
         Self {
             started: std::time::Instant::now(),
             events: Mutex::new(Vec::new()),
         }
     }
+    /// Retain at most 256 observations, including actual raw-byte handoffs.
     fn record(&self, event: &'static str, count: usize) {
         let mut events = self.events.lock().unwrap();
         if events.len() < 256 {
@@ -37,9 +39,11 @@ impl EventTrace {
         }
     }
 }
+/// Linearizable in-memory authority with explicit commit-return and denial controls.
 struct AuthorityFixture {
     state: Mutex<(u64, Option<Transition>, bool)>,
     commits: AtomicUsize,
+    reads: AtomicUsize,
     mode: AtomicUsize,
     committed: Notify,
     reserved: Notify,
@@ -47,10 +51,12 @@ struct AuthorityFixture {
     trace: Arc<EventTrace>,
 }
 impl AuthorityFixture {
+    /// Select one evidence/failure mode for a new active binding.
     fn new(mode: usize) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new((1, None, false)),
             commits: AtomicUsize::new(0),
+            reads: AtomicUsize::new(0),
             mode: AtomicUsize::new(mode),
             committed: Notify::new(),
             reserved: Notify::new(),
@@ -63,6 +69,7 @@ impl Authority for AuthorityFixture {
     fn observe(&self, transition: Option<Transition>) -> BoxFuture<'_, Observation> {
         Box::pin(async move {
             let s = self.state.lock().unwrap();
+            self.reads.fetch_add(1, Ordering::SeqCst);
             self.trace.record(
                 if s.1.is_some() {
                     "observe.owner-record"
@@ -120,6 +127,7 @@ impl Authority for AuthorityFixture {
         })
     }
 }
+/// Supply typed policy and optionally the test's driven elapsed domain.
 struct Factory {
     authority: Arc<AuthorityFixture>,
     payload: Vec<u8>,
@@ -148,6 +156,7 @@ impl AuthenticatorFactory for Factory {
         })
     }
 }
+/// Retire only the configured method; sibling methods exercise ordinary output.
 struct Retire;
 impl Handler for Retire {
     fn handle(&self, _: String, p: Vec<u8>, _: CancelToken) -> HandlerFut {
@@ -177,6 +186,7 @@ impl Handler for Retire {
         })
     }
 }
+/// Build fresh encrypted TCP provisioning; application credentials bind the principal.
 fn configs() -> (ClientConfig, ServerConfig) {
     let (private_key, public) = generate_server_key().unwrap();
     let context = Context {
@@ -203,6 +213,7 @@ fn configs() -> (ClientConfig, ServerConfig) {
         },
     )
 }
+/// Establish real TCP peers with native elapsed clocks and a 100 ms read bound.
 async fn pair(
     authority: Arc<AuthorityFixture>,
     payload: Vec<u8>,
@@ -238,6 +249,7 @@ async fn pair(
     .unwrap();
     (client, accept.await.unwrap().unwrap())
 }
+/// Bound the wait for observable host retirement separately from joined cleanup.
 async fn closed(host: &tcp::HostHandle) {
     tokio::time::timeout(Duration::from_secs(2), async {
         while !host.is_closed() {
@@ -247,6 +259,7 @@ async fn closed(host: &tcp::HostHandle) {
     .await
     .unwrap();
 }
+/// One owned commit emits exact bytes and makes this connection unusable afterward.
 #[tokio::test]
 async fn encrypted_tcp_exact_receipt_and_retirement() {
     let authority = AuthorityFixture::new(0);
@@ -261,6 +274,7 @@ async fn encrypted_tcp_exact_receipt_and_retirement() {
     client.close().await;
     host.close().await;
 }
+/// Default-disabled retirement leaves ordinary RPCs available and commits nothing.
 #[tokio::test]
 async fn disabled_never_mutates_and_connection_remains_ordinary() {
     let authority = AuthorityFixture::new(0);
@@ -278,6 +292,7 @@ async fn disabled_never_mutates_and_connection_remains_ordinary() {
     client.close().await;
     host.close().await;
 }
+/// Denial, uncertainty, stale-active evidence, and mismatched ownership suppress success.
 #[tokio::test]
 async fn authoritative_external_unknown_stale_wrong_owner_never_emit_success() {
     for mode in 1..=4 {
@@ -293,6 +308,7 @@ async fn authoritative_external_unknown_stale_wrong_owner_never_emit_success() {
         host.close().await;
     }
 }
+/// Owned evidence bridges callback delay without restoring ordinary output permission.
 #[tokio::test]
 async fn commit_before_callback_return_is_observed_but_not_sent_early() {
     let authority = AuthorityFixture::new(5);
@@ -310,6 +326,7 @@ async fn commit_before_callback_return_is_observed_but_not_sent_early() {
     client.close().await;
     host.close().await;
 }
+/// Deadline closes reporting while the retained commit task still holds its lease.
 #[tokio::test]
 async fn surviving_authority_work_keeps_execution_charge_after_deadline() {
     let authority = AuthorityFixture::new(5);
@@ -336,6 +353,7 @@ async fn surviving_authority_work_keeps_execution_charge_after_deadline() {
     host.close().await;
 }
 
+/// The size ceiling counts the complete serialized result frame, not just its payload.
 #[tokio::test]
 async fn complete_frame_limit_is_1024_not_payload_limit() {
     use prost::Message;
@@ -372,6 +390,7 @@ async fn complete_frame_limit_is_1024_not_payload_limit() {
     }
 }
 
+/// Wire cancellation before selection aborts despite a visible durable owner.
 #[tokio::test]
 async fn cancellation_before_selection_aborts_even_when_commit_is_visible() {
     let authority = AuthorityFixture::new(5);
@@ -387,6 +406,7 @@ async fn cancellation_before_selection_aborts_even_when_commit_is_visible() {
     host.close().await;
 }
 
+/// A superseding denial during the commit-return gap wins over owned evidence.
 #[tokio::test]
 async fn superseding_denial_in_commit_return_gap_wins() {
     let authority = AuthorityFixture::new(5);
@@ -409,6 +429,7 @@ struct Controlled<S> {
     gate: Arc<Gate>,
 }
 #[derive(Default)]
+/// Bound raw write progress without suspending the reader or authority watchdog.
 struct Gate {
     state: Mutex<Option<usize>>,
     waker: futures_util::task::AtomicWaker,
@@ -416,15 +437,18 @@ struct Gate {
     trace: Mutex<Option<Arc<EventTrace>>>,
 }
 impl Gate {
+    /// Forward optional diagnostics without influencing protocol time.
     fn record(&self, event: &'static str, count: usize) {
         if let Some(trace) = self.trace.lock().unwrap().as_ref() {
             trace.record(event, count);
         }
     }
+    /// Permit exactly this many raw bytes before returning Pending.
     fn pause_after(&self, n: usize) {
         self.record("gate.arm", n);
         *self.state.lock().unwrap() = Some(n);
     }
+    /// Restore raw writability and wake the same retained I/O future.
     fn release(&self) {
         self.record("gate.release", 0);
         *self.state.lock().unwrap() = None;
@@ -477,6 +501,7 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Controlled<S> {
         std::pin::Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
     }
 }
+/// Use a controlled real TCP writer with the normal native elapsed source.
 async fn controlled_pair(
     authority: Arc<AuthorityFixture>,
     gate: Arc<Gate>,
@@ -553,6 +578,7 @@ struct ManualTime {
     awake: Option<tokio::task::JoinHandle<()>>,
 }
 impl ManualTime {
+    /// Prevent idle Tokio auto-advance while the test drives real sockets.
     fn new() -> Self {
         Self {
             clock: ElapsedClock::lifecycle_driven(),
@@ -563,6 +589,7 @@ impl ManualTime {
             })),
         }
     }
+    /// Cancel and join the ready task before leaving the test runtime.
     async fn finish(mut self) {
         let awake = self.awake.take().unwrap();
         awake.abort();
@@ -577,6 +604,74 @@ impl Drop for ManualTime {
     }
 }
 
+/// Prompt authority survives six idle refreshes with a simulated 15 ms wakeup
+/// delay at the minimum policy bound, but a full missed freshness window still fences.
+#[tokio::test(start_paused = true)]
+async fn idle_minimum_bound_refreshes_with_timer_margin_then_expires_exactly() {
+    let time = ManualTime::new();
+    let authority = AuthorityFixture::new(0);
+    let (client, host) = controlled_pair_with_clock(
+        authority.clone(),
+        Arc::new(Gate::default()),
+        Some(time.clock.clone()),
+    )
+    .await;
+    let coordinator = host.host.terminal_coordinator().unwrap();
+    assert_eq!(coordinator.read_timeout(), Duration::from_millis(100));
+    // Settle the owner's initial watchdog read at t=0.
+    tokio::task::yield_now().await;
+    for _ in 0..6 {
+        let before = authority.reads.load(Ordering::SeqCst);
+        tokio::time::advance(Duration::from_millis(65)).await;
+        let wall_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while authority.reads.load(Ordering::SeqCst) == before && !host.is_closed() {
+            assert!(
+                std::time::Instant::now() < wall_deadline,
+                "watchdog did not refresh"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(!host.is_closed());
+        assert!(coordinator.raw_allowed());
+        assert!(authority.reads.load(Ordering::SeqCst) > before);
+    }
+    tokio::time::advance(Duration::from_millis(100)).await;
+    assert!(
+        !coordinator.raw_allowed(),
+        "exact freshness tie fails closed"
+    );
+    assert!(
+        coordinator.refresh().await.is_err(),
+        "prompt late evidence cannot revive authority"
+    );
+    assert_eq!(authority.commits.load(Ordering::SeqCst), 0);
+    client.close().await;
+    host.close().await;
+    time.finish().await;
+}
+
+/// Native elapsed time and real idle TCP stay live across several minimum-bound
+/// refresh intervals; no incoming RPC is needed to keep prompt authority fresh.
+#[tokio::test]
+async fn real_idle_minimum_bound_refreshes_before_retirement() {
+    let authority = AuthorityFixture::new(0);
+    let (client, host) = pair(authority.clone(), b"retired".to_vec(), true).await;
+    let before = authority.reads.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert!(!host.is_closed());
+    assert!(authority.reads.load(Ordering::SeqCst) >= before + 5);
+    assert_eq!(authority.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        client.conn.call(METHOD, vec![], 2000).await.unwrap(),
+        b"retired"
+    );
+    closed(&host).await;
+    assert_eq!(authority.commits.load(Ordering::SeqCst), 1);
+    client.close().await;
+    host.close().await;
+}
+
+/// A full multi-record ordinary frame finishes before commit; queued output is dropped.
 #[tokio::test(start_paused = true)]
 async fn partial_ordinary_frame_finishes_before_commit_and_queued_notifications_drop() {
     let time = ManualTime::new();
@@ -652,6 +747,7 @@ async fn partial_ordinary_frame_finishes_before_commit_and_queued_notifications_
     time.finish().await;
 }
 
+/// Exact whole-frame write expiry aborts without commit even with fresh authority.
 #[tokio::test(start_paused = true)]
 async fn partial_ordinary_frame_exact_write_cutoff_aborts_before_commit_with_fresh_authority() {
     let time = ManualTime::new();
@@ -697,6 +793,7 @@ async fn partial_ordinary_frame_exact_write_cutoff_aborts_before_commit_with_fre
     time.finish().await;
 }
 
+/// Stalled ordinary ciphertext cannot be spliced with a terminal result or trigger commit.
 #[tokio::test]
 async fn stalled_partial_frame_aborts_without_mutation_or_receipt_splice() {
     let authority = AuthorityFixture::new(0);
@@ -718,6 +815,7 @@ async fn stalled_partial_frame_aborts_without_mutation_or_receipt_splice() {
     host.close().await;
 }
 
+/// External denial blocks the remainder of a partially handed-off receipt.
 #[tokio::test]
 async fn partial_receipt_is_not_reencrypted_and_external_denial_aborts_remainder() {
     let authority = AuthorityFixture::new(0);
@@ -736,6 +834,7 @@ async fn partial_receipt_is_not_reencrypted_and_external_denial_aborts_remainder
     host.close().await;
 }
 
+/// Temporary backpressure resumes the same ciphertext sequence exactly once.
 #[tokio::test]
 async fn partial_receipt_completes_same_encrypted_stream_after_backpressure() {
     let authority = AuthorityFixture::new(0);
@@ -753,6 +852,7 @@ async fn partial_receipt_completes_same_encrypted_stream_after_backpressure() {
     host.close().await;
 }
 
+/// Custom record adapters refuse terminal policy before any handler effects.
 #[tokio::test]
 async fn custom_record_driver_refuses_policy_before_handler_effects() {
     let authority = AuthorityFixture::new(0);
@@ -793,6 +893,7 @@ async fn custom_record_driver_refuses_policy_before_handler_effects() {
     assert_eq!(authority.commits.load(Ordering::SeqCst), 0);
 }
 
+/// Handle loss and write stall both retire without reconnecting or replaying mutation.
 #[tokio::test]
 async fn dropped_handle_and_stalled_receipt_retire_without_replay() {
     for drop_handle in [false, true] {
@@ -819,6 +920,7 @@ async fn dropped_handle_and_stalled_receipt_retire_without_replay() {
     }
 }
 
+/// Completed sibling work cannot escape the fence while own commit waits to return.
 #[tokio::test]
 async fn sibling_completion_during_owned_commit_gap_has_no_delivery_permission() {
     let authority = AuthorityFixture::new(5);
@@ -844,6 +946,7 @@ async fn sibling_completion_during_owned_commit_gap_has_no_delivery_permission()
     host.close().await;
 }
 
+/// A changed active revision prevents conditional mutation after reservation.
 #[tokio::test]
 async fn expected_revision_mismatch_aborts_before_conditional_mutation() {
     let authority = AuthorityFixture::new(0);

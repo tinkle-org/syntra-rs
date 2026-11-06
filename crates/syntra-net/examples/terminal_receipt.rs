@@ -9,8 +9,12 @@ mod fixture {
     };
     use syntra_core::secure_channel::*;
     use syntra_core::{ErrorCode, SyntraError};
-    use syntra_net::{pump::AuthenticatorFactory, tcp};
+    use syntra_net::{
+        pump::{AuthenticatorFactory, RecordReader},
+        tcp,
+    };
     use syntra_runtime::{terminal::*, *};
+    use tokio::io::AsyncReadExt;
 
     const METHOD: &str = "/example.Authority/Retire";
     const PRIVATE: &str = "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a";
@@ -25,29 +29,29 @@ mod fixture {
         committing: bool,
         gap_seen: bool,
     }
+    /// Read-only key lookup plus separately recorded authority/fixture evidence.
     struct Store {
         state: Mutex<State>,
         scenario: String,
         gap_observed: tokio::sync::Notify,
     }
     impl KeyStore for Store {
+        /// Validate the exact requested handle/epoch and read its active key, without evidence effects.
         fn lookup(
             &self,
             context: &Context,
         ) -> Result<Secret32, syntra_core::secure_channel::Error> {
-            let mut state = self.state.lock().unwrap();
-            if state.transition.is_some() {
-                state.denials += 1;
-                println!("{{\"event\":\"fresh_denied\",\"before_handler\":true}}");
+            if context.handle != [7; 8] || context.epoch != 2 {
                 return Err(syntra_core::secure_channel::Error::Authentication);
             }
-            if context.handle != [7; 8] || context.epoch != 2 {
+            if self.state.lock().unwrap().transition.is_some() {
                 return Err(syntra_core::secure_channel::Error::Authentication);
             }
             Ok(Secret32::new([8; 32]))
         }
     }
     impl Authority for Store {
+        /// Report current typed authority, including recorded-owner visibility during callback delay.
         fn observe(&self, _: Option<Transition>) -> BoxFuture<'_, Observation> {
             Box::pin(async {
                 let mut state = self.state.lock().unwrap();
@@ -78,6 +82,7 @@ mod fixture {
                 }
             })
         }
+        /// Atomically record the in-memory withdrawal/owner before any optional gap await.
         fn commit(&self, claim: Transition, _lease: ExecutionLease) -> BoxFuture<'_, ()> {
             Box::pin(async move {
                 {
@@ -98,6 +103,7 @@ mod fixture {
             })
         }
     }
+    /// Bind authentication and terminal policy to the fixture's verified connection.
     struct Factory(Arc<Store>);
     impl AuthenticatorFactory for Factory {
         fn create(&self, identity: &VerifiedIdentity) -> Result<Arc<dyn Authenticator>, AuthError> {
@@ -120,6 +126,7 @@ mod fixture {
             })
         }
     }
+    /// Count actual handler admission; only the authority callback mutates binding state.
     struct Retire(Arc<Store>);
     impl Handler for Retire {
         fn authorize(&self, _: &Principal, method: &str) -> Result<(), AuthError> {
@@ -134,6 +141,7 @@ mod fixture {
                 HandlerOutcome::error(syntra_core::ErrorCode::Unimplemented, "unsupported method")
             })
         }
+        /// Validate the request, await the authority-owned mutation, and return without further effects.
         fn handle_with_context(
             &self,
             _: String,
@@ -159,11 +167,13 @@ mod fixture {
             })
         }
     }
+    /// Decode fixed public test provisioning bytes.
     fn key(hex: &str) -> [u8; 32] {
         std::array::from_fn(|i| {
             u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("fixed public test key")
         })
     }
+    /// Exact public binding that the independent fresh Returning probe must request.
     fn context() -> Context {
         Context {
             mode: Mode::Returning,
@@ -174,6 +184,182 @@ mod fixture {
             epoch: 2,
         }
     }
+    /// Inspect the actual bounded first message outside KeyStore, then replay it
+    /// unchanged through native accept (and its normal respond_with_clock path).
+    /// Only an exact withdrawn-binding authentication refusal counts as evidence;
+    /// an arbitrary bad handle/epoch or wrong-key failure on an active binding does not.
+    async fn accept_probe(
+        listener: &tcp::Listener,
+        security: &ServerConfig,
+        store: Arc<Store>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let stream = listener.accept_socket().await?;
+        let (read, write) = tokio::io::split(stream);
+        let mut reader = tcp::StreamReader(read);
+        let first = reader.read_record(MAX_WRAPPER).await?;
+        let (requested, _) = Context::parse_first(&first)?;
+        let mut prefix = (first.len() as u16).to_be_bytes().to_vec();
+        prefix.extend_from_slice(&first);
+        let stream = tokio::io::join(std::io::Cursor::new(prefix).chain(reader.0), write);
+        let result = tcp::accept_stream(
+            stream,
+            security,
+            Arc::new(Factory(store.clone())),
+            Arc::new(Retire(store.clone())),
+            ConnectionConfig::default(),
+            tcp::Limits::default(),
+        )
+        .await;
+        if !matches!(
+            result,
+            Err(syntra_net::Error::Channel(
+                syntra_core::secure_channel::Error::Authentication
+            ))
+        ) || requested != context()
+        {
+            if let Ok(host) = result {
+                host.close().await;
+            }
+            return Err("expected actual withdrawn-binding authentication denial".into());
+        }
+        let mut state = store.state.lock().unwrap();
+        if state.transition.is_none() || state.handlers != 1 || state.commits != 1 {
+            return Err("fresh denial lacked the intended committed withdrawal".into());
+        }
+        state.denials += 1;
+        println!("{{\"event\":\"fresh_denied\",\"before_handler\":true}}");
+        Ok(())
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Attempt a real first message and return only the server's evidence verdict.
+        async fn probe(
+            listener: &tcp::Listener,
+            store: Arc<Store>,
+            requested: Context,
+            ak: [u8; 32],
+        ) -> bool {
+            let security = ServerConfig {
+                mode: Mode::Returning,
+                carrier: Carrier::Tcp,
+                server_key_id: 1,
+                scope: context().scope,
+                private_key: Secret32::new(key(PRIVATE)),
+                store: Some(store.clone()),
+            };
+            let client = tcp::connect(
+                listener.local_addr().unwrap(),
+                ClientConfig {
+                    context: requested,
+                    server_public_key: key(PUBLIC),
+                    authorization_key: Some(Secret32::new(ak)),
+                },
+                b"terminal-fixture".to_vec(),
+                ConnectionConfig::default(),
+                tcp::Limits::default(),
+            );
+            let (evidence, connected) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(accept_probe(listener, &security, store), client)
+            })
+            .await
+            .unwrap();
+            assert!(connected.is_err(), "probe must never establish");
+            evidence.is_ok()
+        }
+
+        /// A bad AK on an active binding is not proof of a committed withdrawal.
+        #[tokio::test]
+        async fn wrong_key_failure_is_not_withdrawn_binding_evidence() {
+            let store = Arc::new(Store {
+                state: Mutex::new(State::default()),
+                scenario: "owned".into(),
+                gap_observed: tokio::sync::Notify::new(),
+            });
+            let listener = tcp::Listener::bind("127.0.0.1:0", 2).await.unwrap();
+            assert!(!probe(&listener, store.clone(), context(), [9; 32]).await);
+            assert_eq!(store.state.lock().unwrap().denials, 0);
+        }
+
+        /// Rejected lookups are read-only, even after withdrawal and for wrong bindings.
+        #[tokio::test]
+        async fn lookup_is_pure_and_validates_the_requested_binding() {
+            let store = Arc::new(Store {
+                state: Mutex::new(State::default()),
+                scenario: "owned".into(),
+                gap_observed: tokio::sync::Notify::new(),
+            });
+            assert_eq!(*store.lookup(&context()).unwrap().expose(), [8; 32]);
+            let mut wrong_handle = context();
+            wrong_handle.handle = [9; 8];
+            let mut wrong_epoch = context();
+            wrong_epoch.epoch += 1;
+            for requested in [&wrong_handle, &wrong_epoch] {
+                assert!(store.lookup(requested).is_err());
+            }
+            let listener = tcp::Listener::bind("127.0.0.1:0", 2).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server_store = store.clone();
+            let accept = tokio::spawn(async move {
+                let host = listener
+                    .accept(
+                        &ServerConfig {
+                            mode: Mode::Returning,
+                            carrier: Carrier::Tcp,
+                            server_key_id: 1,
+                            scope: context().scope,
+                            private_key: Secret32::new(key(PRIVATE)),
+                            store: Some(server_store.clone()),
+                        },
+                        Arc::new(Factory(server_store.clone())),
+                        Arc::new(Retire(server_store)),
+                        ConnectionConfig::default(),
+                        tcp::Limits::default(),
+                    )
+                    .await
+                    .unwrap();
+                (host, listener)
+            });
+            let client = tcp::connect(
+                address,
+                ClientConfig {
+                    context: context(),
+                    server_public_key: key(PUBLIC),
+                    authorization_key: Some(Secret32::new([8; 32])),
+                },
+                b"terminal-fixture".to_vec(),
+                ConnectionConfig::default(),
+                tcp::Limits::default(),
+            )
+            .await
+            .unwrap();
+            let (host, listener) = accept.await.unwrap();
+            assert_eq!(
+                client.conn.call(METHOD, vec![], 2000).await.unwrap(),
+                b"retired"
+            );
+            for requested in [&context(), &wrong_handle, &wrong_epoch] {
+                assert!(store.lookup(requested).is_err());
+            }
+            assert_eq!(
+                store.state.lock().unwrap().denials,
+                0,
+                "lookup must not record evidence"
+            );
+            client.close().await;
+            host.close().await;
+            for requested in [wrong_handle, wrong_epoch] {
+                assert!(!probe(&listener, store.clone(), requested, [8; 32]).await);
+                assert_eq!(store.state.lock().unwrap().denials, 0);
+            }
+            assert!(probe(&listener, store.clone(), context(), [8; 32]).await);
+            let state = store.state.lock().unwrap();
+            assert_eq!(state.denials, 1);
+            assert_eq!((state.commits, state.handlers), (1, 1));
+        }
+    }
+    /// Run one bounded loopback fixture role, preserving the JSON evidence contract.
     pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let args: Vec<_> = std::env::args().collect();
         if args.len() < 3
@@ -287,23 +473,10 @@ mod fixture {
         // Required, independent fresh Returning handshake. No mutation retry.
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            listener.accept(
-                &security,
-                Arc::new(Factory(store.clone())),
-                Arc::new(Retire(store.clone())),
-                ConnectionConfig::default(),
-                tcp::Limits::default(),
-            ),
+            accept_probe(&listener, &security, store.clone()),
         )
         .await?;
-        if !matches!(
-            result,
-            Err(syntra_net::Error::Channel(
-                syntra_core::secure_channel::Error::Authentication
-            ))
-        ) {
-            return Err("expected actual withdrawn-binding authentication denial".into());
-        }
+        result?;
         let state = store.state.lock().unwrap();
         if state.transition.is_none()
             || state.commits != 1
@@ -322,11 +495,13 @@ mod fixture {
 
 #[cfg(feature = "tcp")]
 #[tokio::main]
+/// Bound the complete fixture run independently of individual connection deadlines.
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::timeout(std::time::Duration::from_secs(25), fixture::run()).await?
 }
 
 #[cfg(not(feature = "tcp"))]
+/// Explain the explicitly required carrier feature for this fixture.
 fn main() {
     eprintln!("enable syntra-net/tcp for this local fixture");
 }

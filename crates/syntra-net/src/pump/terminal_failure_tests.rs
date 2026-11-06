@@ -8,6 +8,7 @@ use std::{
 use syntra_runtime::{terminal::*, Principal, RequestContext, StaticToken};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+/// Minimal in-memory active-to-owned transition for raw handoff tests.
 struct Owned(Mutex<Option<Transition>>);
 impl Authority for Owned {
     fn observe(&self, _: Option<Transition>) -> BoxFuture<'_, Observation> {
@@ -28,6 +29,7 @@ impl Authority for Owned {
         })
     }
 }
+/// Require the context-aware path and return its fixed outcome immediately.
 struct Retire;
 impl Handler for Retire {
     fn authorize(&self, _: &Principal, _: &str) -> Result<(), AuthError> {
@@ -82,6 +84,7 @@ impl AsyncWrite for CaptureWrite {
         Poll::Ready(Ok(()))
     }
 }
+/// Count record-future construction independently from underlying write polls.
 struct CountRecord {
     inner: crate::tcp::StreamWriter<CaptureWrite>,
     starts: Arc<AtomicUsize>,
@@ -96,6 +99,7 @@ impl RecordWriter for CountRecord {
     }
 }
 
+/// Publish one fatal input while withholding parent cleanup, then repoll ciphertext.
 async fn fatal_reader_defeats_retained_receipt(fault: usize) {
     use syntra_core::{proto::ClientHello, Frame, RpcRequest};
     let clock = ElapsedClock::lifecycle_driven();
@@ -286,19 +290,23 @@ async fn fatal_reader_defeats_retained_receipt(fault: usize) {
     host.close().await;
 }
 
+/// Bad-tag publication prevents another raw byte before parent cleanup runs.
 #[tokio::test(start_paused = true)]
 async fn fatal_reader_bad_tag_blocks_retained_receipt_before_parent_cleanup() {
     fatal_reader_defeats_retained_receipt(0).await;
 }
+/// Invalid record length publishes sticky denial before the retained write resumes.
 #[tokio::test(start_paused = true)]
 async fn fatal_reader_invalid_outer_length_blocks_retained_receipt_before_parent_cleanup() {
     fatal_reader_defeats_retained_receipt(1).await;
 }
+/// EOF closes output eligibility without depending on eventual reader joining.
 #[tokio::test(start_paused = true)]
 async fn fatal_reader_carrier_eof_blocks_retained_receipt_before_parent_cleanup() {
     fatal_reader_defeats_retained_receipt(2).await;
 }
 
+/// Count fresh reads to distinguish authority I/O from cache-only gates.
 struct CountAuthority(AtomicUsize);
 impl Authority for CountAuthority {
     fn observe(&self, _: Option<Transition>) -> BoxFuture<'_, Observation> {
@@ -309,6 +317,7 @@ impl Authority for CountAuthority {
         panic!("cache checks cannot commit")
     }
 }
+/// Install one initial fresh observation for subsequent cache and repoll checks.
 async fn cached_terminal() -> (Arc<Host>, Arc<FreshAuthorization>, Arc<CountAuthority>) {
     let clock = ElapsedClock::lifecycle_driven();
     let (host, _) = Host::try_new_with_clock(
@@ -340,6 +349,7 @@ async fn cached_terminal() -> (Arc<Host>, Arc<FreshAuthorization>, Arc<CountAuth
     (host, guard, authority)
 }
 
+/// Repeated local checks neither call the adapter nor renew start-based freshness.
 #[tokio::test(start_paused = true)]
 async fn terminal_cached_hot_path_neither_reads_nor_renews_freshness() {
     let (host, guard, authority) = cached_terminal().await;
@@ -357,6 +367,7 @@ async fn terminal_cached_hot_path_neither_reads_nor_renews_freshness() {
     host.close().await;
 }
 
+/// Raw repolls retain one ciphertext future and stop at freshness expiry without reads.
 #[tokio::test(start_paused = true)]
 async fn terminal_cached_raw_repolls_never_reopen_authority() {
     let (host, guard, authority) = cached_terminal().await;
@@ -406,6 +417,7 @@ async fn terminal_cached_raw_repolls_never_reopen_authority() {
     host.close().await;
 }
 
+/// The watchdog wrapper preserves queue and actual-read budgets without an obsolete cap.
 #[tokio::test(start_paused = true)]
 async fn terminal_watchdog_queued_refresh_keeps_the_actual_observation_budget() {
     struct ReadQueue(tokio::sync::Semaphore, AtomicUsize);
@@ -488,6 +500,7 @@ impl syntra_core::secure_channel::ElapsedSource for EncryptionSample {
         Some(Duration::ZERO)
     }
 }
+/// Detect and optionally deny the explicit authority read after encryption.
 struct HandoffAuthority {
     owned: Mutex<Option<Transition>>,
     encrypted: Arc<AtomicBool>,
@@ -518,6 +531,7 @@ impl Authority for HandoffAuthority {
     }
 }
 
+/// Drive the actual writer across nonce consumption, final proof, and partial raw I/O.
 async fn actual_writer_final_gate(deny_final: bool) {
     use syntra_core::{proto::ClientHello, Frame, RpcRequest};
     let encrypted = Arc::new(AtomicBool::new(false));
@@ -684,16 +698,19 @@ async fn actual_writer_final_gate(deny_final: bool) {
     host.close().await;
 }
 
+/// Exactly one post-encryption read precedes otherwise cache-only retained repolls.
 #[tokio::test(start_paused = true)]
 async fn actual_receipt_writer_reads_once_after_encryption_then_repolls_locally() {
     actual_writer_final_gate(false).await;
 }
 
+/// Final post-encryption denial prevents even the first raw prefix handoff.
 #[tokio::test(start_paused = true)]
 async fn actual_receipt_writer_denial_after_encryption_prevents_first_handoff() {
     actual_writer_final_gate(true).await;
 }
 
+/// Bind a driven elapsed source to a counted prompt authority during native accept.
 struct ExpiryFactory {
     clock: ElapsedClock,
     authority: Arc<CountAuthority>,
@@ -718,6 +735,7 @@ impl AuthenticatorFactory for ExpiryFactory {
     }
 }
 
+/// Ordinary output observes expiry immediately rather than silently dropping a result.
 #[tokio::test(start_paused = true)]
 async fn ordinary_tcp_result_with_invalid_freshness_aborts_instead_of_quietly_dropping() {
     // Keep the scheduler from auto-advancing while real loopback TCP is pending.

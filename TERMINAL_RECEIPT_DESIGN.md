@@ -24,6 +24,7 @@ use syntra_runtime::terminal::{Authority, Policy};
 fn retirement_policy(authority: Arc<dyn Authority>) -> Policy {
     Policy {
         method: "/example.Authority/Retire".into(),
+        // Non-sensitive only: remote denial can race delivery after the final read.
         payload: b"retired".to_vec(),
         authority,
         read_timeout: Duration::from_millis(100),
@@ -46,8 +47,12 @@ handlers default to `handle_with_execution`; forwarding adapters must preserve
 that context and lease path. `AllowAll` forwards it, but is not a production
 authorization policy.
 
-For the configured method, call `context.retire(expected_revision).await` before
-any terminal application mutation, then return its `HandlerOutcome` promptly.
+For the configured method, call `context.retire(expected_revision).await`.
+`Authority::commit` owns the application mutation, withdrawal, private owner,
+and every condition represented by the fixed receipt in the same conditional
+transaction. Do not mutate in the handler before or after this await. On success,
+`retire` returns AFTER commit and fresh owned-evidence verification; return its
+`HandlerOutcome` promptly.
 For example, this helper can be called from the context-aware hook:
 
 ```rust
@@ -64,7 +69,12 @@ async fn retire_request(context: RequestContext, expected_revision: u64) -> Hand
 `retire` returns the fixed outcome after the coordinated transition; it does
 **not** await its own output. Waiting inside the handler for receipt delivery or
 joined cleanup would block work that depends on that handler returning. A
-refusal does not authorize mutation elsewhere or fallback to ordinary output.
+refusal does not authorize mutation elsewhere. Before reservation, the handler
+may return a normal correlated error (as above) if the connection is otherwise
+valid. Once reserved, the connection is fenced: a failed retirement closes
+without an ordinary fallback response, even if the handler returns an error.
+Clients must handle that loss as an unknown operation outcome; it neither proves
+rollback nor permits an automatic mutation retry.
 
 Only a live, pending, authorized call on an authenticated binding can reserve.
 Expected revision must be nonzero and below `u64::MAX`. Zero/exhausted revisions
@@ -110,8 +120,19 @@ failure. A later external revoke must remain visible as `HardDenied`; an old
 owner tombstone alone is insufficient.
 
 Reads must cover current expiry, enrollment/key policy, and application authority.
-Stale caches or replicas cannot supply proof. `read_timeout` is **1..=250 ms**,
+Stale caches or replicas cannot supply proof. `read_timeout` is **100..=250 ms**,
 including the start-based freshness bound. Idle refresh runs at half that interval.
+The 100 ms implementation minimum leaves 50 ms from the scheduled refresh to
+expiry for timer quantization, executor scheduling, and a prompt authority read.
+[Tokio sleep](https://docs.rs/tokio/1.54.1/tokio/time/fn.sleep.html) has millisecond
+granularity and documents coarser resolution on some platforms, including Windows;
+the former 1 ms bound left only 0.5 ms, below even the documented granularity.
+This conservative floor is not a real-time scheduling guarantee or a DB latency
+allowance: timer delay plus read completion must fit the remaining prior freshness.
+For example, the deterministic idle regression models a 15 ms late wake at the
+minimum (65 ms between prompt reads) for six intervals. The real TCP regression
+also keeps a native-clock connection idle for 350 ms before retirement. Neither
+establishes a universal platform latency bound.
 A new read must finish before prior freshness expires and the operation cutoff;
 a late read cannot renew stale authority. Future construction and polling must
 not block the executor.
@@ -165,6 +186,12 @@ and carrier loss can still prevent completion. Locally observed denial before
 serialized handoff wins. Remote denial after the last authoritative read can race
 even the first bytes; accepted bytes cannot be recalled. No atomic
 database-to-socket transaction or delivery guarantee is implied.
+
+The fixed payload must therefore be **non-sensitive**: a remote denial can happen
+after the final authoritative read but before or during TCP handoff, and bytes
+already accepted by the carrier cannot be recalled. The receipt must contain no
+secret, fresh credential, or protected application data. Local sticky denial gates
+reduce this race but cannot eliminate it.
 
 ## Deadline and retained cleanup
 
@@ -238,6 +265,25 @@ Recorded verification on 2026-11-06 includes the stable-newer-revision checks:
 
 These are recorded results, not a fresh verification of subsequent edits.
 
+Follow-up verification on 2026-11-06 with Rust **1.88.0**, `--locked`, on macOS
+arm64 covers the lookup-purity and minimum-read-bound corrections:
+
+| Command/scope | Fresh result |
+| --- | --- |
+| `cargo test --locked -p syntra-runtime` | 442 passed |
+| Same runtime suite with `--no-default-features` | 442 passed; repeated configuration, not additional distinct cases |
+| `cargo test --locked -p syntra-net --no-default-features --features tcp` | 110 passed, including 19 receipt integration tests |
+| Same net features with `--example terminal_receipt` | 2 fixture regressions passed; examples are tested explicitly |
+| `cargo test --locked --workspace` | 697 tests/doc-tests passed; 1 Docker fixture ignored |
+| Rust CLI server/client/probe | `owned`, `deny`, `unknown`, `gap` passed with unchanged JSON result/summary fields and one exact-binding denial each |
+| Rustfmt check, `git diff --check`, workspace rustdoc and all-target Clippy | Completed; Clippy retains existing warnings in untouched core/runtime code |
+
+The policy regression first failed because 1 ms was accepted. The lookup
+regression first failed because three refused lookups incremented the denial
+counter three times. Five regressions were added: one policy, two idle TCP, and
+two example tests. Counts above overlap and must not be summed. The Rust CLI
+checks are same-implementation runs, not a fresh cross-language verdict.
+
 The partial-ordinary-frame success test uses explicit reservation notification
 and a driven elapsed clock over real encrypted TCP. A CPU-load run exposed that
 its previous wall-time sleep and 200 KB frame could legitimately exceed the
@@ -259,6 +305,22 @@ there. Its public provisioning and in-memory authority are not production storag
 or credentials. Fixture passes do not prove application durability, platform
 suspend behavior, non-TCP support, application Logout acceptance, or formal
 conformance.
+
+The fixture's `KeyStore::lookup` validates the requested handle/epoch and returns
+the key only while active; it records no counters or output. Fresh-denial evidence
+is recorded outside lookup after inspecting the actual bounded Returning first
+message, replaying those exact bytes through normal native acceptance, and
+checking authentication refusal for the exact withdrawn fixture context. A wrong
+handle/epoch or a wrong-key failure on an active binding is not withdrawal proof.
+The existing JSON event names/fields and summary counts remain unchanged; the
+parent-owned Go harness must rerun cross-language evidence for these source bytes.
+
+Documentation checks are scoped to this repository's actual configuration:
+`cargo doc --locked --workspace --no-deps` is informational, and scheduled
+`cargo-llvm-cov` reports execution coverage with no threshold. Neither measures
+doc-comment completeness. Branch-added public APIs, coordination helpers, fixture
+helpers, and regression tests have descriptive Rust comments; no coverage or lint
+threshold has been changed.
 
 ## Shared contract and release boundary
 
