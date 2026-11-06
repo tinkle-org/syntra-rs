@@ -259,6 +259,286 @@ async fn closed(host: &Host) {
     .unwrap();
 }
 
+/// The actual recovery attachment closes before the conditional terminal transition.
+#[tokio::test]
+async fn terminal_reservation_retires_actual_recovery_attachment_before_transition() {
+    use crate::terminal::{
+        Authority, DriverCommand, Observation, Policy, RequestContext, Transition,
+    };
+    use futures_util::future::BoxFuture;
+    /// In-memory owner evidence for retirement of an actual recovery attachment.
+    struct Owned(Mutex<Option<Transition>>);
+    impl Authority for Owned {
+        /// Report active authority or the owner recorded by the transition callback.
+        fn observe(&self, _: Option<Transition>) -> BoxFuture<'_, Observation> {
+            Box::pin(async {
+                match self.0.lock().unwrap().as_ref() {
+                    None => Observation::Active { revision: 1 },
+                    Some(c) => Observation::OwnedCommitted {
+                        reservation: c.reservation.clone(),
+                        expected_revision: 1,
+                        revision: 2,
+                    },
+                }
+            })
+        }
+        /// Record ownership after the test has checked the recovery-close barrier.
+        fn commit(&self, c: Transition, _: ExecutionLease) -> BoxFuture<'_, ()> {
+            Box::pin(async move {
+                *self.0.lock().unwrap() = Some(c);
+            })
+        }
+    }
+    /// Require context-aware retirement for the recovery-attachment fixture.
+    struct Retire;
+    impl Handler for Retire {
+        /// Admit fixture requests to the retirement hook.
+        fn authorize(&self, _: &Principal, _: &str) -> Result<(), AuthError> {
+            Ok(())
+        }
+        /// Fail if dispatch bypasses the request context.
+        fn handle(&self, _: String, _: Vec<u8>, _: CancelToken) -> HandlerFut {
+            panic!("context hook required")
+        }
+        /// Retire at the fixture's active revision and return its fixed outcome.
+        fn handle_with_context(
+            &self,
+            _: String,
+            _: Vec<u8>,
+            _: CancelToken,
+            _: ExecutionLease,
+            c: RequestContext,
+        ) -> HandlerFut {
+            Box::pin(async move { c.retire(1).await.unwrap() })
+        }
+    }
+    let (host, mut writer) = Host::new(
+        ConnectionConfig::default(),
+        Arc::new(StaticToken::new(b"credential".to_vec(), "actual-principal")),
+        Arc::new(Retire),
+    );
+    let authority = Arc::new(Owned(Mutex::new(None)));
+    let coordinator = host
+        .install_terminal_tcp(Policy {
+            method: "/example.Authority/Retire".into(),
+            payload: b"retired".to_vec(),
+            authority: authority.clone(),
+            read_timeout: Duration::from_millis(250),
+        })
+        .unwrap();
+    coordinator.refresh().await.unwrap();
+    host.configure_recovery(service(Arc::new(Source::default())))
+        .await
+        .unwrap();
+    activate(&host, &mut writer).await;
+    negotiate(&host, &mut writer).await;
+    subscribe(&host, &mut writer, 2, b"stream").await;
+    let recovery = bound_session(&host);
+    let mut commands = host.take_terminal_commands().unwrap();
+    send(&host, 3, "/example.Authority/Retire", vec![], 2000).await;
+    let Some(DriverCommand::Barrier(ack)) = commands.recv().await else {
+        panic!("expected barrier")
+    };
+    assert!(
+        recovery.is_closed(),
+        "actual recovery producer closes before mutation"
+    );
+    assert!(authority.0.lock().unwrap().is_none());
+    assert!(host.notify(b"protected".to_vec()).await.is_err());
+    assert!(
+        writer.try_recv().is_err(),
+        "no ordinary recovery/result output"
+    );
+    ack.send(()).unwrap(); // Runtime-only fixture; native barriers tested separately.
+    let Some(DriverCommand::Receipt(output)) = commands.recv().await else {
+        panic!("expected exact typed result")
+    };
+    assert_eq!(
+        result(Frame::decode(output.bytes()).unwrap(), 3).unwrap(),
+        b"retired"
+    );
+    coordinator.refresh().await.unwrap();
+    assert!(coordinator
+        .with_receipt_io(&output, &mut true, || ())
+        .is_some());
+    coordinator.written();
+    closed(&host).await;
+    assert!(writer.try_recv().is_err());
+    host.close().await;
+}
+
+/// Exercise real application/recovery workers with a preemption at the shared
+/// last-check/hook gap, and real RequestContext reservation on the other task.
+async fn reservation_dispatch_linearization(profile: bool) {
+    use crate::terminal::{
+        Authority, DriverCommand, Observation, Policy, RequestContext, Transition,
+    };
+    use futures_util::future::BoxFuture;
+    /// In-memory authority used to observe mutation ordering across dispatch.
+    struct Owned(Mutex<Option<Transition>>);
+    impl Authority for Owned {
+        /// Report active authority until the exact operation owner is recorded.
+        fn observe(&self, _: Option<Transition>) -> BoxFuture<'_, Observation> {
+            Box::pin(async {
+                match self.0.lock().unwrap().as_ref() {
+                    None => Observation::Active { revision: 1 },
+                    Some(c) => Observation::OwnedCommitted {
+                        reservation: c.reservation.clone(),
+                        expected_revision: 1,
+                        revision: 2,
+                    },
+                }
+            })
+        }
+        /// Record the owner so the test can detect mutation before dispatch completes.
+        fn commit(&self, c: Transition, _: ExecutionLease) -> BoxFuture<'_, ()> {
+            Box::pin(async move {
+                *self.0.lock().unwrap() = Some(c);
+            })
+        }
+    }
+    /// Capture a retirement context and count ordinary synchronous hook construction.
+    struct Capture {
+        context: Mutex<Option<oneshot::Sender<RequestContext>>>,
+        effects: Arc<AtomicUsize>,
+    }
+    impl Handler for Capture {
+        /// Admit fixture requests for the dispatch-ordering test.
+        fn authorize(&self, _: &Principal, _: &str) -> Result<(), AuthError> {
+            Ok(())
+        }
+        /// Fail if dispatch omits the context-aware hook.
+        fn handle(&self, _: String, _: Vec<u8>, _: CancelToken) -> HandlerFut {
+            panic!("context hook required")
+        }
+        /// Export the retirement context or synchronously count an ordinary dispatch.
+        fn handle_with_context(
+            &self,
+            method: String,
+            _: Vec<u8>,
+            _: CancelToken,
+            _: ExecutionLease,
+            context: RequestContext,
+        ) -> HandlerFut {
+            if method == "/example.Authority/Retire" {
+                assert!(self
+                    .context
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(context)
+                    .is_ok());
+                return Box::pin(std::future::pending());
+            }
+            self.effects.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { HandlerOutcome::Payload(b"ordinary".to_vec()) })
+        }
+    }
+    let (capture, captured) = oneshot::channel();
+    let effects = Arc::new(AtomicUsize::new(0));
+    let (host, mut writer) = Host::new(
+        ConnectionConfig::default(),
+        Arc::new(StaticToken::new(b"credential".to_vec(), "actual-principal")),
+        Arc::new(Capture {
+            context: Mutex::new(Some(capture)),
+            effects: effects.clone(),
+        }),
+    );
+    let authority = Arc::new(Owned(Mutex::new(None)));
+    let coordinator = host
+        .install_terminal_tcp(Policy {
+            method: "/example.Authority/Retire".into(),
+            payload: b"retired".to_vec(),
+            authority: authority.clone(),
+            read_timeout: Duration::from_millis(250),
+        })
+        .unwrap();
+    coordinator.refresh().await.unwrap();
+    let source = Arc::new(Source::default());
+    host.configure_recovery(service(source.clone()))
+        .await
+        .unwrap();
+    activate(&host, &mut writer).await;
+    negotiate(&host, &mut writer).await;
+    send(&host, 2, "/example.Authority/Retire", vec![], 2000).await;
+    let context = captured.await.unwrap();
+    let pause = Arc::new(DispatchPause {
+        id: 3,
+        checked: Notify::new(),
+        release: Notify::new(),
+    });
+    *host.dispatch_pause.lock().unwrap() = Some(pause.clone());
+    let before = source.seen.lock().unwrap().len();
+    let method = if profile {
+        wire::SUBSCRIBE
+    } else {
+        "/example.Authority/Ordinary"
+    };
+    let payload = if profile {
+        subscribe_payload(b"stream")
+    } else {
+        vec![]
+    };
+    send(&host, 3, method, payload, 2000).await;
+    pause.checked.notified().await;
+    let mut retiring = Box::pin(context.retire(1));
+    assert!(futures_util::poll!(&mut retiring).is_pending());
+    assert!(
+        !coordinator.fenced(),
+        "reservation crossed the checked-but-not-dispatched worker"
+    );
+    assert!(
+        authority.0.lock().unwrap().is_none(),
+        "no transition before the synchronous hook finishes"
+    );
+    pause.release.notify_one();
+    let mut commands = host.take_terminal_commands().unwrap();
+    let driver = async {
+        let Some(DriverCommand::Barrier(ack)) = commands.recv().await else {
+            panic!("expected barrier")
+        };
+        if profile {
+            assert!(
+                source.seen.lock().unwrap().len() > before,
+                "prepared recovery dispatch must run before fencing"
+            );
+        } else {
+            assert_eq!(
+                effects.load(Ordering::SeqCst),
+                1,
+                "synchronous application construction must finish before fencing"
+            );
+        }
+        ack.send(()).unwrap();
+    };
+    let (outcome, ()) = tokio::join!(retiring, driver);
+    host.calls.lock().unwrap().select(2, outcome.unwrap());
+    let Some(DriverCommand::Receipt(output)) = commands.recv().await else {
+        panic!("expected receipt")
+    };
+    assert!(coordinator
+        .with_receipt_io(&output, &mut true, || ())
+        .is_some());
+    coordinator.written();
+    drop(output);
+    drop(context);
+    closed(&host).await;
+    host.close().await;
+}
+
+/// Reservation cannot cross the worker's final check/application-hook construction gap.
+#[tokio::test]
+async fn terminal_fence_waits_for_application_hook_construction() {
+    reservation_dispatch_linearization(false).await;
+}
+
+/// Reservation waits for an already-checked prepared recovery dispatch to complete.
+#[tokio::test]
+async fn terminal_fence_waits_for_prepared_recovery_dispatch() {
+    reservation_dispatch_linearization(true).await;
+}
+
 #[tokio::test]
 async fn mandatory_only_refuses_the_entire_profile_prefix_without_app_policy() {
     let (host, mut writer, app) = new_host(ConnectionConfig::default());

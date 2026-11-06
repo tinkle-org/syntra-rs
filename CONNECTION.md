@@ -12,8 +12,11 @@ derived artifact hashes. Its `CARRIER` bindings describe one protocol. The recor
 pins the exact candidate inputs at upstream commit
 `3f7e8ea037fefcc5c86101d23e7722c83e28a0d3`. See
 [CONTRIBUTING.md](CONTRIBUTING.md#input-provenance-and-authority) for the separate
-pinned upstream inputs. No formal conformance, independent
-interoperability or independent security-review verdict is claimed here.
+pinned upstream inputs. No formal conformance or independent security-review
+verdict is claimed here. The terminal receipt fixture report at
+`syntra-go/TERMINAL_RECEIPT_INTEROP.md` requires a sibling checkout and records a
+bounded bidirectional TCP matrix, not general interoperability. That uncommitted
+report is absent from the run-2 Go commit; no pinned hosted copy is claimed.
 
 ## Layer and crate ownership
 
@@ -70,6 +73,24 @@ a principal. `Handler::authorize` checks that principal before each method's
 effects. Key-store validity, enrollment/revocation policy and application-side
 effect fencing remain host responsibilities. Neither encryption nor TLS supplies
 an application identity system or permission policy.
+
+**Opt-in native TCP terminal receipt:** `AuthenticatorFactory::terminal_receipt`
+supplies a fixed method/payload policy and a typed application authority adapter.
+`Handler::handle_with_context` receives a private `RequestContext`; its
+`retire(expected_revision)` fences ordinary traffic, waits for full-frame writer
+quiescence, and attempts the conditional transition before returning the fixed
+handler outcome. Return that outcome promptly; do not await its own output.
+Only exact, fresh owned-commit evidence permits that result. The typed per-binding
+authority replaces the ordinary connection guard; combining it with an independent
+generic guard is refused. Actual Host recovery attachments are fenced and retired
+before transition. The default is disabled. Raw/custom record, WASM, FFI, WS/WSS,
+and HTTP/HTTPS drivers do not support this path; they refuse before the terminal
+mutation.
+No client method, wire field or advertised capability is added. Ordinary
+withdrawal/graceful close keep their existing defaults. See
+[API, authority contract, support, and evidence](TERMINAL_RECEIPT_DESIGN.md).
+Local writing, client observation, and joined cleanup remain separate facts;
+loss never permits an automatic mutation retry.
 
 Each connection requires fresh cryptographic randomness for ephemeral handshake
 keys. Entropy failure aborts establishment. Authorization keys and lookup handles

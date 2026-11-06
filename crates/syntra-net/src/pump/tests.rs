@@ -10,6 +10,10 @@ use syntra_runtime::{
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
+#[cfg(feature = "tcp")]
+#[path = "terminal_failure_tests.rs"]
+mod terminal_failures;
+
 struct Store;
 impl KeyStore for Store {
     fn lookup(&self, _: &Context) -> Result<Secret32, syntra_core::secure_channel::Error> {

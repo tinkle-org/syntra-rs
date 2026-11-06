@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Default-disabled scoped terminal receipts through `Handler::handle_with_context`,
+  `RequestContext::retire`, and `terminal::{Policy, Authority, Transition, Observation}`.
+  The runtime fences ordinary dispatch/output, closes recovery attachments before
+  transition, and requires fresh exact-owned evidence with a strictly newer,
+  stable committed revision. Return the resulting `HandlerOutcome` promptly;
+  it does not await its own output or prove peer receipt or joined cleanup.
+- Retained authority execution and cleanup ownership across waiter loss and
+  deadlines. Terminal output requires the coordinated native TCP driver; raw,
+  WASM, FFI, and non-TCP paths are unsupported and refuse before terminal effects.
+  Ordinary withdrawal and wire messages are unchanged. See the
+  [SDK API and support boundaries](../../TERMINAL_RECEIPT_DESIGN.md).
+
 ## [1.0.0-rc.2](https://github.com/tinkle-org/syntra-rs/compare/syntra-runtime-v1.0.0-rc.1...syntra-runtime-v1.0.0-rc.2) - 2026-11-05
 
 ### Added

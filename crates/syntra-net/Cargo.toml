@@ -81,3 +81,8 @@ required-features = ["managed", "websocket"]
 [[example]]
 name = "managed_http"
 required-features = ["managed", "http"]
+
+[[example]]
+name = "terminal_receipt"
+test = true
+required-features = ["tcp"]
