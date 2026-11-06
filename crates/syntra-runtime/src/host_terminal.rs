@@ -761,6 +761,7 @@ mod tests {
     /// Select active, owned, denied, unknown, or changed-revision evidence in memory.
     struct Fixture(Mutex<usize>);
     impl Authority for Fixture {
+        /// Return the selected evidence mode with the supplied reservation owner.
         fn observe(&self, claim: Option<Transition>) -> BoxFuture<'_, Observation> {
             Box::pin(async move {
                 match *self.0.lock().unwrap() {
@@ -784,6 +785,7 @@ mod tests {
                 }
             })
         }
+        /// Leave evidence under explicit test control rather than mutating it.
         fn commit(&self, _: Transition, _: ExecutionLease) -> BoxFuture<'_, ()> {
             Box::pin(async {})
         }
@@ -1135,12 +1137,14 @@ mod tests {
     /// if an invalid revision were admitted, this fixture would record a commit.
     async fn invalid_expected_revision_preflight(expected: u64) {
         use std::sync::atomic::AtomicUsize;
+        /// Record any accidental commit admitted by an invalid revision preflight.
         struct AuthorityFixture {
             expected: u64,
             committed: Mutex<Option<Transition>>,
             commits: AtomicUsize,
         }
         impl Authority for AuthorityFixture {
+            /// Expose the requested revision and any accidentally recorded ownership.
             fn observe(&self, _: Option<Transition>) -> BoxFuture<'_, Observation> {
                 Box::pin(async {
                     match self.committed.lock().unwrap().as_ref() {
@@ -1155,6 +1159,7 @@ mod tests {
                     }
                 })
             }
+            /// Record and count mutation so preflight tests can detect admission.
             fn commit(&self, claim: Transition, _: ExecutionLease) -> BoxFuture<'_, ()> {
                 Box::pin(async move {
                     *self.committed.lock().unwrap() = Some(claim);
@@ -1297,6 +1302,7 @@ mod tests {
         denied: std::sync::atomic::AtomicBool,
     }
     impl Authority for QueuedAuthority {
+        /// Count each constructed read and hold its evidence behind a test permit.
         fn observe(&self, _: Option<Transition>) -> BoxFuture<'_, Observation> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
@@ -1308,6 +1314,7 @@ mod tests {
                 }
             })
         }
+        /// Reject mutation in tests concerned only with serialized authority reads.
         fn commit(&self, _: Transition, _: ExecutionLease) -> BoxFuture<'_, ()> {
             panic!("refresh tests never commit")
         }

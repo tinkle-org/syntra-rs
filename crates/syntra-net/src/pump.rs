@@ -600,6 +600,7 @@ struct FreshAuthorization {
 /// Internal typed-authority bridge; generic authorization is never reclassified.
 struct TerminalAuthorization(Arc<Coordinator>);
 impl ConnectionAuthorization for TerminalAuthorization {
+    /// Refresh typed authority and map refusal to connection authentication loss.
     fn check(&self) -> BoxFuture<'_, Result<(), AuthError>> {
         Box::pin(async {
             self.0
@@ -608,12 +609,15 @@ impl ConnectionAuthorization for TerminalAuthorization {
                 .map_err(|_| AuthError::unauthenticated())
         })
     }
+    /// Refresh halfway through the authority's start-based freshness window.
     fn interval(&self) -> Duration {
         self.0.read_timeout() / 2
     }
+    /// Preserve the configured bound for each authoritative observation.
     fn read_timeout(&self) -> Duration {
         self.0.read_timeout()
     }
+    /// Supply the bridge's bounded local close interval.
     fn close_timeout(&self) -> Duration {
         Duration::from_millis(250)
     }
@@ -794,6 +798,7 @@ impl<F: AuthenticatorFactory> RecoveryAuthenticatorFactory<F> {
 }
 
 impl<F: AuthenticatorFactory> AuthenticatorFactory for RecoveryAuthenticatorFactory<F> {
+    /// Preserve the base factory's explicit per-binding terminal policy.
     fn terminal_receipt(&self, identity: &VerifiedIdentity) -> Option<TerminalPolicy> {
         self.base.terminal_receipt(identity)
     }

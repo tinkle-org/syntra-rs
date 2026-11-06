@@ -11,6 +11,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 /// Minimal in-memory active-to-owned transition for raw handoff tests.
 struct Owned(Mutex<Option<Transition>>);
 impl Authority for Owned {
+    /// Report active authority or the exact in-memory owner recorded by commit.
     fn observe(&self, _: Option<Transition>) -> BoxFuture<'_, Observation> {
         Box::pin(async {
             match self.0.lock().unwrap().as_ref() {
@@ -23,6 +24,7 @@ impl Authority for Owned {
             }
         })
     }
+    /// Record ownership without introducing an external storage dependency.
     fn commit(&self, c: Transition, _: ExecutionLease) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             *self.0.lock().unwrap() = Some(c);
@@ -32,12 +34,15 @@ impl Authority for Owned {
 /// Require the context-aware path and return its fixed outcome immediately.
 struct Retire;
 impl Handler for Retire {
+    /// Allow fixture calls to reach the context-aware retirement hook.
     fn authorize(&self, _: &Principal, _: &str) -> Result<(), AuthError> {
         Ok(())
     }
+    /// Fail if dispatch bypasses the required request context.
     fn handle(&self, _: String, _: Vec<u8>, _: CancelToken) -> HandlerFut {
         panic!("context hook required")
     }
+    /// Return the fixed outcome after the context-owned transition completes.
     fn handle_with_context(
         &self,
         _: String,
@@ -59,6 +64,7 @@ struct CaptureWrite {
     waker: Arc<AtomicWaker>,
 }
 impl AsyncWrite for CaptureWrite {
+    /// Count raw polls and capture only bytes permitted by the current allowance.
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
@@ -77,9 +83,11 @@ impl AsyncWrite for CaptureWrite {
         }
         Poll::Ready(Ok(n))
     }
+    /// Complete immediately because captured bytes need no separate flush.
     fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
+    /// Complete the in-memory writer's shutdown without further output.
     fn poll_shutdown(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
@@ -90,10 +98,12 @@ struct CountRecord {
     starts: Arc<AtomicUsize>,
 }
 impl RecordWriter for CountRecord {
+    /// Count record writes separately from their retained underlying raw polls.
     async fn write_record(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.starts.fetch_add(1, Ordering::SeqCst);
         self.inner.write_record(bytes).await
     }
+    /// Delegate shutdown to the wrapped TCP record writer.
     async fn shutdown(&mut self) -> Result<(), Error> {
         self.inner.shutdown().await
     }
@@ -309,10 +319,12 @@ async fn fatal_reader_carrier_eof_blocks_retained_receipt_before_parent_cleanup(
 /// Count fresh reads to distinguish authority I/O from cache-only gates.
 struct CountAuthority(AtomicUsize);
 impl Authority for CountAuthority {
+    /// Count fresh observation construction and return prompt active evidence.
     fn observe(&self, _: Option<Transition>) -> BoxFuture<'_, Observation> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Observation::Active { revision: 1 } })
     }
+    /// Fail if a cache-only authorization test attempts mutation.
     fn commit(&self, _: Transition, _: ExecutionLease) -> BoxFuture<'_, ()> {
         panic!("cache checks cannot commit")
     }
@@ -420,8 +432,10 @@ async fn terminal_cached_raw_repolls_never_reopen_authority() {
 /// The watchdog wrapper preserves queue and actual-read budgets without an obsolete cap.
 #[tokio::test(start_paused = true)]
 async fn terminal_watchdog_queued_refresh_keeps_the_actual_observation_budget() {
+    /// Hold counted observations behind permits to drive the read queue explicitly.
     struct ReadQueue(tokio::sync::Semaphore, AtomicUsize);
     impl Authority for ReadQueue {
+        /// Count construction, then await permission to return active evidence.
         fn observe(&self, _: Option<Transition>) -> BoxFuture<'_, Observation> {
             self.1.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
@@ -429,6 +443,7 @@ async fn terminal_watchdog_queued_refresh_keeps_the_actual_observation_budget() 
                 Observation::Active { revision: 1 }
             })
         }
+        /// Fail if watchdog refresh unexpectedly invokes a mutation.
         fn commit(&self, _: Transition, _: ExecutionLease) -> BoxFuture<'_, ()> {
             panic!("watchdog cannot commit")
         }
@@ -495,6 +510,7 @@ async fn terminal_watchdog_queued_refresh_keeps_the_actual_observation_budget() 
 /// the actual writer's pre-encryption gate from its final handoff gate.
 struct EncryptionSample(Arc<AtomicBool>);
 impl syntra_core::secure_channel::ElapsedSource for EncryptionSample {
+    /// Mark the encryption clock sample without advancing elapsed time.
     fn elapsed(&self) -> Option<Duration> {
         self.0.store(true, Ordering::SeqCst);
         Some(Duration::ZERO)
@@ -508,6 +524,7 @@ struct HandoffAuthority {
     deny_final: bool,
 }
 impl Authority for HandoffAuthority {
+    /// Count post-encryption observations and optionally deny the final handoff.
     fn observe(&self, _: Option<Transition>) -> BoxFuture<'_, Observation> {
         Box::pin(async {
             if self.encrypted.load(Ordering::SeqCst) {
@@ -526,6 +543,7 @@ impl Authority for HandoffAuthority {
             }
         })
     }
+    /// Record the in-memory owner before the writer tests its final authority gate.
     fn commit(&self, c: Transition, _: ExecutionLease) -> BoxFuture<'_, ()> {
         Box::pin(async move { *self.owned.lock().unwrap() = Some(c) })
     }
@@ -716,15 +734,18 @@ struct ExpiryFactory {
     authority: Arc<CountAuthority>,
 }
 impl AuthenticatorFactory for ExpiryFactory {
+    /// Share the test's driven elapsed source with the accepted connection.
     fn elapsed_clock(&self) -> ElapsedClock {
         self.clock.clone()
     }
+    /// Authenticate the fixed test principal.
     fn create(&self, _: &VerifiedIdentity) -> Result<Arc<dyn Authenticator>, AuthError> {
         Ok(Arc::new(StaticToken::new(
             b"fixture".to_vec(),
             "fixture-principal",
         )))
     }
+    /// Install minimum-bound counted authority for the ordinary-output expiry test.
     fn terminal_receipt(&self, _: &VerifiedIdentity) -> Option<Policy> {
         Some(Policy {
             method: "/example.Authority/Retire".into(),

@@ -106,6 +106,7 @@ mod fixture {
     /// Bind authentication and terminal policy to the fixture's verified connection.
     struct Factory(Arc<Store>);
     impl AuthenticatorFactory for Factory {
+        /// Authenticate the fixed principal only for a still-active Returning binding.
         fn create(&self, identity: &VerifiedIdentity) -> Result<Arc<dyn Authenticator>, AuthError> {
             if identity.context().mode != Mode::Returning
                 || self.0.state.lock().unwrap().transition.is_some()
@@ -117,6 +118,7 @@ mod fixture {
                 "fixture-principal",
             )))
         }
+        /// Bind the fixed non-sensitive receipt to this fixture's in-memory authority.
         fn terminal_receipt(&self, _: &VerifiedIdentity) -> Option<Policy> {
             Some(Policy {
                 method: METHOD.into(),
@@ -129,6 +131,7 @@ mod fixture {
     /// Count actual handler admission; only the authority callback mutates binding state.
     struct Retire(Arc<Store>);
     impl Handler for Retire {
+        /// Authorize only the fixture's exact retirement method.
         fn authorize(&self, _: &Principal, method: &str) -> Result<(), AuthError> {
             if method == METHOD {
                 Ok(())
@@ -136,6 +139,7 @@ mod fixture {
                 Err(AuthError::denied())
             }
         }
+        /// Refuse the legacy hook, which cannot supply a retirement context.
         fn handle(&self, _: String, _: Vec<u8>, _: CancelToken) -> HandlerFut {
             Box::pin(async {
                 HandlerOutcome::error(syntra_core::ErrorCode::Unimplemented, "unsupported method")

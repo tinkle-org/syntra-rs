@@ -11,9 +11,11 @@ use syntra_runtime::{
 /// Count context-hook admission after confirming unsupported-driver refusal.
 struct Retire(Arc<AtomicUsize>);
 impl Handler for Retire {
+    /// Fail if the adapter loses the context-aware hook delegation.
     fn handle(&self, _: String, _: Vec<u8>, _: CancelToken) -> HandlerFut {
         panic!("context hook must be forwarded by AllowAll")
     }
+    /// Confirm raw-driver refusal before counting the admitted context hook.
     fn handle_with_context(
         &self,
         _: String,

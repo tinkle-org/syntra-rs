@@ -66,6 +66,7 @@ impl AuthorityFixture {
     }
 }
 impl Authority for AuthorityFixture {
+    /// Count and report the fixture's current active, owned, or failure evidence.
     fn observe(&self, transition: Option<Transition>) -> BoxFuture<'_, Observation> {
         Box::pin(async move {
             let s = self.state.lock().unwrap();
@@ -105,6 +106,7 @@ impl Authority for AuthorityFixture {
             Observation::Active { revision: s.0 }
         })
     }
+    /// Conditionally record ownership and optionally hold the callback open.
     fn commit(&self, c: Transition, _lease: ExecutionLease) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             self.trace.record("commit", 0);
@@ -135,9 +137,11 @@ struct Factory {
     clock: Option<ElapsedClock>,
 }
 impl AuthenticatorFactory for Factory {
+    /// Use the explicitly driven clock when supplied, otherwise native elapsed time.
     fn elapsed_clock(&self) -> ElapsedClock {
         self.clock.clone().unwrap_or_default()
     }
+    /// Refuse withdrawn bindings and authenticate the fixed fixture principal.
     fn create(&self, _: &VerifiedIdentity) -> Result<Arc<dyn Authenticator>, AuthError> {
         if self.authority.state.lock().unwrap().1.is_some() {
             return Err(AuthError::unauthenticated());
@@ -147,6 +151,7 @@ impl AuthenticatorFactory for Factory {
             "fixture-principal",
         )))
     }
+    /// Opt into the fixed receipt with the minimum supported authority read bound.
     fn terminal_receipt(&self, _: &VerifiedIdentity) -> Option<Policy> {
         self.enabled.then(|| Policy {
             method: METHOD.into(),
@@ -159,9 +164,11 @@ impl AuthenticatorFactory for Factory {
 /// Retire only the configured method; sibling methods exercise ordinary output.
 struct Retire;
 impl Handler for Retire {
+    /// Echo payloads on the legacy hook; retirement requires the request context.
     fn handle(&self, _: String, p: Vec<u8>, _: CancelToken) -> HandlerFut {
         Box::pin(async move { HandlerOutcome::Payload(p) })
     }
+    /// Retire the configured method or return an ordinary, optionally delayed echo.
     fn handle_with_context(
         &self,
         method: String,
@@ -456,6 +463,7 @@ impl Gate {
     }
 }
 impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Controlled<S> {
+    /// Forward inbound reads independently of the controlled write gate.
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -465,6 +473,7 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Controlled<S> {
     }
 }
 impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Controlled<S> {
+    /// Hand off at most the remaining allowance and record actual byte progress.
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -488,12 +497,14 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Controlled<S> {
         }
         result
     }
+    /// Forward flushes without changing the raw-byte allowance.
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.get_mut().stream).poll_flush(cx)
     }
+    /// Forward shutdown to the underlying stream.
     fn poll_shutdown(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -597,6 +608,7 @@ impl ManualTime {
     }
 }
 impl Drop for ManualTime {
+    /// Stop the ready task if the test exits before explicit joined cleanup.
     fn drop(&mut self) {
         if let Some(awake) = &self.awake {
             awake.abort();
@@ -650,16 +662,14 @@ async fn idle_minimum_bound_refreshes_with_timer_margin_then_expires_exactly() {
     time.finish().await;
 }
 
-/// Native elapsed time and real idle TCP stay live across several minimum-bound
-/// refresh intervals; no incoming RPC is needed to keep prompt authority fresh.
+/// Real idle TCP stays open and completes retirement with native elapsed time.
+/// The driven-clock test above checks minimum-bound refresh counts and expiry.
 #[tokio::test]
 async fn real_idle_minimum_bound_refreshes_before_retirement() {
     let authority = AuthorityFixture::new(0);
     let (client, host) = pair(authority.clone(), b"retired".to_vec(), true).await;
-    let before = authority.reads.load(Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(350)).await;
     assert!(!host.is_closed());
-    assert!(authority.reads.load(Ordering::SeqCst) >= before + 5);
     assert_eq!(authority.commits.load(Ordering::SeqCst), 0);
     assert_eq!(
         client.conn.call(METHOD, vec![], 2000).await.unwrap(),

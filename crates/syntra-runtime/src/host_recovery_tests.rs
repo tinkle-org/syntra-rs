@@ -266,8 +266,10 @@ async fn terminal_reservation_retires_actual_recovery_attachment_before_transiti
         Authority, DriverCommand, Observation, Policy, RequestContext, Transition,
     };
     use futures_util::future::BoxFuture;
+    /// In-memory owner evidence for retirement of an actual recovery attachment.
     struct Owned(Mutex<Option<Transition>>);
     impl Authority for Owned {
+        /// Report active authority or the owner recorded by the transition callback.
         fn observe(&self, _: Option<Transition>) -> BoxFuture<'_, Observation> {
             Box::pin(async {
                 match self.0.lock().unwrap().as_ref() {
@@ -280,20 +282,25 @@ async fn terminal_reservation_retires_actual_recovery_attachment_before_transiti
                 }
             })
         }
+        /// Record ownership after the test has checked the recovery-close barrier.
         fn commit(&self, c: Transition, _: ExecutionLease) -> BoxFuture<'_, ()> {
             Box::pin(async move {
                 *self.0.lock().unwrap() = Some(c);
             })
         }
     }
+    /// Require context-aware retirement for the recovery-attachment fixture.
     struct Retire;
     impl Handler for Retire {
+        /// Admit fixture requests to the retirement hook.
         fn authorize(&self, _: &Principal, _: &str) -> Result<(), AuthError> {
             Ok(())
         }
+        /// Fail if dispatch bypasses the request context.
         fn handle(&self, _: String, _: Vec<u8>, _: CancelToken) -> HandlerFut {
             panic!("context hook required")
         }
+        /// Retire at the fixture's active revision and return its fixed outcome.
         fn handle_with_context(
             &self,
             _: String,
@@ -367,8 +374,10 @@ async fn reservation_dispatch_linearization(profile: bool) {
         Authority, DriverCommand, Observation, Policy, RequestContext, Transition,
     };
     use futures_util::future::BoxFuture;
+    /// In-memory authority used to observe mutation ordering across dispatch.
     struct Owned(Mutex<Option<Transition>>);
     impl Authority for Owned {
+        /// Report active authority until the exact operation owner is recorded.
         fn observe(&self, _: Option<Transition>) -> BoxFuture<'_, Observation> {
             Box::pin(async {
                 match self.0.lock().unwrap().as_ref() {
@@ -381,23 +390,28 @@ async fn reservation_dispatch_linearization(profile: bool) {
                 }
             })
         }
+        /// Record the owner so the test can detect mutation before dispatch completes.
         fn commit(&self, c: Transition, _: ExecutionLease) -> BoxFuture<'_, ()> {
             Box::pin(async move {
                 *self.0.lock().unwrap() = Some(c);
             })
         }
     }
+    /// Capture a retirement context and count ordinary synchronous hook construction.
     struct Capture {
         context: Mutex<Option<oneshot::Sender<RequestContext>>>,
         effects: Arc<AtomicUsize>,
     }
     impl Handler for Capture {
+        /// Admit fixture requests for the dispatch-ordering test.
         fn authorize(&self, _: &Principal, _: &str) -> Result<(), AuthError> {
             Ok(())
         }
+        /// Fail if dispatch omits the context-aware hook.
         fn handle(&self, _: String, _: Vec<u8>, _: CancelToken) -> HandlerFut {
             panic!("context hook required")
         }
+        /// Export the retirement context or synchronously count an ordinary dispatch.
         fn handle_with_context(
             &self,
             method: String,

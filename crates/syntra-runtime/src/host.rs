@@ -185,6 +185,7 @@ where
         self.0.handle_with_execution(method, payload, cancel, lease)
     }
 
+    /// Forward the admitted request context and execution lease to the inner handler.
     fn handle_with_context(
         &self,
         method: String,
