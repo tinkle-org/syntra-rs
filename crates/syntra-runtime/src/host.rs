@@ -60,6 +60,9 @@ use crate::session::{AuthError, Authenticator, Principal, Session, SessionManage
 mod execution;
 pub use execution::{ExecutionBudget, ExecutionLease};
 
+#[path = "host_terminal.rs"]
+pub mod terminal;
+
 #[path = "host_recovery.rs"]
 mod recovery;
 
@@ -130,6 +133,20 @@ pub trait Handler: Send + Sync {
             work.await
         })
     }
+
+    /// Request-scoped hook for optional terminal retirement. The private context
+    /// cannot be constructed from a wire request ID. Existing handlers keep their
+    /// execution hook and lease behavior through this default delegation.
+    fn handle_with_context(
+        &self,
+        method: String,
+        payload: Vec<u8>,
+        cancel: crate::connection::CancelToken,
+        lease: ExecutionLease,
+        _context: terminal::RequestContext,
+    ) -> HandlerFut {
+        self.handle_with_execution(method, payload, cancel, lease)
+    }
 }
 
 pub type HandlerFut = std::pin::Pin<Box<dyn std::future::Future<Output = HandlerOutcome> + Send>>;
@@ -166,6 +183,18 @@ where
         lease: ExecutionLease,
     ) -> HandlerFut {
         self.0.handle_with_execution(method, payload, cancel, lease)
+    }
+
+    fn handle_with_context(
+        &self,
+        method: String,
+        payload: Vec<u8>,
+        cancel: crate::connection::CancelToken,
+        lease: ExecutionLease,
+        context: terminal::RequestContext,
+    ) -> HandlerFut {
+        self.0
+            .handle_with_context(method, payload, cancel, lease, context)
     }
 }
 
@@ -209,8 +238,17 @@ struct WithdrawalOwner {
     done: tokio::sync::watch::Receiver<bool>,
 }
 
+/// Deterministic test-only preemption after the worker's last dispatch check.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+struct DispatchPause {
+    id: u64,
+    checked: Notify,
+    release: Notify,
+}
+
 #[derive(Default)]
 struct Calls {
+    terminal: Option<Arc<terminal::Coordinator>>,
     clock: crate::elapsed::ElapsedClock,
     pending: HashMap<u64, PendingCall>,
     delivery_stopped: bool,
@@ -229,6 +267,9 @@ impl Calls {
             } else {
                 candidate
             };
+            if let Some(terminal) = &self.terminal {
+                terminal.select(id, &outcome);
+            }
             call.cancel.cancel();
             // Receiver ownership is the worker's; a panic is still surfaced by
             // the task runtime, not converted to a fabricated success/result.
@@ -247,6 +288,9 @@ impl Calls {
         // Loss settles reporting, not another wire result. In particular an ID
         // violation must not cause a new UNAVAILABLE result under that same ID.
         self.delivery_stopped = true;
+        if let Some(terminal) = &self.terminal {
+            terminal.abort();
+        }
         self.select_all(ErrorCode::Unavailable, message);
     }
 }
@@ -281,6 +325,10 @@ pub struct Host {
     withdrawal: Mutex<Option<WithdrawalOwner>>,
     recovery: Mutex<Option<recovery::Attachment>>,
     weak_self: Weak<Host>,
+    terminal: Mutex<Option<Arc<terminal::Coordinator>>>,
+    terminal_commands: Mutex<Option<mpsc::Receiver<terminal::DriverCommand>>>,
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    dispatch_pause: Mutex<Option<Arc<DispatchPause>>>,
 }
 
 impl Host {
@@ -542,6 +590,10 @@ impl Host {
             withdrawal: Mutex::new(None),
             recovery: Mutex::new(None),
             weak_self: weak_self.clone(),
+            terminal: Mutex::new(None),
+            terminal_commands: Mutex::new(None),
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            dispatch_pause: Mutex::new(None),
         });
         // Handshake timer (SNTR-HS-002/011): ACTIVE or explicit close.
         // The `handshake_done` signal lets a successful handshake stop the
@@ -1072,6 +1124,7 @@ impl Host {
         let deadline = received_at + self.request_timeout(&req);
         let state = self.conn.shared.state.read().await;
         if *state != ConnectionState::Active
+            || self.conn.terminal_fenced()
             || self.conn.is_closed()
             || self.conn.lifecycle_blocked()
             || self
@@ -1223,6 +1276,9 @@ impl Host {
         {
             return true;
         }
+        if self.conn.terminal_fenced() {
+            return true;
+        }
         let Some(output) = self.output.try_acquire() else {
             return false;
         };
@@ -1283,6 +1339,15 @@ impl Host {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let request_context = terminal::RequestContext::new(
+            self.weak_self.clone(),
+            id,
+            version,
+            req.method.clone(),
+            deadline,
+        );
+        #[cfg(all(test, not(target_arch = "wasm32")))]
+        let dispatch_pause = self.dispatch_pause.lock().unwrap().clone();
         let body = async move {
             // Keep the independent profile charge through output, not just the
             // synchronous callback. Backpressure cannot grow replacement work.
@@ -1290,13 +1355,16 @@ impl Host {
                 let mut closed = sender.subscribe_close();
                 let cancelled = cancel.clone();
                 let work = async {
-                    // Read lock fences dispatch against close/withdraw. Check
-                    // expiry again immediately before the synchronous hook.
+                    // Keep the lifecycle read guard through synchronous hook
+                    // construction / prepared recovery dispatch. Reservation
+                    // takes the exclusive side, so its fence cannot cross this
+                    // final check/callback gap. No raw-I/O gate spans callbacks.
                     let state = sender.shared.state.read().await;
                     {
                         let mut calls = registry.lock().unwrap_or_else(|e| e.into_inner());
                         if sender.is_closed()
                             || sender.lifecycle_blocked()
+                            || sender.terminal_fenced()
                             || sender
                                 .shared
                                 .principal_withdrawn
@@ -1319,6 +1387,11 @@ impl Host {
                             return;
                         }
                     }
+                    #[cfg(all(test, not(target_arch = "wasm32")))]
+                    if let Some(pause) = dispatch_pause.as_ref().filter(|pause| pause.id == id) {
+                        pause.checked.notify_one();
+                        pause.release.notified().await;
+                    }
                     let work: HandlerFut = if let Some(profile) = &profile {
                         Box::pin(std::future::ready(profile.handle(
                             &req.method,
@@ -1327,11 +1400,12 @@ impl Host {
                             &sender,
                         )))
                     } else {
-                        handler.handle_with_execution(
+                        handler.handle_with_context(
                             req.method,
                             req.payload,
                             cancel,
                             lease.clone(),
+                            request_context.with_lease(lease.clone()),
                         )
                     };
                     drop(state);
@@ -1442,6 +1516,17 @@ impl Host {
         // Selection is immutable BEFORE this wait. Withdrawal may close delivery
         // but cannot fence away/replace an earlier selected success with an error.
         let bytes = frame.encode_to_vec();
+        let terminal = registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .terminal
+            .clone();
+        if let Some(terminal) = terminal {
+            if terminal.fenced() {
+                terminal.emit(id, bytes, _output);
+                return;
+            }
+        }
         let permit = match sender.reserve_writer().await {
             Ok(permit) => permit,
             Err(_) => {
@@ -1460,6 +1545,7 @@ impl Host {
         if !calls.delivery_stopped
             && !sender.is_closed()
             && !sender.writer_is_fenced()
+            && !sender.terminal_fenced()
             && !sender.lifecycle_blocked()
         {
             permit.send(bytes);
@@ -1504,6 +1590,7 @@ impl Host {
         if *state != ConnectionState::Active
             || self.conn.is_closed()
             || self.conn.writer_is_fenced()
+            || self.conn.terminal_fenced()
             || self.conn.lifecycle_blocked()
             || self
                 .conn
@@ -1591,6 +1678,9 @@ impl Host {
     /// continuation, not termination/join of retained external execution.
     pub async fn withdraw_principal(&self) {
         use std::sync::atomic::Ordering;
+        if let Some(terminal) = self.terminal.lock().unwrap().as_ref() {
+            terminal.abort();
+        }
         let deadline = self.conn.shared.clock.now() + SHUTDOWN_GRACE;
         let (mut done, from_handler) = {
             let mut state = self.conn.shared.state.write().await;

@@ -10,9 +10,12 @@ runtime scheduling and socket policy. Encryption is integral to the protocol. Se
 [CONNECTION.md](CONNECTION.md) for current architecture and embedding boundaries.
 
 The implementation is experimental and distributed as release-candidate crates.
-No formal conformance,
-independent interoperability or independent
-security-review verdict is claimed. The current candidate is recorded in
+No formal conformance or independent security-review verdict is claimed.
+The terminal receipt fixture report,
+`syntra-go/TERMINAL_RECEIPT_INTEROP.md` (requires a sibling checkout), records a
+bounded bidirectional TCP matrix, not general interoperability or application
+acceptance. The report and handoff are not present at the recorded run-2 Go
+commit, so no commit-pinned hosted copy is claimed. The current candidate is recorded in
 [`protocol-contract.json`](protocol-contract.json); it pins `committed-candidate`
 inputs, not a release or specification freeze. See
 [input provenance](CONTRIBUTING.md#input-provenance-and-authority) for the separate
@@ -359,6 +362,26 @@ they do not select a different encryption protocol.
   terminal gates check the deadline first; previously selected outcomes stay
   terminal. See the [core](crates/syntra-core/src/lib.rs) and
   [runtime](crates/syntra-runtime/src/lib.rs) source contracts.
+
+## Optional terminal receipt
+
+Native TCP supports a default-disabled terminal result for an authorized
+self-withdrawing operation. `AuthenticatorFactory::terminal_receipt(identity)`
+supplies a per-verified-binding fixed policy and complete typed authority adapter.
+`Handler::handle_with_context` calls `context.retire(expected_revision).await`
+before mutation and returns its `HandlerOutcome` promptly; it must not wait for
+its own output. A selected outcome, complete local writing, peer observation,
+and joined cleanup are different facts. Loss is unknown and never automatically
+retried or replayed.
+
+The typed policy replaces the ordinary connection guard; combining it with an
+independent generic guard is refused. The runtime fences ordinary traffic and
+retires actual recovery attachments before transition. Raw/custom record, WASM,
+FFI, WS/WSS, and HTTP/HTTPS paths do not support terminal effects. Existing clients
+parse the same `RpcResult`, with no new wire message or peer option. See
+[API, support, tests, and evidence limits](TERMINAL_RECEIPT_DESIGN.md) and the
+manual merge/release handoff at `syntra-go/TERMINAL_RECEIPT_HANDOFF.md`
+(requires a sibling checkout).
 
 ## Native FFI
 

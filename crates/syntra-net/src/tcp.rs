@@ -139,7 +139,7 @@ where
         budget: budget.io.clone(),
     };
     let (read, write) = tokio::io::split(stream);
-    pump::accept_records_with_budget(
+    pump::accept_tcp_records_with_budget(
         StreamReader(read),
         StreamWriter(write),
         security,

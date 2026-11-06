@@ -23,6 +23,9 @@ use syntra_core::{
 use syntra_runtime::connection::validate_close_grace;
 use syntra_runtime::elapsed::ElapsedClock;
 use syntra_runtime::recovery::wire::RecoveryService;
+use syntra_runtime::terminal::{
+    Coordinator, DriverCommand, Policy as TerminalPolicy, TerminalOutput,
+};
 use syntra_runtime::{
     AuthError, Authenticator, ConnectionConfig, ExecutionBudget, Handler, Host, Initiator,
 };
@@ -153,6 +156,7 @@ impl syntra_core::secure_channel::ElapsedSource for ChannelElapsed {
     }
 }
 pub(crate) struct AttemptIoBudget {
+    terminal: Mutex<Option<Arc<Coordinator>>>,
     clock: ElapsedClock,
     deadline: Instant,
     phase_deadline: Mutex<Instant>,
@@ -167,6 +171,15 @@ impl AttemptIoBudget {
                 "Syntra establishment gate unavailable",
             )
         };
+        if self
+            .terminal
+            .lock()
+            .map_err(|_| unavailable())?
+            .as_ref()
+            .is_some_and(|c| !c.raw_allowed())
+        {
+            return Err(unavailable());
+        }
         let phase = *self.phase_deadline.lock().map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -238,6 +251,7 @@ impl EstablishmentBudget {
             released: AtomicBool::new(false),
         });
         let io = Arc::new(AttemptIoBudget {
+            terminal: Mutex::new(None),
             clock: clock.clone(),
             deadline,
             phase_deadline: Mutex::new(deadline),
@@ -482,6 +496,13 @@ static DEFAULT_EXECUTION_BUDGET: OnceLock<ExecutionBudget> = OnceLock::new();
 /// Returning authorization must re-check current enrollment policy here. A factory
 /// can capture the private-constructed identity in an Authenticator wrapper.
 pub trait AuthenticatorFactory: Send + Sync {
+    /// Explicit per-verified-binding terminal policy, disabled by default. Only
+    /// native TCP accepts this today. The adapter supplies complete operation-
+    /// aware connection authority; configuring generic authorization alongside
+    /// it is refused rather than interpreting an AuthError as commit evidence.
+    fn terminal_receipt(&self, _identity: &VerifiedIdentity) -> Option<TerminalPolicy> {
+        None
+    }
     fn create(&self, identity: &VerifiedIdentity) -> Result<Arc<dyn Authenticator>, AuthError>;
 
     /// One process-local clock shared by establishment, Core and policy checks.
@@ -567,12 +588,35 @@ pub trait ConnectionAuthorization: Send + Sync {
 }
 
 struct FreshAuthorization {
+    terminal: Option<Arc<Coordinator>>,
     base: Arc<dyn ConnectionAuthorization>,
     clock: ElapsedClock,
     interval: Duration,
     read: Duration,
     close: Duration,
     state: Mutex<(Option<Instant>, bool)>,
+}
+
+/// Internal typed-authority bridge; generic authorization is never reclassified.
+struct TerminalAuthorization(Arc<Coordinator>);
+impl ConnectionAuthorization for TerminalAuthorization {
+    fn check(&self) -> BoxFuture<'_, Result<(), AuthError>> {
+        Box::pin(async {
+            self.0
+                .refresh()
+                .await
+                .map_err(|_| AuthError::unauthenticated())
+        })
+    }
+    fn interval(&self) -> Duration {
+        self.0.read_timeout() / 2
+    }
+    fn read_timeout(&self) -> Duration {
+        self.0.read_timeout()
+    }
+    fn close_timeout(&self) -> Duration {
+        Duration::from_millis(250)
+    }
 }
 
 impl FreshAuthorization {
@@ -591,6 +635,7 @@ impl FreshAuthorization {
             return Err(Error::Configuration);
         }
         Ok(Self {
+            terminal: None,
             base,
             clock,
             interval,
@@ -603,6 +648,11 @@ impl FreshAuthorization {
     /// Hot-path gate only: successful polls never renew authority. Establishment
     /// and the watchdog must call check() to perform authoritative reads.
     async fn check_cached(&self) -> Result<(), AuthError> {
+        if let Some(terminal) = &self.terminal {
+            return terminal
+                .with_io(|| ())
+                .ok_or_else(AuthError::unauthenticated);
+        }
         {
             // No await or dependency I/O under this short synchronous state lock.
             let mut state = self
@@ -630,6 +680,12 @@ impl FreshAuthorization {
 impl ConnectionAuthorization for FreshAuthorization {
     fn check(&self) -> BoxFuture<'_, Result<(), AuthError>> {
         Box::pin(async move {
+            if let Some(terminal) = &self.terminal {
+                return terminal
+                    .refresh()
+                    .await
+                    .map_err(|_| AuthError::unauthenticated());
+            }
             let start = elapsed_now(&self.clock);
             let deadline = {
                 let mut state = self
@@ -704,6 +760,11 @@ async fn refresh_authorization(
         return Err(Error::Authentication);
     }
     let Some(guard) = guard else { return Ok(()) };
+    if guard.terminal.is_some() {
+        // The coordinator bounds queue wait and the actual serialized read
+        // separately against current freshness and the immutable cutoff.
+        return guard.check().await.map_err(|_| Error::Authentication);
+    }
     let deadline = elapsed_now(clock) + guard.read_timeout();
     elapsed_timeout(clock, deadline, guard.check())
         .await
@@ -733,6 +794,9 @@ impl<F: AuthenticatorFactory> RecoveryAuthenticatorFactory<F> {
 }
 
 impl<F: AuthenticatorFactory> AuthenticatorFactory for RecoveryAuthenticatorFactory<F> {
+    fn terminal_receipt(&self, identity: &VerifiedIdentity) -> Option<TerminalPolicy> {
+        self.base.terminal_receipt(identity)
+    }
     fn create(&self, identity: &VerifiedIdentity) -> Result<Arc<dyn Authenticator>, AuthError> {
         self.base.create(identity)
     }
@@ -833,7 +897,19 @@ async fn authorized_io<T>(
     peer: Option<&Peer>,
     authorization: &Option<Arc<FreshAuthorization>>,
 ) -> Result<T, Error> {
+    authorized_io_inner(io, clock, deadline, peer, authorization, None).await
+}
+
+async fn authorized_io_inner<T>(
+    io: impl Future<Output = Result<T, Error>>,
+    clock: &ElapsedClock,
+    deadline: Instant,
+    peer: Option<&Peer>,
+    authorization: &Option<Arc<FreshAuthorization>>,
+    receipt: Option<(&Coordinator, &TerminalOutput)>,
+) -> Result<T, Error> {
     elapsed_timeout(clock, deadline, async {
+        let mut first = true;
         tokio::pin!(io);
         let wake = Arc::new(IoWake {
             ready: AtomicBool::new(false),
@@ -880,11 +956,15 @@ async fn authorized_io<T>(
                         io.as_mut().poll(&mut io_context)
                     }))
                 };
-                let result = match peer {
-                    Some(peer) => peer
+                let result = match (peer, receipt) {
+                    (Some(Peer::Host(host)), Some((coordinator, output))) => coordinator
+                        .with_receipt_io(output, &mut first, || host.with_carrier_io(poll))
+                        .flatten()
+                        .unwrap_or(Ok(std::task::Poll::Ready(Err(Error::Closed)))),
+                    (Some(peer), _) => peer
                         .with_carrier_io(poll)
                         .unwrap_or(Ok(std::task::Poll::Ready(Err(Error::Closed)))),
-                    None => poll(),
+                    (None, _) => poll(),
                 };
                 match result {
                     Ok(result) => result.map(Some),
@@ -1157,10 +1237,24 @@ enum Peer {
     Host(Arc<Host>),
 }
 impl Peer {
+    /// Publish connection-fatal reader failure at the same serialized gate as
+    /// receipt handoff, before diagnostics/completion can wake the parent owner.
+    /// Poisoning a channel alone cannot stop an already-encrypted pending write.
+    fn abort_terminal_output(&self) {
+        if let Self::Host(host) = self {
+            if let Some(coordinator) = host.terminal_coordinator() {
+                coordinator.abort();
+            }
+        }
+    }
+
     fn with_carrier_io<T>(&self, poll: impl FnOnce() -> T) -> Option<T> {
         match self {
             Self::Client(c) => c.with_carrier_io(poll),
-            Self::Host(h) => h.with_carrier_io(poll),
+            Self::Host(h) => match h.terminal_coordinator() {
+                Some(c) => c.with_io(|| h.with_carrier_io(poll)).flatten(),
+                None => h.with_carrier_io(poll),
+            },
         }
     }
 
@@ -1398,6 +1492,82 @@ struct ReadContext {
     authorization: Option<Arc<FreshAuthorization>>,
 }
 
+/// The same owned reader continuation is used by the pump and deterministic
+/// tests that withhold parent joining while repolling already-encrypted output.
+struct ReaderTask {
+    channel: Arc<Mutex<Channel>>,
+    receive: ReceiveState,
+    end: Instant,
+    limits: Limits,
+    peer: Peer,
+    authorization: Option<Arc<FreshAuthorization>>,
+    terminal: TransportTerminal,
+}
+
+async fn run_reader<R: RecordReader>(
+    reader: R,
+    state: ReaderTask,
+) -> (Direction, Result<(), Error>) {
+    let ReaderTask {
+        channel,
+        receive,
+        end,
+        limits,
+        peer,
+        authorization,
+        terminal,
+    } = state;
+    let _panic_guard = TransportPanicGuard(terminal.clone());
+    let clock = peer.clock();
+    let ingest_peer = peer.clone();
+    let read_clock = clock.clone();
+    let read_authorization = authorization.clone();
+    let result = read_frames(
+        reader,
+        channel,
+        receive,
+        end,
+        limits,
+        ReadContext {
+            clock,
+            peer: Some(peer.clone()),
+            authorization,
+        },
+        move |frame, received_at| {
+            let peer = ingest_peer.clone();
+            let authorization = read_authorization.clone();
+            let clock = read_clock.clone();
+            async move {
+                check_authorization(&authorization, &clock).await?;
+                if !peer.delivery_open() {
+                    return Err(Error::Closed);
+                }
+                peer.ingest_received_at(&frame, received_at).await;
+                if peer.closed() {
+                    Err(Error::Closed)
+                } else {
+                    Ok(())
+                }
+            }
+        },
+    )
+    .await;
+    if result.is_err() {
+        // Every failed reader ends this connection, including retryable loss
+        // categories. Never defer its local output cutoff to join_next/cleanup.
+        peer.abort_terminal_output();
+    }
+    let result = result.map_err(|error| match error {
+        // Local teardown can close the cipher before a buffered read resumes.
+        Error::Channel(syntra_core::secure_channel::Error::Closed) if !peer.delivery_open() => {
+            Error::Closed
+        }
+        error => error,
+    });
+    terminal.result(&result);
+    (Direction::Read, result)
+}
+
 struct DrainDeadline<'a> {
     until: Instant,
     cutoff: Instant,
@@ -1501,6 +1671,14 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
         policy_jobs,
     } = state;
     let clock = peer.clock();
+    let mut terminal_commands = match &peer {
+        Peer::Host(host) => host.take_terminal_commands(),
+        _ => None,
+    };
+    let coordinator = match &peer {
+        Peer::Host(host) => host.terminal_coordinator(),
+        _ => None,
+    };
     let owner_clock = clock.clone();
     let retained_peer = peer.clone();
     // Register before publishing the handle. A caller may begin shutdown before
@@ -1539,62 +1717,24 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
             return;
         }
         let mut tasks = JoinSet::new();
-        let read_channel = channel.clone();
-        let read_peer = peer.clone();
-        let read_limits = limits.clone();
-        let read_clock = clock.clone();
-        let read_authorization = authorization.clone();
-        let read_terminal = owner_terminal.clone();
-        let reader_abort = tasks.spawn(async move {
-            let _panic_guard = TransportPanicGuard(read_terminal.clone());
-            let ingest_peer = read_peer.clone();
-            let result = read_frames(
-                reader,
-                read_channel,
+        let reader_abort = tasks.spawn(run_reader(
+            reader,
+            ReaderTask {
+                channel: channel.clone(),
                 receive,
                 end,
-                read_limits,
-                ReadContext {
-                    clock: read_clock.clone(),
-                    peer: Some(read_peer.clone()),
-                    authorization: read_authorization.clone(),
-                },
-                move |frame, received_at| {
-                    let peer = ingest_peer.clone();
-                    let authorization = read_authorization.clone();
-                    let clock = read_clock.clone();
-                    async move {
-                        check_authorization(&authorization, &clock).await?;
-                        if !peer.delivery_open() {
-                            return Err(Error::Closed);
-                        }
-                        peer.ingest_received_at(&frame, received_at).await;
-                        if peer.closed() {
-                            Err(Error::Closed)
-                        } else {
-                            Ok(())
-                        }
-                    }
-                },
-            )
-            .await;
-            let result = result.map_err(|error| match error {
-                // Local teardown can close the cipher before a buffered read resumes.
-                Error::Channel(syntra_core::secure_channel::Error::Closed)
-                    if !read_peer.delivery_open() =>
-                {
-                    Error::Closed
-                }
-                error => error,
-            });
-            read_terminal.result(&result);
-            (Direction::Read, result)
-        });
+                limits: limits.clone(),
+                peer: peer.clone(),
+                authorization: authorization.clone(),
+                terminal: owner_terminal.clone(),
+            },
+        ));
         let write_channel = channel.clone();
         let write_peer = peer.clone();
         let write_authorization = authorization.clone();
         let write_clock = clock.clone();
         let write_terminal = owner_terminal.clone();
+        let write_coordinator = coordinator.clone();
         tasks.spawn(async move {
             let _panic_guard = TransportPanicGuard(write_terminal.clone());
             let mut teardown_deadline = end;
@@ -1608,6 +1748,36 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
                     }
                     let frame = tokio::select! {
                         biased;
+                        command = async { match &mut terminal_commands { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {
+                            let coordinator = write_coordinator.as_ref().ok_or(Error::Configuration)?;
+                            match command.ok_or(Error::Closed)? {
+                                DriverCommand::Barrier(ack) => {
+                                    // Sole writer reached this arm only after its active full
+                                    // frame completed; drop every unstarted ordinary frame.
+                                    while outbound.try_recv().is_ok() {}
+                                    coordinator.refresh().await.map_err(|_| Error::Authentication)?;
+                                    ack.send(()).map_err(|_| Error::Closed)?;
+                                    continue;
+                                }
+                                DriverCommand::Receipt(output) => {
+                                    coordinator.refresh().await.map_err(|_| Error::Authentication)?;
+                                    let deadline = Instant::from_std(coordinator.cutoff().ok_or(Error::Closed)?).min(end);
+                                    teardown_deadline = Instant::from_std(coordinator.deadline().ok_or(Error::Closed)?).min(end);
+                                    let plaintext = frame_plaintext(output.bytes())?;
+                                    // The 1024-byte ceiling guarantees one record. Keep this
+                                    // exact ciphertext/write future across all partial polls.
+                                     let ciphertext = write_channel.lock().map_err(|_| Error::Closed)?.encrypt(&plaintext)?;
+                                     // Explicit fresh proof after nonce consumption, immediately
+                                     // before first handoff. Retained I/O repolls are cache-only.
+                                     elapsed_timeout(&write_clock, deadline, coordinator.refresh()).await?
+                                         .map_err(|_| Error::Authentication)?;
+                                     authorized_io_inner(writer.write_record(&ciphertext), &write_clock, deadline,
+                                        Some(&write_peer), &write_authorization, Some((coordinator, &output))).await?;
+                                    coordinator.written();
+                                    break;
+                                }
+                            }
+                        },
                         _ = draining.changed(), if drain_deadline.is_none() => continue,
                         frame = outbound.recv() => match frame { Some(frame) => frame, None => break },
                     };
@@ -1631,9 +1801,15 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
                     let plaintext = frame_plaintext(&frame)?;
                     // One frame's complete record sequence is owned until completion or abort.
                     elapsed_timeout(&write_clock, deadline, async {
-                        for chunk in plaintext.chunks(MAX_PLAINTEXT) {
+                        for (index, chunk) in plaintext.chunks(MAX_PLAINTEXT).enumerate() {
                             if !write_peer.delivery_open() || elapsed_now(&write_clock) >= deadline { return Err(Error::Timeout); }
-                            let ciphertext = write_channel.lock().map_err(|_| Error::Closed)?.encrypt(chunk)?;
+                            let encrypt = || write_channel.lock().map_err(|_| Error::Closed)?.encrypt(chunk).map_err(Error::from);
+                            let ciphertext = if index == 0 {
+                                match &write_coordinator {
+                                    Some(c) => match c.start_ordinary(encrypt).map_err(|_| Error::Authentication)? { Some(result) => result?, None => return Ok(()) },
+                                    None => encrypt()?,
+                                }
+                            } else { encrypt()? };
                             write_checked(&mut writer, &ciphertext, &write_clock, deadline, Some(&write_peer), &write_authorization).await?;
                             if elapsed_now(&write_clock) >= deadline { return Err(Error::Timeout); }
                             tokio::task::yield_now().await;
@@ -1671,7 +1847,16 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
                     return Err(error);
                 }
                 clock
-                    .sleep_until((start + guard.interval()).into_std())
+                    .sleep_until(
+                        (start + guard.interval())
+                            .min(
+                                coordinator
+                                    .as_ref()
+                                    .and_then(|c| c.cutoff())
+                                    .map_or(end, Instant::from_std),
+                            )
+                            .into_std(),
+                    )
                     .await;
             }
         };
@@ -1985,7 +2170,30 @@ pub async fn accept_records_with_budget<R: RecordReader, W: RecordWriter>(
         factory,
         handler,
         config,
-        (establishment, None),
+        (establishment, None, false),
+    )
+    .await
+}
+
+/// Internal TCP entry point: custom record adapters never inherit this support.
+#[cfg(feature = "tcp")]
+pub(crate) async fn accept_tcp_records_with_budget<R: RecordReader, W: RecordWriter>(
+    reader: R,
+    writer: W,
+    security: &ServerConfig,
+    factory: Arc<dyn AuthenticatorFactory>,
+    handler: Arc<dyn Handler>,
+    config: (ConnectionConfig, Limits),
+    establishment: EstablishmentBudget,
+) -> Result<HostHandle, Error> {
+    accept_records_impl(
+        reader,
+        writer,
+        security,
+        factory,
+        handler,
+        config,
+        (establishment, None, true),
     )
     .await
 }
@@ -2007,7 +2215,7 @@ pub(crate) async fn accept_records_owned<R: RecordReader, W: RecordWriter>(
         factory,
         handler,
         config,
-        (setup.0, Some(setup.1)),
+        (setup.0, Some(setup.1), false),
     )
     .await
 }
@@ -2019,9 +2227,9 @@ async fn accept_records_impl<R: RecordReader, W: RecordWriter>(
     factory: Arc<dyn AuthenticatorFactory>,
     handler: Arc<dyn Handler>,
     config: (ConnectionConfig, Limits),
-    setup: (EstablishmentBudget, Option<Arc<AcceptOwner>>),
+    setup: (EstablishmentBudget, Option<Arc<AcceptOwner>>, bool),
 ) -> Result<HostHandle, Error> {
-    let (establishment, owner) = setup;
+    let (establishment, owner, terminal_supported) = setup;
     let (runtime, limits) = config;
     limits.validate(&runtime)?;
     establishment.io.check().map_err(|_| Error::Timeout)?;
@@ -2172,7 +2380,7 @@ async fn accept_records_impl<R: RecordReader, W: RecordWriter>(
     if elapsed_now(&clock) >= core_deadline {
         return Err(Error::Timeout);
     }
-    let authorization = factory
+    let mut authorization = factory
         .connection_authorization(&identity)
         .map_err(|_| Error::Authentication)?
         .map(|base| FreshAuthorization::new(base, clock.clone()).map(Arc::new))
@@ -2215,6 +2423,31 @@ async fn accept_records_impl<R: RecordReader, W: RecordWriter>(
         clock.clone(),
     )
     .map_err(|_| Error::Configuration)?;
+    if let Some(policy) = factory.terminal_receipt(&identity) {
+        if !terminal_supported || authorization.is_some() {
+            return Err(Error::Configuration);
+        }
+        // Only tcp::accept_stream enters with support. Its split stream
+        // cannot flush output from reads; the sole writer/barrier/raw gates above
+        // own all protected output and bounded retirement for this connection.
+        let coordinator = host
+            .install_terminal_tcp(policy)
+            .map_err(|_| Error::Configuration)?;
+        coordinator
+            .refresh()
+            .await
+            .map_err(|_| Error::Authentication)?;
+        *io.terminal.lock().map_err(|_| Error::Closed)? = Some(coordinator.clone());
+        authorization = Some(Arc::new(FreshAuthorization {
+            base: Arc::new(TerminalAuthorization(coordinator.clone())),
+            clock: clock.clone(),
+            interval: coordinator.read_timeout() / 2,
+            read: coordinator.read_timeout(),
+            close: limits.close_timeout,
+            state: Mutex::new((None, false)),
+            terminal: Some(coordinator),
+        }));
+    }
     if let Some(owner) = &owner {
         *owner.host.lock().unwrap_or_else(|e| e.into_inner()) = Some(host.clone());
     }

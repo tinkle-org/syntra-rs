@@ -628,6 +628,7 @@ pub(crate) struct Shared {
     pub config: ConnectionConfig,
     pub closed: AtomicBool,
     pub(crate) principal_withdrawn: AtomicBool,
+    pub(crate) terminal_fenced: AtomicBool,
     terminal_reason: StdMutex<Option<SyntraError>>,
     /// Intentional outbound admission fence. Unlike CLOSED, this leaves
     /// inbound validation and existing RPC waiters live until the pump drains.
@@ -709,6 +710,7 @@ impl Shared {
             config,
             closed: AtomicBool::new(false),
             principal_withdrawn: AtomicBool::new(false),
+            terminal_fenced: AtomicBool::new(false),
             terminal_reason: StdMutex::new(None),
             writer_fenced: AtomicBool::new(false),
             misbehavior: AtomicU32::new(0),
@@ -848,6 +850,10 @@ impl Connection {
         self.shared.writer_fenced.load(Ordering::Acquire)
     }
 
+    pub(crate) fn terminal_fenced(&self) -> bool {
+        self.shared.terminal_fenced.load(Ordering::Acquire)
+    }
+
     /// Stop new sends without failing admitted RPCs or inbound frames.
     /// The pump must fence BEFORE closing its writer receiver and must
     /// report transport loss once the inbound drain has completed.
@@ -882,7 +888,11 @@ impl Connection {
         // Close and queue admission linearize on state. No lifecycle lock
         // is held while waiting for channel capacity.
         let _state = self.shared.state.read().await;
-        if self.is_closed() || self.writer_is_fenced() || !self.carrier_io_allowed() {
+        if self.is_closed()
+            || self.writer_is_fenced()
+            || self.terminal_fenced()
+            || !self.carrier_io_allowed()
+        {
             return Err(SyntraError::Closed("connection closed".to_string()));
         }
         permit.send(bytes);

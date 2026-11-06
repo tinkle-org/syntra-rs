@@ -39,6 +39,7 @@ pub use connection::{
     validate_close_grace, CancelToken, Connection, ConnectionConfig, DEFAULT_CLOSE_GRACE,
     MAX_CLOSE_GRACE,
 };
+pub use host::terminal;
 pub use host::{
     AllowAll, ExecutionBudget, ExecutionLease, FnHandler, Handler, HandlerFut, HandlerOutcome, Host,
 };
@@ -53,6 +54,7 @@ pub use session::{
     AllowAnonymous, AuthError, Authenticator, Principal, RejectAll, Session, SessionManager,
     StaticToken,
 };
+pub use terminal::RequestContext;
 
 /// Sleep without depending on a timer driver: native tokio timers on
 /// native targets, JS `setTimeout` on wasm32. Powers deadline paths that

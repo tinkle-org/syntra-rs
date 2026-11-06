@@ -334,6 +334,7 @@ async fn notifications(
             if *state != ConnectionState::Active
                 || conn.is_closed()
                 || conn.writer_is_fenced()
+                || conn.terminal_fenced()
                 || conn.shared.principal_withdrawn.load(Ordering::Acquire)
                 || session.is_closed()
             {

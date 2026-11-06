@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in native TCP terminal receipts through
+  `AuthenticatorFactory::terminal_receipt(&VerifiedIdentity)`. The per-binding
+  typed authority replaces ordinary connection authorization; combining a policy
+  with an independent generic connection guard is refused. Full-frame barriers,
+  fresh authority gates, and retained ciphertext prevent new ordinary egress or
+  receipt replay after fencing. Local writing is not a delivery guarantee.
+- Native TCP receipt tests and a volatile loopback fixture. Raw/custom record,
+  WS/WSS, HTTP/HTTPS, WASM, and FFI compositions have no terminal support and
+  refuse before terminal effects. Defaults and wire inputs remain unchanged;
+  loss never automatically retries the application mutation. See the
+  [SDK API, support, and evidence limits](../../TERMINAL_RECEIPT_DESIGN.md).
+
 ## [1.0.0-rc.2](https://github.com/tinkle-org/syntra-rs/releases/tag/syntra-net-v1.0.0-rc.2) - 2026-11-05
 
 ### Added

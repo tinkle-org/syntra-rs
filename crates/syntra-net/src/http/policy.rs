@@ -77,6 +77,14 @@ impl LimitedFactory {
     }
 }
 impl AuthenticatorFactory for LimitedFactory {
+    fn terminal_receipt(
+        &self,
+        identity: &VerifiedIdentity,
+    ) -> Option<syntra_runtime::terminal::Policy> {
+        // Preserve the opt-in so the unsupported HTTP driver rejects it before
+        // handler effects, instead of silently dropping host configuration.
+        self.base.terminal_receipt(identity)
+    }
     fn create(&self, identity: &VerifiedIdentity) -> Result<Arc<dyn Authenticator>, AuthError> {
         Ok(self.wrap(self.base.create(identity)?))
     }
