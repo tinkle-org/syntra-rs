@@ -32,8 +32,8 @@ native-enrollment = ["dep:rusqlite", "dep:fs2", "dep:serde", "dep:serde_json", "
 
 # All driver APIs use native Tokio scheduling and task ownership.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-syntra-core = { path = "../syntra-core", version = "1.0.0-rc.2" }
-syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.2" }
+syntra-core = { path = "../syntra-core", version = "1.0.0-rc.3" }
+syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.3" }
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true

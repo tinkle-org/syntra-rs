@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.3](https://github.com/tinkle-org/syntra-rs/compare/syntra-runtime-v1.0.0-rc.2...syntra-runtime-v1.0.0-rc.3) - 2026-11-06
+
+### Added
+
+- add opt-in scoped terminal receipts over native TCP ([#28](https://github.com/tinkle-org/syntra-rs/pull/28))
+
 ### Added
 
 - Default-disabled scoped terminal receipts through `Handler::handle_with_context`,

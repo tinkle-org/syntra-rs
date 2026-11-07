@@ -26,8 +26,8 @@ production = ["dep:syntra-core", "dep:prost", "dep:syntra-runtime", "dep:tokio"]
 prost = { workspace = true, optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-syntra-core = { path = "../syntra-core", version = "1.0.0-rc.2", optional = true }
-syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.2", optional = true }
+syntra-core = { path = "../syntra-core", version = "1.0.0-rc.3", optional = true }
+syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.3", optional = true }
 tokio = { version = "1", default-features = false, features = ["sync", "time", "rt-multi-thread", "macros"], optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
