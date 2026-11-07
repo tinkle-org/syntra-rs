@@ -57,6 +57,17 @@ class ReportTests(unittest.TestCase):
             **self.provenance, "sha256": {name: evidence.digest(data) for name, data in self.source.items()}})
         run.assert_not_called()
 
+    def test_report_gates_cover_sdk_validation_scope(self):
+        """Report only the remaining protocol, platform and review limits."""
+        status, report, _ = self.invoke()
+        self.assertEqual(status, 0)
+        self.assertEqual(set(report["external_gates"]), {
+            "formal_conformance", "physical_ios_android", "browser",
+            "direct_host_tls13_wss", "independent_noise_vectors",
+            "device_budgets_and_soak", "independent_security_review",
+            "specification_freeze",
+        })
+
     def test_current_candidate_verification_adds_only_current_contract_carriers(self):
         agreement = {"verdict": "PASS", "kind": "encoding_agreement", "publication_authorized": False}
         carriers = {"SYNTRA-1.0-TCP": {}, "SYNTRA-1.0-WS": {}, "SYNTRA-1.0-WSS": {}}

@@ -44,6 +44,11 @@ own checks.
 
 ## Checks
 
+SDK-owned tests and tooling must run without another SDK checkout, toolchain or
+release. Keep developer experiments and their evidence in a developer-local cache
+outside this repository and its public documentation. Normative upstream SDD
+input/provenance checks remain separate and retain their pinned sources.
+
 ```sh
 export RUSTUP_TOOLCHAIN=1.88.0
 cargo fmt --all -- --check
@@ -124,9 +129,8 @@ FFI contract also requires Python 3, `nm` and a C compiler. The kernel browser
 runner requires `wasm-bindgen-test-runner` matching Cargo.lock and a browser/WebDriver;
 set `NO_HEADLESS=1` for an interactive browser. It exercises kernel tests, not a
 carrier. Run the relevant focused tests while iterating. The container suite is ignored by workspace
-runs; follow its own tooling instructions and record the actual peer
-revision. A same-implementation container round trip does not establish
-independent cross-language Syntra interoperability.
+runs; follow its own tooling instructions and record the actual fixture revision.
+A container round trip covers SDK-local connectivity, not formal conformance.
 
 Security checks:
 
@@ -149,15 +153,14 @@ negative and regression suites explicitly when touching
 their parsers: `codec_vectors`, `encode_allocation`, `runtime_defects`,
 pump split-point and fault-injection tests. Pinned upstream conformance vectors
 and the selected local assets in `tests/interoperability/fixtures/` must retain
-their provenance. Local fixture tests, carrier
-integration tests and true independent Rust wire interop are separate
-evidence; name the level actually exercised.
+their provenance. Local fixture tests and carrier integration tests have distinct
+scopes; name the boundary actually exercised.
 
 The exact context/prologue fixture tests cover **public encoding only**, not
 independent Noise cryptographic vectors. Preserve the scope and contract revision
 of each result. Same-library round trips, candidate agreement checks and pinned
-input checks do not establish formal conformance, independent cross-language
-interoperability, device validation or independent security review.
+input checks do not establish formal conformance, device validation or independent
+security review.
 
 Workflows (all actions SHA-pinned, `contents: read`, timeouts, concurrency
 cancel for PRs):
@@ -342,10 +345,9 @@ records implementation identity before and after execution; a changed worktree
 invalidates passing execution claims and requires a stable-snapshot rerun.
 Supplemental rows retain `formal_conformance: false`; the report retains
 `formal_conformance_claimed: false` and an external formal-conformance gate of
-`NOT_EXECUTED`. Browser/device execution, independent interoperability,
-independent cryptographic vectors, security review and specification freeze
-remain separate external evidence. A successful command does not turn those
-gates into passes.
+`NOT_EXECUTED`. Browser/device execution, independent cryptographic vectors,
+security review and specification freeze remain separate evidence requirements.
+A successful command does not turn those gates into passes.
 
 ## Schema and generated code
 

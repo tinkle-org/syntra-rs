@@ -1095,3 +1095,266 @@ async fn expected_revision_mismatch_aborts_before_conditional_mutation() {
     client.close().await;
     host.close().await;
 }
+
+/// Returning admission reads authority; only verified refusal records denial evidence.
+struct ReturningFixture {
+    authority: Arc<AuthorityFixture>,
+    handlers: AtomicUsize,
+    denials: AtomicUsize,
+}
+impl ReturningFixture {
+    /// Start with one active binding and no operation or refusal observations.
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            authority: AuthorityFixture::new(0),
+            handlers: AtomicUsize::new(0),
+            denials: AtomicUsize::new(0),
+        })
+    }
+
+    /// Reuse the receipt suite's authentication and typed authority policy.
+    fn factory(&self) -> Arc<Factory> {
+        Arc::new(Factory {
+            authority: self.authority.clone(),
+            payload: b"retired".to_vec(),
+            enabled: true,
+            clock: None,
+        })
+    }
+}
+impl KeyStore for ReturningFixture {
+    /// Look up only the exact active handle/epoch, without recording evidence.
+    fn lookup(&self, context: &Context) -> Result<Secret32, syntra_core::secure_channel::Error> {
+        if context.handle != [7; 8]
+            || context.epoch != 2
+            || self.authority.state.lock().unwrap().1.is_some()
+        {
+            return Err(syntra_core::secure_channel::Error::Authentication);
+        }
+        Ok(Secret32::new([8; 32]))
+    }
+}
+
+/// Count actual handler admission while retaining the existing retirement behavior.
+struct ReturningRetire(Arc<ReturningFixture>);
+impl Handler for ReturningRetire {
+    /// Forward the legacy handler without manufacturing a request context.
+    fn handle(&self, method: String, payload: Vec<u8>, cancel: CancelToken) -> HandlerFut {
+        Retire.handle(method, payload, cancel)
+    }
+
+    /// Count context-aware dispatch before delegating to the suite's handler.
+    fn handle_with_context(
+        &self,
+        method: String,
+        payload: Vec<u8>,
+        cancel: CancelToken,
+        lease: ExecutionLease,
+        context: RequestContext,
+    ) -> HandlerFut {
+        self.0.handlers.fetch_add(1, Ordering::SeqCst);
+        Retire.handle_with_context(method, payload, cancel, lease, context)
+    }
+}
+
+/// Fix one public test binding independently of each freshly generated server key.
+fn returning_context() -> Context {
+    Context {
+        mode: Mode::Returning,
+        carrier: Carrier::Tcp,
+        server_key_id: 1,
+        scope: b"terminal-fixture".to_vec(),
+        handle: [7; 8],
+        epoch: 2,
+    }
+}
+
+/// Reuse native key generation with a Returning key store and matching client key.
+fn returning_configs(fixture: Arc<ReturningFixture>) -> (ClientConfig, ServerConfig) {
+    let (mut client, mut server) = configs();
+    client.context = returning_context();
+    client.authorization_key = Some(Secret32::new([8; 32]));
+    server.mode = Mode::Returning;
+    server.store = Some(fixture);
+    (client, server)
+}
+
+/// Inspect and replay the bounded first message through native acceptance; count
+/// only an exact withdrawn-binding refusal after one handler and one commit.
+async fn returning_probe(
+    listener: &tcp::Listener,
+    server: &ServerConfig,
+    fixture: Arc<ReturningFixture>,
+    requested: Context,
+    key: [u8; 32],
+    public: [u8; 32],
+) -> bool {
+    use syntra_net::pump::RecordReader;
+    use tokio::io::AsyncReadExt;
+
+    let accept = async {
+        let stream = listener.accept_socket().await.unwrap();
+        let (read, write) = tokio::io::split(stream);
+        let mut reader = tcp::StreamReader(read);
+        let first = reader.read_record(MAX_WRAPPER).await.unwrap();
+        let (actual, _) = Context::parse_first(&first).unwrap();
+        let mut prefix = (first.len() as u16).to_be_bytes().to_vec();
+        prefix.extend_from_slice(&first);
+        let stream = tokio::io::join(std::io::Cursor::new(prefix).chain(reader.0), write);
+        let result = tcp::accept_stream(
+            stream,
+            server,
+            fixture.factory(),
+            Arc::new(AllowAll(ReturningRetire(fixture.clone()))),
+            ConnectionConfig::default(),
+            Limits::default(),
+        )
+        .await;
+        match result {
+            Err(syntra_net::Error::Channel(syntra_core::secure_channel::Error::Authentication)) => {
+            }
+            Ok(host) => {
+                host.close().await;
+                panic!("refused Returning attempt unexpectedly established");
+            }
+            Err(error) => panic!("expected native authentication refusal, got {error:?}"),
+        }
+        actual
+    };
+    let connect = tcp::connect(
+        listener.local_addr().unwrap(),
+        ClientConfig {
+            context: requested,
+            server_public_key: public,
+            authorization_key: Some(Secret32::new(key)),
+        },
+        b"fixture".to_vec(),
+        ConnectionConfig::default(),
+        Limits::default(),
+    );
+    let (actual, connected) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(accept, connect)
+    })
+    .await
+    .unwrap();
+    assert!(connected.is_err(), "refused attempt must never establish");
+    let withdrawn = actual == returning_context()
+        && fixture.authority.state.lock().unwrap().1.is_some()
+        && fixture.authority.commits.load(Ordering::SeqCst) == 1
+        && fixture.handlers.load(Ordering::SeqCst) == 1;
+    if withdrawn {
+        fixture.denials.fetch_add(1, Ordering::SeqCst);
+    }
+    withdrawn
+}
+
+/// Wrong-key native authentication refusal does not prove an active binding withdrew.
+#[tokio::test]
+async fn wrong_key_failure_is_not_withdrawn_binding_evidence() {
+    let fixture = ReturningFixture::new();
+    let (client, server) = returning_configs(fixture.clone());
+    let listener = tcp::Listener::bind("127.0.0.1:0", 2).await.unwrap();
+    assert!(
+        !returning_probe(
+            &listener,
+            &server,
+            fixture.clone(),
+            returning_context(),
+            [9; 32],
+            client.server_public_key,
+        )
+        .await
+    );
+    assert_eq!(fixture.denials.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.handlers.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.authority.commits.load(Ordering::SeqCst), 0);
+    assert!(fixture.authority.state.lock().unwrap().1.is_none());
+    assert_eq!(
+        *fixture.lookup(&returning_context()).unwrap().expose(),
+        [8; 32]
+    );
+}
+
+/// Lookup validates handle/epoch without effects; only a real exact-binding
+/// refusal after retirement counts, and no refused attempt reaches the handler.
+#[tokio::test]
+async fn lookup_is_pure_and_validates_the_requested_binding() {
+    let fixture = ReturningFixture::new();
+    assert_eq!(
+        *fixture.lookup(&returning_context()).unwrap().expose(),
+        [8; 32]
+    );
+    let mut wrong_handle = returning_context();
+    wrong_handle.handle = [9; 8];
+    let mut wrong_epoch = returning_context();
+    wrong_epoch.epoch += 1;
+    for requested in [&wrong_handle, &wrong_epoch] {
+        assert!(fixture.lookup(requested).is_err());
+    }
+    let (client, server) = returning_configs(fixture.clone());
+    let public = client.server_public_key;
+    let listener = tcp::Listener::bind("127.0.0.1:0", 2).await.unwrap();
+    let (accepted, connected) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            listener.accept(
+                &server,
+                fixture.factory(),
+                Arc::new(AllowAll(ReturningRetire(fixture.clone()))),
+                ConnectionConfig::default(),
+                Limits::default(),
+            ),
+            tcp::connect(
+                listener.local_addr().unwrap(),
+                client,
+                b"fixture".to_vec(),
+                ConnectionConfig::default(),
+                Limits::default(),
+            )
+        )
+    })
+    .await
+    .unwrap();
+    let (host, client) = (accepted.unwrap(), connected.unwrap());
+    assert_eq!(
+        client.conn.call(METHOD, vec![], 2000).await.unwrap(),
+        b"retired"
+    );
+    for requested in [&returning_context(), &wrong_handle, &wrong_epoch] {
+        assert!(fixture.lookup(requested).is_err());
+    }
+    assert_eq!(
+        fixture.denials.load(Ordering::SeqCst),
+        0,
+        "lookup records no evidence"
+    );
+    client.close().await;
+    host.close().await;
+    for requested in [wrong_handle, wrong_epoch] {
+        assert!(
+            !returning_probe(
+                &listener,
+                &server,
+                fixture.clone(),
+                requested,
+                [8; 32],
+                public
+            )
+            .await
+        );
+        assert_eq!(fixture.denials.load(Ordering::SeqCst), 0);
+    }
+    assert!(
+        returning_probe(
+            &listener,
+            &server,
+            fixture.clone(),
+            returning_context(),
+            [8; 32],
+            public
+        )
+        .await
+    );
+    assert_eq!(fixture.denials.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.handlers.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.authority.commits.load(Ordering::SeqCst), 1);
+}

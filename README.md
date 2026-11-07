@@ -11,11 +11,7 @@ runtime scheduling and socket policy. Encryption is integral to the protocol. Se
 
 The implementation is experimental and distributed as release-candidate crates.
 No formal conformance or independent security-review verdict is claimed.
-The terminal receipt fixture report,
-`syntra-go/TERMINAL_RECEIPT_INTEROP.md` (requires a sibling checkout), records a
-bounded bidirectional TCP matrix, not general interoperability or application
-acceptance. The report and handoff are not present at the recorded run-2 Go
-commit, so no commit-pinned hosted copy is claimed. The current candidate is recorded in
+The current candidate is recorded in
 [`protocol-contract.json`](protocol-contract.json); it pins `committed-candidate`
 inputs, not a release or specification freeze. See
 [input provenance](CONTRIBUTING.md#input-provenance-and-authority) for the separate
@@ -421,9 +417,7 @@ independent generic guard is refused. The runtime fences ordinary traffic and
 retires actual recovery attachments before transition. Raw/custom record, WASM,
 FFI, WS/WSS, and HTTP/HTTPS paths do not support terminal effects. Existing clients
 parse the same `RpcResult`, with no new wire message or peer option. See
-[API, support, tests, and evidence limits](TERMINAL_RECEIPT_DESIGN.md) and the
-manual merge/release handoff at `syntra-go/TERMINAL_RECEIPT_HANDOFF.md`
-(requires a sibling checkout).
+[API, support, tests, and evidence limits](TERMINAL_RECEIPT_DESIGN.md).
 
 ## Native FFI
 
@@ -466,25 +460,6 @@ drivers; its default WASM build has no driver exports and rejects native feature
 `syntra-ffi` is native-only. The kernel browser runner requires a matching
 `wasm-bindgen-test-runner` and a browser/WebDriver; compilation alone does not
 execute those tests or verify a browser carrier.
-
-### Go native sibling
-
-For sibling checkouts `syntra-rs/` and
-[`syntra-go/`](https://github.com/tinkle-org/syntra-go), first build the
-production library above. From the **syntra-go root**, use an absolute
-library path (adjust it if `CARGO_TARGET_DIR` is set):
-
-```sh
-LIBDIR="$(realpath ../syntra-rs/target/debug)"
-# Linux
-CGO_ENABLED=1 CGO_LDFLAGS="-L$LIBDIR -lsyntra_ffi" LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" go test -tags syntranative -count=1 ./...
-# macOS (use this command instead on macOS)
-CGO_ENABLED=1 CGO_LDFLAGS="-L$LIBDIR -lsyntra_ffi" DYLD_LIBRARY_PATH="$LIBDIR${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" go test -tags syntranative -count=1 ./...
-```
-
-This requires a Go toolchain and C compiler for the same architecture as
-the Rust library. Pure-Go builds need no Rust library. Cross-repository
-integration is checked separately from this repository's Rust CI.
 
 ## Benchmarks, containers and generated code
 

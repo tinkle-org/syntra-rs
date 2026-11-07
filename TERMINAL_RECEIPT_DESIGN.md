@@ -272,187 +272,80 @@ No new wire message, peer option, advertised capability, or client API is needed
 existing clients parse the correlated `RpcResult`. Protobuf sources and generated
 bindings are unchanged. Ordinary withdrawal and close defaults remain unchanged.
 
-## Tests and recorded evidence
+## SDK tests and limits
 
-### Request-wide local budget implementation, 2026-11-07
-
-Executed on macOS arm64 using Rust **1.88.0**, locked dependencies, on
-`feat/request-wide-deadlines` based on the rc.3 release. No version, dependency,
-wire, generated-code or pin update is part of this work.
-
-| Exact command | Result |
-| --- | --- |
-| `cargo +1.88.0 test --locked -p syntra-runtime --lib request_budget_tests` | Red: missing additive APIs; after default hooks compiled, 3 failed / 1 passed because dispatch still used legacy authorization and ignored the selector. Green after wiring: 4/4 passed at that stage. Later focused cases extend that set to 7. |
-| `cargo +1.88.0 test --locked -p syntra-runtime --lib request_wide_` | Red: missing authority hooks; after default methods compiled, 2/2 failed with `budget-aware observation must be used`. |
-| `cargo +1.88.0 test --locked -p syntra-runtime --lib request_wide_ -- --nocapture` | Green: 2/2 passed after authority wiring and fixture correction. A prior attempt timed out: the fixture incorrectly expected a 250 ms tail from 960 ms remaining; the existing quarter rule gives 240 ms. Only the fixture expectations changed, and fixture waits now have diagnostic bounds. |
-| `cargo +1.88.0 test --locked -p syntra-runtime --lib budget` | Initial run: 19/19 passed, including 7 request-budget and 3 terminal-budget regressions; overlaps the full suite. |
-| `cargo +1.88.0 test --locked -p syntra-net --no-default-features --features tcp --test terminal_receipt local_budget` | 2/2 passed over actual encrypted loopback TCP. |
-| `cargo +1.88.0 test --locked -p syntra-runtime` | Before parent review correction: 452 passed (318 unit + 134 integration); none ignored; 0 doctests. |
-| `cargo +1.88.0 test --locked -p syntra-net --no-default-features --features tcp` | Final run: 114 passed (79 unit, 6 connectivity, 3 record-adapter, 3 routes, 21 terminal-receipt, 2 existing example tests); none ignored; feature-gated zero-test binaries are not coverage. |
-| `cargo +1.88.0 fmt --all -- --check` | Passed after applying formatting corrections. |
-| `cargo +1.88.0 clippy --locked -p syntra-runtime -p syntra-net --no-default-features --features syntra-net/tcp --all-targets -- --no-deps` | Completed successfully; existing warnings in untouched runtime/test/example code, no new-code warnings. |
-| `git diff --check` | Passed. |
-
-Parent review identified that releasing lifecycle state through authorization
-allowed a racing reservation to swallow an `Unauthenticated` denial. The
-deterministic regression below was executed before the correction:
+Run the owned suites with Rust **1.88.0** and locked dependencies:
 
 ```sh
-cargo +1.88.0 test --locked -p syntra-runtime --lib racing_authorization_hard_denial_cannot_be_swallowed_by_terminal_reservation -- --exact host::terminal::budget_tests::racing_authorization_hard_denial_cannot_be_swallowed_by_terminal_reservation --nocapture
+cargo +1.88.0 test --locked -p syntra-runtime
+cargo +1.88.0 test --locked -p syntra-net --no-default-features --features tcp
+cargo +1.88.0 test --locked --workspace
 ```
 
-Red: 1 failed, with `(reservation crossed authorization, withdrawn, committed,
-retirement succeeded, receipts) = (true, false, true, true, 1)`.
-Green after moving lifecycle reacquisition/recheck immediately before
-authorization: 1 passed, requiring `(false, true, false, false, 0)`.
-The test's blocking barrier follows the existing
-`expiry_during_synchronous_authorization_prevents_handler_effects` slow-policy
-pattern; only the test deliberately violates the nonblocking callback contract.
-The classifier stays outside the guard; authorization through registration retains
-the original barrier. Expired-input and built-in recovery selector skips remain.
+Runtime coverage includes `crates/syntra-runtime/src/host_terminal.rs`,
+`crates/syntra-runtime/tests/terminal_receipt.rs`, and
+`crates/syntra-runtime/src/host_recovery_tests.rs`. Native coverage is in
+`crates/syntra-net/tests/terminal_receipt.rs` and
+`crates/syntra-net/src/pump/terminal_failure_tests.rs`. These exercise:
 
-Post-correction verification on the same toolchain/platform:
+- Exact/private ownership, stable newer revisions, disabled/unsupported preflight,
+  and the 1,024/1,025-byte complete-frame boundary.
+- Full-frame barriers, dispatch/recovery fencing, fatal-reader publication,
+  cancellation, freshness/deadline ties, partial loss and retained work.
+- `None`, zero, long and maximum-duration caps against wire/default/deployment
+  limits; receipt-origin admission delay; selector/authorization time; exact
+  dispatch/selection expiry; readonly budgets; bounded validation; built-in
+  recovery routing; `AllowAll` forwarding and unrelated methods.
+- Terminal cutoff/read-bound propagation and an explicitly uncooperative late
+  commit whose execution charge survives timeout without a receipt.
+- The authorization/reservation race: an initial hard denial cannot be overtaken
+  and swallowed by terminal fencing. Its deterministic blocking barrier
+  deliberately violates the production nonblocking callback contract.
 
-| Exact command | Result |
-| --- | --- |
-| `cargo +1.88.0 test --locked -p syntra-runtime --lib budget` | 20/20 passed, including the hard-denial race regression. |
-| `cargo +1.88.0 test --locked -p syntra-runtime --quiet` | 453 passed (319 unit + 134 integration), none ignored; 0 doctests. |
-| `cargo +1.88.0 test --locked -p syntra-net --no-default-features --features tcp --quiet` | 114 passed, none ignored, including 21 receipt tests and 2 existing example tests. |
-| `cargo +1.88.0 fmt --all -- --check` | Passed. |
-| `cargo +1.88.0 clippy --locked -p syntra-runtime -p syntra-net --no-default-features --features syntra-net/tcp --all-targets -- --no-deps` | Completed with existing warnings in untouched code; no new-code warnings. |
-| `git diff --check` | Passed. |
+The native target also owns `lookup_is_pure_and_validates_the_requested_binding`
+and `wrong_key_failure_is_not_withdrawn_binding_evidence`. Lookup validates the
+requested handle/epoch and returns the key only while active, recording no counters
+or output. Tests inspect the bounded Returning first message, replay its exact
+bytes through normal native acceptance, and require native authentication refusal
+for the exact withdrawn context after one handler and one commit. Wrong
+handle/epoch refusals and a wrong key on an active binding cannot count as
+withdrawal evidence.
 
-The focused cases cover `None`, zero, long and maximum-duration caps against
-wire/default/deployment limits; original-receipt admission delay; selector and
-authorization time; exact dispatch/selection expiry; retained readonly budgets;
-bounded envelope/method checks; reserved recovery routing; `AllowAll` forwarding
-and unrelated methods; terminal cutoff/read-bound propagation; and an explicitly
-uncooperative late commit whose charge survives timeout without a receipt.
-Fake elapsed sources and paused time drive runtime cases. Native TCP cases use
-in-memory authority and establish SDK integration, not durable DB behavior.
+Fake elapsed sources and paused time drive runtime cases. The partial-ordinary-
+frame success regression uses reservation notification and a driven elapsed clock
+over real encrypted TCP. Its separate exact-cutoff case keeps authority fresh at
+50 ms and proves partial output aborts with zero commits. Native idle tests cover
+minimum-bound refresh and expiry independently of successful retirement.
 
-Application integration should use `Handler::request_budget` and
-`authorize_with_budget`, `RequestContext::budget`, and
-`Authority::{observe_with_budget,commit_with_budget}` with
-`syntra_runtime::elapsed::ElapsedDeadline`. Preserve the passed clock/cutoff;
-do not reconstruct a fresh budget at hook entry.
+Native TCP fixtures use in-memory authority and establish SDK integration, not
+durable database behavior, application acceptance, platform suspend behavior or
+bulk-transfer capacity. Unsupported carriers and ABI paths retain their separate
+refusal checks. Feature-gated zero-test binaries are not execution coverage;
+workspace tests leave Docker execution to its explicit integration lane. Local
+tests do not establish formal conformance or independent security review.
+Production adapters must preserve the passed clock/cutoff, bound their own storage
+I/O, and retain execution leases until work actually stops. A timeout cannot prove
+rollback or guarantee receipt delivery.
 
-The bounded cross-language run `terminal-request-budget-20261107-run4` passed
-20/20 cases with stable before/after source manifests and 31 harness test methods.
-It covers both host directions, including host caps, earlier peer budgets and
-budgeted observations during retained late commits. The Go-owned
-[fixture report](https://github.com/tinkle-org/syntra-go/blob/acf61c2d5493338eeb6e033df27281ef85d16a9c/TERMINAL_RECEIPT_INTEROP.md#request-wide-deadline-regression-matrix)
-records exact hashes, reproduction commands and earlier failed attempts. Subsequent
-editorial documentation updates are outside those captured source hashes.
-Independent source review found no remaining runtime issue in its inspected scope.
+## Normative provenance
 
-Existing `SNTR-RPC-004` already requires receipt-origin accounting and permits
-documented bounded host policy. This optional SDK-local mechanism requires no
-wire or normative specification change. The unchanged specification repository's
-structural/schema checks and 159 Python tests passed; that is not executed runtime
-conformance. Cooperative production-storage enforcement remains an application
-obligation. A timeout cannot establish no late durable commit or guaranteed
-receipt. Merge and RC publication remain manual maintainer actions.
+Upstream SDD commit
+[`985d90eb5ee6d7aec0d20ea088430f271eed7cd7`](https://github.com/tinkle-org/syntra/commit/985d90eb5ee6d7aec0d20ea088430f271eed7cd7)
+contains canonical adoption of RFC 0014. Its
+[connection §6](https://github.com/tinkle-org/syntra/blob/985d90eb5ee6d7aec0d20ea088430f271eed7cd7/specifications/connection.md#6-scoped-terminal-receipt),
+[RPC §7](https://github.com/tinkle-org/syntra/blob/985d90eb5ee6d7aec0d20ea088430f271eed7cd7/specifications/rpc.md#7-scoped-terminal-result),
+[security §9](https://github.com/tinkle-org/syntra/blob/985d90eb5ee6d7aec0d20ea088430f271eed7cd7/specifications/security.md#9-terminal-transition-authority),
+and [transports §8](https://github.com/tinkle-org/syntra/blob/985d90eb5ee6d7aec0d20ea088430f271eed7cd7/specifications/transports.md#8-terminal-only-output)
+adopt thirteen `SNTR-TRC-*` requirements. The
+[RFC](https://github.com/tinkle-org/syntra/blob/985d90eb5ee6d7aec0d20ea088430f271eed7cd7/rfcs/0014-scoped-terminal-receipt.md)
+is marked **Implemented** for specification adoption and registration of fourteen
+conformance case groups, which remain **NOT_EXECUTED**. It records sole-maintainer
+human self-review/self-approval, not independent security review. Adoption does not
+activate host policy or establish durable application integration.
 
-### Earlier terminal-receipt evidence
-
-Source coverage includes `crates/syntra-runtime/src/host_terminal.rs`,
-`crates/syntra-runtime/tests/terminal_receipt.rs`,
-`crates/syntra-runtime/src/host_recovery_tests.rs`,
-`crates/syntra-net/tests/terminal_receipt.rs`, and
-`crates/syntra-net/src/pump/terminal_failure_tests.rs`. Tests cover exact/private
-ownership, stable newer revisions, preflight, 1024/1025-byte boundaries, barriers,
-dispatch fencing, fatal-reader publication, cancellation, freshness/deadline ties,
-partial loss, retained work, and fresh Returning denial.
-
-Recorded verification on 2026-11-06 includes the stable-newer-revision checks:
-
-| Scope | Result and limit |
-| --- | --- |
-| Runtime default and no-default features | 434 passed in each; the same scope, not 868 distinct cases |
-| Net with native TCP | 102 passed, including 17 receipt integration tests |
-| Net without default features | 68 passed; raw-driver scope, not TCP coverage |
-| FFI `production` | 14 passed; no receipt ABI support |
-| Full `cargo test --locked --workspace` | 681 passing tests/doc-tests with one Docker fixture ignored; feature-gated zero-test entries are not coverage |
-| WASM build and dependency isolation | Portable build and all six isolation graphs passed; no browser execution |
-| Clippy | Completed, not warning-free; two existing runtime warnings remain in untouched code |
-
-These are recorded results, not a fresh verification of subsequent edits.
-
-Follow-up verification on 2026-11-06 with Rust **1.88.0**, `--locked`, on macOS
-arm64 covers the lookup-purity and minimum-read-bound corrections:
-
-| Command/scope | Fresh result |
-| --- | --- |
-| `cargo test --locked -p syntra-runtime` | 442 passed |
-| Same runtime suite with `--no-default-features` | 442 passed; repeated configuration, not additional distinct cases |
-| `cargo test --locked -p syntra-net --no-default-features --features tcp` | 110 passed, including 19 receipt integration tests |
-| Same net features with `--example terminal_receipt` | 2 fixture regressions passed; examples are tested explicitly |
-| `cargo test --locked --workspace` | 697 tests/doc-tests passed; 1 Docker fixture ignored |
-| Rust CLI server/client/probe | `owned`, `deny`, `unknown`, `gap` passed with unchanged JSON result/summary fields and one exact-binding denial each |
-| Rustfmt check, `git diff --check`, workspace rustdoc and all-target Clippy | Completed; Clippy retains existing warnings in untouched core/runtime code |
-
-The policy regression first failed because 1 ms was accepted. The lookup
-regression first failed because three refused lookups incremented the denial
-counter three times. Five regressions were added: one policy, two idle TCP, and
-two example tests. Counts above overlap and must not be summed. The Rust CLI
-checks are same-implementation runs, not a fresh cross-language verdict.
-
-The partial-ordinary-frame success test uses explicit reservation notification
-and a driven elapsed clock over real encrypted TCP. A CPU-load run exposed that
-its previous wall-time sleep and 200 KB frame could legitimately exceed the
-existing 50 ms whole-frame write budget before commit. Production budgets were
-not increased. A separate exact-cutoff test keeps authority fresh at 50 ms and
-proves partial output aborts with zero commits. After correction, 500 focused
-runs and 50 complete 17-test receipt-suite runs passed under owned CPU load;
-repetitions are not additional distinct cases.
-
-The cross-language report at `syntra-go/TERMINAL_RECEIPT_INTEROP.md`
-(requires a sibling checkout) records
-**14 distinct passing cases** in both TCP role directions: owned/gap over direct
-and fragmented streams, denial, unknown authority, and partial loss. Every case
-checks a fresh Returning denial with no RPC. Its run-2 report and source hashes
-remain exact evidence for that run only; later trees require a fresh run.
-
-`crates/syntra-net/examples/terminal_receipt.rs` is the loopback-only fixture used
-there. Its public provisioning and in-memory authority are not production storage
-or credentials. Fixture passes do not prove application durability, platform
-suspend behavior, non-TCP support, application Logout acceptance, or formal
-conformance.
-
-The fixture's `KeyStore::lookup` validates the requested handle/epoch and returns
-the key only while active; it records no counters or output. Fresh-denial evidence
-is recorded outside lookup after inspecting the actual bounded Returning first
-message, replaying those exact bytes through normal native acceptance, and
-checking authentication refusal for the exact withdrawn fixture context. A wrong
-handle/epoch or a wrong-key failure on an active binding is not withdrawal proof.
-The existing JSON event names/fields and summary counts remain unchanged; the
-parent-owned Go harness must rerun cross-language evidence for these source bytes.
-
-Documentation checks are scoped to this repository's actual configuration:
-`cargo doc --locked --workspace --no-deps` is informational, and scheduled
-`cargo-llvm-cov` reports execution coverage with no threshold. Neither measures
-doc-comment completeness. Branch-added public APIs, coordination helpers, fixture
-helpers, and regression tests have descriptive Rust comments; no coverage or lint
-threshold has been changed.
-
-## Shared contract and release boundary
-
-The shared connection contract at
-`syntra/specifications/connection.md#6-scoped-terminal-receipt` (requires a
-sibling checkout) links its RPC, security, and transport requirements. The
-sibling branch contains
-canonical adoption of thirteen `SNTR-TRC-*` requirements and fourteen registered
-case groups, not a formal execution verdict. Uncommitted adoption must merge
-before being cited as the merged reference. Existing wire-input provenance pins
-remain valid for their unchanged inputs; they are not publication of this feature.
-
-See `syntra-go/TERMINAL_RECEIPT_HANDOFF.md` (requires a sibling checkout) for
-manual merge, release, and consumer order. The evidence/handoff files are absent
-from the recorded run-2 Go commit `3993457af7d36ffdb0fbe7f6615ab597a1e95abe`,
-and connection section 6 is absent from the accepted specification commit
-`c6a28abf2c52b3f21a7362366d3f5891f33601d5`. These paths preserve the intended
-destinations and anchor without inventing resolvable pinned URLs.
-[Issue 17](https://github.com/tinkle-org/syntra-go/issues/17)
-remains open: tested SDK capability does not by itself fix a consumer's Logout
-flow or replace its authority adapter.
+`SNTR-RPC-004` already requires receipt-origin accounting and permits documented
+bounded host policy. The optional SDK-local request-budget hooks require no wire
+or normative specification change. Existing wire-input provenance pins remain
+valid for their unchanged inputs; this normative reference does not repin those
+inputs. See [input provenance](CONTRIBUTING.md#input-provenance-and-authority) for
+the separate implementation-input checks and source attribution.
