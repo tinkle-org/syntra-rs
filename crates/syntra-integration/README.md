@@ -7,6 +7,11 @@ test package. Its current harness is `tests/syntra_containers.rs`. Maintain
 the peer and its tests together; a successful run is same-implementation
 connectivity evidence, not a conformance verdict.
 
+SDK-owned tests and tooling must run without another SDK checkout, toolchain or
+release. Keep developer experiments and their evidence in a developer-local cache
+outside the SDK repository and its public documentation. Normative SDD provenance
+and pinned vector sources retain their separate input-checking requirements.
+
 The peer and tests use `syntra_net::{tcp, websocket}`. Core owns message
 mechanics and record protection through `syntra_core::secure_channel`; runtime
 scheduling and native I/O remain separate responsibilities. Transport defaults enable no
@@ -39,8 +44,7 @@ The `tls_provider` suite uses `websocket` with a real test TLS provider supplied
 through dev dependencies. The provider is trusted application code responsible
 for real certificate chain/hostname/time/current-policy checks; metadata checks
 alone do not establish that it performed TLS. TCP/WS fixture results do not
-establish TLS, browser, independent cryptographic-vector or cross-language
-interoperability coverage.
+establish TLS, browser or independent cryptographic-vector coverage.
 
 Record the peer revision, dirty-worktree state and actual carrier/mode results
 when executing the suite.
@@ -146,8 +150,8 @@ metadata; the explicit candidate `Route::HttpForward` sends forward requests.
 UDP and browser connections are excluded. This suite does not
 yet cover packet-level tampering, malformed-record fuzzing, enrollment
 revocation, automatic reconnection/backoff, or exhaustive fault
-combinations. A container round trip through the same Noise library is not
-independent cross-language Syntra interoperability or a security audit.
+combinations. A container round trip exercises the SDK's own Noise implementation
+and does not establish independent security review.
 
 ## Logs and CI
 

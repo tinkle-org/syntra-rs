@@ -90,6 +90,13 @@ constructed from public request IDs or transferred to a new connection.
   fresh authoritative read. `None` requests ordinary pre-reservation validity.
 - `Authority::commit(Transition, ExecutionLease) -> BoxFuture<'_, ()>` performs the
   conditional application transaction. Returning `()` is deliberately not proof.
+- `Authority::observe_with_budget(Option<Transition>, ElapsedDeadline)` receives
+  the fresh read's absolute bound, already restricted by `read_timeout`, prior
+  freshness and (once reserved) the operation cutoff. The default calls `observe`.
+- `Authority::commit_with_budget(Transition, ExecutionLease, ElapsedDeadline)`
+  receives the operation cutoff with its teardown tail excluded. The default
+  calls `commit`. Cooperative DB adapters should check the deadline and bound
+  their I/O using its remaining time or `run`; neither hook starts a new budget.
 - `Transition` carries the private `ReservationId`, expected revision,
   authenticated `Principal`, and fixed method. The adapter is already bound to
   the verified channel's scope/enrollment by its factory.
@@ -195,8 +202,29 @@ reduce this race but cannot eliminate it.
 
 ## Deadline and retained cleanup
 
+The optional `Handler::request_budget(principal, method, payload)` selects an
+SDK-local cap before initial `authorize_with_budget`. It is measured from the
+original complete bounded-frame receipt, including queueing, classification and
+authorization time, not from dispatch or reservation. `None` preserves the
+existing wire/default/deployment limit; zero expires, and even `Duration::MAX`
+cannot extend or overflow that limit. Envelope/method validation and request-ID
+ordering precede this prompt, nonblocking, side-effect-free classifier. Built-in
+recovery retains its own routing. The classifier runs outside protocol/raw-I/O/
+lifecycle locks, retaining FIFO admission. Immediately afterward, lifecycle state
+is reacquired and rechecked, then held through authorization and registration.
+This preserves the existing authorization/reservation barrier: an in-progress
+hard denial cannot be overtaken and swallowed by terminal fencing. The same
+deadline is registered for pending selection, dispatch and the request context.
+
+`Handler::authorize_with_budget` remains synchronous/nonblocking and defaults to
+the existing fail-closed `authorize`. `RequestContext::budget()` exposes a readonly
+`ElapsedDeadline` on that same clock for ordinary handlers as well as retirement.
+These hooks are additive: legacy handlers/authority adapters keep their methods,
+and `AllowAll` forwards budget selection/context while keeping its explicit
+authorization bypass. They do not change the wire contract.
+
 ```text
-D = min(RPC deadline, reservation start + 5 seconds)
+D = min(request-wide RPC deadline, reservation start + 5 seconds)
 T = min(initial remaining time / 4, 250 milliseconds)
 write cutoff = D - T
 ```
@@ -213,6 +241,10 @@ carrier loss does not abandon that task's charge. Additional spawned/blocking
 work must keep its own lease copy until it actually ends. Selected output,
 complete local writing, client observation, and joined cleanup are separate facts.
 Neither an operation nor its receipt is automatically retried or replayed.
+Passing a budget to an adapter is cooperative enforcement, not a transaction
+rollback guarantee. An uncooperative authority can commit durably after expiry;
+its retained execution charge survives until actual completion, while sticky
+failure prevents late completion from restoring a receipt.
 
 The current native pump also caps each ordinary frame's complete write by the
 authority interval, `read_timeout / 2`, in addition to its configured I/O limits.
@@ -240,105 +272,80 @@ No new wire message, peer option, advertised capability, or client API is needed
 existing clients parse the correlated `RpcResult`. Protobuf sources and generated
 bindings are unchanged. Ordinary withdrawal and close defaults remain unchanged.
 
-## Tests and recorded evidence
+## SDK tests and limits
 
-Source coverage includes `crates/syntra-runtime/src/host_terminal.rs`,
-`crates/syntra-runtime/tests/terminal_receipt.rs`,
-`crates/syntra-runtime/src/host_recovery_tests.rs`,
-`crates/syntra-net/tests/terminal_receipt.rs`, and
-`crates/syntra-net/src/pump/terminal_failure_tests.rs`. Tests cover exact/private
-ownership, stable newer revisions, preflight, 1024/1025-byte boundaries, barriers,
-dispatch fencing, fatal-reader publication, cancellation, freshness/deadline ties,
-partial loss, retained work, and fresh Returning denial.
+Run the owned suites with Rust **1.88.0** and locked dependencies:
 
-Recorded verification on 2026-11-06 includes the stable-newer-revision checks:
+```sh
+cargo +1.88.0 test --locked -p syntra-runtime
+cargo +1.88.0 test --locked -p syntra-net --no-default-features --features tcp
+cargo +1.88.0 test --locked --workspace
+```
 
-| Scope | Result and limit |
-| --- | --- |
-| Runtime default and no-default features | 434 passed in each; the same scope, not 868 distinct cases |
-| Net with native TCP | 102 passed, including 17 receipt integration tests |
-| Net without default features | 68 passed; raw-driver scope, not TCP coverage |
-| FFI `production` | 14 passed; no receipt ABI support |
-| Full `cargo test --locked --workspace` | 681 passing tests/doc-tests with one Docker fixture ignored; feature-gated zero-test entries are not coverage |
-| WASM build and dependency isolation | Portable build and all six isolation graphs passed; no browser execution |
-| Clippy | Completed, not warning-free; two existing runtime warnings remain in untouched code |
+Runtime coverage includes `crates/syntra-runtime/src/host_terminal.rs`,
+`crates/syntra-runtime/tests/terminal_receipt.rs`, and
+`crates/syntra-runtime/src/host_recovery_tests.rs`. Native coverage is in
+`crates/syntra-net/tests/terminal_receipt.rs` and
+`crates/syntra-net/src/pump/terminal_failure_tests.rs`. These exercise:
 
-These are recorded results, not a fresh verification of subsequent edits.
+- Exact/private ownership, stable newer revisions, disabled/unsupported preflight,
+  and the 1,024/1,025-byte complete-frame boundary.
+- Full-frame barriers, dispatch/recovery fencing, fatal-reader publication,
+  cancellation, freshness/deadline ties, partial loss and retained work.
+- `None`, zero, long and maximum-duration caps against wire/default/deployment
+  limits; receipt-origin admission delay; selector/authorization time; exact
+  dispatch/selection expiry; readonly budgets; bounded validation; built-in
+  recovery routing; `AllowAll` forwarding and unrelated methods.
+- Terminal cutoff/read-bound propagation and an explicitly uncooperative late
+  commit whose execution charge survives timeout without a receipt.
+- The authorization/reservation race: an initial hard denial cannot be overtaken
+  and swallowed by terminal fencing. Its deterministic blocking barrier
+  deliberately violates the production nonblocking callback contract.
 
-Follow-up verification on 2026-11-06 with Rust **1.88.0**, `--locked`, on macOS
-arm64 covers the lookup-purity and minimum-read-bound corrections:
+The native target also owns `lookup_is_pure_and_validates_the_requested_binding`
+and `wrong_key_failure_is_not_withdrawn_binding_evidence`. Lookup validates the
+requested handle/epoch and returns the key only while active, recording no counters
+or output. Tests inspect the bounded Returning first message, replay its exact
+bytes through normal native acceptance, and require native authentication refusal
+for the exact withdrawn context after one handler and one commit. Wrong
+handle/epoch refusals and a wrong key on an active binding cannot count as
+withdrawal evidence.
 
-| Command/scope | Fresh result |
-| --- | --- |
-| `cargo test --locked -p syntra-runtime` | 442 passed |
-| Same runtime suite with `--no-default-features` | 442 passed; repeated configuration, not additional distinct cases |
-| `cargo test --locked -p syntra-net --no-default-features --features tcp` | 110 passed, including 19 receipt integration tests |
-| Same net features with `--example terminal_receipt` | 2 fixture regressions passed; examples are tested explicitly |
-| `cargo test --locked --workspace` | 697 tests/doc-tests passed; 1 Docker fixture ignored |
-| Rust CLI server/client/probe | `owned`, `deny`, `unknown`, `gap` passed with unchanged JSON result/summary fields and one exact-binding denial each |
-| Rustfmt check, `git diff --check`, workspace rustdoc and all-target Clippy | Completed; Clippy retains existing warnings in untouched core/runtime code |
+Fake elapsed sources and paused time drive runtime cases. The partial-ordinary-
+frame success regression uses reservation notification and a driven elapsed clock
+over real encrypted TCP. Its separate exact-cutoff case keeps authority fresh at
+50 ms and proves partial output aborts with zero commits. Native idle tests cover
+minimum-bound refresh and expiry independently of successful retirement.
 
-The policy regression first failed because 1 ms was accepted. The lookup
-regression first failed because three refused lookups incremented the denial
-counter three times. Five regressions were added: one policy, two idle TCP, and
-two example tests. Counts above overlap and must not be summed. The Rust CLI
-checks are same-implementation runs, not a fresh cross-language verdict.
+Native TCP fixtures use in-memory authority and establish SDK integration, not
+durable database behavior, application acceptance, platform suspend behavior or
+bulk-transfer capacity. Unsupported carriers and ABI paths retain their separate
+refusal checks. Feature-gated zero-test binaries are not execution coverage;
+workspace tests leave Docker execution to its explicit integration lane. Local
+tests do not establish formal conformance or independent security review.
+Production adapters must preserve the passed clock/cutoff, bound their own storage
+I/O, and retain execution leases until work actually stops. A timeout cannot prove
+rollback or guarantee receipt delivery.
 
-The partial-ordinary-frame success test uses explicit reservation notification
-and a driven elapsed clock over real encrypted TCP. A CPU-load run exposed that
-its previous wall-time sleep and 200 KB frame could legitimately exceed the
-existing 50 ms whole-frame write budget before commit. Production budgets were
-not increased. A separate exact-cutoff test keeps authority fresh at 50 ms and
-proves partial output aborts with zero commits. After correction, 500 focused
-runs and 50 complete 17-test receipt-suite runs passed under owned CPU load;
-repetitions are not additional distinct cases.
+## Normative provenance
 
-The cross-language report at `syntra-go/TERMINAL_RECEIPT_INTEROP.md`
-(requires a sibling checkout) records
-**14 distinct passing cases** in both TCP role directions: owned/gap over direct
-and fragmented streams, denial, unknown authority, and partial loss. Every case
-checks a fresh Returning denial with no RPC. Its run-2 report and source hashes
-remain exact evidence for that run only; later trees require a fresh run.
+Upstream SDD commit
+[`985d90eb5ee6d7aec0d20ea088430f271eed7cd7`](https://github.com/tinkle-org/syntra/commit/985d90eb5ee6d7aec0d20ea088430f271eed7cd7)
+contains canonical adoption of RFC 0014. Its
+[connection §6](https://github.com/tinkle-org/syntra/blob/985d90eb5ee6d7aec0d20ea088430f271eed7cd7/specifications/connection.md#6-scoped-terminal-receipt),
+[RPC §7](https://github.com/tinkle-org/syntra/blob/985d90eb5ee6d7aec0d20ea088430f271eed7cd7/specifications/rpc.md#7-scoped-terminal-result),
+[security §9](https://github.com/tinkle-org/syntra/blob/985d90eb5ee6d7aec0d20ea088430f271eed7cd7/specifications/security.md#9-terminal-transition-authority),
+and [transports §8](https://github.com/tinkle-org/syntra/blob/985d90eb5ee6d7aec0d20ea088430f271eed7cd7/specifications/transports.md#8-terminal-only-output)
+adopt thirteen `SNTR-TRC-*` requirements. The
+[RFC](https://github.com/tinkle-org/syntra/blob/985d90eb5ee6d7aec0d20ea088430f271eed7cd7/rfcs/0014-scoped-terminal-receipt.md)
+is marked **Implemented** for specification adoption and registration of fourteen
+conformance case groups, which remain **NOT_EXECUTED**. It records sole-maintainer
+human self-review/self-approval, not independent security review. Adoption does not
+activate host policy or establish durable application integration.
 
-`crates/syntra-net/examples/terminal_receipt.rs` is the loopback-only fixture used
-there. Its public provisioning and in-memory authority are not production storage
-or credentials. Fixture passes do not prove application durability, platform
-suspend behavior, non-TCP support, application Logout acceptance, or formal
-conformance.
-
-The fixture's `KeyStore::lookup` validates the requested handle/epoch and returns
-the key only while active; it records no counters or output. Fresh-denial evidence
-is recorded outside lookup after inspecting the actual bounded Returning first
-message, replaying those exact bytes through normal native acceptance, and
-checking authentication refusal for the exact withdrawn fixture context. A wrong
-handle/epoch or a wrong-key failure on an active binding is not withdrawal proof.
-The existing JSON event names/fields and summary counts remain unchanged; the
-parent-owned Go harness must rerun cross-language evidence for these source bytes.
-
-Documentation checks are scoped to this repository's actual configuration:
-`cargo doc --locked --workspace --no-deps` is informational, and scheduled
-`cargo-llvm-cov` reports execution coverage with no threshold. Neither measures
-doc-comment completeness. Branch-added public APIs, coordination helpers, fixture
-helpers, and regression tests have descriptive Rust comments; no coverage or lint
-threshold has been changed.
-
-## Shared contract and release boundary
-
-The shared connection contract at
-`syntra/specifications/connection.md#6-scoped-terminal-receipt` (requires a
-sibling checkout) links its RPC, security, and transport requirements. The
-sibling branch contains
-canonical adoption of thirteen `SNTR-TRC-*` requirements and fourteen registered
-case groups, not a formal execution verdict. Uncommitted adoption must merge
-before being cited as the merged reference. Existing wire-input provenance pins
-remain valid for their unchanged inputs; they are not publication of this feature.
-
-See `syntra-go/TERMINAL_RECEIPT_HANDOFF.md` (requires a sibling checkout) for
-manual merge, release, and consumer order. The evidence/handoff files are absent
-from the recorded run-2 Go commit `3993457af7d36ffdb0fbe7f6615ab597a1e95abe`,
-and connection section 6 is absent from the accepted specification commit
-`c6a28abf2c52b3f21a7362366d3f5891f33601d5`. These paths preserve the intended
-destinations and anchor without inventing resolvable pinned URLs.
-[Issue 17](https://github.com/tinkle-org/syntra-go/issues/17)
-remains open: tested SDK capability does not by itself fix a consumer's Logout
-flow or replace its authority adapter.
+`SNTR-RPC-004` already requires receipt-origin accounting and permits documented
+bounded host policy. The optional SDK-local request-budget hooks require no wire
+or normative specification change. Existing wire-input provenance pins remain
+valid for their unchanged inputs; this normative reference does not repin those
+inputs. See [input provenance](CONTRIBUTING.md#input-provenance-and-authority) for
+the separate implementation-input checks and source attribution.

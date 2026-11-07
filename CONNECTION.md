@@ -13,10 +13,7 @@ pins the exact candidate inputs at upstream commit
 `3f7e8ea037fefcc5c86101d23e7722c83e28a0d3`. See
 [CONTRIBUTING.md](CONTRIBUTING.md#input-provenance-and-authority) for the separate
 pinned upstream inputs. No formal conformance or independent security-review
-verdict is claimed here. The terminal receipt fixture report at
-`syntra-go/TERMINAL_RECEIPT_INTEROP.md` requires a sibling checkout and records a
-bounded bidirectional TCP matrix, not general interoperability. That uncommitted
-report is absent from the run-2 Go commit; no pinned hosted copy is claimed.
+verdict is claimed here.
 
 ## Layer and crate ownership
 
@@ -484,9 +481,9 @@ Run the isolated native, WASM, FFI and carrier checks in
 [CONTRIBUTING.md](CONTRIBUTING.md). Kernel browser execution and Docker integration
 are separate from compilation. Public context fixtures establish encoding
 agreement, not independent cryptographic vectors.
-Same-library round trips and candidate contract checks are not formal conformance
-or independent cross-language interoperability evidence. Preserve the revision
-and scope of each recorded result. The
+SDK-local round trips and candidate contract checks do not establish formal
+conformance or independent security review. Preserve the revision and scope of
+each recorded result. The
 [unified implementation-evidence runner](CONTRIBUTING.md#implementation-evidence)
 checks declared inputs and optional candidate agreement separately from its local
 execution lanes. Its formal-conformance gate remains `NOT_EXECUTED`.

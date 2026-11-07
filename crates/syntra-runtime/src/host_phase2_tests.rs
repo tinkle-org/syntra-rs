@@ -1,6 +1,9 @@
 //! Host-only RFC 0004 D2/D4 and RFC 0008 D2/D5 regressions. These exercise
 //! serialized wire frames locally; they are not an independent interop verdict.
 
+#[path = "host_request_budget_tests.rs"]
+mod request_budget_tests;
+
 use super::*;
 use crate::session::AllowAnonymous;
 use std::sync::atomic::{AtomicUsize, Ordering};

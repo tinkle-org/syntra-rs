@@ -15,6 +15,8 @@ const IMAGE: &str = "syntra-integration-peer:test";
 #[derive(Clone)]
 struct DockerCli {
     program: PathBuf,
+    /// Read injected shell fixtures as data instead of executing a newly written file.
+    script: Option<PathBuf>,
     private_hex: String,
 }
 
@@ -28,9 +30,13 @@ impl DockerCli {
         }
     }
 
-    /// Run without a shell, bounding execution and allowing a separate kill budget.
+    /// Pass literal arguments to Docker or the injected script, bounding execution
+    /// and allowing a separate kill budget without shell command interpolation.
     async fn run(&self, args: &[&str], budget: Duration) -> Result<Output, String> {
         let mut command = Command::new(&self.program);
+        if let Some(script) = &self.script {
+            command.arg(script);
+        }
         command.args(args).stdin(Stdio::null()).kill_on_drop(true);
         if args.first() == Some(&"create") {
             // Docker inherits the value by key, not via a secret-bearing argv.
@@ -240,6 +246,7 @@ async fn syntra_tcp_and_ws_over_containers() -> Result<(), Box<dyn std::error::E
     init_tracing();
     let mut cli = DockerCli {
         program: "docker".into(),
+        script: None,
         private_hex: String::new(),
     };
     if cli.run(&["info"], COMMAND_TIMEOUT).await.is_err() {
@@ -422,7 +429,6 @@ fn readiness_requires_both_actual_peer_lines_in_either_order() {
 #[cfg(unix)]
 mod command_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -458,15 +464,18 @@ esac
 "#,
             )
             .unwrap();
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
             Self(path)
         }
 
-        /// Bind an owned peer guard to the injected executable and dummy key.
+        /// Bind an owned peer guard to the shell-read fixture and dummy key.
         fn peer(&self) -> DockerPeer {
             DockerPeer {
                 cli: DockerCli {
-                    program: self.0.join("docker"),
+                    // Linux can return ETXTBSY when parallel child creation races
+                    // direct execution of a freshly written script. Read it via
+                    // the existing shell; the timeout still owns the actual child.
+                    program: "/bin/sh".into(),
+                    script: Some(self.0.join("docker")),
                     private_hex: "fixture-private-value".into(),
                 },
                 name: "fixture-peer".into(),
@@ -497,7 +506,10 @@ esac
             let error = peer.start("integration").await.unwrap_err();
             assert!(!error.contains(&peer.cli.private_hex));
             if phase == "create" {
-                assert!(error.contains("[redacted]"));
+                assert!(
+                    error.contains("[redacted]"),
+                    "expected redacted create failure: {error}"
+                );
             }
             drop(peer);
             let calls = fake.calls();
@@ -546,7 +558,10 @@ esac
             .run(&["hang"], Duration::from_millis(100))
             .await
             .unwrap_err();
-        assert!(error.contains("Elapsed"));
+        assert!(
+            error.contains("Elapsed"),
+            "expected command timeout: {error}"
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
         let error = peer
             .wait_ready(Duration::from_millis(200))

@@ -97,6 +97,22 @@ impl HandlerOutcome {
 /// Only generic authentication/authorization codes and messages are
 /// exposed on the wire; policy internals must never leak.
 pub trait Handler: Send + Sync {
+    /// Optional SDK-local cap measured from original complete-frame receipt,
+    /// including queueing and this selector. `None` preserves existing deadlines;
+    /// zero expires immediately. A cap can only shorten wire/default/deployment
+    /// limits. Called for validated application requests, not built-in recovery.
+    /// This classifier must be prompt, nonblocking and side-effect-free; payload
+    /// bytes are bounded but opaque and untrusted. No protocol/lifecycle lock is
+    /// held, except ordered admission, so do not reenter ingestion.
+    fn request_budget(
+        &self,
+        _principal: &Principal,
+        _method: &str,
+        _payload: &[u8],
+    ) -> Option<Duration> {
+        None
+    }
+
     /// Host-owned per-method policy, evaluated for every RPC using the
     /// connection's bound principal, before handler effects. Implementations
     /// must be nonblocking and may re-check expiry/revocation here. The
@@ -105,6 +121,21 @@ pub trait Handler: Send + Sync {
     /// wire.
     fn authorize(&self, _principal: &Principal, _method: &str) -> Result<(), AuthError> {
         Err(AuthError::denied())
+    }
+
+    /// Budget-aware synchronous authorization. The clock-bound budget includes
+    /// all time since receipt, including budget selection and queueing. Preserve
+    /// `authorize`'s prompt, nonblocking contract; expiry never permits handler
+    /// effects. The default delegates to the existing fail-closed policy.
+    /// Lifecycle state remains read-locked through authorization and registration
+    /// to serialize terminal reservation; do not reenter lifecycle operations.
+    fn authorize_with_budget(
+        &self,
+        principal: &Principal,
+        method: &str,
+        _budget: crate::elapsed::ElapsedDeadline,
+    ) -> Result<(), AuthError> {
+        self.authorize(principal, method)
     }
 
     fn handle(
@@ -162,6 +193,17 @@ impl<H> Handler for AllowAll<H>
 where
     H: Handler,
 {
+    /// Preserve the inner handler's receipt-origin cap despite this wrapper's
+    /// explicit authorization bypass; allowing a method never extends its budget.
+    fn request_budget(
+        &self,
+        principal: &Principal,
+        method: &str,
+        payload: &[u8],
+    ) -> Option<Duration> {
+        self.0.request_budget(principal, method, payload)
+    }
+
     fn authorize(&self, _principal: &Principal, _method: &str) -> Result<(), AuthError> {
         Ok(())
     }
@@ -710,6 +752,9 @@ impl Host {
         self.dispatch(frame, received_at).await;
     }
 
+    /// Apply handshake and active-frame error precedence before considering an RPC
+    /// rejection. A correlated invalid-method rejection retains the receipt-origin
+    /// timeout without invoking application budget selection or authorization.
     async fn on_decode_error(&self, raw: &[u8], e: SyntraError, received_at: Instant) {
         let st = self.conn.state().await;
         if st == ConnectionState::Closed {
@@ -816,6 +861,8 @@ impl Host {
         self.conn.negotiated_version().await.unwrap_or(0)
     }
 
+    /// Route a validated frame in connection-state order, consuming each request ID
+    /// before admission and forwarding its original receipt time unchanged.
     async fn dispatch(&self, frame: Frame, received_at: Instant) {
         let st = self.conn.state().await;
         match frame.body {
@@ -1103,8 +1150,8 @@ impl Host {
         increasing
     }
 
-    // Compatibility for the existing colocated tests; real input always goes
-    // through the ordered, bounded decode path above.
+    /// Admit a decoded request for colocated tests, sampling receipt before the
+    /// ordered gate. Real input uses the bounded decode path in `ingest_received_at`.
     #[cfg(test)]
     async fn on_request(&self, id: u64, version: u32, req: RpcRequest) {
         let received_at = now();
@@ -1115,6 +1162,8 @@ impl Host {
         }
     }
 
+    /// Apply the effective timeout from complete-frame receipt before initial
+    /// authorization, retaining that deadline through admission and dispatch.
     async fn on_request_received_at(
         &self,
         id: u64,
@@ -1122,7 +1171,8 @@ impl Host {
         req: RpcRequest,
         received_at: Instant,
     ) {
-        let deadline = received_at + self.request_timeout(&req);
+        let timeout = self.request_timeout(&req);
+        let mut deadline = received_at + timeout;
         let state = self.conn.shared.state.read().await;
         if *state != ConnectionState::Active
             || self.conn.terminal_fenced()
@@ -1140,6 +1190,37 @@ impl Host {
             let bound = self.bound_id.lock().unwrap_or_else(|e| e.into_inner());
             bound.as_deref().and_then(|id| self.sessions.get(id))
         };
+        drop(state);
+        // Keep FIFO admission, but release lifecycle state for the pure classifier.
+        // Authorization and registration must still serialize with reservation.
+        if syntra_core::validate_method(&req.method).is_ok()
+            && !recovery::is_profile(&req.method)
+            && self.conn.shared.clock.now() < deadline
+        {
+            if let Some(session) = &session {
+                if let Some(cap) =
+                    self.handler
+                        .request_budget(&session.principal, &req.method, &req.payload)
+                {
+                    // Compare durations BEFORE addition: even Duration::MAX can
+                    // neither overflow nor extend an already bounded deadline.
+                    deadline = received_at + timeout.min(cap);
+                }
+            }
+        }
+        let state = self.conn.shared.state.read().await;
+        if *state != ConnectionState::Active
+            || self.conn.terminal_fenced()
+            || self.conn.is_closed()
+            || self.conn.lifecycle_blocked()
+            || self
+                .conn
+                .shared
+                .shutdown_requested
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
         // Check before policy AND after synchronous policy; even a policy that
         // exceeds its nonblocking contract cannot cause expired handler effects.
         let mut rejection = if self.conn.shared.clock.now() >= deadline {
@@ -1163,10 +1244,13 @@ impl Host {
                 None
             }
         } else {
-            match session
-                .as_ref()
-                .map(|s| self.handler.authorize(&s.principal, &req.method))
-            {
+            match session.as_ref().map(|s| {
+                self.handler.authorize_with_budget(
+                    &s.principal,
+                    &req.method,
+                    self.conn.shared.clock.deadline_at(deadline),
+                )
+            }) {
                 Some(Ok(())) => None,
                 Some(Err(e)) if e.code == ErrorCode::FailedPrecondition => {
                     Some(HandlerOutcome::error(
@@ -1224,6 +1308,8 @@ impl Host {
         }
     }
 
+    /// Register a correlated rejection under its existing absolute deadline without
+    /// acquiring an execution lease. Close if bounded terminal output is exhausted.
     async fn reject_request(
         &self,
         id: u64,
@@ -1256,10 +1342,11 @@ impl Host {
         .await;
     }
 
-    // Admission never waits for a writer. Both accepted work and ordinary
-    // rejections own bounded output slots, distinct from execution permits.
-    // Caller holds lifecycle read + ordered admission; the std mutex below is
-    // only a short terminal/registry gate, never held over an await/user code.
+    /// Register accepted work or a rejection without waiting for writer capacity.
+    /// Both retain a bounded output slot; only accepted work acquires execution
+    /// permits. Return false on output exhaustion so the caller can close.
+    /// The caller holds lifecycle read and ordered admission; the registry mutex
+    /// is a short selection gate, never held across awaits or application hooks.
     fn start_request(
         &self,
         id: u64,
@@ -1346,6 +1433,7 @@ impl Host {
             version,
             req.method.clone(),
             deadline,
+            self.conn.shared.clock.clone(),
         );
         #[cfg(all(test, not(target_arch = "wasm32")))]
         let dispatch_pause = self.dispatch_pause.lock().unwrap().clone();

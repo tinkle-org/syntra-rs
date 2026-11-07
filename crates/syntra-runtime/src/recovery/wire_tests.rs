@@ -1,5 +1,5 @@
 //! Source-independent host/codec tests using ordinary protobuf payloads.
-//! Transport integration and cross-repo ABI tests are separate.
+//! SDK-owned transport integration and FFI contract tests run separately.
 
 use super::*;
 use prost::Message;

@@ -11,11 +11,7 @@ runtime scheduling and socket policy. Encryption is integral to the protocol. Se
 
 The implementation is experimental and distributed as release-candidate crates.
 No formal conformance or independent security-review verdict is claimed.
-The terminal receipt fixture report,
-`syntra-go/TERMINAL_RECEIPT_INTEROP.md` (requires a sibling checkout), records a
-bounded bidirectional TCP matrix, not general interoperability or application
-acceptance. The report and handoff are not present at the recorded run-2 Go
-commit, so no commit-pinned hosted copy is claimed. The current candidate is recorded in
+The current candidate is recorded in
 [`protocol-contract.json`](protocol-contract.json); it pins `committed-candidate`
 inputs, not a release or specification freeze. See
 [input provenance](CONTRIBUTING.md#input-provenance-and-authority) for the separate
@@ -363,6 +359,45 @@ they do not select a different encryption protocol.
   terminal. See the [core](crates/syntra-core/src/lib.rs) and
   [runtime](crates/syntra-runtime/src/lib.rs) source contracts.
 
+## Host-local request budgets
+
+`Handler::request_budget(&Principal, &str, &[u8]) -> Option<Duration>` optionally
+shortens an application RPC's deadline under SNTR-RPC-004. The selector runs after
+bounded envelope/method validation and ordered request-ID consumption, before
+initial authorization. Its payload is opaque, bounded, untrusted data. The callback
+must be prompt, nonblocking and side-effect-free; FIFO admission remains held,
+but protocol mutexes, raw-I/O gates and lifecycle guards are released around it.
+Lifecycle state is reacquired and rechecked before authorization, then retained
+through authorization and request registration to serialize terminal reservation.
+Built-in update/recovery RPCs retain their separate routing and source policy.
+
+The effective deadline is original complete-frame receipt plus the minimum of
+the effective wire/default timeout, deployment maximum and optional host cap.
+Queueing, selector execution and authorization all consume that same budget.
+`None` preserves existing limits; `Some(Duration::ZERO)` expires immediately,
+and a longer cap, including `Duration::MAX`, cannot extend or overflow them.
+Expiration is rechecked before handler construction and terminal selection;
+an already selected result remains immutable.
+
+The additive hooks use `syntra_runtime::elapsed::ElapsedDeadline`, which carries
+the host's clock and offers `check`, `remaining`, `expired` and `run`:
+
+| API | Budget and compatibility |
+| --- | --- |
+| `Handler::authorize_with_budget(principal, method, budget)` | Same request-wide deadline; synchronous/nonblocking, defaults to existing `authorize` (fail-closed) |
+| `RequestContext::budget()` | Readonly clone of that deadline for cooperative application/storage work, including ordinary RPCs |
+| `Authority::observe_with_budget(transition, budget)` | Existing read timeout restricted by prior freshness and terminal cutoff; defaults to `observe` |
+| `Authority::commit_with_budget(transition, lease, budget)` | Terminal cutoff with teardown tail excluded; defaults to `commit` |
+
+Existing handlers, closure/FFI adapters and authority implementations keep their
+default behavior. `AllowAll` forwards the selector and context/execution hooks;
+its authorization, including the default budget-aware delegation, still explicitly
+bypasses the inner policy. Custom forwarding adapters must preserve these hooks.
+These are SDK-local APIs with no wire, schema or peer-option change. Cooperative
+callers must bound their own I/O and retain execution leases through actual work.
+Timeout does not establish rollback, prevent a late durable commit, or guarantee
+receipt delivery. See [terminal deadlines](TERMINAL_RECEIPT_DESIGN.md#deadline-and-retained-cleanup).
+
 ## Optional terminal receipt
 
 Native TCP supports a default-disabled terminal result for an authorized
@@ -382,9 +417,7 @@ independent generic guard is refused. The runtime fences ordinary traffic and
 retires actual recovery attachments before transition. Raw/custom record, WASM,
 FFI, WS/WSS, and HTTP/HTTPS paths do not support terminal effects. Existing clients
 parse the same `RpcResult`, with no new wire message or peer option. See
-[API, support, tests, and evidence limits](TERMINAL_RECEIPT_DESIGN.md) and the
-manual merge/release handoff at `syntra-go/TERMINAL_RECEIPT_HANDOFF.md`
-(requires a sibling checkout).
+[API, support, tests, and evidence limits](TERMINAL_RECEIPT_DESIGN.md).
 
 ## Native FFI
 
@@ -427,25 +460,6 @@ drivers; its default WASM build has no driver exports and rejects native feature
 `syntra-ffi` is native-only. The kernel browser runner requires a matching
 `wasm-bindgen-test-runner` and a browser/WebDriver; compilation alone does not
 execute those tests or verify a browser carrier.
-
-### Go native sibling
-
-For sibling checkouts `syntra-rs/` and
-[`syntra-go/`](https://github.com/tinkle-org/syntra-go), first build the
-production library above. From the **syntra-go root**, use an absolute
-library path (adjust it if `CARGO_TARGET_DIR` is set):
-
-```sh
-LIBDIR="$(realpath ../syntra-rs/target/debug)"
-# Linux
-CGO_ENABLED=1 CGO_LDFLAGS="-L$LIBDIR -lsyntra_ffi" LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" go test -tags syntranative -count=1 ./...
-# macOS (use this command instead on macOS)
-CGO_ENABLED=1 CGO_LDFLAGS="-L$LIBDIR -lsyntra_ffi" DYLD_LIBRARY_PATH="$LIBDIR${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" go test -tags syntranative -count=1 ./...
-```
-
-This requires a Go toolchain and C compiler for the same architecture as
-the Rust library. Pure-Go builds need no Rust library. Cross-repository
-integration is checked separately from this repository's Rust CI.
 
 ## Benchmarks, containers and generated code
 

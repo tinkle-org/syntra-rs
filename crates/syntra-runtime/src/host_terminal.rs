@@ -1,6 +1,6 @@
 //! Opt-in, connection-local terminal receipt coordination. No wire extension.
 use super::*;
-use crate::elapsed::ElapsedClock;
+use crate::elapsed::{ElapsedClock, ElapsedDeadline};
 use futures_util::future::BoxFuture;
 use std::sync::atomic::Ordering;
 
@@ -67,11 +67,39 @@ pub trait Authority: Send + Sync {
     /// Future construction/polls must be nonblocking. Independently spawned
     /// storage work remains the adapter's accounted-for cleanup responsibility.
     fn observe(&self, transition: Option<Transition>) -> BoxFuture<'_, Observation>;
+
+    /// Fresh read with a clock-bound deadline already restricted by the read
+    /// timeout, prior freshness and (after reservation) the operation cutoff.
+    /// Queueing never restarts these bounds. Construction/polls must be
+    /// nonblocking; cooperative storage adapters should honor this budget.
+    /// Existing adapters delegate to `observe` unchanged.
+    fn observe_with_budget(
+        &self,
+        transition: Option<Transition>,
+        _budget: ElapsedDeadline,
+    ) -> BoxFuture<'_, Observation> {
+        self.observe(transition)
+    }
     /// Own the application mutation: conditionally commit expected revision,
     /// withdrawal, private owner, and every fixed-receipt condition in the same
     /// transaction. The handler must not mutate after awaiting `retire`.
     /// Return carries no proof; errors/uncertainty must be observable as Unknown.
     fn commit(&self, transition: Transition, lease: ExecutionLease) -> BoxFuture<'_, ()>;
+
+    /// Conditional mutation with the original operation cutoff (teardown tail
+    /// excluded), never a fresh phase timeout. Check/bound cooperative DB work
+    /// using this budget, and retain the lease until actual work ends. Timeout
+    /// cannot prove rollback or prevent an uncooperative late durable commit;
+    /// late completion never restores receipt eligibility. The default delegates
+    /// to `commit` so existing authority implementations remain compatible.
+    fn commit_with_budget(
+        &self,
+        transition: Transition,
+        lease: ExecutionLease,
+        _budget: ElapsedDeadline,
+    ) -> BoxFuture<'_, ()> {
+        self.commit(transition, lease)
+    }
 }
 
 /// Fixed host policy. No default policy exists. Payload must be non-sensitive.
@@ -110,6 +138,7 @@ pub struct RequestContext {
     version: u32,
     method: String,
     deadline: Instant,
+    clock: ElapsedClock,
     lease: Option<ExecutionLease>,
 }
 impl RequestContext {
@@ -120,6 +149,7 @@ impl RequestContext {
         version: u32,
         method: String,
         deadline: Instant,
+        clock: ElapsedClock,
     ) -> Self {
         Self {
             host,
@@ -127,8 +157,17 @@ impl RequestContext {
             version,
             method,
             deadline,
+            clock,
             lease: None,
         }
+    }
+
+    /// Readonly request-wide deadline on the host's original elapsed clock.
+    /// Clones preserve the same cutoff and expire even if retained after dispatch.
+    /// Cooperative storage/I/O callers should check it and bound their operations;
+    /// timeout does not prove that external work or a durable commit stopped.
+    pub fn budget(&self) -> ElapsedDeadline {
+        self.clock.deadline_at(self.deadline)
     }
     /// Keep actual application execution accounted for while the context survives.
     pub(super) fn with_lease(mut self, lease: ExecutionLease) -> Self {
@@ -476,7 +515,12 @@ impl Coordinator {
         let (start, deadline, claim) = read_window()?;
         let result = self
             .clock
-            .timeout_until(deadline, self.policy.authority.observe(claim))
+            .timeout_until(
+                deadline,
+                self.policy
+                    .authority
+                    .observe_with_budget(claim, self.clock.deadline_at(deadline)),
+            )
             .await;
         let _io = self.io_gate.lock().unwrap();
         let mut s = self.state.lock().unwrap();
@@ -562,12 +606,15 @@ impl Coordinator {
                     s.claim.clone().ok_or(Refused::Unavailable)?
                 };
                 let authority = self.policy.authority.clone();
+                let budget = self.clock.deadline_at(cutoff);
                 let (completed, completion) = oneshot::channel();
                 // Actual authority work has its own retained task and lease. The
                 // result/close deadline may drop this waiter, never that task.
                 let task = spawn_task(async move {
                     let _lease = lease.clone();
-                    authority.commit(claim, lease).await;
+                    if budget.check().is_ok() {
+                        authority.commit_with_budget(claim, lease, budget).await;
+                    }
                     let _ = completed.send(());
                 });
                 sender.shared.tasks.register(task);
@@ -732,6 +779,10 @@ impl Host {
         self.terminal_commands.lock().unwrap().take()
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "host_terminal_budget_tests.rs"]
+mod budget_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
@@ -1222,6 +1273,7 @@ mod tests {
             1,
             "/example.Authority/Retire".into(),
             deadline,
+            c.clock.clone(),
         )
         .with_lease(lease);
         let mut commands = host.take_terminal_commands().unwrap();
@@ -1300,6 +1352,8 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
         release: tokio::sync::Semaphore,
         denied: std::sync::atomic::AtomicBool,
+        /// Optional source-only suspension in the poll returning authority evidence.
+        completion_advance: Mutex<Option<(Arc<SuspendSource>, u64)>>,
     }
     impl Authority for QueuedAuthority {
         /// Count each constructed read and hold its evidence behind a test permit.
@@ -1307,6 +1361,9 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
                 self.release.acquire().await.unwrap().forget();
+                if let Some((source, millis)) = self.completion_advance.lock().unwrap().take() {
+                    source.0.store(millis, Ordering::SeqCst);
+                }
                 if self.denied.load(Ordering::SeqCst) {
                     Observation::HardDenied
                 } else {
@@ -1321,17 +1378,26 @@ mod tests {
     }
     /// Initialize one successful read before independently controlling queued reads.
     async fn queued_coordinator() -> (Arc<Host>, Arc<Coordinator>, Arc<QueuedAuthority>) {
-        let (host, _) = Host::new(
+        queued_coordinator_with_clock(ElapsedClock::lifecycle_driven()).await
+    }
+    /// Bind serialized authority reads to an explicitly selected elapsed domain.
+    async fn queued_coordinator_with_clock(
+        clock: ElapsedClock,
+    ) -> (Arc<Host>, Arc<Coordinator>, Arc<QueuedAuthority>) {
+        let (host, _) = Host::try_new_with_clock(
             ConnectionConfig::default(),
             Arc::new(crate::AllowAnonymous),
             Arc::new(super::super::FnHandler(|_, p, _| async {
                 HandlerOutcome::Payload(p)
             })),
-        );
+            clock,
+        )
+        .unwrap();
         let authority = Arc::new(QueuedAuthority {
             calls: std::sync::atomic::AtomicUsize::new(0),
             release: tokio::sync::Semaphore::new(1),
             denied: std::sync::atomic::AtomicBool::new(false),
+            completion_advance: Mutex::new(None),
         });
         let c = host
             .install_terminal_tcp(Policy {
@@ -1343,6 +1409,81 @@ mod tests {
             .unwrap();
         c.refresh().await.unwrap();
         (host, c, authority)
+    }
+
+    /// Drive suspend-inclusive time independently of Tokio's paused scheduler.
+    struct SuspendSource(std::sync::atomic::AtomicU64);
+    impl crate::elapsed::ElapsedSource for SuspendSource {
+        /// Return trusted process-local milliseconds without waking the executor.
+        fn elapsed(&self) -> Option<Duration> {
+            Some(Duration::from_millis(self.0.load(Ordering::SeqCst)))
+        }
+    }
+
+    /// Source-only expiry bounds queued and in-flight reads, without timer wakeups
+    /// or late active evidence renewing freshness/operation eligibility.
+    #[tokio::test(start_paused = true)]
+    async fn suspended_authority_reads_keep_original_freshness_and_operation_cutoffs() {
+        for reserved in [false, true] {
+            for queued in [false, true] {
+                let source = Arc::new(SuspendSource(std::sync::atomic::AtomicU64::new(0)));
+                let clock = ElapsedClock::with_source(source.clone());
+                let scheduled = tokio::time::Instant::now();
+                let (host, c, authority) = queued_coordinator_with_clock(clock.clone()).await;
+                let origin = clock.now();
+                let expires = if reserved {
+                    reserve(&c, 1).unwrap();
+                    // Keep authority fresh past C=t750, so only the immutable
+                    // operation cutoff can defeat the final observation.
+                    for millis in (80..=720).step_by(80) {
+                        source.0.store(millis, Ordering::SeqCst);
+                        authority.release.add_permits(1);
+                        c.refresh().await.unwrap();
+                    }
+                    assert_eq!(c.cutoff(), Some(origin + Duration::from_millis(750)));
+                    assert_eq!(
+                        c.state.lock().unwrap().fresh_until,
+                        Some(origin + Duration::from_millis(820))
+                    );
+                    750
+                } else {
+                    100
+                };
+                let fresh_until = c.state.lock().unwrap().fresh_until;
+                let reads = authority.calls.load(Ordering::SeqCst);
+                let lock = if queued {
+                    Some(c.reads.lock().await)
+                } else {
+                    None
+                };
+                let mut refresh = Box::pin(c.refresh());
+                assert!(futures_util::poll!(&mut refresh).is_pending());
+                assert_eq!(
+                    authority.calls.load(Ordering::SeqCst),
+                    reads + usize::from(!queued)
+                );
+                if queued {
+                    source.0.store(expires, Ordering::SeqCst);
+                } else {
+                    // Return Ready in the same poll that crosses the bound;
+                    // timer priority alone cannot detect this late evidence.
+                    *authority.completion_advance.lock().unwrap() = Some((source.clone(), expires));
+                }
+                drop(lock);
+                authority.release.add_permits(1);
+                assert_eq!(refresh.await, Err(Refused::Unavailable));
+                assert_eq!(c.state.lock().unwrap().fresh_until, fresh_until);
+                assert!(!c.raw_allowed());
+                assert_eq!(c.refresh().await, Err(Refused::Unavailable));
+                assert_eq!(
+                    authority.calls.load(Ordering::SeqCst),
+                    reads + usize::from(!queued),
+                    "expiry must prevent constructing any replacement authority read"
+                );
+                assert_eq!(tokio::time::Instant::now(), scheduled);
+                host.close().await;
+            }
+        }
     }
 
     /// Queue wait never substitutes for the actual serialized observation start.

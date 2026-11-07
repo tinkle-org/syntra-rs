@@ -3,8 +3,8 @@
 //! Exercises selected loopback/manual byte-pump cases described in
 //! historical scenario descriptions, not a manifest-driven CONF executor.
 //! No `conformance/runner/scenarios.yaml` exists at the accepted upstream pin.
-//! Recovery tests run separately; these are not formal conformance verdicts or
-//! independent Rust/Go interoperability. The corpus copy's committed origin is
+//! Recovery tests run separately; these SDK-local cases do not establish formal
+//! conformance. The corpus copy's committed origin is
 //! checked by scripts/check-upstream-pin.py before the evidence runner uses it.
 //!
 //! Fault injection is deterministic: a seeded counter decides drop/duplicate/

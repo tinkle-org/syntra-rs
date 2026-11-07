@@ -229,7 +229,6 @@ def main():
         "fixture_verification": transcriptions,
         "external_gates": {key: {"verdict": "NOT_EXECUTED", "reason": reason} for key, reason in {
             "formal_conformance": "no independent formal conformance assessment executed; implementation checks and local lanes are supplemental",
-            "rust_go_both_roles": "no independently aligned Go process executed by this runner",
             "physical_ios_android": "no physical-device lifecycle or budget harness executed",
             "browser": "no real browser scenario executed",
             "direct_host_tls13_wss": "local host observations alone do not establish independent full carrier/lifecycle validation",

@@ -1,7 +1,6 @@
 // Candidate Syntra 1.0 public context/prologue examples, independent of the
 // scoped upstream inputs. IDs match the derived local context fixture. These
-// are encoding examples, not Noise vectors
-// or evidence of cross-implementation interoperability.
+// are public encoding examples, not independent Noise vectors or security proof.
 
 pub struct Fixture {
     pub id: &'static str,

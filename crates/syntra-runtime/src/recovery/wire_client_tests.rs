@@ -1,6 +1,6 @@
 //! Controlled core peer tests. Initiator::call, core handshake/correlation and
-//! emission gates are real. Recovery-host attachment is deliberately not faked
-//! as parent Host integration or cross-repository Rust/Go acceptance evidence.
+//! emission gates are real. Recovery-host attachment is outside this fixture's
+//! scope and is exercised separately by the SDK's Host integration tests.
 
 use super::super::persistence::MemoryRecoveryStore;
 use super::*;
