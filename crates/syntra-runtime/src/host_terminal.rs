@@ -1,6 +1,6 @@
 //! Opt-in, connection-local terminal receipt coordination. No wire extension.
 use super::*;
-use crate::elapsed::ElapsedClock;
+use crate::elapsed::{ElapsedClock, ElapsedDeadline};
 use futures_util::future::BoxFuture;
 use std::sync::atomic::Ordering;
 
@@ -67,11 +67,39 @@ pub trait Authority: Send + Sync {
     /// Future construction/polls must be nonblocking. Independently spawned
     /// storage work remains the adapter's accounted-for cleanup responsibility.
     fn observe(&self, transition: Option<Transition>) -> BoxFuture<'_, Observation>;
+
+    /// Fresh read with a clock-bound deadline already restricted by the read
+    /// timeout, prior freshness and (after reservation) the operation cutoff.
+    /// Queueing never restarts these bounds. Construction/polls must be
+    /// nonblocking; cooperative storage adapters should honor this budget.
+    /// Existing adapters delegate to `observe` unchanged.
+    fn observe_with_budget(
+        &self,
+        transition: Option<Transition>,
+        _budget: ElapsedDeadline,
+    ) -> BoxFuture<'_, Observation> {
+        self.observe(transition)
+    }
     /// Own the application mutation: conditionally commit expected revision,
     /// withdrawal, private owner, and every fixed-receipt condition in the same
     /// transaction. The handler must not mutate after awaiting `retire`.
     /// Return carries no proof; errors/uncertainty must be observable as Unknown.
     fn commit(&self, transition: Transition, lease: ExecutionLease) -> BoxFuture<'_, ()>;
+
+    /// Conditional mutation with the original operation cutoff (teardown tail
+    /// excluded), never a fresh phase timeout. Check/bound cooperative DB work
+    /// using this budget, and retain the lease until actual work ends. Timeout
+    /// cannot prove rollback or prevent an uncooperative late durable commit;
+    /// late completion never restores receipt eligibility. The default delegates
+    /// to `commit` so existing authority implementations remain compatible.
+    fn commit_with_budget(
+        &self,
+        transition: Transition,
+        lease: ExecutionLease,
+        _budget: ElapsedDeadline,
+    ) -> BoxFuture<'_, ()> {
+        self.commit(transition, lease)
+    }
 }
 
 /// Fixed host policy. No default policy exists. Payload must be non-sensitive.
@@ -110,6 +138,7 @@ pub struct RequestContext {
     version: u32,
     method: String,
     deadline: Instant,
+    clock: ElapsedClock,
     lease: Option<ExecutionLease>,
 }
 impl RequestContext {
@@ -120,6 +149,7 @@ impl RequestContext {
         version: u32,
         method: String,
         deadline: Instant,
+        clock: ElapsedClock,
     ) -> Self {
         Self {
             host,
@@ -127,8 +157,17 @@ impl RequestContext {
             version,
             method,
             deadline,
+            clock,
             lease: None,
         }
+    }
+
+    /// Readonly request-wide deadline on the host's original elapsed clock.
+    /// Clones preserve the same cutoff and expire even if retained after dispatch.
+    /// Cooperative storage/I/O callers should check it and bound their operations;
+    /// timeout does not prove that external work or a durable commit stopped.
+    pub fn budget(&self) -> ElapsedDeadline {
+        self.clock.deadline_at(self.deadline)
     }
     /// Keep actual application execution accounted for while the context survives.
     pub(super) fn with_lease(mut self, lease: ExecutionLease) -> Self {
@@ -476,7 +515,12 @@ impl Coordinator {
         let (start, deadline, claim) = read_window()?;
         let result = self
             .clock
-            .timeout_until(deadline, self.policy.authority.observe(claim))
+            .timeout_until(
+                deadline,
+                self.policy
+                    .authority
+                    .observe_with_budget(claim, self.clock.deadline_at(deadline)),
+            )
             .await;
         let _io = self.io_gate.lock().unwrap();
         let mut s = self.state.lock().unwrap();
@@ -562,12 +606,15 @@ impl Coordinator {
                     s.claim.clone().ok_or(Refused::Unavailable)?
                 };
                 let authority = self.policy.authority.clone();
+                let budget = self.clock.deadline_at(cutoff);
                 let (completed, completion) = oneshot::channel();
                 // Actual authority work has its own retained task and lease. The
                 // result/close deadline may drop this waiter, never that task.
                 let task = spawn_task(async move {
                     let _lease = lease.clone();
-                    authority.commit(claim, lease).await;
+                    if budget.check().is_ok() {
+                        authority.commit_with_budget(claim, lease, budget).await;
+                    }
                     let _ = completed.send(());
                 });
                 sender.shared.tasks.register(task);
@@ -732,6 +779,10 @@ impl Host {
         self.terminal_commands.lock().unwrap().take()
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "host_terminal_budget_tests.rs"]
+mod budget_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
@@ -1222,6 +1273,7 @@ mod tests {
             1,
             "/example.Authority/Retire".into(),
             deadline,
+            c.clock.clone(),
         )
         .with_lease(lease);
         let mut commands = host.take_terminal_commands().unwrap();

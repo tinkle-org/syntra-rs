@@ -5,7 +5,7 @@ mod fixture {
     use futures_util::future::BoxFuture;
     use std::{
         sync::{Arc, Mutex},
-        time::Duration,
+        time::{Duration, Instant},
     };
     use syntra_core::secure_channel::*;
     use syntra_core::{ErrorCode, SyntraError};
@@ -13,6 +13,7 @@ mod fixture {
         pump::{AuthenticatorFactory, RecordReader},
         tcp,
     };
+    use syntra_runtime::elapsed::ElapsedDeadline;
     use syntra_runtime::{terminal::*, *};
     use tokio::io::AsyncReadExt;
 
@@ -28,12 +29,41 @@ mod fixture {
         denials: usize,
         committing: bool,
         gap_seen: bool,
+        /// Local measurement origin only; never exported as an absolute timestamp.
+        budget_started: Option<Instant>,
     }
     /// Read-only key lookup plus separately recorded authority/fixture evidence.
     struct Store {
         state: Mutex<State>,
         scenario: String,
         gap_observed: tokio::sync::Notify,
+    }
+    /// Opt in only the three neutral application request-budget scenarios.
+    fn budget_case(scenario: &str) -> bool {
+        scenario.starts_with("budget-")
+    }
+    /// Keep healthy caps generous enough for independent read freshness renewal.
+    fn host_cap(scenario: &str) -> Duration {
+        Duration::from_millis(if scenario == "budget-late" { 600 } else { 1500 })
+    }
+    impl Store {
+        /// Print clock-relative metrics without provisioning or authority identifiers.
+        fn observe_budget(&self, phase: &str, budget: &ElapsedDeadline) {
+            if !budget_case(&self.scenario) {
+                return;
+            }
+            let Some(started) = self.state.lock().unwrap().budget_started else {
+                return;
+            };
+            let remaining = budget.remaining();
+            println!(
+                "{{\"event\":\"budget\",\"phase\":\"{}\",\"live\":{},\"sdk_budget_present\":true,\"remaining_ms\":{},\"elapsed_ms\":{}}}",
+                phase,
+                remaining.is_ok(),
+                remaining.unwrap_or_default().as_secs_f64() * 1000.0,
+                started.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
     }
     impl KeyStore for Store {
         /// Validate the exact requested handle/epoch and read its active key, without evidence effects.
@@ -51,6 +81,42 @@ mod fixture {
         }
     }
     impl Authority for Store {
+        /// Report the runtime's bounded authoritative read budget after reservation.
+        fn observe_with_budget(
+            &self,
+            transition: Option<Transition>,
+            budget: ElapsedDeadline,
+        ) -> BoxFuture<'_, Observation> {
+            if transition.is_some() {
+                self.observe_budget("observe", &budget);
+            }
+            self.observe(transition)
+        }
+
+        /// Retain actual work and its execution lease beyond cutoff only in the
+        /// explicitly labelled uncooperative test adapter, never in authorization.
+        fn commit_with_budget(
+            &self,
+            claim: Transition,
+            lease: ExecutionLease,
+            budget: ElapsedDeadline,
+        ) -> BoxFuture<'_, ()> {
+            self.observe_budget("commit", &budget);
+            Box::pin(async move {
+                if self.scenario == "budget-late" {
+                    // TEST-ONLY CONTRACT VIOLATION: external work ignores expiry.
+                    // The retained SDK task/lease must join and cannot regain a receipt.
+                    // Open a deterministic event range for reads after actual
+                    // commit admission but before delayed mutation completion.
+                    println!("{{\"event\":\"commit_pending\"}}");
+                    budget.expired().await;
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    println!("{{\"event\":\"late_commit\",\"expired\":{},\"retained_work\":true,\"contract_violation\":true}}", budget.check().is_err());
+                }
+                self.commit(claim, lease).await;
+            })
+        }
+
         /// Report current typed authority, including recorded-owner visibility during callback delay.
         fn observe(&self, _: Option<Transition>) -> BoxFuture<'_, Observation> {
             Box::pin(async {
@@ -131,6 +197,35 @@ mod fixture {
     /// Count actual handler admission; only the authority callback mutates binding state.
     struct Retire(Arc<Store>);
     impl Handler for Retire {
+        /// Select only by authenticated principal, exact method and opaque input.
+        fn request_budget(
+            &self,
+            principal: &Principal,
+            method: &str,
+            payload: &[u8],
+        ) -> Option<Duration> {
+            if !budget_case(&self.0.scenario) {
+                return None;
+            }
+            self.0.state.lock().unwrap().budget_started = Some(Instant::now());
+            let cap = host_cap(&self.0.scenario);
+            println!(
+                "{{\"event\":\"budget_selected\",\"cap_ms\":{},\"input_valid\":{}}}",
+                cap.as_millis(),
+                principal.subject == "fixture-principal" && method == METHOD && payload.is_empty()
+            );
+            Some(cap)
+        }
+        /// Observe the selected budget without blocking the synchronous authorizer.
+        fn authorize_with_budget(
+            &self,
+            principal: &Principal,
+            method: &str,
+            budget: ElapsedDeadline,
+        ) -> Result<(), AuthError> {
+            self.0.observe_budget("authorize", &budget);
+            self.authorize(principal, method)
+        }
         /// Authorize only the fixture's exact retirement method.
         fn authorize(&self, _: &Principal, method: &str) -> Result<(), AuthError> {
             if method == METHOD {
@@ -155,12 +250,18 @@ mod fixture {
             context: RequestContext,
         ) -> HandlerFut {
             self.0.state.lock().unwrap().handlers += 1;
+            let store = self.0.clone();
             Box::pin(async move {
                 if !payload.is_empty() {
                     return HandlerOutcome::error(
                         syntra_core::ErrorCode::InvalidArgument,
                         "expected empty request",
                     );
+                }
+                if budget_case(&store.scenario) {
+                    // Cooperative async work spends, rather than refreshes, D.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    store.observe_budget("handler", &context.budget());
                 }
                 context.retire(1).await.unwrap_or_else(|_| {
                     HandlerOutcome::error(
@@ -371,7 +472,7 @@ mod fixture {
             || !matches!(args[1].as_str(), "server" | "client" | "probe")
         {
             return Err(
-                "usage: terminal_receipt server|client|probe 127.0.0.1:PORT [owned|deny|unknown|gap]"
+                "usage: terminal_receipt server|client|probe 127.0.0.1:PORT [owned|deny|unknown|gap|budget-cap|budget-short|budget-late]"
                     .into(),
             );
         }
@@ -380,7 +481,10 @@ mod fixture {
             return Err("fixture requires loopback".into());
         }
         let scenario = args.get(3).map_or("owned", String::as_str);
-        if !matches!(scenario, "owned" | "deny" | "unknown" | "gap") {
+        if !matches!(
+            scenario,
+            "owned" | "deny" | "unknown" | "gap" | "budget-cap" | "budget-short" | "budget-late"
+        ) {
             return Err("unknown fixture scenario".into());
         }
         if args[1] == "client" || args[1] == "probe" {
@@ -421,12 +525,24 @@ mod fixture {
             }
             let client = connected?;
             println!("{{\"event\":\"established\"}}");
-            let result = client.conn.call(METHOD, vec![], 3000).await;
+            let peer_budget = match scenario {
+                "budget-short" => 1000,
+                "budget-cap" | "budget-late" => 120000,
+                _ => 3000,
+            };
+            if budget_case(scenario) {
+                println!(
+                    "{{\"event\":\"peer_budget\",\"timeout_ms\":{}}}",
+                    peer_budget
+                );
+            }
+            let result = client.conn.call(METHOD, vec![], peer_budget).await;
             match (scenario, result) {
-                ("owned" | "gap", Ok(payload)) if payload == b"retired" => {
+                ("owned" | "gap" | "budget-cap" | "budget-short", Ok(payload)) if payload == b"retired" => {
                     println!("{{\"event\":\"result\",\"outcome\":\"observed\",\"payload\":\"retired\",\"receipts\":1}}")
                 }
-                ("deny" | "unknown", Err(SyntraError::Unavailable(_))) => println!("{{\"event\":\"result\",\"outcome\":\"unknown\",\"code\":\"Unavailable\",\"receipts\":0}}"),
+                ("deny" | "unknown" | "budget-late", Err(SyntraError::Unavailable(_))) => println!("{{\"event\":\"result\",\"outcome\":\"unknown\",\"code\":\"Unavailable\",\"receipts\":0}}"),
+                ("budget-late", Err(SyntraError::Rpc { code: ErrorCode::DeadlineExceeded, .. })) => println!("{{\"event\":\"result\",\"outcome\":\"unknown\",\"code\":\"DeadlineExceeded\",\"receipts\":0}}"),
                 ("deny", Err(SyntraError::Rpc { code: ErrorCode::Unauthenticated, .. })) => println!("{{\"event\":\"result\",\"outcome\":\"unknown\",\"code\":\"Unauthenticated\",\"receipts\":0}}"),
                 _ => return Err("unexpected fixture result".into()),
             }

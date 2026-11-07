@@ -85,6 +85,14 @@ impl Default for ElapsedClock {
 }
 
 impl ElapsedClock {
+    /// Bind an existing absolute deadline without restarting its budget.
+    pub(crate) fn deadline_at(&self, at: Instant) -> ElapsedDeadline {
+        ElapsedDeadline {
+            clock: self.clone(),
+            at,
+        }
+    }
+
     pub fn deadline_after(&self, budget: Duration) -> Result<ElapsedDeadline, ElapsedFailure> {
         if !self.is_continuous() {
             return Err(ElapsedFailure::ContinuityLost);

@@ -11,7 +11,7 @@ use syntra_net::{
     pump::{AuthenticatorFactory, Limits},
     tcp,
 };
-use syntra_runtime::elapsed::ElapsedClock;
+use syntra_runtime::elapsed::{ElapsedClock, ElapsedDeadline};
 use syntra_runtime::{terminal::*, *};
 use tokio::sync::Notify;
 
@@ -49,6 +49,8 @@ struct AuthorityFixture {
     reserved: Notify,
     release: Notify,
     trace: Arc<EventTrace>,
+    read_budgets: Mutex<Vec<Duration>>,
+    commit_budgets: Mutex<Vec<Duration>>,
 }
 impl AuthorityFixture {
     /// Select one evidence/failure mode for a new active binding.
@@ -62,10 +64,37 @@ impl AuthorityFixture {
             reserved: Notify::new(),
             release: Notify::new(),
             trace: Arc::new(EventTrace::new()),
+            read_budgets: Mutex::new(vec![]),
+            commit_budgets: Mutex::new(vec![]),
         })
     }
 }
 impl Authority for AuthorityFixture {
+    /// Record the actual read bound while preserving legacy fixture behavior.
+    fn observe_with_budget(
+        &self,
+        transition: Option<Transition>,
+        budget: ElapsedDeadline,
+    ) -> BoxFuture<'_, Observation> {
+        self.read_budgets
+            .lock()
+            .unwrap()
+            .push(budget.remaining().unwrap());
+        self.observe(transition)
+    }
+    /// Record the non-renewed cutoff passed across the native TCP boundary.
+    fn commit_with_budget(
+        &self,
+        transition: Transition,
+        lease: ExecutionLease,
+        budget: ElapsedDeadline,
+    ) -> BoxFuture<'_, ()> {
+        self.commit_budgets
+            .lock()
+            .unwrap()
+            .push(budget.remaining().unwrap());
+        self.commit(transition, lease)
+    }
     /// Count and report the fixture's current active, owned, or failure evidence.
     fn observe(&self, transition: Option<Transition>) -> BoxFuture<'_, Observation> {
         Box::pin(async move {
@@ -226,6 +255,16 @@ async fn pair(
     payload: Vec<u8>,
     enabled: bool,
 ) -> (tcp::ClientHandle, tcp::HostHandle) {
+    pair_with_handler(authority, payload, enabled, Arc::new(AllowAll(Retire))).await
+}
+
+/// Establish TCP with an explicitly selected application handler and policy.
+async fn pair_with_handler(
+    authority: Arc<AuthorityFixture>,
+    payload: Vec<u8>,
+    enabled: bool,
+    handler: Arc<dyn Handler>,
+) -> (tcp::ClientHandle, tcp::HostHandle) {
     let (client, server) = configs();
     let listener = tcp::Listener::bind("127.0.0.1:0", 2).await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -239,7 +278,7 @@ async fn pair(
                     enabled,
                     clock: None,
                 }),
-                Arc::new(AllowAll(Retire)),
+                handler,
                 ConnectionConfig::default(),
                 Limits::default(),
             )
@@ -255,6 +294,94 @@ async fn pair(
     .await
     .unwrap();
     (client, accept.await.unwrap().unwrap())
+}
+
+/// Add only a local request cap, forwarding the existing context-aware handler.
+struct CappedRetire(Duration);
+impl Handler for CappedRetire {
+    fn request_budget(&self, _: &Principal, method: &str, _: &[u8]) -> Option<Duration> {
+        (method == METHOD).then_some(self.0)
+    }
+    fn handle(&self, method: String, payload: Vec<u8>, cancel: CancelToken) -> HandlerFut {
+        Retire.handle(method, payload, cancel)
+    }
+    fn handle_with_context(
+        &self,
+        method: String,
+        payload: Vec<u8>,
+        cancel: CancelToken,
+        lease: ExecutionLease,
+        context: RequestContext,
+    ) -> HandlerFut {
+        if method == METHOD {
+            assert!(context.budget().remaining().unwrap() <= self.0);
+        }
+        Retire.handle_with_context(method, payload, cancel, lease, context)
+    }
+}
+
+/// Real TCP uses the SDK-local cap for terminal authority without changing wire timeouts.
+#[tokio::test]
+async fn encrypted_tcp_local_budget_reaches_terminal_authority() {
+    let authority = AuthorityFixture::new(0);
+    let (client, host) = pair_with_handler(
+        authority.clone(),
+        b"retired".to_vec(),
+        true,
+        Arc::new(AllowAll(CappedRetire(Duration::from_secs(3)))),
+    )
+    .await;
+    assert_eq!(
+        client.conn.call(METHOD, vec![], 30_000).await.unwrap(),
+        b"retired"
+    );
+    closed(&host).await;
+    assert_eq!(authority.commits.load(Ordering::SeqCst), 1);
+    let budgets = authority.commit_budgets.lock().unwrap().clone();
+    assert_eq!(budgets.len(), 1);
+    assert!(!budgets[0].is_zero());
+    assert!(budgets[0] <= Duration::from_millis(2750));
+    assert!(authority
+        .read_budgets
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|b| *b <= Duration::from_millis(100)));
+    client.close().await;
+    host.close().await;
+}
+
+/// Zero local cap expires before retirement, leaving unrelated RPCs usable.
+#[tokio::test]
+async fn encrypted_tcp_zero_local_budget_never_commits() {
+    let authority = AuthorityFixture::new(0);
+    let (client, host) = pair_with_handler(
+        authority.clone(),
+        b"retired".to_vec(),
+        true,
+        Arc::new(AllowAll(CappedRetire(Duration::ZERO))),
+    )
+    .await;
+    assert_eq!(
+        client
+            .conn
+            .call(METHOD, vec![], 30_000)
+            .await
+            .unwrap_err()
+            .code(),
+        syntra_core::ErrorCode::DeadlineExceeded
+    );
+    assert_eq!(authority.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        client
+            .conn
+            .call("/example.Authority/Echo", vec![], 1000)
+            .await
+            .unwrap(),
+        b""
+    );
+    client.close().await;
+    host.close().await;
 }
 /// Bound the wait for observable host retirement separately from joined cleanup.
 async fn closed(host: &tcp::HostHandle) {

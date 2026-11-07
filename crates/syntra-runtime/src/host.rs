@@ -97,6 +97,22 @@ impl HandlerOutcome {
 /// Only generic authentication/authorization codes and messages are
 /// exposed on the wire; policy internals must never leak.
 pub trait Handler: Send + Sync {
+    /// Optional SDK-local cap measured from original complete-frame receipt,
+    /// including queueing and this selector. `None` preserves existing deadlines;
+    /// zero expires immediately. A cap can only shorten wire/default/deployment
+    /// limits. Called for validated application requests, not built-in recovery.
+    /// This classifier must be prompt, nonblocking and side-effect-free; payload
+    /// bytes are bounded but opaque and untrusted. No protocol/lifecycle lock is
+    /// held, except ordered admission, so do not reenter ingestion.
+    fn request_budget(
+        &self,
+        _principal: &Principal,
+        _method: &str,
+        _payload: &[u8],
+    ) -> Option<Duration> {
+        None
+    }
+
     /// Host-owned per-method policy, evaluated for every RPC using the
     /// connection's bound principal, before handler effects. Implementations
     /// must be nonblocking and may re-check expiry/revocation here. The
@@ -105,6 +121,21 @@ pub trait Handler: Send + Sync {
     /// wire.
     fn authorize(&self, _principal: &Principal, _method: &str) -> Result<(), AuthError> {
         Err(AuthError::denied())
+    }
+
+    /// Budget-aware synchronous authorization. The clock-bound budget includes
+    /// all time since receipt, including budget selection and queueing. Preserve
+    /// `authorize`'s prompt, nonblocking contract; expiry never permits handler
+    /// effects. The default delegates to the existing fail-closed policy.
+    /// Lifecycle state remains read-locked through authorization and registration
+    /// to serialize terminal reservation; do not reenter lifecycle operations.
+    fn authorize_with_budget(
+        &self,
+        principal: &Principal,
+        method: &str,
+        _budget: crate::elapsed::ElapsedDeadline,
+    ) -> Result<(), AuthError> {
+        self.authorize(principal, method)
     }
 
     fn handle(
@@ -162,6 +193,15 @@ impl<H> Handler for AllowAll<H>
 where
     H: Handler,
 {
+    fn request_budget(
+        &self,
+        principal: &Principal,
+        method: &str,
+        payload: &[u8],
+    ) -> Option<Duration> {
+        self.0.request_budget(principal, method, payload)
+    }
+
     fn authorize(&self, _principal: &Principal, _method: &str) -> Result<(), AuthError> {
         Ok(())
     }
@@ -1122,7 +1162,8 @@ impl Host {
         req: RpcRequest,
         received_at: Instant,
     ) {
-        let deadline = received_at + self.request_timeout(&req);
+        let timeout = self.request_timeout(&req);
+        let mut deadline = received_at + timeout;
         let state = self.conn.shared.state.read().await;
         if *state != ConnectionState::Active
             || self.conn.terminal_fenced()
@@ -1140,6 +1181,37 @@ impl Host {
             let bound = self.bound_id.lock().unwrap_or_else(|e| e.into_inner());
             bound.as_deref().and_then(|id| self.sessions.get(id))
         };
+        drop(state);
+        // Keep FIFO admission, but release lifecycle state for the pure classifier.
+        // Authorization and registration must still serialize with reservation.
+        if syntra_core::validate_method(&req.method).is_ok()
+            && !recovery::is_profile(&req.method)
+            && self.conn.shared.clock.now() < deadline
+        {
+            if let Some(session) = &session {
+                if let Some(cap) =
+                    self.handler
+                        .request_budget(&session.principal, &req.method, &req.payload)
+                {
+                    // Compare durations BEFORE addition: even Duration::MAX can
+                    // neither overflow nor extend an already bounded deadline.
+                    deadline = received_at + timeout.min(cap);
+                }
+            }
+        }
+        let state = self.conn.shared.state.read().await;
+        if *state != ConnectionState::Active
+            || self.conn.terminal_fenced()
+            || self.conn.is_closed()
+            || self.conn.lifecycle_blocked()
+            || self
+                .conn
+                .shared
+                .shutdown_requested
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
         // Check before policy AND after synchronous policy; even a policy that
         // exceeds its nonblocking contract cannot cause expired handler effects.
         let mut rejection = if self.conn.shared.clock.now() >= deadline {
@@ -1163,10 +1235,13 @@ impl Host {
                 None
             }
         } else {
-            match session
-                .as_ref()
-                .map(|s| self.handler.authorize(&s.principal, &req.method))
-            {
+            match session.as_ref().map(|s| {
+                self.handler.authorize_with_budget(
+                    &s.principal,
+                    &req.method,
+                    self.conn.shared.clock.deadline_at(deadline),
+                )
+            }) {
                 Some(Ok(())) => None,
                 Some(Err(e)) if e.code == ErrorCode::FailedPrecondition => {
                     Some(HandlerOutcome::error(
@@ -1346,6 +1421,7 @@ impl Host {
             version,
             req.method.clone(),
             deadline,
+            self.conn.shared.clock.clone(),
         );
         #[cfg(all(test, not(target_arch = "wasm32")))]
         let dispatch_pause = self.dispatch_pause.lock().unwrap().clone();

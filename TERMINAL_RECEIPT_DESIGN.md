@@ -90,6 +90,13 @@ constructed from public request IDs or transferred to a new connection.
   fresh authoritative read. `None` requests ordinary pre-reservation validity.
 - `Authority::commit(Transition, ExecutionLease) -> BoxFuture<'_, ()>` performs the
   conditional application transaction. Returning `()` is deliberately not proof.
+- `Authority::observe_with_budget(Option<Transition>, ElapsedDeadline)` receives
+  the fresh read's absolute bound, already restricted by `read_timeout`, prior
+  freshness and (once reserved) the operation cutoff. The default calls `observe`.
+- `Authority::commit_with_budget(Transition, ExecutionLease, ElapsedDeadline)`
+  receives the operation cutoff with its teardown tail excluded. The default
+  calls `commit`. Cooperative DB adapters should check the deadline and bound
+  their I/O using its remaining time or `run`; neither hook starts a new budget.
 - `Transition` carries the private `ReservationId`, expected revision,
   authenticated `Principal`, and fixed method. The adapter is already bound to
   the verified channel's scope/enrollment by its factory.
@@ -195,8 +202,29 @@ reduce this race but cannot eliminate it.
 
 ## Deadline and retained cleanup
 
+The optional `Handler::request_budget(principal, method, payload)` selects an
+SDK-local cap before initial `authorize_with_budget`. It is measured from the
+original complete bounded-frame receipt, including queueing, classification and
+authorization time, not from dispatch or reservation. `None` preserves the
+existing wire/default/deployment limit; zero expires, and even `Duration::MAX`
+cannot extend or overflow that limit. Envelope/method validation and request-ID
+ordering precede this prompt, nonblocking, side-effect-free classifier. Built-in
+recovery retains its own routing. The classifier runs outside protocol/raw-I/O/
+lifecycle locks, retaining FIFO admission. Immediately afterward, lifecycle state
+is reacquired and rechecked, then held through authorization and registration.
+This preserves the existing authorization/reservation barrier: an in-progress
+hard denial cannot be overtaken and swallowed by terminal fencing. The same
+deadline is registered for pending selection, dispatch and the request context.
+
+`Handler::authorize_with_budget` remains synchronous/nonblocking and defaults to
+the existing fail-closed `authorize`. `RequestContext::budget()` exposes a readonly
+`ElapsedDeadline` on that same clock for ordinary handlers as well as retirement.
+These hooks are additive: legacy handlers/authority adapters keep their methods,
+and `AllowAll` forwards budget selection/context while keeping its explicit
+authorization bypass. They do not change the wire contract.
+
 ```text
-D = min(RPC deadline, reservation start + 5 seconds)
+D = min(request-wide RPC deadline, reservation start + 5 seconds)
 T = min(initial remaining time / 4, 250 milliseconds)
 write cutoff = D - T
 ```
@@ -213,6 +241,10 @@ carrier loss does not abandon that task's charge. Additional spawned/blocking
 work must keep its own lease copy until it actually ends. Selected output,
 complete local writing, client observation, and joined cleanup are separate facts.
 Neither an operation nor its receipt is automatically retried or replayed.
+Passing a budget to an adapter is cooperative enforcement, not a transaction
+rollback guarantee. An uncooperative authority can commit durably after expiry;
+its retained execution charge survives until actual completion, while sticky
+failure prevents late completion from restoring a receipt.
 
 The current native pump also caps each ordinary frame's complete write by the
 authority interval, `read_timeout / 2`, in addition to its configured I/O limits.
@@ -241,6 +273,88 @@ existing clients parse the correlated `RpcResult`. Protobuf sources and generate
 bindings are unchanged. Ordinary withdrawal and close defaults remain unchanged.
 
 ## Tests and recorded evidence
+
+### Request-wide local budget implementation, 2026-11-07
+
+Executed on macOS arm64 using Rust **1.88.0**, locked dependencies, on
+`feat/request-wide-deadlines` based on the rc.3 release. No version, dependency,
+wire, generated-code or pin update is part of this work.
+
+| Exact command | Result |
+| --- | --- |
+| `cargo +1.88.0 test --locked -p syntra-runtime --lib request_budget_tests` | Red: missing additive APIs; after default hooks compiled, 3 failed / 1 passed because dispatch still used legacy authorization and ignored the selector. Green after wiring: 4/4 passed at that stage. Later focused cases extend that set to 7. |
+| `cargo +1.88.0 test --locked -p syntra-runtime --lib request_wide_` | Red: missing authority hooks; after default methods compiled, 2/2 failed with `budget-aware observation must be used`. |
+| `cargo +1.88.0 test --locked -p syntra-runtime --lib request_wide_ -- --nocapture` | Green: 2/2 passed after authority wiring and fixture correction. A prior attempt timed out: the fixture incorrectly expected a 250 ms tail from 960 ms remaining; the existing quarter rule gives 240 ms. Only the fixture expectations changed, and fixture waits now have diagnostic bounds. |
+| `cargo +1.88.0 test --locked -p syntra-runtime --lib budget` | Initial run: 19/19 passed, including 7 request-budget and 3 terminal-budget regressions; overlaps the full suite. |
+| `cargo +1.88.0 test --locked -p syntra-net --no-default-features --features tcp --test terminal_receipt local_budget` | 2/2 passed over actual encrypted loopback TCP. |
+| `cargo +1.88.0 test --locked -p syntra-runtime` | Before parent review correction: 452 passed (318 unit + 134 integration); none ignored; 0 doctests. |
+| `cargo +1.88.0 test --locked -p syntra-net --no-default-features --features tcp` | Final run: 114 passed (79 unit, 6 connectivity, 3 record-adapter, 3 routes, 21 terminal-receipt, 2 existing example tests); none ignored; feature-gated zero-test binaries are not coverage. |
+| `cargo +1.88.0 fmt --all -- --check` | Passed after applying formatting corrections. |
+| `cargo +1.88.0 clippy --locked -p syntra-runtime -p syntra-net --no-default-features --features syntra-net/tcp --all-targets -- --no-deps` | Completed successfully; existing warnings in untouched runtime/test/example code, no new-code warnings. |
+| `git diff --check` | Passed. |
+
+Parent review identified that releasing lifecycle state through authorization
+allowed a racing reservation to swallow an `Unauthenticated` denial. The
+deterministic regression below was executed before the correction:
+
+```sh
+cargo +1.88.0 test --locked -p syntra-runtime --lib racing_authorization_hard_denial_cannot_be_swallowed_by_terminal_reservation -- --exact host::terminal::budget_tests::racing_authorization_hard_denial_cannot_be_swallowed_by_terminal_reservation --nocapture
+```
+
+Red: 1 failed, with `(reservation crossed authorization, withdrawn, committed,
+retirement succeeded, receipts) = (true, false, true, true, 1)`.
+Green after moving lifecycle reacquisition/recheck immediately before
+authorization: 1 passed, requiring `(false, true, false, false, 0)`.
+The test's blocking barrier follows the existing
+`expiry_during_synchronous_authorization_prevents_handler_effects` slow-policy
+pattern; only the test deliberately violates the nonblocking callback contract.
+The classifier stays outside the guard; authorization through registration retains
+the original barrier. Expired-input and built-in recovery selector skips remain.
+
+Post-correction verification on the same toolchain/platform:
+
+| Exact command | Result |
+| --- | --- |
+| `cargo +1.88.0 test --locked -p syntra-runtime --lib budget` | 20/20 passed, including the hard-denial race regression. |
+| `cargo +1.88.0 test --locked -p syntra-runtime --quiet` | 453 passed (319 unit + 134 integration), none ignored; 0 doctests. |
+| `cargo +1.88.0 test --locked -p syntra-net --no-default-features --features tcp --quiet` | 114 passed, none ignored, including 21 receipt tests and 2 existing example tests. |
+| `cargo +1.88.0 fmt --all -- --check` | Passed. |
+| `cargo +1.88.0 clippy --locked -p syntra-runtime -p syntra-net --no-default-features --features syntra-net/tcp --all-targets -- --no-deps` | Completed with existing warnings in untouched code; no new-code warnings. |
+| `git diff --check` | Passed. |
+
+The focused cases cover `None`, zero, long and maximum-duration caps against
+wire/default/deployment limits; original-receipt admission delay; selector and
+authorization time; exact dispatch/selection expiry; retained readonly budgets;
+bounded envelope/method checks; reserved recovery routing; `AllowAll` forwarding
+and unrelated methods; terminal cutoff/read-bound propagation; and an explicitly
+uncooperative late commit whose charge survives timeout without a receipt.
+Fake elapsed sources and paused time drive runtime cases. Native TCP cases use
+in-memory authority and establish SDK integration, not durable DB behavior.
+
+Application integration should use `Handler::request_budget` and
+`authorize_with_budget`, `RequestContext::budget`, and
+`Authority::{observe_with_budget,commit_with_budget}` with
+`syntra_runtime::elapsed::ElapsedDeadline`. Preserve the passed clock/cutoff;
+do not reconstruct a fresh budget at hook entry.
+
+The bounded cross-language run `terminal-request-budget-20261107-run4` passed
+20/20 cases with stable before/after source manifests and 31 harness test methods.
+It covers both host directions, including host caps, earlier peer budgets and
+budgeted observations during retained late commits. The Go-owned
+[fixture report](https://github.com/tinkle-org/syntra-go/blob/acf61c2d5493338eeb6e033df27281ef85d16a9c/TERMINAL_RECEIPT_INTEROP.md#request-wide-deadline-regression-matrix)
+records exact hashes, reproduction commands and earlier failed attempts. Subsequent
+editorial documentation updates are outside those captured source hashes.
+Independent source review found no remaining runtime issue in its inspected scope.
+
+Existing `SNTR-RPC-004` already requires receipt-origin accounting and permits
+documented bounded host policy. This optional SDK-local mechanism requires no
+wire or normative specification change. The unchanged specification repository's
+structural/schema checks and 159 Python tests passed; that is not executed runtime
+conformance. Cooperative production-storage enforcement remains an application
+obligation. A timeout cannot establish no late durable commit or guaranteed
+receipt. Merge and RC publication remain manual maintainer actions.
+
+### Earlier terminal-receipt evidence
 
 Source coverage includes `crates/syntra-runtime/src/host_terminal.rs`,
 `crates/syntra-runtime/tests/terminal_receipt.rs`,

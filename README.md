@@ -363,6 +363,45 @@ they do not select a different encryption protocol.
   terminal. See the [core](crates/syntra-core/src/lib.rs) and
   [runtime](crates/syntra-runtime/src/lib.rs) source contracts.
 
+## Host-local request budgets
+
+`Handler::request_budget(&Principal, &str, &[u8]) -> Option<Duration>` optionally
+shortens an application RPC's deadline under SNTR-RPC-004. The selector runs after
+bounded envelope/method validation and ordered request-ID consumption, before
+initial authorization. Its payload is opaque, bounded, untrusted data. The callback
+must be prompt, nonblocking and side-effect-free; FIFO admission remains held,
+but protocol mutexes, raw-I/O gates and lifecycle guards are released around it.
+Lifecycle state is reacquired and rechecked before authorization, then retained
+through authorization and request registration to serialize terminal reservation.
+Built-in update/recovery RPCs retain their separate routing and source policy.
+
+The effective deadline is original complete-frame receipt plus the minimum of
+the effective wire/default timeout, deployment maximum and optional host cap.
+Queueing, selector execution and authorization all consume that same budget.
+`None` preserves existing limits; `Some(Duration::ZERO)` expires immediately,
+and a longer cap, including `Duration::MAX`, cannot extend or overflow them.
+Expiration is rechecked before handler construction and terminal selection;
+an already selected result remains immutable.
+
+The additive hooks use `syntra_runtime::elapsed::ElapsedDeadline`, which carries
+the host's clock and offers `check`, `remaining`, `expired` and `run`:
+
+| API | Budget and compatibility |
+| --- | --- |
+| `Handler::authorize_with_budget(principal, method, budget)` | Same request-wide deadline; synchronous/nonblocking, defaults to existing `authorize` (fail-closed) |
+| `RequestContext::budget()` | Readonly clone of that deadline for cooperative application/storage work, including ordinary RPCs |
+| `Authority::observe_with_budget(transition, budget)` | Existing read timeout restricted by prior freshness and terminal cutoff; defaults to `observe` |
+| `Authority::commit_with_budget(transition, lease, budget)` | Terminal cutoff with teardown tail excluded; defaults to `commit` |
+
+Existing handlers, closure/FFI adapters and authority implementations keep their
+default behavior. `AllowAll` forwards the selector and context/execution hooks;
+its authorization, including the default budget-aware delegation, still explicitly
+bypasses the inner policy. Custom forwarding adapters must preserve these hooks.
+These are SDK-local APIs with no wire, schema or peer-option change. Cooperative
+callers must bound their own I/O and retain execution leases through actual work.
+Timeout does not establish rollback, prevent a late durable commit, or guarantee
+receipt delivery. See [terminal deadlines](TERMINAL_RECEIPT_DESIGN.md#deadline-and-retained-cleanup).
+
 ## Optional terminal receipt
 
 Native TCP supports a default-disabled terminal result for an authorized
