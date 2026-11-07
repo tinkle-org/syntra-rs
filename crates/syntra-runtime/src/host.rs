@@ -1162,6 +1162,19 @@ impl Host {
         }
     }
 
+    /// Check ordinary request admission while the caller holds the lifecycle read guard.
+    fn request_admission_open(&self, state: &ConnectionState) -> bool {
+        *state == ConnectionState::Active
+            && !self.conn.terminal_fenced()
+            && !self.conn.is_closed()
+            && !self.conn.lifecycle_blocked()
+            && !self
+                .conn
+                .shared
+                .shutdown_requested
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Apply the effective timeout from complete-frame receipt before initial
     /// authorization, retaining that deadline through admission and dispatch.
     async fn on_request_received_at(
@@ -1174,16 +1187,7 @@ impl Host {
         let timeout = self.request_timeout(&req);
         let mut deadline = received_at + timeout;
         let state = self.conn.shared.state.read().await;
-        if *state != ConnectionState::Active
-            || self.conn.terminal_fenced()
-            || self.conn.is_closed()
-            || self.conn.lifecycle_blocked()
-            || self
-                .conn
-                .shared
-                .shutdown_requested
-                .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if !self.request_admission_open(&state) {
             return;
         }
         let session = {
@@ -1209,16 +1213,7 @@ impl Host {
             }
         }
         let state = self.conn.shared.state.read().await;
-        if *state != ConnectionState::Active
-            || self.conn.terminal_fenced()
-            || self.conn.is_closed()
-            || self.conn.lifecycle_blocked()
-            || self
-                .conn
-                .shared
-                .shutdown_requested
-                .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if !self.request_admission_open(&state) {
             return;
         }
         // Check before policy AND after synchronous policy; even a policy that
