@@ -1327,7 +1327,8 @@ impl Peer {
         };
         lifecycle && (!self.closed() || self.ordinary_close())
     }
-    // Receipt affects host RPC budgets only; initiator correlation has its own clock.
+    /// Preserve the completing batch's receipt time for host RPC admission.
+    /// Initiator result correlation keeps its own clock and ignores this timestamp.
     async fn ingest_received_at(&self, bytes: &[u8], received_at: std::time::Instant) {
         match self {
             Self::Client(c) => c.ingest(bytes).await,
@@ -1391,6 +1392,9 @@ struct ReceiveState {
 }
 
 impl From<FrameDecoder> for ReceiveState {
+    /// Adopt a decoder without a carried assembly deadline; `read_frames` starts
+    /// a bound on entry if it contains a partial frame. Ready handoff instead
+    /// transfers the full `ReceiveState` to preserve its existing deadline.
     fn from(decoder: FrameDecoder) -> Self {
         Self {
             decoder,
@@ -1401,20 +1405,27 @@ impl From<FrameDecoder> for ReceiveState {
 
 type ReceivedFrame = (Zeroizing<Vec<u8>>, std::time::Instant);
 
-/// Extract and timestamp the entire bounded batch before validation or delivery.
-/// A lazy iterator here would renew later frames' budgets after an earlier await.
+/// Attach one origin captured on the peer's elapsed clock BEFORE this assembly.
+/// Every completed frame keeps that origin through ordered validation/delivery;
+/// neither synchronous parsing nor an earlier delivery may renew later budgets.
 fn received_frames(
     decoder: &mut FrameDecoder,
     plaintext: &[u8],
-    clock: &ElapsedClock,
+    received_at: std::time::Instant,
 ) -> Result<Vec<ReceivedFrame>, Error> {
-    Ok(decoder
-        .push(plaintext)?
+    #[cfg(test)]
+    tests::advance_assembly_clock(tests::AssemblyPoint::Before);
+    let frames = decoder.push(plaintext)?;
+    #[cfg(test)]
+    tests::advance_assembly_clock(tests::AssemblyPoint::After);
+    Ok(frames
         .into_iter()
-        .map(|frame| (Zeroizing::new(frame), clock.now()))
+        .map(|frame| (Zeroizing::new(frame), received_at))
         .collect())
 }
 
+/// Reconstruct ordered input under existing read/assembly bounds, then deliver
+/// each complete frame with its original completing-batch elapsed timestamp.
 async fn read_frames<R, F, Fut>(
     mut reader: R,
     channel: Arc<Mutex<Channel>>,
@@ -1466,13 +1477,19 @@ where
         if !clock.is_continuous() || elapsed_now(&clock) >= deadline {
             return Err(Error::Timeout);
         }
-        let frames = received_frames(&mut decoder, &plaintext, &clock)?;
+        let received_at = clock.now();
+        let frames = received_frames(&mut decoder, &plaintext, received_at)?;
+        // Assembly can cross a bound without yielding. Check the OLD deadline
+        // before a completed frame clears it or a trailing partial replaces it.
+        if !clock.is_continuous() || elapsed_now(&clock) >= deadline {
+            return Err(Error::Timeout);
+        }
         // A new partial frame starts at parsing, before any backpressured delivery.
         // Completion of an earlier frame in this batch permits a new assembly budget.
         if !decoder.is_partial() {
             frame_deadline = None;
         } else if frame_deadline.is_none() || !frames.is_empty() {
-            frame_deadline = Some(elapsed_now(&clock) + limits.frame_timeout);
+            frame_deadline = Some(Instant::from_std(received_at) + limits.frame_timeout);
         }
         let delivery_deadline = (elapsed_now(&clock) + limits.write_timeout)
             .min(frame_deadline.unwrap_or(end))
@@ -1959,6 +1976,8 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
     })
 }
 
+/// Establish an encrypted client over owned record halves using the default elapsed
+/// clock. Complete the hello/ready exchange before starting background pump tasks.
 pub async fn connect_records<R: RecordReader, W: RecordWriter>(
     reader: R,
     writer: W,
@@ -1997,6 +2016,10 @@ pub async fn connect_records_with_clock<R: RecordReader, W: RecordWriter>(
     .await
 }
 
+/// Continue client establishment within the caller's original clock and cutoff.
+/// Ingest the complete ready batch and retain any trailing partial-frame deadline
+/// before handing the record halves to the pump. Cancellation before that handoff
+/// drops both halves without leaving a background establishment task.
 pub async fn connect_records_with_budget<R: RecordReader, W: RecordWriter>(
     mut reader: R,
     mut writer: W,
@@ -2073,19 +2096,23 @@ pub async fn connect_records_with_budget<R: RecordReader, W: RecordWriter>(
                     let record = record?;
                     if elapsed_now(&clock) >= deadline || !peer.delivery_open() { return Err(Error::Timeout); }
                     let plaintext = channel.decrypt(&record)?;
-                    let frames = receive.decoder.push(&plaintext)?;
+                    let received_at = clock.now();
+                    let frames = received_frames(&mut receive.decoder, &plaintext, received_at)?;
+                    // Ready cannot erase the old record/assembly deadline while
+                    // handing this decoder and any trailing partial to the pump.
+                    if !clock.is_continuous() || elapsed_now(&clock) >= deadline { return Err(Error::Timeout); }
                     if !receive.decoder.is_partial() {
                         receive.frame_deadline = None;
                     } else if receive.frame_deadline.is_none() || !frames.is_empty() {
-                        receive.frame_deadline = Some(elapsed_now(&clock) + limits.frame_timeout);
+                        receive.frame_deadline = Some(Instant::from_std(received_at) + limits.frame_timeout);
                     }
                     // This body is outside the select futures: ready cannot
                     // cancel delivery midway through a decoded batch. Yielding
                     // in ingest preserves the iterator until its whole batch
                     // has been accounted for (unless establishment itself fails).
-                    for frame in frames {
+                    for (frame, _) in frames {
                         if !peer.delivery_open() || elapsed_now(&clock) >= core_deadline { return Err(Error::Closed); }
-                        conn.ingest(&Zeroizing::new(frame)).await;
+                        conn.ingest(&frame).await;
                     }
                 }
             }
@@ -2129,6 +2156,9 @@ fn runtime_error(error: SyntraError) -> Error {
     }
 }
 
+/// Accept an encrypted host over custom record halves using the factory's clock.
+/// Validate runtime limits before I/O; custom adapters cannot enable TCP-only
+/// terminal receipts through this entry point.
 pub async fn accept_records<R: RecordReader, W: RecordWriter>(
     reader: R,
     writer: W,
@@ -2161,6 +2191,9 @@ pub(crate) struct AcceptOwner {
     pub(crate) jobs: Mutex<Vec<Arc<PolicyJobs>>>,
 }
 
+/// Accept custom record halves without restarting the caller's establishment budget.
+/// Terminal receipt policy is refused because this entry does not attest ownership
+/// of the native TCP writer and its receipt barriers.
 pub async fn accept_records_with_budget<R: RecordReader, W: RecordWriter>(
     reader: R,
     writer: W,
@@ -2205,6 +2238,8 @@ pub(crate) async fn accept_tcp_records_with_budget<R: RecordReader, W: RecordWri
     .await
 }
 
+/// Retain the partially constructed host and policy jobs in the inline supervisor
+/// while accepting within the original budget; this does not enable TCP receipts.
 #[cfg(feature = "http")]
 pub(crate) async fn accept_records_owned<R: RecordReader, W: RecordWriter>(
     reader: R,
@@ -2227,6 +2262,9 @@ pub(crate) async fn accept_records_owned<R: RecordReader, W: RecordWriter>(
     .await
 }
 
+/// Perform bounded Noise and host readiness setup before transferring I/O to the pump.
+/// Pass the reconstructed hello's receipt origin to host ingestion; only the native
+/// TCP entry may install the terminal receipt coordinator.
 async fn accept_records_impl<R: RecordReader, W: RecordWriter>(
     mut reader: R,
     mut writer: W,
@@ -2357,7 +2395,8 @@ async fn accept_records_impl<R: RecordReader, W: RecordWriter>(
             )
             .await?;
             let plaintext = channel.decrypt(&record)?;
-            let mut frames = received_frames(&mut decoder, &plaintext, &clock)?;
+            let received_at = clock.now();
+            let mut frames = received_frames(&mut decoder, &plaintext, received_at)?;
             if !frames.is_empty() {
                 // The first envelope must be hello, with no pipelined application data.
                 if frames.len() != 1 || decoder.is_partial() {

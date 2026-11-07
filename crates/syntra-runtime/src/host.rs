@@ -193,6 +193,8 @@ impl<H> Handler for AllowAll<H>
 where
     H: Handler,
 {
+    /// Preserve the inner handler's receipt-origin cap despite this wrapper's
+    /// explicit authorization bypass; allowing a method never extends its budget.
     fn request_budget(
         &self,
         principal: &Principal,
@@ -750,6 +752,9 @@ impl Host {
         self.dispatch(frame, received_at).await;
     }
 
+    /// Apply handshake and active-frame error precedence before considering an RPC
+    /// rejection. A correlated invalid-method rejection retains the receipt-origin
+    /// timeout without invoking application budget selection or authorization.
     async fn on_decode_error(&self, raw: &[u8], e: SyntraError, received_at: Instant) {
         let st = self.conn.state().await;
         if st == ConnectionState::Closed {
@@ -856,6 +861,8 @@ impl Host {
         self.conn.negotiated_version().await.unwrap_or(0)
     }
 
+    /// Route a validated frame in connection-state order, consuming each request ID
+    /// before admission and forwarding its original receipt time unchanged.
     async fn dispatch(&self, frame: Frame, received_at: Instant) {
         let st = self.conn.state().await;
         match frame.body {
@@ -1143,8 +1150,8 @@ impl Host {
         increasing
     }
 
-    // Compatibility for the existing colocated tests; real input always goes
-    // through the ordered, bounded decode path above.
+    /// Admit a decoded request for colocated tests, sampling receipt before the
+    /// ordered gate. Real input uses the bounded decode path in `ingest_received_at`.
     #[cfg(test)]
     async fn on_request(&self, id: u64, version: u32, req: RpcRequest) {
         let received_at = now();
@@ -1155,6 +1162,8 @@ impl Host {
         }
     }
 
+    /// Apply the effective timeout from complete-frame receipt before initial
+    /// authorization, retaining that deadline through admission and dispatch.
     async fn on_request_received_at(
         &self,
         id: u64,
@@ -1299,6 +1308,8 @@ impl Host {
         }
     }
 
+    /// Register a correlated rejection under its existing absolute deadline without
+    /// acquiring an execution lease. Close if bounded terminal output is exhausted.
     async fn reject_request(
         &self,
         id: u64,
@@ -1331,10 +1342,11 @@ impl Host {
         .await;
     }
 
-    // Admission never waits for a writer. Both accepted work and ordinary
-    // rejections own bounded output slots, distinct from execution permits.
-    // Caller holds lifecycle read + ordered admission; the std mutex below is
-    // only a short terminal/registry gate, never held over an await/user code.
+    /// Register accepted work or a rejection without waiting for writer capacity.
+    /// Both retain a bounded output slot; only accepted work acquires execution
+    /// permits. Return false on output exhaustion so the caller can close.
+    /// The caller holds lifecycle read and ordered admission; the registry mutex
+    /// is a short selection gate, never held across awaits or application hooks.
     fn start_request(
         &self,
         id: u64,

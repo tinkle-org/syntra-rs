@@ -1352,6 +1352,8 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
         release: tokio::sync::Semaphore,
         denied: std::sync::atomic::AtomicBool,
+        /// Optional source-only suspension in the poll returning authority evidence.
+        completion_advance: Mutex<Option<(Arc<SuspendSource>, u64)>>,
     }
     impl Authority for QueuedAuthority {
         /// Count each constructed read and hold its evidence behind a test permit.
@@ -1359,6 +1361,9 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
                 self.release.acquire().await.unwrap().forget();
+                if let Some((source, millis)) = self.completion_advance.lock().unwrap().take() {
+                    source.0.store(millis, Ordering::SeqCst);
+                }
                 if self.denied.load(Ordering::SeqCst) {
                     Observation::HardDenied
                 } else {
@@ -1373,17 +1378,26 @@ mod tests {
     }
     /// Initialize one successful read before independently controlling queued reads.
     async fn queued_coordinator() -> (Arc<Host>, Arc<Coordinator>, Arc<QueuedAuthority>) {
-        let (host, _) = Host::new(
+        queued_coordinator_with_clock(ElapsedClock::lifecycle_driven()).await
+    }
+    /// Bind serialized authority reads to an explicitly selected elapsed domain.
+    async fn queued_coordinator_with_clock(
+        clock: ElapsedClock,
+    ) -> (Arc<Host>, Arc<Coordinator>, Arc<QueuedAuthority>) {
+        let (host, _) = Host::try_new_with_clock(
             ConnectionConfig::default(),
             Arc::new(crate::AllowAnonymous),
             Arc::new(super::super::FnHandler(|_, p, _| async {
                 HandlerOutcome::Payload(p)
             })),
-        );
+            clock,
+        )
+        .unwrap();
         let authority = Arc::new(QueuedAuthority {
             calls: std::sync::atomic::AtomicUsize::new(0),
             release: tokio::sync::Semaphore::new(1),
             denied: std::sync::atomic::AtomicBool::new(false),
+            completion_advance: Mutex::new(None),
         });
         let c = host
             .install_terminal_tcp(Policy {
@@ -1395,6 +1409,81 @@ mod tests {
             .unwrap();
         c.refresh().await.unwrap();
         (host, c, authority)
+    }
+
+    /// Drive suspend-inclusive time independently of Tokio's paused scheduler.
+    struct SuspendSource(std::sync::atomic::AtomicU64);
+    impl crate::elapsed::ElapsedSource for SuspendSource {
+        /// Return trusted process-local milliseconds without waking the executor.
+        fn elapsed(&self) -> Option<Duration> {
+            Some(Duration::from_millis(self.0.load(Ordering::SeqCst)))
+        }
+    }
+
+    /// Source-only expiry bounds queued and in-flight reads, without timer wakeups
+    /// or late active evidence renewing freshness/operation eligibility.
+    #[tokio::test(start_paused = true)]
+    async fn suspended_authority_reads_keep_original_freshness_and_operation_cutoffs() {
+        for reserved in [false, true] {
+            for queued in [false, true] {
+                let source = Arc::new(SuspendSource(std::sync::atomic::AtomicU64::new(0)));
+                let clock = ElapsedClock::with_source(source.clone());
+                let scheduled = tokio::time::Instant::now();
+                let (host, c, authority) = queued_coordinator_with_clock(clock.clone()).await;
+                let origin = clock.now();
+                let expires = if reserved {
+                    reserve(&c, 1).unwrap();
+                    // Keep authority fresh past C=t750, so only the immutable
+                    // operation cutoff can defeat the final observation.
+                    for millis in (80..=720).step_by(80) {
+                        source.0.store(millis, Ordering::SeqCst);
+                        authority.release.add_permits(1);
+                        c.refresh().await.unwrap();
+                    }
+                    assert_eq!(c.cutoff(), Some(origin + Duration::from_millis(750)));
+                    assert_eq!(
+                        c.state.lock().unwrap().fresh_until,
+                        Some(origin + Duration::from_millis(820))
+                    );
+                    750
+                } else {
+                    100
+                };
+                let fresh_until = c.state.lock().unwrap().fresh_until;
+                let reads = authority.calls.load(Ordering::SeqCst);
+                let lock = if queued {
+                    Some(c.reads.lock().await)
+                } else {
+                    None
+                };
+                let mut refresh = Box::pin(c.refresh());
+                assert!(futures_util::poll!(&mut refresh).is_pending());
+                assert_eq!(
+                    authority.calls.load(Ordering::SeqCst),
+                    reads + usize::from(!queued)
+                );
+                if queued {
+                    source.0.store(expires, Ordering::SeqCst);
+                } else {
+                    // Return Ready in the same poll that crosses the bound;
+                    // timer priority alone cannot detect this late evidence.
+                    *authority.completion_advance.lock().unwrap() = Some((source.clone(), expires));
+                }
+                drop(lock);
+                authority.release.add_permits(1);
+                assert_eq!(refresh.await, Err(Refused::Unavailable));
+                assert_eq!(c.state.lock().unwrap().fresh_until, fresh_until);
+                assert!(!c.raw_allowed());
+                assert_eq!(c.refresh().await, Err(Refused::Unavailable));
+                assert_eq!(
+                    authority.calls.load(Ordering::SeqCst),
+                    reads + usize::from(!queued),
+                    "expiry must prevent constructing any replacement authority read"
+                );
+                assert_eq!(tokio::time::Instant::now(), scheduled);
+                host.close().await;
+            }
+        }
     }
 
     /// Queue wait never substitutes for the actual serialized observation start.

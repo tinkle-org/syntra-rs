@@ -16,11 +16,13 @@ mod terminal_failures;
 
 struct Store;
 impl KeyStore for Store {
+    /// Supply the fixed Returning key shared by this module's handshake fixtures.
     fn lookup(&self, _: &Context) -> Result<Secret32, syntra_core::secure_channel::Error> {
         Ok(Secret32::new([7; 32]))
     }
 }
 
+/// Generate matching TCP security inputs with a fixed scope and optional Returning key.
 fn configs(mode: Mode) -> (ClientConfig, ServerConfig) {
     let (private_key, server_public_key) = generate_server_key().unwrap();
     let returning = mode == Mode::Returning;
@@ -49,6 +51,7 @@ fn configs(mode: Mode) -> (ClientConfig, ServerConfig) {
     )
 }
 
+/// Complete a Bootstrap handshake in memory for encrypted pump record fixtures.
 fn channels() -> (Channel, Channel) {
     let (client, server) = configs(Mode::Bootstrap);
     let (client, first) = ClientHandshake::start(client).unwrap();
@@ -638,6 +641,8 @@ struct QueueReader {
     later_record_delay: Option<Duration>,
 }
 impl RecordReader for QueueReader {
+    /// Count read attempts, optionally delay reads after the first, and enforce the
+    /// requested record bound so tests can separate receipt time from delivery time.
     async fn read_record(&mut self, maximum: usize) -> Result<Vec<u8>, Error> {
         let previous = self.reads.fetch_add(1, Ordering::SeqCst);
         if previous > 0 {
@@ -661,6 +666,7 @@ struct Gate {
     dropped: AtomicBool,
 }
 impl Default for Gate {
+    /// Start with writes unpaused, no observed records, and empty coordination permits.
     fn default() -> Self {
         Self {
             armed: AtomicBool::new(false),
@@ -677,6 +683,8 @@ struct QueueWriter {
     gate: Arc<Gate>,
 }
 impl RecordWriter for QueueWriter {
+    /// Queue ciphertext unchanged, pausing the second armed write until released
+    /// so tests can hold a multi-record frame under backpressure.
     async fn write_record(&mut self, bytes: &[u8]) -> Result<(), Error> {
         if self.gate.armed.load(Ordering::SeqCst)
             && self.gate.records.fetch_add(1, Ordering::SeqCst) == 1
@@ -694,16 +702,19 @@ impl RecordWriter for QueueWriter {
             .await
             .map_err(|_| Error::Closed)
     }
+    /// Complete the in-memory shutdown hook without adding output or a timing delay.
     async fn shutdown(&mut self) -> Result<(), Error> {
         Ok(())
     }
 }
 impl Drop for QueueWriter {
+    /// Record writer release so teardown tests can distinguish closure from retention.
     fn drop(&mut self) {
         self.gate.dropped.store(true, Ordering::SeqCst);
     }
 }
 
+/// Wrap queued records with a fresh read counter and no artificial read delay.
 fn reader(records: mpsc::Receiver<Vec<u8>>) -> QueueReader {
     QueueReader {
         records,
@@ -871,6 +882,199 @@ async fn invalid_runtime_config_rejects_both_record_entries_before_io() {
     }
 }
 
+/// Select a synchronous decoder boundary without sleeping or changing Tokio time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum AssemblyPoint {
+    Before,
+    After,
+}
+
+thread_local! {
+    /// One thread-local jump prevents unrelated parallel tests from changing time.
+    static ASSEMBLY_ADVANCE: std::cell::RefCell<Option<(AssemblyPoint, Arc<ElapsedSource>, u64)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Advance the trusted source exactly at the selected synchronous assembly boundary.
+pub(super) fn advance_assembly_clock(point: AssemblyPoint) {
+    ASSEMBLY_ADVANCE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|(at, _, _)| *at == point) {
+            let (_, source, millis) = slot.take().unwrap();
+            source.0.store(millis, Ordering::SeqCst);
+        }
+    });
+}
+
+/// Clear an armed jump on every exit, including a failed assertion.
+struct AssemblyAdvance;
+impl AssemblyAdvance {
+    /// Install one nonblocking source jump for this current-thread test.
+    fn at(point: AssemblyPoint, source: Arc<ElapsedSource>, millis: u64) -> Self {
+        ASSEMBLY_ADVANCE.with(|slot| {
+            assert!(slot.borrow_mut().replace((point, source, millis)).is_none());
+        });
+        Self
+    }
+}
+impl Drop for AssemblyAdvance {
+    /// Keep failed tests from leaving a clock jump on the reused test thread.
+    fn drop(&mut self) {
+        ASSEMBLY_ADVANCE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// Count source samples to expose any timestamp renewal between completed frames.
+struct SteppingSource(std::sync::atomic::AtomicU64);
+impl syntra_runtime::elapsed::ElapsedSource for SteppingSource {
+    /// Each sample consumes ten milliseconds independently of the executor clock.
+    fn elapsed(&self) -> Option<Duration> {
+        Some(Duration::from_millis(
+            self.0.fetch_add(10, Ordering::SeqCst),
+        ))
+    }
+}
+
+/// All frames completed by one push share its first sample, even across source jumps.
+#[tokio::test(start_paused = true)]
+async fn receipt_batch_never_resamples_between_completed_frames() {
+    let source = Arc::new(SteppingSource(std::sync::atomic::AtomicU64::new(0)));
+    let clock = ElapsedClock::with_source(source.clone());
+    let mut plaintext = frame_plaintext(&[1]).unwrap().to_vec();
+    plaintext.extend_from_slice(&frame_plaintext(&[2]).unwrap());
+    let before = source.0.load(Ordering::SeqCst);
+    let frames = received_frames(&mut FrameDecoder::default(), &plaintext, clock.now()).unwrap();
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0].1, frames[1].1, "one batch must have one origin");
+    assert_eq!(source.0.load(Ordering::SeqCst) - before, 10);
+}
+
+/// Parsing delay belongs to the completing batch, never to a later per-frame origin.
+#[tokio::test(start_paused = true)]
+async fn receipt_batch_origin_precedes_synchronous_assembly() {
+    for point in [AssemblyPoint::Before, AssemblyPoint::After] {
+        let (source, clock) = elapsed_clock();
+        let origin = clock.now();
+        let mut decoder = FrameDecoder::default();
+        let partial = frame_plaintext(&[1]).unwrap();
+        assert!(received_frames(&mut decoder, &partial[..4], clock.now())
+            .unwrap()
+            .is_empty());
+        source.0.store(10, Ordering::SeqCst);
+        let _jump = AssemblyAdvance::at(point, source.clone(), 80);
+        let mut completion = partial[4..].to_vec();
+        completion.extend_from_slice(&frame_plaintext(&[2]).unwrap());
+        let frames = received_frames(&mut decoder, &completion, clock.now()).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].1, origin + Duration::from_millis(10));
+        assert_eq!(frames[1].1, frames[0].1);
+        assert_eq!(clock.now(), origin + Duration::from_millis(80));
+        source.0.store(90, Ordering::SeqCst);
+        let next =
+            received_frames(&mut decoder, &frame_plaintext(&[3]).unwrap(), clock.now()).unwrap();
+        assert_eq!(next[0].1, origin + Duration::from_millis(90));
+    }
+}
+
+/// Synchronous parsing cannot clear an expired record/old partial bound before delivery.
+#[tokio::test(start_paused = true)]
+async fn receipt_batch_rechecks_old_bounds_after_synchronous_assembly() {
+    for partial in [false, true] {
+        for point in [AssemblyPoint::Before, AssemblyPoint::After] {
+            for new_partial in [false, true] {
+                let (source, clock) = elapsed_clock();
+                let origin = Instant::from_std(clock.now());
+                let (mut client, server) = channels();
+                let mut decoder = FrameDecoder::default();
+                let plaintext = frame_plaintext(&[1]).unwrap();
+                let mut completion = if partial {
+                    assert!(decoder.push(&plaintext[..4]).unwrap().is_empty());
+                    plaintext[4..].to_vec()
+                } else {
+                    plaintext.to_vec()
+                };
+                if new_partial {
+                    completion.extend_from_slice(&frame_plaintext(&[2]).unwrap()[..4]);
+                }
+                let (tx, rx) = mpsc::channel(1);
+                tx.send(client.encrypt(&completion).unwrap()).await.unwrap();
+                let delivered = Arc::new(AtomicUsize::new(0));
+                let count = delivered.clone();
+                let _jump = AssemblyAdvance::at(point, source, 50);
+                let result = read_frames(
+                    reader(rx),
+                    Arc::new(Mutex::new(server)),
+                    ReceiveState {
+                        decoder,
+                        frame_deadline: partial.then_some(origin + Duration::from_millis(50)),
+                    },
+                    origin + Duration::from_secs(2),
+                    Limits {
+                        record_timeout: if partial {
+                            Duration::from_secs(1)
+                        } else {
+                            Duration::from_millis(50)
+                        },
+                        ..Limits::default()
+                    },
+                    ReadContext {
+                        clock,
+                        peer: None,
+                        authorization: None,
+                    },
+                    move |_, _| {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        async { Err(Error::Closed) }
+                    },
+                )
+                .await;
+                assert!(matches!(result, Err(Error::Timeout)));
+                assert_eq!(delivered.load(Ordering::SeqCst), 0);
+                assert_eq!(Instant::now(), origin, "scheduler time must not advance");
+            }
+        }
+    }
+}
+
+/// A new trailing partial frame spends its assembly allowance during the same push.
+#[tokio::test(start_paused = true)]
+async fn receipt_batch_new_partial_budget_starts_before_assembly() {
+    let (source, clock) = elapsed_clock();
+    let origin = Instant::from_std(clock.now());
+    let (mut client, server) = channels();
+    let mut plaintext = frame_plaintext(&[1]).unwrap().to_vec();
+    plaintext.extend_from_slice(&frame_plaintext(&[2]).unwrap()[..4]);
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(client.encrypt(&plaintext).unwrap()).await.unwrap();
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let count = delivered.clone();
+    let _jump = AssemblyAdvance::at(AssemblyPoint::After, source, 50);
+    let result = read_frames(
+        reader(rx),
+        Arc::new(Mutex::new(server)),
+        ReceiveState::default(),
+        origin + Duration::from_secs(2),
+        Limits {
+            frame_timeout: Duration::from_millis(50),
+            ..Limits::default()
+        },
+        ReadContext {
+            clock,
+            peer: None,
+            authorization: None,
+        },
+        move |_, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            async { Err(Error::Closed) }
+        },
+    )
+    .await;
+    assert!(matches!(result, Err(Error::Timeout)));
+    assert_eq!(delivered.load(Ordering::SeqCst), 0);
+    assert_eq!(Instant::now(), origin, "scheduler time must not advance");
+}
+
+/// Timestamp coalesced and fragmented batches before any backpressured delivery.
 #[tokio::test(start_paused = true)]
 async fn receipt_timestamps_precede_every_delivery_in_a_reconstructed_batch() {
     for fragmented in [false, true] {
@@ -938,6 +1142,67 @@ async fn receipt_timestamps_precede_every_delivery_in_a_reconstructed_batch() {
     }
 }
 
+/// Ready assembly must honor the old record/partial bound before handing off its decoder.
+#[tokio::test(start_paused = true)]
+async fn receipt_batch_ready_handoff_rechecks_old_assembly_bounds() {
+    for partial in [false, true] {
+        let (source, clock) = elapsed_clock();
+        let scheduled = Instant::now();
+        let (client, server) = configs(Mode::Bootstrap);
+        let (client_tx, mut server_rx) = mpsc::channel(8);
+        let (server_tx, client_rx) = mpsc::channel(8);
+        let mut dial = Box::pin(connect_records_with_clock(
+            reader(client_rx),
+            QueueWriter {
+                records: client_tx,
+                gate: Arc::new(Gate::default()),
+            },
+            client,
+            vec![],
+            ConnectionConfig::default(),
+            Limits {
+                record_timeout: if partial {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::from_millis(50)
+                },
+                frame_timeout: Duration::from_millis(50),
+                ..Limits::default()
+            },
+            clock,
+        ));
+        assert!(futures_util::poll!(&mut dial).is_pending());
+        let (mut channel, second) = respond(&server, &server_rx.try_recv().unwrap()).unwrap();
+        server_tx.try_send(second).unwrap();
+        assert!(futures_util::poll!(&mut dial).is_pending());
+        channel.decrypt(&server_rx.try_recv().unwrap()).unwrap();
+        let ready = frame_plaintext(&ready_bytes()).unwrap();
+        let completion = if partial {
+            server_tx
+                .try_send(channel.encrypt(&ready[..4]).unwrap())
+                .unwrap();
+            assert!(futures_util::poll!(&mut dial).is_pending());
+            &ready[4..]
+        } else {
+            &ready[..]
+        };
+        let _jump = AssemblyAdvance::at(AssemblyPoint::After, source, 50);
+        server_tx
+            .try_send(channel.encrypt(completion).unwrap())
+            .unwrap();
+        match dial.await {
+            Err(Error::Timeout) => {}
+            Ok(client) => {
+                client.close().await;
+                panic!("expired ready assembly must not install a background pump");
+            }
+            Err(error) => panic!("expected assembly timeout, got {error:?}"),
+        }
+        assert_eq!(Instant::now(), scheduled);
+    }
+}
+
+/// Delivery after the original RPC cutoff returns deadline exceeded without handler effects.
 #[tokio::test(start_paused = true)]
 async fn host_peer_uses_receipt_time_not_later_delivery_time() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1108,6 +1373,7 @@ async fn core_handshake_loss_and_deadline_remain_retryable() {
     }
 }
 
+/// Encode a valid ready frame for tests that control coalescing and partial assembly.
 fn ready_bytes() -> Vec<u8> {
     syntra_core::Frame {
         version: 1,
@@ -1826,10 +2092,12 @@ async fn authorization_freshness_also_bounds_a_stalled_server_ready_write() {
 
 struct ElapsedSource(std::sync::atomic::AtomicU64);
 impl syntra_runtime::elapsed::ElapsedSource for ElapsedSource {
+    /// Sample the explicitly controlled millisecond counter without advancing Tokio time.
     fn elapsed(&self) -> Option<Duration> {
         Some(Duration::from_millis(self.0.load(Ordering::SeqCst)))
     }
 }
+/// Return a zero-based source and its bound clock for source-only deadline advances.
 fn elapsed_clock() -> (Arc<ElapsedSource>, ElapsedClock) {
     let source = Arc::new(ElapsedSource(std::sync::atomic::AtomicU64::new(0)));
     let clock = ElapsedClock::with_source(source.clone());

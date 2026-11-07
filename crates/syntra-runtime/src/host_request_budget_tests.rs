@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicU64;
 #[derive(Default)]
 struct Source(AtomicU64);
 impl ElapsedSource for Source {
+    /// Read the test-controlled monotonic millisecond counter.
     fn elapsed(&self) -> Option<Duration> {
         Some(Duration::from_millis(self.0.load(Ordering::SeqCst)))
     }
@@ -26,6 +27,7 @@ struct BudgetPolicy {
     host: Mutex<Weak<Host>>,
 }
 impl Handler for BudgetPolicy {
+    /// Verify lock-free classification, charge selector time, and return the local cap.
     fn request_budget(&self, _: &Principal, method: &str, payload: &[u8]) -> Option<Duration> {
         assert_eq!(method, "/example.Echo/Echo");
         assert!(payload.is_empty());
@@ -40,6 +42,7 @@ impl Handler for BudgetPolicy {
         self.source.0.fetch_add(self.selector_ms, Ordering::SeqCst);
         self.cap
     }
+    /// Retain the admitted deadline and charge simulated authorization time to it.
     fn authorize_with_budget(
         &self,
         _: &Principal,
@@ -50,9 +53,11 @@ impl Handler for BudgetPolicy {
         self.source.0.fetch_add(self.auth_ms, Ordering::SeqCst);
         Ok(())
     }
+    /// Reject legacy dispatch so the test cannot miss request-context propagation.
     fn handle(&self, _: String, _: Vec<u8>, _: crate::CancelToken) -> HandlerFut {
         panic!("context-aware dispatch required")
     }
+    /// Record dispatch and advance elapsed time before returning a ready payload.
     fn handle_with_context(
         &self,
         _: String,
@@ -72,6 +77,7 @@ impl Handler for BudgetPolicy {
     }
 }
 
+/// Activate a host with independent default/deployment limits and a driven policy clock.
 async fn fixture(
     cap: Option<Duration>,
     selector_ms: u64,
@@ -224,9 +230,11 @@ async fn queue_expiry_is_not_restarted_at_budget_selection() {
 async fn allow_all_preserves_scoped_caps_and_unrelated_methods() {
     struct Scoped;
     impl Handler for Scoped {
+        /// Expire only Echo, leaving other methods subject to their ordinary deadline.
         fn request_budget(&self, _: &Principal, method: &str, _: &[u8]) -> Option<Duration> {
             (method == "/example.Echo/Echo").then_some(Duration::ZERO)
         }
+        /// Fail if AllowAll delegates authorization instead of preserving its bypass.
         fn authorize_with_budget(
             &self,
             _: &Principal,
@@ -235,9 +243,11 @@ async fn allow_all_preserves_scoped_caps_and_unrelated_methods() {
         ) -> Result<(), AuthError> {
             panic!("AllowAll must retain its explicit authorization bypass")
         }
+        /// Fail if AllowAll drops the request context during dispatch.
         fn handle(&self, _: String, _: Vec<u8>, _: crate::CancelToken) -> HandlerFut {
             panic!("AllowAll must forward context")
         }
+        /// Verify the unrelated method retains its full wire budget through AllowAll.
         fn handle_with_context(
             &self,
             _: String,

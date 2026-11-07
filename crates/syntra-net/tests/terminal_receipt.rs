@@ -299,12 +299,15 @@ async fn pair_with_handler(
 /// Add only a local request cap, forwarding the existing context-aware handler.
 struct CappedRetire(Duration);
 impl Handler for CappedRetire {
+    /// Cap only retirement, preserving ordinary request deadlines for sibling methods.
     fn request_budget(&self, _: &Principal, method: &str, _: &[u8]) -> Option<Duration> {
         (method == METHOD).then_some(self.0)
     }
+    /// Preserve the legacy echo hook; retirement still requires context-aware dispatch.
     fn handle(&self, method: String, payload: Vec<u8>, cancel: CancelToken) -> HandlerFut {
         Retire.handle(method, payload, cancel)
     }
+    /// Verify the retirement cap reaches dispatch before forwarding its context and lease.
     fn handle_with_context(
         &self,
         method: String,

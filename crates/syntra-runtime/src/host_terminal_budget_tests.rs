@@ -15,12 +15,15 @@ struct BudgetAuthority {
     effects: AtomicUsize,
 }
 impl Authority for BudgetAuthority {
+    /// Reject a legacy read that would bypass the coordinator's deadline handoff.
     fn observe(&self, _: Option<Transition>) -> BoxFuture<'_, Observation> {
         panic!("budget-aware observation must be used")
     }
+    /// Reject a legacy mutation that would bypass the operation cutoff.
     fn commit(&self, _: Transition, _: ExecutionLease) -> BoxFuture<'_, ()> {
         panic!("budget-aware commit must be used")
     }
+    /// Capture the bounded read deadline and report active or exact owned evidence.
     fn observe_with_budget(
         &self,
         _: Option<Transition>,
@@ -39,6 +42,7 @@ impl Authority for BudgetAuthority {
             }
         })
     }
+    /// Check the inherited cutoff, then optionally hold mutation past its expiry.
     fn commit_with_budget(
         &self,
         transition: Transition,
@@ -62,9 +66,11 @@ impl Authority for BudgetAuthority {
 /// Select one second from original receipt and retire through the actual context.
 struct BudgetRetire;
 impl Handler for BudgetRetire {
+    /// Apply a one-second cap to the request's original receipt time.
     fn request_budget(&self, _: &Principal, _: &str, _: &[u8]) -> Option<Duration> {
         Some(Duration::from_secs(1))
     }
+    /// Verify admission has already spent the fixture's forty milliseconds.
     fn authorize_with_budget(
         &self,
         _: &Principal,
@@ -74,9 +80,11 @@ impl Handler for BudgetRetire {
         assert_eq!(budget.remaining(), Ok(Duration::from_millis(960)));
         Ok(())
     }
+    /// Reject dispatch without the terminal request context.
     fn handle(&self, _: String, _: Vec<u8>, _: crate::CancelToken) -> HandlerFut {
         panic!("context required")
     }
+    /// Check the same remaining budget at dispatch and request conditional retirement.
     fn handle_with_context(
         &self,
         _: String,
@@ -94,6 +102,7 @@ impl Handler for BudgetRetire {
     }
 }
 
+/// Admit an aged request, acknowledge its write barrier, and wait for commit entry.
 async fn fixture(
     hold: bool,
 ) -> (
@@ -264,9 +273,11 @@ async fn racing_authorization_hard_denial_cannot_be_swallowed_by_terminal_reserv
         result: Mutex<Option<oneshot::Receiver<HandlerOutcome>>>,
     }
     impl Handler for SlowDenial {
+        /// Keep the race within a request-wide cap without resetting it at reservation.
         fn request_budget(&self, _: &Principal, _: &str, _: &[u8]) -> Option<Duration> {
             Some(Duration::from_secs(3))
         }
+        /// Allow retirement but hold a sibling's hard denial until the test releases it.
         fn authorize(&self, _: &Principal, method: &str) -> Result<(), AuthError> {
             if method == METHOD {
                 return Ok(());
@@ -281,9 +292,11 @@ async fn racing_authorization_hard_denial_cannot_be_swallowed_by_terminal_reserv
             self.release.lock().unwrap().recv().unwrap();
             Err(AuthError::unauthenticated())
         }
+        /// Reject legacy dispatch that cannot expose the retirement capability.
         fn handle(&self, _: String, _: Vec<u8>, _: crate::CancelToken) -> HandlerFut {
             panic!("context hook required")
         }
+        /// Expose only the admitted retirement context and await its controlled result.
         fn handle_with_context(
             &self,
             method: String,
@@ -308,6 +321,7 @@ async fn racing_authorization_hard_denial_cannot_be_swallowed_by_terminal_reserv
     /// Expose any improperly admitted transition as exact owned evidence.
     struct Owned(Mutex<Option<Transition>>);
     impl Authority for Owned {
+        /// Report exact owner evidence if a transition crossed the authorization fence.
         fn observe(&self, _: Option<Transition>) -> BoxFuture<'_, Observation> {
             Box::pin(async {
                 match self.0.lock().unwrap().as_ref() {
@@ -320,6 +334,7 @@ async fn racing_authorization_hard_denial_cannot_be_swallowed_by_terminal_reserv
                 }
             })
         }
+        /// Retain any admitted transition so the test detects an improper mutation.
         fn commit(&self, claim: Transition, _: ExecutionLease) -> BoxFuture<'_, ()> {
             Box::pin(async move { *self.0.lock().unwrap() = Some(claim) })
         }
