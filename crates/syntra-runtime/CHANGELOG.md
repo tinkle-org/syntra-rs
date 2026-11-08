@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.4](https://github.com/tinkle-org/syntra-rs/compare/syntra-runtime-v1.0.0-rc.3...syntra-runtime-v1.0.0-rc.4) - 2026-11-08
+
+### Added
+
+- *(runtime)* implement lifecycle unlock checks for transient output readers ([#33](https://github.com/tinkle-org/syntra-rs/pull/33))
+- *(runtime)* add request-wide host budgets ([#31](https://github.com/tinkle-org/syntra-rs/pull/31))
+
+### Other
+
+- *(runtime)* centralize request admission checks ([#32](https://github.com/tinkle-org/syntra-rs/pull/32))
+
 ## [1.0.0-rc.3](https://github.com/tinkle-org/syntra-rs/compare/syntra-runtime-v1.0.0-rc.2...syntra-runtime-v1.0.0-rc.3) - 2026-11-06
 
 ### Added
