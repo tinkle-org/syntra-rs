@@ -48,6 +48,32 @@ fn run_paused_test(shutdown_timeout: Duration, test: impl std::future::Future<Ou
     }
 }
 
+/// Check admission unlocked without mistaking a transient output reader for it.
+async fn assert_lifecycle_unlocked(state: &tokio::sync::RwLock<ConnectionState>) {
+    // Retirement has settled, but the denied request's output worker may still
+    // hold a read guard or have been granted one from the fair lock's queue.
+    wall_clock_timeout(Duration::from_secs(2), async {
+        drop(state.write().await);
+    })
+    .await
+    .expect("the pause must not retain the lifecycle read guard");
+}
+
+/// A concurrent output reader is transient contention, not a retained admission guard.
+#[tokio::test(start_paused = true)]
+async fn lifecycle_unlock_probe_waits_for_transient_reader() {
+    let state = tokio::sync::RwLock::new(ConnectionState::Active);
+    let reader = state.read().await;
+    let mut probe = Box::pin(assert_lifecycle_unlocked(&state));
+    assert!(futures_util::poll!(&mut probe).is_pending());
+    drop(reader);
+    probe.await;
+    assert!(
+        state.try_write().is_ok(),
+        "the probe must release its guard"
+    );
+}
+
 /// Prove wall-clock expiry and bounded panic teardown with blocking work still held.
 #[test]
 fn wall_clock_watchdog_bounds_paused_wait_and_blocking_teardown() {
@@ -555,7 +581,7 @@ async fn hard_denial_reservation_race() {
             }
         }
     };
-    let unlocked = host.conn.shared.state.try_write().is_ok();
+    assert_lifecycle_unlocked(&host.conn.shared.state).await;
     let succeeded = outcome.is_ok();
     let _ = returned.send(outcome.unwrap_or_else(|_| {
         HandlerOutcome::error(ErrorCode::Unavailable, "retirement unavailable")
@@ -588,10 +614,6 @@ async fn hard_denial_reservation_race() {
     assert!(
         waited_for_authorization,
         "reservation must await authorization"
-    );
-    assert!(
-        unlocked,
-        "the pause must not retain the lifecycle read guard"
     );
     assert!(
         withdrawal_deferred,
