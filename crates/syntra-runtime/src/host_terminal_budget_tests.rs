@@ -4,6 +4,116 @@ use std::sync::atomic::AtomicUsize;
 
 const METHOD: &str = "/example.Authority/Retire";
 
+/// Bound an async wait even while blocking work inhibits Tokio's paused clock.
+async fn wall_clock_timeout<F: std::future::Future>(
+    duration: Duration,
+    future: F,
+) -> Result<F::Output, &'static str> {
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let (expired, expiry) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("terminal-budget-watchdog".into())
+        .spawn(move || {
+            if matches!(
+                stopped.recv_timeout(duration),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                let _ = expired.send(());
+            }
+        })
+        .expect("wall-clock watchdog must start");
+    let result = tokio::select! {
+        biased;
+        _ = expiry => Err("wall-clock watchdog expired or disconnected"),
+        output = future => Ok(output),
+    };
+    // Also disarm on cancellation/unwind: the sender is local to this future.
+    drop(stop);
+    result
+}
+
+/// Preserve test panics without an unbounded runtime drop on blocking admission.
+fn run_paused_test(shutdown_timeout: Duration, test: impl std::future::Future<Output = ()>) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("paused test runtime must start");
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(test)));
+    // A started spawn_blocking task cannot be aborted. Bound the wait even if
+    // releasing the fixture's channels during unwind cannot make it finish.
+    runtime.shutdown_timeout(shutdown_timeout);
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// Prove wall-clock expiry and bounded panic teardown with blocking work still held.
+#[test]
+fn wall_clock_watchdog_bounds_paused_wait_and_blocking_teardown() {
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let (finished, completion) = std::sync::mpsc::channel();
+    let shutdown_started = Mutex::new(None);
+    let outcome = std::panic::catch_unwind(|| {
+        run_paused_test(Duration::from_millis(50), async {
+            let (entered, entry) = oneshot::channel();
+            let blocking = tokio::task::spawn_blocking(move || {
+                let _ = entered.send(());
+                let _ = released.recv();
+                let _ = finished.send(());
+            });
+            wall_clock_timeout(Duration::from_secs(2), entry)
+                .await
+                .expect("blocking probe must start")
+                .unwrap();
+            assert_eq!(
+                wall_clock_timeout(Duration::from_secs(2), async { 7 }).await,
+                Ok(7)
+            );
+            let frozen_at = tokio::time::Instant::now();
+            let mut virtual_timeout = Box::pin(tokio::time::timeout(
+                Duration::from_millis(10),
+                std::future::pending::<()>(),
+            ));
+            assert!(
+                wall_clock_timeout(Duration::from_millis(50), &mut virtual_timeout)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(tokio::time::Instant::now(), frozen_at);
+            assert!(futures_util::poll!(&mut virtual_timeout).is_pending());
+            assert!(!blocking.is_finished());
+            *shutdown_started.lock().unwrap() = Some(std::time::Instant::now());
+            panic!("watchdog teardown probe");
+        });
+    });
+    let elapsed = shutdown_started
+        .lock()
+        .unwrap()
+        .map(|start| start.elapsed());
+    let still_blocked = matches!(
+        completion.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    );
+    // Release before assertions so even a failed teardown probe owns its cleanup.
+    drop(release);
+    completion
+        .recv_timeout(Duration::from_secs(2))
+        .expect("blocking probe must finish after release");
+    assert_eq!(
+        outcome.unwrap_err().downcast_ref::<&str>(),
+        Some(&"watchdog teardown probe")
+    );
+    assert!(
+        still_blocked,
+        "shutdown must return with blocking work held"
+    );
+    assert!(
+        elapsed.expect("probe must reach shutdown") < Duration::from_secs(2),
+        "teardown took {elapsed:?}"
+    );
+}
+
 /// Observe every passed deadline and optionally delay the actual mutation.
 struct BudgetAuthority {
     reads: Mutex<Vec<ElapsedDeadline>>,
@@ -260,9 +370,19 @@ async fn request_wide_observation_budget_is_clamped_to_remaining_cutoff() {
     host.close().await;
 }
 
-/// An in-progress hard-denial callback must serialize before terminal reservation.
-#[tokio::test(start_paused = true)]
-async fn racing_authorization_hard_denial_cannot_be_swallowed_by_terminal_reservation() {
+/// Hard denial must fence reservation before unlocking, not in later withdrawal.
+#[test]
+fn racing_authorization_hard_denial_cannot_be_swallowed_by_terminal_reservation() {
+    run_paused_test(Duration::from_secs(2), async {
+        // Backstop the other scenario awaits too, including admission join/close.
+        wall_clock_timeout(Duration::from_secs(10), hard_denial_reservation_race())
+            .await
+            .expect("authorization race scenario must finish");
+    });
+}
+
+/// Exercise the actual admission and reservation interleaving on a paused runtime.
+async fn hard_denial_reservation_race() {
     /// Hold authorization on a separate thread, as in the existing slow-policy
     /// regression `expiry_during_synchronous_authorization_prevents_handler_effects`.
     /// Only this test barrier deliberately violates the nonblocking contract.
@@ -289,7 +409,9 @@ async fn racing_authorization_hard_denial_cannot_be_swallowed_by_terminal_reserv
                 .unwrap()
                 .send(())
                 .unwrap();
-            self.release.lock().unwrap().recv().unwrap();
+            // The sender lives only in the test: unwinding drops it and releases
+            // this callback too, so a failed assertion cannot strand blocking work.
+            let _ = self.release.lock().unwrap().recv();
             Err(AuthError::unauthenticated())
         }
         /// Reject legacy dispatch that cannot expose the retirement capability.
@@ -394,6 +516,13 @@ async fn racing_authorization_hard_denial_cannot_be_swallowed_by_terminal_reserv
     };
     host.ingest(&request(1, METHOD)).await;
     let context = captured.await.unwrap();
+    let (resume, resumed) = oneshot::channel();
+    let pause = Arc::new(WithdrawalPause {
+        id: 2,
+        unlocked: Notify::new(),
+        release: Mutex::new(Some(resumed)),
+    });
+    *host.withdrawal_pause.lock().unwrap() = Some(pause.clone());
     let admission_host = host.clone();
     let runtime = tokio::runtime::Handle::current();
     let bytes = request(2, "/example.Authority/Check");
@@ -405,48 +534,69 @@ async fn racing_authorization_hard_denial_cannot_be_swallowed_by_terminal_reserv
         drop(context);
         outcome
     });
-    assert!(futures_util::poll!(&mut retiring).is_pending());
+    let waited_for_authorization = futures_util::poll!(&mut retiring).is_pending();
     let crossed_authorization = coordinator.fenced();
     // Release before any assertion that could strand the blocking test callback.
     release.send(()).unwrap();
-    let finish = async {
-        let outcome = retiring.await;
-        let succeeded = outcome.is_ok();
-        let _ = returned.send(outcome.unwrap_or_else(|_| {
-            HandlerOutcome::error(ErrorCode::Unavailable, "retirement unavailable")
-        }));
-        succeeded
-    };
-    let settled = async { tokio::join!(finish, admission) };
-    tokio::pin!(settled);
+    wall_clock_timeout(Duration::from_secs(2), pause.unlocked.notified())
+        .await
+        .expect("admission must reach the post-unlock pause");
+    let withdrawal_deferred = !host.conn.shared.principal_withdrawn.load(Ordering::Acquire);
+    // Drive reservation and the real authority/barrier path while admission is
+    // held specifically in the post-unlock/pre-withdraw gap, not by scheduler luck.
     let mut commands = host.take_terminal_commands().unwrap();
     let mut receipts = 0;
-    let succeeded = loop {
+    let outcome = loop {
         tokio::select! {
-            result = &mut settled => {
-                result.1.unwrap();
-                break result.0;
-            }
+            outcome = &mut retiring => break outcome,
             Some(command) = commands.recv() => match command {
                 DriverCommand::Barrier(ack) => { let _ = ack.send(()); }
                 DriverCommand::Receipt(_) => receipts += 1,
             }
         }
     };
-    for _ in 0..1000 {
-        if host.worker_len() == 0 {
-            break;
+    let unlocked = host.conn.shared.state.try_write().is_ok();
+    let succeeded = outcome.is_ok();
+    let _ = returned.send(outcome.unwrap_or_else(|_| {
+        HandlerOutcome::error(ErrorCode::Unavailable, "retirement unavailable")
+    }));
+    // Observe worker completion (including receipt selection/emission), rather
+    // than giving it an arbitrary number of yields to produce an illegal receipt.
+    wall_clock_timeout(Duration::from_secs(2), async {
+        loop {
+            let changed = host.progress.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if host.worker_len() == 0 {
+                break;
+            }
+            changed.await;
         }
-        tokio::task::yield_now().await;
-    }
+    })
+    .await
+    .expect("request workers must finish after retirement settles");
     while let Ok(command) = commands.try_recv() {
         if matches!(command, DriverCommand::Receipt(_)) {
             receipts += 1;
         }
     }
-    let withdrawn = host.conn.shared.principal_withdrawn.load(Ordering::Acquire);
     let committed = authority.0.lock().unwrap().is_some();
+    let _ = resume.send(());
+    admission.await.unwrap();
+    let withdrawn = host.conn.shared.principal_withdrawn.load(Ordering::Acquire);
     host.close().await;
+    assert!(
+        waited_for_authorization,
+        "reservation must await authorization"
+    );
+    assert!(
+        unlocked,
+        "the pause must not retain the lifecycle read guard"
+    );
+    assert!(
+        withdrawal_deferred,
+        "withdrawal must remain paused during retirement"
+    );
     assert_eq!(
         (crossed_authorization, withdrawn, committed, succeeded, receipts),
         (false, true, false, false, 0),
