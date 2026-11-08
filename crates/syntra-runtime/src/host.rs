@@ -289,6 +289,14 @@ struct DispatchPause {
     release: Notify,
 }
 
+/// Deterministic test-only preemption after authorization unlocks, before withdrawal.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+struct WithdrawalPause {
+    id: u64,
+    unlocked: Notify,
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
 #[derive(Default)]
 struct Calls {
     terminal: Option<Arc<terminal::Coordinator>>,
@@ -372,6 +380,8 @@ pub struct Host {
     terminal_commands: Mutex<Option<mpsc::Receiver<terminal::DriverCommand>>>,
     #[cfg(all(test, not(target_arch = "wasm32")))]
     dispatch_pause: Mutex<Option<Arc<DispatchPause>>>,
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    withdrawal_pause: Mutex<Option<Arc<WithdrawalPause>>>,
 }
 
 impl Host {
@@ -637,6 +647,8 @@ impl Host {
             terminal_commands: Mutex::new(None),
             #[cfg(all(test, not(target_arch = "wasm32")))]
             dispatch_pause: Mutex::new(None),
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            withdrawal_pause: Mutex::new(None),
         });
         // Handshake timer (SNTR-HS-002/011): ACTIVE or explicit close.
         // The `handshake_done` signal lets a successful handshake stop the
@@ -1295,7 +1307,27 @@ impl Host {
             rejection
         };
         let admitted = self.start_request(id, version, req, deadline, rejection, profile);
+        if withdraw {
+            // Reservation needs the lifecycle write guard. Publish sticky denial
+            // before releasing our read guard, including when the RPC deadline
+            // won its result; later withdrawal still owns connection cleanup.
+            if let Some(terminal) = self.terminal.lock().unwrap().as_ref() {
+                terminal.abort();
+            }
+        }
         drop(state);
+        #[cfg(all(test, not(target_arch = "wasm32")))]
+        if withdraw {
+            let pause = self.withdrawal_pause.lock().unwrap().clone();
+            if let Some(pause) = pause.filter(|pause| pause.id == id) {
+                let release = pause.release.lock().unwrap().take();
+                pause.unlocked.notify_one();
+                if let Some(release) = release {
+                    // Dropping the test's sender also releases a failed test.
+                    let _ = release.await;
+                }
+            }
+        }
         if !admitted {
             self.output_exhausted().await;
         } else if withdraw {
