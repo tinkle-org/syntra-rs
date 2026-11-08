@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.4](https://github.com/tinkle-org/syntra-rs/compare/syntra-core-v1.0.0-rc.3...syntra-core-v1.0.0-rc.4) - 2026-11-08
+
+### Added
+
+- *(runtime)* add request-wide host budgets ([#31](https://github.com/tinkle-org/syntra-rs/pull/31))
+
 ## [1.0.0-rc.2](https://github.com/tinkle-org/syntra-rs/compare/syntra-core-v1.0.0-rc.1...syntra-core-v1.0.0-rc.2) - 2026-11-05
 
 ### Added
