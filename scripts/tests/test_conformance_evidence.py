@@ -233,8 +233,10 @@ class ExecutionProofTests(unittest.TestCase):
         self.assertEqual(evidence.local_verdict(101, text, "test_name")[0], "FAIL")
 
     def test_subprocess_is_exact_locked_and_preserves_log(self):
+        """Check exact locked lane execution, toolchain pinning, and preserved log hashes."""
         for lane, name in evidence.LOCAL_LANES.items():
             def run(command, **kwargs):
+                """Validate the lane command and write a successful single-test log."""
                 for arg in ("--exact", "--locked", "--no-default-features", "syntra-runtime", name):
                     self.assertIn(arg, command)
                 self.assertEqual(kwargs["env"]["RUSTUP_TOOLCHAIN"], "1.89.0")

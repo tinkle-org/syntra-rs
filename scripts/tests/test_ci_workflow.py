@@ -27,6 +27,7 @@ NATIVE_COMMANDS = (
 class CiWorkflowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        """Load CI and scheduled workflows for validation gate assertions."""
         cls.workflow = yaml.load(
             (ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
         cls.scheduled = yaml.load(
@@ -62,6 +63,7 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", self.workflow["jobs"]["rust"])
 
     def test_native_commands_are_identical_ordered_and_individually_blocking(self):
+        """Require identical ordered native commands with no optional jobs or steps."""
         for workflow, job_id in ((self.workflow, "native-macos"),
                                  (self.scheduled, "compat-macos"),
                                  (self.scheduled, "compat-windows")):
@@ -82,6 +84,7 @@ class CiWorkflowTests(unittest.TestCase):
                         self.assertEqual(step["shell"], "pwsh")
 
     def test_macos_ci_job_uses_pinned_actions_and_minimal_permissions(self):
+        """Check the macOS runner, timeout, permissions, and pinned actions and toolchain."""
         job = self.workflow["jobs"]["native-macos"]
         self.assertEqual(job["runs-on"], "macos-15")
         self.assertEqual(job["timeout-minutes"], "45")
@@ -95,6 +98,7 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(actions[1]["with"]["toolchain"], "1.89.0")
 
     def test_workflow_toolchains_and_cache_keys_are_migrated(self):
+        """Require the migrated toolchain and cache keys in both workflows."""
         for name, workflow in (("ci", self.workflow), ("scheduled", self.scheduled)):
             with self.subTest(workflow=name):
                 self.assertNotIn("1.88", (ROOT / f".github/workflows/{name}.yml").read_text())
@@ -113,6 +117,7 @@ class CiWorkflowTests(unittest.TestCase):
                          "extended dependency security scan")
 
     def run_required_check(self, results):
+        """Execute the workflow's required gate with supplied dependency results."""
         step, = self.workflow["jobs"]["required"]["steps"]
         self.assertNotIn("if", step)
         self.assertNotIn("continue-on-error", step)
@@ -126,6 +131,7 @@ class CiWorkflowTests(unittest.TestCase):
             exec(compile("\n".join(lines[1:-1]), "required CI status", "exec"), {})
 
     def test_required_aggregate_rejects_unsuccessful_or_missing_native_and_evidence_jobs(self):
+        """Require the aggregate gate to reject failed, cancelled, skipped, or absent validation jobs."""
         required = self.workflow["jobs"]["required"]
         self.assertEqual(required["if"], "always()")
         self.assertNotIn("continue-on-error", required)
@@ -145,6 +151,7 @@ class CiWorkflowTests(unittest.TestCase):
                         self.run_required_check(results)
 
     def test_required_aggregate_preserves_dependency_review_exceptions(self):
+        """Allow skipped dependency review or failure without manifests, but reject failure with manifests."""
         passing = {job: {"result": "success"}
                    for job in self.workflow["jobs"]["required"]["needs"]}
         for result, manifests, rejected in (

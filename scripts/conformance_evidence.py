@@ -143,6 +143,7 @@ def local_verdict(returncode, output, test):
 
 
 def run_local(lane, output_dir, root=ROOT):
+    """Run a supplemental local lane and return its verdict and artifact metadata."""
     if lane in SUPPLEMENTAL_SCENARIOS:
         return execute_supplemental(lane, output_dir, local_verdict, root)
     if lane in NATIVE_LOCAL_LANES:
