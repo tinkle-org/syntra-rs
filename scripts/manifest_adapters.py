@@ -252,14 +252,14 @@ def execute_supplemental(identifier, output, execution_proof, root=ROOT):
     command = ["cargo", "test", "--locked", "-p", "syntra-net", "--no-default-features",
                "--features", "tls-rustls,native-enrollment", "--test", "manifest_cases", "supplemental_scenario", "--",
                "--exact", "--ignored", "--show-output", "--color", "never"]
-    execution = {"command":command, "RUSTUP_TOOLCHAIN":"1.88.0", "artifacts":{},
+    execution = {"command":command, "RUSTUP_TOOLCHAIN":"1.89.0", "artifacts":{},
                  "scope":{"iut":"native host", "peer":"raw harness, not client IUT", "mode":"bootstrap",
                            "transport":"direct-host TLS 1.3/WSS + Syntra 1.0", "enrollment_lifecycle_claimed":False}}
     verdict, reason = "NOT_EXECUTED", "executor could not finish"
     try:
         with log.open("x", encoding="utf-8") as stream:
             completed = subprocess.run(command, cwd=root, stdout=stream, stderr=subprocess.STDOUT, timeout=180,
-                                       env={**os.environ, "RUSTUP_TOOLCHAIN":"1.88.0",
+                                       env={**os.environ, "RUSTUP_TOOLCHAIN":"1.89.0",
                                              "SYNTRA_SUPPLEMENTAL_REQUEST":str(request_path.resolve()), "SYNTRA_SUPPLEMENTAL_RESULT":str(result_path.resolve())})
         execution["exit_code"] = completed.returncode
         proof, proof_reason = execution_proof(completed.returncode, log.read_text(), "supplemental_scenario")

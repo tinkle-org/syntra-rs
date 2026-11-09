@@ -18,7 +18,7 @@ import sys
 sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[1]
-TOOLCHAIN = "1.88.0"
+TOOLCHAIN = "1.89.0"
 ISOLATED_PACKAGES = ("syntra-core", "syntra-runtime", "syntra-net")
 FORBIDDEN_PACKAGES = re.compile(
     r"^(?:mio|socket2|http|http-body|httparse|h2|hyper(?:-.*)?|reqwest|"

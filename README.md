@@ -17,8 +17,8 @@ inputs, not a release or specification freeze. See
 [input provenance](CONTRIBUTING.md#input-provenance-and-authority) for the separate
 11-input upstream lock, source credit and exact Git/offline checks.
 
-Use **Rust 1.88.0** for production builds and current verification. The
-crate MSRV floor is **1.88**; it is a build compatibility constraint, not a
+Use **Rust 1.89.0** for production builds and current verification. The
+crate MSRV floor is **1.89**; it is a build compatibility constraint, not a
 security recommendation. Production binaries must be built with a
 security-patched toolchain. Current dependency pins are:
 
@@ -46,7 +46,7 @@ The default build needs no CGO or native library beyond the Rust toolchain.
 native binaries.
 
 ```sh
-export RUSTUP_TOOLCHAIN=1.88.0
+export RUSTUP_TOOLCHAIN=1.89.0
 cargo build --locked
 cargo test --locked
 ```
@@ -449,7 +449,7 @@ expected FFI WASM rejection in all three modes.
 ### WASM
 
 ```sh
-rustup target add --toolchain 1.88.0 wasm32-unknown-unknown
+rustup target add --toolchain 1.89.0 wasm32-unknown-unknown
 cargo check --locked -p syntra-core -p syntra-runtime --target wasm32-unknown-unknown
 python3 crates/syntra-net/tests/target_contract.py
 sh crates/syntra-core/tests/run-kernel-browser.sh
@@ -510,9 +510,10 @@ cargo audit --deny warnings
 cargo deny --locked check advisories licenses sources
 ```
 
-CI uses Rust **1.88.0**. Root tests and benchmarks require no Docker. PR CI
+CI uses Rust **1.89.0**. Root tests and benchmarks require no Docker. PR/main CI
 runs formatting, clippy, locked tests, FFI contract, WASM compile,
-generation drift and security jobs; the scheduled lane adds native compat
-and coverage. See [CONTRIBUTING.md](CONTRIBUTING.md),
+generation drift and security jobs, with required macOS native validation.
+Scheduled validation periodically rechecks Linux, macOS and Windows and adds
+coverage and vulnerability scans. See [CONTRIBUTING.md](CONTRIBUTING.md),
 [crates/syntra-integration/README.md](crates/syntra-integration/README.md)
 and [BENCHMARKS.md](BENCHMARKS.md).

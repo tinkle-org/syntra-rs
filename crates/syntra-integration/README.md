@@ -66,7 +66,7 @@ uncommitted production changes.
 From the repository root:
 
 ```sh
-export RUSTUP_TOOLCHAIN=1.88.0
+export RUSTUP_TOOLCHAIN=1.89.0
 
 # Compile the test package and the fixture without contacting Docker:
 cargo test -p syntra-integration --no-run
@@ -85,7 +85,7 @@ SYNTRA_INTEGRATION_REQUIRE_DOCKER=1 cargo test -p syntra-integration --test synt
 The optional-Docker path returns success after printing its skip message;
 a green Cargo result on that path is not proof that containers ran.
 
-The fixture image builds with the pinned `rust:1.88-bookworm` builder from
+The fixture image builds with the pinned `rust:1.89-bookworm` builder from
 the repository root context using this crate's `Dockerfile`, then reuses the
 built peer for TCP and WS groups. The root `.dockerignore` whitelists only
 workspace manifests, the lockfile and crate Rust sources; `.git`, `target`,

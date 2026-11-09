@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 env:
-  RUSTUP_TOOLCHAIN: "1.88.0"
+  RUSTUP_TOOLCHAIN: "1.89.0"
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -29,15 +29,15 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.89.0"
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-registry-${{ runner.os }}-1.88.0-${{ hashFiles('Cargo.lock') }}
+          key: cargo-registry-${{ runner.os }}-1.89.0-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-registry-${{ runner.os }}-1.88.0-
+            cargo-registry-${{ runner.os }}-1.89.0-
       - name: Compile benchmarks
         run: cargo bench --locked --workspace --features syntra-net/tcp -- --test
       - name: Run benchmarks (short, report-only)

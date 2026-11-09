@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 env:
-  RUSTUP_TOOLCHAIN: "1.88.0"
+  RUSTUP_TOOLCHAIN: "1.89.0"
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: 10
 
@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.89.0"
           components: rustfmt
       - name: Check formatting
         continue-on-error: true
@@ -49,16 +49,16 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.89.0"
           components: clippy
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-registry-${{ runner.os }}-1.88.0-${{ hashFiles('Cargo.lock') }}
+          key: cargo-registry-${{ runner.os }}-1.89.0-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-registry-${{ runner.os }}-1.88.0-
+            cargo-registry-${{ runner.os }}-1.89.0-
       - name: Clippy (locked, workspace, all targets)
         # Warnings are reported here; the strict preview is informational.
         # Never add `--all-features`: production and
@@ -81,7 +81,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.89.0"
           targets: wasm32-unknown-unknown
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -91,9 +91,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-registry-${{ runner.os }}-1.88.0-${{ hashFiles('Cargo.lock') }}
+          key: cargo-registry-${{ runner.os }}-1.89.0-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-registry-${{ runner.os }}-1.88.0-
+            cargo-registry-${{ runner.os }}-1.89.0-
       - name: Locked default-members tests (without integration feature unification)
         run: cargo test --locked
       - name: Locked workspace tests (includes integration carrier fixtures)
@@ -181,6 +181,38 @@ jobs:
       - name: FFI exports, C smoke tests and expected WASM rejection
         run: python3 crates/syntra-ffi/tests/build_contract.py
 
+  native-macos:
+    name: native validation (macOS)
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: "1.89.0"
+      - name: Locked default-members tests
+        run: cargo test --locked
+      - name: Locked workspace tests
+        run: cargo test --locked --workspace
+      - name: Isolated HTTP carrier tests
+        run: cargo test --locked -p syntra-net --no-default-features --features http
+      - name: Managed HTTP and proxy routes
+        run: cargo test --locked -p syntra-net --no-default-features --features managed,http,proxy --test http_connections --test network_http --test routes
+      - name: Managed WebSocket and proxy routes
+        run: cargo test --locked -p syntra-net --no-default-features --features managed,websocket,proxy --test network_websocket --test routes
+      - name: Explicit native transport and enrollment tests
+        run: cargo test --locked -p syntra-net --no-default-features --features managed,proxy,tls-rustls,native-enrollment,http
+      - name: Runtime file-store tests
+        run: cargo test --locked -p syntra-runtime --no-default-features --features file-store
+      - name: Production FFI tests
+        run: cargo test --locked -p syntra-ffi --no-default-features --features production
+      - name: Test-fixture FFI tests
+        run: cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
+
   generated-rust:
     name: generation drift + upstream pin
     runs-on: ubuntu-24.04
@@ -195,7 +227,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.89.0"
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
@@ -239,7 +271,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.89.0"
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
@@ -281,7 +313,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.89.0"
       - name: Cargo package contents (non-publishing)
         # Metadata determines public members; publish=false test support stays
         # excluded. --list checks contents, not archives or packaged compilation.
@@ -305,7 +337,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.89.0"
       - name: Install pinned security tools
         run: |
           cargo install --locked cargo-deny --version 0.20.2
@@ -409,7 +441,7 @@ jobs:
 
   required:
     name: required CI status
-    needs: [clippy, rust, generated-rust, manifest-cases, package, security, actionlint, dependency-review]
+    needs: [clippy, rust, native-macos, generated-rust, manifest-cases, package, security, actionlint, dependency-review]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -429,9 +461,9 @@ jobs:
                   continue
               if r not in ("success", "skipped"):
                   raise SystemExit(f"required jobs did not all succeed: {bad}")
-          # rust and generated-rust are hard requirements: skipped is not success.
+          # Native validation and evidence jobs are hard requirements: skipped is not success.
           # fmt is informational and does not gate this aggregate check.
-          for hard in ("rust", "generated-rust", "manifest-cases"):
+          for hard in ("rust", "native-macos", "generated-rust", "manifest-cases"):
               if bad.get(hard) != "success":
                   raise SystemExit(f"hard-required job {hard} was {bad.get(hard)}")
           # Include dependency-review when it was applicable: fail required

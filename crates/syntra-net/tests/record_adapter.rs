@@ -122,7 +122,7 @@ async fn external_record_adapter_authenticates_and_runs_rpc_without_native_carri
         .unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn external_dialer_passes_its_expired_budget_without_emitting_a_record() {
     let (client, _) = security();
     let clock = syntra_runtime::elapsed::ElapsedClock::lifecycle_driven();

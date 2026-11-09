@@ -143,6 +143,7 @@ def local_verdict(returncode, output, test):
 
 
 def run_local(lane, output_dir, root=ROOT):
+    """Run a supplemental local lane and return its verdict and artifact metadata."""
     if lane in SUPPLEMENTAL_SCENARIOS:
         return execute_supplemental(lane, output_dir, local_verdict, root)
     if lane in NATIVE_LOCAL_LANES:
@@ -156,12 +157,12 @@ def run_local(lane, output_dir, root=ROOT):
     command += ["--", "--exact", "--show-output", "--color", "never"]
     log = output_dir / f"local-{lane}.log"
     result = {"lane": lane, "kind": "supplemental_local_test", "formal_conformance": False,
-              "command": command, "RUSTUP_TOOLCHAIN": "1.88.0", "test": test}
+              "command": command, "RUSTUP_TOOLCHAIN": "1.89.0", "test": test}
     try:
         # Logs stay on disk; a large compiler log must not become a truncated PASS.
         with log.open("x", encoding="utf-8") as stream:
             completed = subprocess.run(command, cwd=root, stdout=stream, stderr=subprocess.STDOUT,
-                                       env={**os.environ, "RUSTUP_TOOLCHAIN": "1.88.0"}, timeout=300)
+                                       env={**os.environ, "RUSTUP_TOOLCHAIN": "1.89.0"}, timeout=300)
         text = log.read_text(encoding="utf-8")
         verdict, reason = local_verdict(completed.returncode, text, test)
         result["exit_code"] = completed.returncode

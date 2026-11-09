@@ -77,7 +77,7 @@ def negative_bytes(row, base, layout):
 
 
 def probe(root, contexts, negatives, layout):
-    """No crate-source edits or exports. Compile copied bodies with rustc 1.88.0.
+    """No crate-source edits or exports. Compile copied bodies with rustc 1.89.0.
 
     The probe has only a local Error::Invalid stub, no Noise/socket implementation.
     Compilation of the complete crates and real-carrier tests are separate gates.
@@ -154,7 +154,7 @@ def probe(root, contexts, negatives, layout):
     with tempfile.TemporaryDirectory(prefix="syntra-candidate-probe-") as directory:
         source, binary = Path(directory) / "probe.rs", Path(directory) / "probe"
         source.write_text('\n'.join(code), encoding="utf-8")
-        env = {**os.environ, "RUSTUP_TOOLCHAIN": "1.88.0"}
+        env = {**os.environ, "RUSTUP_TOOLCHAIN": "1.89.0"}
         subprocess.run(["rustc", "--edition=2021", str(source), "-o", str(binary)],
                        check=True, capture_output=True, text=True, env=env, timeout=60)
         output = subprocess.run([str(binary)], check=True, capture_output=True, text=True, timeout=30).stdout

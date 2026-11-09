@@ -112,10 +112,12 @@ class AdapterTests(unittest.TestCase):
             adapters.frame_bytes({**frame, 'unreviewed': True})
 
     def run_fake(self, text, returncode=0, artifact=True, tamper=None):
+        """Return a mocked supplemental lane result with configurable logs and observations."""
         def run(command, **kwargs):
+            """Check the pinned scenario command and emit the configured artifacts and status."""
             for arg in ('--exact', '--ignored', 'tls-rustls,native-enrollment', 'syntra-net', 'supplemental_scenario'):
                 self.assertIn(arg, command)
-            self.assertEqual(kwargs['env']['RUSTUP_TOOLCHAIN'], '1.88.0')
+            self.assertEqual(kwargs['env']['RUSTUP_TOOLCHAIN'], '1.89.0')
             request = json.loads(Path(kwargs['env']['SYNTRA_SUPPLEMENTAL_REQUEST']).read_text())
             if artifact:
                 result = self.result(request)
@@ -264,6 +266,7 @@ class LiveExecutionProtocolTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('SYNTRA_LIVE_ADAPTER_PROTOCOL') == '1',
                          'opt-in real Cargo execution protocol check (native-enrollment graph)')
     def test_real_zero_ignored_and_single_test_proofs(self):
+        """Check real Cargo output classifies absent, ignored, and successful exact tests."""
         prefix = ['cargo', 'test', '--locked', '-p', 'syntra-net', '--no-default-features',
                   '--features', 'tls-rustls,native-enrollment', '--test', 'manifest_cases']
         for name, expected in [('_no_such_supplemental_scenario_', 'NOT_EXECUTED'),
@@ -271,7 +274,7 @@ class LiveExecutionProtocolTests(unittest.TestCase):
                                ('supplemental_error_vocabulary', 'PASS')]:
             command = [*prefix, name, '--', '--exact', '--show-output', '--color', 'never']
             completed = subprocess.run(command, cwd=adapters.ROOT, check=True, capture_output=True,
-                                       text=True, timeout=180, env={**os.environ, 'RUSTUP_TOOLCHAIN': '1.88.0'})
+                                       text=True, timeout=180, env={**os.environ, 'RUSTUP_TOOLCHAIN': '1.89.0'})
             proof, _ = evidence.local_verdict(completed.returncode, completed.stdout, name)
             with self.subTest(test=name):
                 self.assertEqual(proof, expected)

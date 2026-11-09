@@ -98,8 +98,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
             self.assertEqual(checkout["with"]["persist-credentials"], "false")
 
     def test_validation_checks_candidate_before_builds(self):
+        """Require pinned release validation to verify the candidate before mandatory Cargo checks."""
         validation = self.workflow["jobs"]["validate-release"]
-        self.assertEqual(self.workflow["env"]["RUSTUP_TOOLCHAIN"], "1.88.0")
+        self.assertEqual(self.workflow["env"]["RUSTUP_TOOLCHAIN"], "1.89.0")
         steps = validation["steps"]
         runs = [step["run"] for step in steps if "run" in step]
         candidate, = [run for run in runs if "--release-revision" in run]

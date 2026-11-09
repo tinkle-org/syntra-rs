@@ -1,7 +1,7 @@
 # Contributing to Syntra Rust
 
-Run commands from the repository root. **Rust 1.88.0 is the toolchain**;
-the crate MSRV floor of **1.88** is an API/build compatibility constraint,
+Run commands from the repository root. **Rust 1.89.0 is the toolchain**;
+the crate MSRV floor of **1.89** is an API/build compatibility constraint,
 not a secure-runtime recommendation. Production binaries must be built with
 a security-patched toolchain. Current pins are `prost =0.14.4`,
 `snow =0.10.0`, `getrandom 0.3`, `tokio 1`, `tungstenite`/`tokio-tungstenite`
@@ -50,7 +50,7 @@ outside this repository and its public documentation. Normative upstream SDD
 input/provenance checks remain separate and retain their pinned sources.
 
 ```sh
-export RUSTUP_TOOLCHAIN=1.88.0
+export RUSTUP_TOOLCHAIN=1.89.0
 cargo fmt --all -- --check
 cargo test --locked
 cargo test --locked --workspace
@@ -167,12 +167,13 @@ cancel for PRs):
 
 - `CI` – PR/main validation (`clippy`, `rust`, `generated-rust`,
   `manifest-cases`, `package`, `security`, `actionlint`, `dependency-review`,
-  aggregator `required`). `fmt` is informational. Require `required` in the
-  main-branch ruleset. The retained `manifest-cases` job ID produces unified
+  aggregator `required`), including required macOS native validation. `fmt` is
+  informational. Require `required` in the main-branch ruleset. The retained
+  `manifest-cases` job ID produces unified
   implementation evidence and ten supplemental WSS scenarios; it does not execute
   an upstream transport-profile suite.
-- `Scheduled` – extended validation on Linux/macOS/Windows, coverage and
-  vulnerability scans (does not gate).
+- `Scheduled` – periodic Linux/macOS/Windows validation rechecks, coverage and
+  vulnerability scans (does not gate PR/main validation).
 - `Integration` – separate Docker-based connectivity checks; see
   [crates/syntra-integration/README.md](crates/syntra-integration/README.md).
 - `Benchmarks` – report-only Criterion samples across workspace benches,

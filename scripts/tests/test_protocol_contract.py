@@ -419,12 +419,14 @@ class CandidateTests(unittest.TestCase):
         self.assertTrue(all(not (self.upstream / other).exists() for other in self.source if other != name))
 
     def test_rust_control_zero_or_ignored_tests_do_not_pass(self):
+        """Ensure absent or ignored Rust tests never produce passing agreement verdicts."""
         for text, expected in (("test result: ok. 0 passed; 0 failed; 0 ignored;", "NOT_EXECUTED"),
                                ("test result: ok. 0 passed; 0 failed; 1 ignored;", "SKIP")):
             def run(command, **kwargs):
+                """Check exact locked execution and the toolchain pin, then emit the control log."""
                 self.assertIn("--exact", command)
                 self.assertIn("--locked", command)
-                self.assertEqual(kwargs["env"]["RUSTUP_TOOLCHAIN"], "1.88.0")
+                self.assertEqual(kwargs["env"]["RUSTUP_TOOLCHAIN"], "1.89.0")
                 kwargs["stdout"].write(text)
                 return subprocess.CompletedProcess(command, 0)
             with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory, \
@@ -434,6 +436,7 @@ class CandidateTests(unittest.TestCase):
                 self.assertTrue(all(row["verdict"] == expected and not row["formal_conformance"] for row in results))
 
     def test_rust_agreement_uses_exact_package_target_and_qualified_test_names(self):
+        """Check agreement lane selectors, qualified test names, toolchain pinning, and log hashes."""
         expected = [
             ("kernel-contexts", ["-p", "syntra-core", "--lib"],
              "secure_channel::context_tests::four_candidate_context_and_prologue_fixtures"),
@@ -460,7 +463,7 @@ class CandidateTests(unittest.TestCase):
                 command = ["cargo", "test", "--locked", *selector, test,
                            "--", "--exact", "--show-output", "--color", "never"]
                 self.assertEqual(call.args[0], command)
-                self.assertEqual(call.kwargs["env"]["RUSTUP_TOOLCHAIN"], "1.88.0")
+                self.assertEqual(call.kwargs["env"]["RUSTUP_TOOLCHAIN"], "1.89.0")
                 self.assertEqual((result["lane"], result["command"], result["test"]), (lane, command, test))
                 self.assertEqual(result["verdict"], "PASS")
                 self.assertFalse(result["formal_conformance"])

@@ -238,9 +238,10 @@ class DependencyIsolationTests(unittest.TestCase):
         ])
 
     def test_cargo_is_locked_to_pinned_toolchain(self):
+        """Check that Cargo uses the pinned toolchain and raises on command failure."""
         with mock.patch.object(contracts.subprocess, "run") as run:
             contracts.cargo(["metadata", "--locked"])
-        self.assertEqual(run.call_args.kwargs["env"]["RUSTUP_TOOLCHAIN"], "1.88.0")
+        self.assertEqual(run.call_args.kwargs["env"]["RUSTUP_TOOLCHAIN"], "1.89.0")
         self.assertTrue(run.call_args.kwargs["check"])
 
 
