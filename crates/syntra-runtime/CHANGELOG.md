@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.5](https://github.com/tinkle-org/syntra-rs/compare/syntra-runtime-v1.0.0-rc.4...syntra-runtime-v1.0.0-rc.5) - 2026-11-09
+
+### Other
+
+- release v1.0.0-rc.5 ([#34](https://github.com/tinkle-org/syntra-rs/pull/34))
+
 ## [1.0.0-rc.4](https://github.com/tinkle-org/syntra-rs/compare/syntra-runtime-v1.0.0-rc.3...syntra-runtime-v1.0.0-rc.4) - 2026-11-08
 
 ### Added

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.5](https://github.com/tinkle-org/syntra-rs/compare/syntra-ffi-v1.0.0-rc.4...syntra-ffi-v1.0.0-rc.5) - 2026-11-09
+
+### Other
+
+- release v1.0.0-rc.5 ([#34](https://github.com/tinkle-org/syntra-rs/pull/34))
+
 ## [1.0.0-rc.2](https://github.com/tinkle-org/syntra-rs/compare/syntra-ffi-v1.0.0-rc.1...syntra-ffi-v1.0.0-rc.2) - 2026-11-05
 
 ### Added
