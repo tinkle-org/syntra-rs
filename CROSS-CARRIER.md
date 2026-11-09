@@ -218,7 +218,7 @@ behavior.
 
 ## Validation
 
-Run from the repository root using the pinned Rust 1.88.0 toolchain. The focused
+Run from the repository root using the pinned Rust 1.89.0 toolchain. The focused
 target contract requires named passing policy, mixed-carrier, budget, recovery and
 WebSocket-loss regressions, rather than accepting compilation or zero-case runs.
 The matrix below identifies coverage responsibilities; a successful command is

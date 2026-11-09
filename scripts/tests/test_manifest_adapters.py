@@ -115,7 +115,7 @@ class AdapterTests(unittest.TestCase):
         def run(command, **kwargs):
             for arg in ('--exact', '--ignored', 'tls-rustls,native-enrollment', 'syntra-net', 'supplemental_scenario'):
                 self.assertIn(arg, command)
-            self.assertEqual(kwargs['env']['RUSTUP_TOOLCHAIN'], '1.88.0')
+            self.assertEqual(kwargs['env']['RUSTUP_TOOLCHAIN'], '1.89.0')
             request = json.loads(Path(kwargs['env']['SYNTRA_SUPPLEMENTAL_REQUEST']).read_text())
             if artifact:
                 result = self.result(request)
@@ -271,7 +271,7 @@ class LiveExecutionProtocolTests(unittest.TestCase):
                                ('supplemental_error_vocabulary', 'PASS')]:
             command = [*prefix, name, '--', '--exact', '--show-output', '--color', 'never']
             completed = subprocess.run(command, cwd=adapters.ROOT, check=True, capture_output=True,
-                                       text=True, timeout=180, env={**os.environ, 'RUSTUP_TOOLCHAIN': '1.88.0'})
+                                       text=True, timeout=180, env={**os.environ, 'RUSTUP_TOOLCHAIN': '1.89.0'})
             proof, _ = evidence.local_verdict(completed.returncode, completed.stdout, name)
             with self.subTest(test=name):
                 self.assertEqual(proof, expected)

@@ -237,7 +237,7 @@ class ExecutionProofTests(unittest.TestCase):
             def run(command, **kwargs):
                 for arg in ("--exact", "--locked", "--no-default-features", "syntra-runtime", name):
                     self.assertIn(arg, command)
-                self.assertEqual(kwargs["env"]["RUSTUP_TOOLCHAIN"], "1.88.0")
+                self.assertEqual(kwargs["env"]["RUSTUP_TOOLCHAIN"], "1.89.0")
                 kwargs["stdout"].write(f"test {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;")
                 return subprocess.CompletedProcess(command, 0)
             with self.subTest(lane=lane), tempfile.TemporaryDirectory() as directory, \

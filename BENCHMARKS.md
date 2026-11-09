@@ -1,7 +1,7 @@
 # Wire, session and connection benchmarks
 
-Use **Rust 1.88.0** for comparable benchmarks and the current CI configuration,
-selecting it with `export RUSTUP_TOOLCHAIN=1.88.0`. The crate MSRV floor of 1.88
+Use **Rust 1.89.0** for current benchmarks and the current CI configuration,
+selecting it with `export RUSTUP_TOOLCHAIN=1.89.0`. The crate MSRV floor of 1.89
 is a build compatibility constraint; production binaries need a security-patched
 toolchain.
 Benchmarks use Criterion 0.5 with `--bench` targets and report timing plus
@@ -103,7 +103,7 @@ cargo bench --locked --workspace --features syntra-net/tcp -- --test
 
 ## Benchmark workflow
 
-`.github/workflows/benchmarks.yml` uses Rust 1.88.0 and runs the three
+`.github/workflows/benchmarks.yml` uses Rust 1.89.0 and runs the three
 Criterion benchmark targets with short report-only settings (the compile
 step still covers every bench target with the harness-neutral `--test`
 selector, since Criterion timing flags are rejected by the default libtest

@@ -68,7 +68,7 @@ separate candidate APIs; neither is enabled by a TCP dependency.
 
 Every explicit feature requires a non-wasm32 target. On wasm32, default builds
 expose no drivers; browser embedders use core/runtime with platform-owned I/O.
-Rust 1.88 is the build compatibility floor, not a security recommendation; build
+Rust 1.89 is the build compatibility floor, not a security recommendation; build
 production binaries with a security-patched toolchain.
 
 See the [API documentation](https://docs.rs/syntra-net),

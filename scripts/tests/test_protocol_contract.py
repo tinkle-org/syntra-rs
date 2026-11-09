@@ -424,7 +424,7 @@ class CandidateTests(unittest.TestCase):
             def run(command, **kwargs):
                 self.assertIn("--exact", command)
                 self.assertIn("--locked", command)
-                self.assertEqual(kwargs["env"]["RUSTUP_TOOLCHAIN"], "1.88.0")
+                self.assertEqual(kwargs["env"]["RUSTUP_TOOLCHAIN"], "1.89.0")
                 kwargs["stdout"].write(text)
                 return subprocess.CompletedProcess(command, 0)
             with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory, \
@@ -460,7 +460,7 @@ class CandidateTests(unittest.TestCase):
                 command = ["cargo", "test", "--locked", *selector, test,
                            "--", "--exact", "--show-output", "--color", "never"]
                 self.assertEqual(call.args[0], command)
-                self.assertEqual(call.kwargs["env"]["RUSTUP_TOOLCHAIN"], "1.88.0")
+                self.assertEqual(call.kwargs["env"]["RUSTUP_TOOLCHAIN"], "1.89.0")
                 self.assertEqual((result["lane"], result["command"], result["test"]), (lane, command, test))
                 self.assertEqual(result["verdict"], "PASS")
                 self.assertFalse(result["formal_conformance"])

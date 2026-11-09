@@ -13,12 +13,12 @@ permissions:
   contents: read
 
 env:
-  RUSTUP_TOOLCHAIN: "1.88.0"
+  RUSTUP_TOOLCHAIN: "1.89.0"
   CARGO_TERM_COLOR: always
 
 jobs:
   full-linux:
-    name: full validation (linux, 1.88.0)
+    name: full validation (linux, 1.89.0)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -29,7 +29,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.89.0"
           targets: wasm32-unknown-unknown
           components: clippy, rustfmt
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -40,9 +40,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-registry-${{ runner.os }}-1.88.0-${{ hashFiles('Cargo.lock') }}
+          key: cargo-registry-${{ runner.os }}-1.89.0-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-registry-${{ runner.os }}-1.88.0-
+            cargo-registry-${{ runner.os }}-1.89.0-
       - name: Default dependency isolation (host + WASM, no dev/test graph)
         run: python3 scripts/cargo_contracts.py isolation
       - name: WebSocket-only production graph excludes TLS implementations and HTTP opt-in
@@ -83,18 +83,25 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: "1.88.0"
-      - name: Native tests (isolated defaults, workspace, explicit features + FFI modes)
-        run: |
-          cargo test --locked
-          cargo test --locked --workspace
-          cargo test --locked -p syntra-net --no-default-features --features http
-          cargo test --locked -p syntra-net --no-default-features --features managed,http,proxy --test http_connections --test network_http --test routes
-          cargo test --locked -p syntra-net --no-default-features --features managed,websocket,proxy --test network_websocket --test routes
-          cargo test --locked -p syntra-net --no-default-features --features managed,proxy,tls-rustls,native-enrollment,http
-          cargo test --locked -p syntra-runtime --no-default-features --features file-store
-          cargo test --locked -p syntra-ffi --no-default-features --features production
-          cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
+          toolchain: "1.89.0"
+      - name: Locked default-members tests
+        run: cargo test --locked
+      - name: Locked workspace tests
+        run: cargo test --locked --workspace
+      - name: Isolated HTTP carrier tests
+        run: cargo test --locked -p syntra-net --no-default-features --features http
+      - name: Managed HTTP and proxy routes
+        run: cargo test --locked -p syntra-net --no-default-features --features managed,http,proxy --test http_connections --test network_http --test routes
+      - name: Managed WebSocket and proxy routes
+        run: cargo test --locked -p syntra-net --no-default-features --features managed,websocket,proxy --test network_websocket --test routes
+      - name: Explicit native transport and enrollment tests
+        run: cargo test --locked -p syntra-net --no-default-features --features managed,proxy,tls-rustls,native-enrollment,http
+      - name: Runtime file-store tests
+        run: cargo test --locked -p syntra-runtime --no-default-features --features file-store
+      - name: Production FFI tests
+        run: cargo test --locked -p syntra-ffi --no-default-features --features production
+      - name: Test-fixture FFI tests
+        run: cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
       # Cross-toolchain C smoke runs in CI's Linux build_contract lane; these
       # compatibility jobs exercise Rust tests, not the C compiler/symbol ABI.
 
@@ -110,18 +117,33 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: "1.88.0"
-      - name: Native tests (isolated defaults, workspace, explicit features + FFI modes)
-        run: |
-          cargo test --locked
-          cargo test --locked --workspace
-          cargo test --locked -p syntra-net --no-default-features --features http
-          cargo test --locked -p syntra-net --no-default-features --features managed,http,proxy --test http_connections --test network_http --test routes
-          cargo test --locked -p syntra-net --no-default-features --features managed,websocket,proxy --test network_websocket --test routes
-          cargo test --locked -p syntra-net --no-default-features --features managed,proxy,tls-rustls,native-enrollment,http
-          cargo test --locked -p syntra-runtime --no-default-features --features file-store
-          cargo test --locked -p syntra-ffi --no-default-features --features production
-          cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
+          toolchain: "1.89.0"
+      - name: Locked default-members tests
+        run: cargo test --locked
+        shell: pwsh
+      - name: Locked workspace tests
+        run: cargo test --locked --workspace
+        shell: pwsh
+      - name: Isolated HTTP carrier tests
+        run: cargo test --locked -p syntra-net --no-default-features --features http
+        shell: pwsh
+      - name: Managed HTTP and proxy routes
+        run: cargo test --locked -p syntra-net --no-default-features --features managed,http,proxy --test http_connections --test network_http --test routes
+        shell: pwsh
+      - name: Managed WebSocket and proxy routes
+        run: cargo test --locked -p syntra-net --no-default-features --features managed,websocket,proxy --test network_websocket --test routes
+        shell: pwsh
+      - name: Explicit native transport and enrollment tests
+        run: cargo test --locked -p syntra-net --no-default-features --features managed,proxy,tls-rustls,native-enrollment,http
+        shell: pwsh
+      - name: Runtime file-store tests
+        run: cargo test --locked -p syntra-runtime --no-default-features --features file-store
+        shell: pwsh
+      - name: Production FFI tests
+        run: cargo test --locked -p syntra-ffi --no-default-features --features production
+        shell: pwsh
+      - name: Test-fixture FFI tests
+        run: cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
         shell: pwsh
 
   coverage:
@@ -136,7 +158,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.89.0"
       - name: Install cargo-llvm-cov (pinned)
         run: cargo install --locked cargo-llvm-cov --version 0.9.1
       - name: Coverage report (no threshold; not a security proof)
@@ -148,7 +170,7 @@ jobs:
           retention-days: 14
 
   vuln-extended:
-    name: extended vulnerability + outdated scan
+    name: extended dependency security scan
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -159,7 +181,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.89.0"
       - name: Install pinned tools
         run: |
           cargo install --locked cargo-deny --version 0.20.2

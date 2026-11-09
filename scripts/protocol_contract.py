@@ -461,12 +461,12 @@ def run_rust_agreement(output, root=ROOT):
         try:
             with path.open("x") as log:
                 completed = subprocess.run(command, cwd=root, stdout=log, stderr=subprocess.STDOUT,
-                    timeout=300, env={**os.environ, "RUSTUP_TOOLCHAIN": "1.88.0"})
+                    timeout=300, env={**os.environ, "RUSTUP_TOOLCHAIN": "1.89.0"})
             verdict, reason = local_verdict(completed.returncode, path.read_text(), test)
             status = completed.returncode
         except (OSError, subprocess.TimeoutExpired) as error:
             verdict, reason, status = "NOT_EXECUTED", str(error), None
-        results.append({"lane": lane, "command": command, "RUSTUP_TOOLCHAIN": "1.88.0", "test": test,
+        results.append({"lane": lane, "command": command, "RUSTUP_TOOLCHAIN": "1.89.0", "test": test,
                         "verdict": verdict, "reason": reason, "exit_code": status, "formal_conformance": False,
                         "log": str(path), "log_sha256": digest(path.read_bytes()) if path.is_file() else None})
     (output / "results.json").write_text(json.dumps(results, indent=2) + "\n")

@@ -1,12 +1,27 @@
-"""CI evidence uploads must follow execution without weakening validation gates."""
+"""CI evidence and native validation must not weaken required validation gates."""
 
+from contextlib import redirect_stdout
+import io
+import json
 from pathlib import Path
 import unittest
+from unittest import mock
 
 import yaml
 
 
 ROOT = Path(__file__).resolve().parents[2]
+NATIVE_COMMANDS = (
+    "cargo test --locked",
+    "cargo test --locked --workspace",
+    "cargo test --locked -p syntra-net --no-default-features --features http",
+    "cargo test --locked -p syntra-net --no-default-features --features managed,http,proxy --test http_connections --test network_http --test routes",
+    "cargo test --locked -p syntra-net --no-default-features --features managed,websocket,proxy --test network_websocket --test routes",
+    "cargo test --locked -p syntra-net --no-default-features --features managed,proxy,tls-rustls,native-enrollment,http",
+    "cargo test --locked -p syntra-runtime --no-default-features --features file-store",
+    "cargo test --locked -p syntra-ffi --no-default-features --features production",
+    "cargo test --locked -p syntra-ffi --no-default-features --features test-fixture",
+)
 
 
 class CiWorkflowTests(unittest.TestCase):
@@ -14,6 +29,8 @@ class CiWorkflowTests(unittest.TestCase):
     def setUpClass(cls):
         cls.workflow = yaml.load(
             (ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
+        cls.scheduled = yaml.load(
+            (ROOT / ".github/workflows/scheduled.yml").read_text(), Loader=yaml.BaseLoader)
         cls.steps = cls.workflow["jobs"]["rust"]["steps"]
 
     def test_candidate_upload_follows_its_identified_producer(self):
@@ -43,6 +60,107 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertIn("--offline", producer["run"])
         self.assertIn("rust", self.workflow["jobs"]["required"]["needs"])
         self.assertNotIn("continue-on-error", self.workflow["jobs"]["rust"])
+
+    def test_native_commands_are_identical_ordered_and_individually_blocking(self):
+        for workflow, job_id in ((self.workflow, "native-macos"),
+                                 (self.scheduled, "compat-macos"),
+                                 (self.scheduled, "compat-windows")):
+            with self.subTest(job=job_id):
+                job = workflow["jobs"][job_id]
+                self.assertNotIn("if", job)
+                self.assertNotIn("continue-on-error", job)
+                runs = [step for step in job["steps"] if "run" in step]
+                self.assertEqual([step["run"].strip() for step in runs], list(NATIVE_COMMANDS))
+                self.assertEqual(len({step["name"] for step in runs}), 9)
+                for step in job["steps"]:
+                    self.assertNotIn("if", step)
+                    self.assertNotIn("continue-on-error", step)
+                for step in runs:
+                    self.assertTrue(step["name"])
+                    self.assertEqual(len(step["run"].strip().splitlines()), 1)
+                    if job_id == "compat-windows":
+                        self.assertEqual(step["shell"], "pwsh")
+
+    def test_macos_ci_job_uses_pinned_actions_and_minimal_permissions(self):
+        job = self.workflow["jobs"]["native-macos"]
+        self.assertEqual(job["runs-on"], "macos-15")
+        self.assertEqual(job["timeout-minutes"], "45")
+        self.assertEqual(job["permissions"], {"contents": "read"})
+        actions = [step for step in job["steps"] if "uses" in step]
+        self.assertEqual([step["uses"] for step in actions],
+                         [step["uses"] for step in self.steps[:2]])
+        for step in actions:
+            self.assertRegex(step["uses"], r"@[0-9a-f]{40}$")
+        self.assertEqual(actions[0]["with"]["persist-credentials"], "false")
+        self.assertEqual(actions[1]["with"]["toolchain"], "1.89.0")
+
+    def test_workflow_toolchains_and_cache_keys_are_migrated(self):
+        for name, workflow in (("ci", self.workflow), ("scheduled", self.scheduled)):
+            with self.subTest(workflow=name):
+                self.assertNotIn("1.88", (ROOT / f".github/workflows/{name}.yml").read_text())
+                self.assertEqual(workflow["env"]["RUSTUP_TOOLCHAIN"], "1.89.0")
+                for job in workflow["jobs"].values():
+                    for step in job["steps"]:
+                        action = step.get("uses", "")
+                        if action.startswith("dtolnay/rust-toolchain@"):
+                            self.assertEqual(step["with"]["toolchain"], "1.89.0")
+                        if action.startswith("actions/cache@"):
+                            for key in ("key", "restore-keys"):
+                                self.assertIn("-1.89.0-", step["with"][key])
+        self.assertEqual(self.scheduled["jobs"]["full-linux"]["name"],
+                         "full validation (linux, 1.89.0)")
+        self.assertEqual(self.scheduled["jobs"]["vuln-extended"]["name"],
+                         "extended dependency security scan")
+
+    def run_required_check(self, results):
+        step, = self.workflow["jobs"]["required"]["steps"]
+        self.assertNotIn("if", step)
+        self.assertNotIn("continue-on-error", step)
+        self.assertEqual(step["env"]["NEEDS_JSON"], "${{ toJSON(needs) }}")
+        lines = step["run"].splitlines()
+        self.assertEqual(lines[0], "python3 - <<'EOF'")
+        self.assertEqual(lines[-1], "EOF")
+        # Execute the workflow's actual gate, not a Python copy of its logic.
+        with mock.patch.dict("os.environ", {"NEEDS_JSON": json.dumps(results)}), \
+                redirect_stdout(io.StringIO()):
+            exec(compile("\n".join(lines[1:-1]), "required CI status", "exec"), {})
+
+    def test_required_aggregate_rejects_unsuccessful_or_missing_native_and_evidence_jobs(self):
+        required = self.workflow["jobs"]["required"]
+        self.assertEqual(required["if"], "always()")
+        self.assertNotIn("continue-on-error", required)
+        self.assertEqual(required["needs"], [
+            "clippy", "rust", "native-macos", "generated-rust", "manifest-cases",
+            "package", "security", "actionlint", "dependency-review",
+        ])
+        passing = {job: {"result": "success"} for job in required["needs"]}
+        self.run_required_check(passing)
+        for job in ("rust", "native-macos", "generated-rust", "manifest-cases"):
+            for result in ("failure", "cancelled", "skipped", None):
+                with self.subTest(job=job, result=result):
+                    results = {**passing, job: {"result": result}}
+                    if result is None:
+                        del results[job]
+                    with self.assertRaises(SystemExit):
+                        self.run_required_check(results)
+
+    def test_required_aggregate_preserves_dependency_review_exceptions(self):
+        passing = {job: {"result": "success"}
+                   for job in self.workflow["jobs"]["required"]["needs"]}
+        for result, manifests, rejected in (
+            ("skipped", None, False),
+            ("failure", "false", False),
+            ("failure", "true", True),
+        ):
+            with self.subTest(result=result, manifests=manifests):
+                results = {**passing, "dependency-review": {
+                    "result": result, "outputs": {"has_manifests": manifests},
+                }}
+                if rejected:
+                    with self.assertRaises(SystemExit):
+                        self.run_required_check(results)
+                else:
+                    self.run_required_check(results)
 
 
 if __name__ == "__main__":

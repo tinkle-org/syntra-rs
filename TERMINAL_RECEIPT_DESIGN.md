@@ -274,12 +274,12 @@ bindings are unchanged. Ordinary withdrawal and close defaults remain unchanged.
 
 ## SDK tests and limits
 
-Run the owned suites with Rust **1.88.0** and locked dependencies:
+Run the owned suites with Rust **1.89.0** and locked dependencies:
 
 ```sh
-cargo +1.88.0 test --locked -p syntra-runtime
-cargo +1.88.0 test --locked -p syntra-net --no-default-features --features tcp
-cargo +1.88.0 test --locked --workspace
+cargo +1.89.0 test --locked -p syntra-runtime
+cargo +1.89.0 test --locked -p syntra-net --no-default-features --features tcp
+cargo +1.89.0 test --locked --workspace
 ```
 
 Runtime coverage includes `crates/syntra-runtime/src/host_terminal.rs`,
