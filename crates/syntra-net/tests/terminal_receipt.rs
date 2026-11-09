@@ -197,7 +197,7 @@ impl Handler for Retire {
     fn handle(&self, _: String, p: Vec<u8>, _: CancelToken) -> HandlerFut {
         Box::pin(async move { HandlerOutcome::Payload(p) })
     }
-    /// Retire the configured method or return an ordinary, optionally delayed echo.
+    /// Retire the configured method or return an ordinary echo.
     fn handle_with_context(
         &self,
         method: String,
@@ -208,9 +208,6 @@ impl Handler for Retire {
     ) -> HandlerFut {
         Box::pin(async move {
             if method != METHOD {
-                if method == "/example.Authority/Slow" {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
                 return HandlerOutcome::Payload(p);
             }
             context.retire(1).await.unwrap_or_else(|_| {
@@ -219,6 +216,39 @@ impl Handler for Retire {
                     "retirement unavailable",
                 )
             })
+        })
+    }
+}
+
+/// Hold an admitted sibling until the test releases its ordinary result.
+#[derive(Clone, Default)]
+struct HeldSibling {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+impl Handler for HeldSibling {
+    /// Preserve the legacy echo hook; retirement still needs the request context.
+    fn handle(&self, method: String, p: Vec<u8>, cancel: CancelToken) -> HandlerFut {
+        Retire.handle(method, p, cancel)
+    }
+    /// Witness sibling entry before reservation and control completion without time.
+    fn handle_with_context(
+        &self,
+        method: String,
+        p: Vec<u8>,
+        cancel: CancelToken,
+        lease: ExecutionLease,
+        context: RequestContext,
+    ) -> HandlerFut {
+        if method != "/example.Authority/Slow" {
+            return Retire.handle_with_context(method, p, cancel, lease, context);
+        }
+        let started = self.started.clone();
+        let release = self.release.clone();
+        Box::pin(async move {
+            started.notify_one();
+            release.notified().await;
+            HandlerOutcome::Payload(p)
         })
     }
 }
@@ -657,6 +687,16 @@ async fn controlled_pair_with_clock(
     gate: Arc<Gate>,
     clock: Option<ElapsedClock>,
 ) -> (tcp::ClientHandle, tcp::HostHandle) {
+    controlled_pair_with_handler_and_clock(authority, gate, clock, Arc::new(AllowAll(Retire))).await
+}
+
+/// Keep the same TCP/clock setup while selecting a synchronized application handler.
+async fn controlled_pair_with_handler_and_clock(
+    authority: Arc<AuthorityFixture>,
+    gate: Arc<Gate>,
+    clock: Option<ElapsedClock>,
+    handler: Arc<dyn Handler>,
+) -> (tcp::ClientHandle, tcp::HostHandle) {
     *gate.trace.lock().unwrap() = Some(authority.trace.clone());
     let (client, server) = configs();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -673,7 +713,7 @@ async fn controlled_pair_with_clock(
                 enabled: true,
                 clock: host_clock,
             }),
-            Arc::new(AllowAll(Retire)),
+            handler,
             ConnectionConfig {
                 writer_capacity: 1,
                 ..Default::default()
@@ -743,6 +783,15 @@ impl Drop for ManualTime {
         if let Some(awake) = &self.awake {
             awake.abort();
         }
+    }
+}
+
+/// Bound fixture progress in wall time even when ManualTime prevents timer advance.
+async fn wait_for_fixture_state(ready: impl Fn() -> bool, message: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !ready() {
+        assert!(std::time::Instant::now() < deadline, "{message}");
+        tokio::task::yield_now().await;
     }
 }
 
@@ -1061,29 +1110,111 @@ async fn dropped_handle_and_stalled_receipt_retire_without_replay() {
 }
 
 /// Completed sibling work cannot escape the fence while own commit waits to return.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn sibling_completion_during_owned_commit_gap_has_no_delivery_permission() {
+    let time = ManualTime::new();
     let authority = AuthorityFixture::new(5);
-    let (client, host) = pair(authority.clone(), b"retired".to_vec(), true).await;
+    let sibling_control = HeldSibling::default();
+    let (client, host) = controlled_pair_with_handler_and_clock(
+        authority.clone(),
+        Arc::new(Gate::default()),
+        Some(time.clock.clone()),
+        Arc::new(AllowAll(sibling_control.clone())),
+    )
+    .await;
+    let started = time.clock.now();
     let conn = client.conn.clone();
     let sibling = tokio::spawn(async move {
         conn.call("/example.Authority/Slow", b"protected".to_vec(), 2000)
             .await
     });
-    tokio::task::yield_now().await;
+    sibling_control.started.notified().await;
     let conn = client.conn.clone();
     let receipt = tokio::spawn(async move { conn.call(METHOD, vec![], 2000).await });
     authority.committed.notified().await;
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    let coordinator = host.host.terminal_coordinator().unwrap();
+    coordinator.refresh().await.unwrap();
+    assert!(!coordinator.ordinary_allowed());
+    assert_eq!(host.host.worker_len(), 2);
+    sibling_control.release.notify_one();
+    wait_for_fixture_state(
+        || host.host.worker_len() == 1,
+        "sibling must finish host selection and fenced emission",
+    )
+    .await;
+    assert_eq!(host.host.inflight_len(), 1);
+    assert!(!host.is_closed());
+    assert!(coordinator.raw_allowed());
+    assert!(!receipt.is_finished(), "callback completion still required");
     assert!(
         !sibling.is_finished(),
         "fenced sibling success must never escape"
     );
+    assert_eq!(
+        time.clock.now(),
+        started,
+        "fixture waits cannot spend freshness"
+    );
     authority.release.notify_one();
     assert_eq!(receipt.await.unwrap().unwrap(), b"retired");
     assert!(sibling.await.unwrap().is_err());
+    assert_eq!(authority.commits.load(Ordering::SeqCst), 1);
     client.close().await;
     host.close().await;
+    time.finish().await;
+}
+
+/// Exact freshness expiry during owned commit is sticky despite late callback return.
+#[tokio::test(start_paused = true)]
+async fn owned_commit_gap_exact_freshness_expiry_cannot_be_revived() {
+    let time = ManualTime::new();
+    let authority = AuthorityFixture::new(5);
+    let (client, host) = controlled_pair_with_clock(
+        authority.clone(),
+        Arc::new(Gate::default()),
+        Some(time.clock.clone()),
+    )
+    .await;
+    let conn = client.conn.clone();
+    let receipt = tokio::spawn(async move { conn.call(METHOD, vec![], 2000).await });
+    authority.committed.notified().await;
+    let coordinator = host.host.terminal_coordinator().unwrap();
+    coordinator.refresh().await.unwrap();
+    assert!(coordinator.raw_allowed());
+    assert!(!coordinator.ordinary_allowed());
+    assert!(!receipt.is_finished());
+    let reads = authority.reads.load(Ordering::SeqCst);
+    let started = time.clock.now();
+    tokio::time::advance(coordinator.read_timeout()).await;
+    assert_eq!(time.clock.now() - started, Duration::from_millis(100));
+    assert!(
+        !coordinator.raw_allowed(),
+        "exact freshness tie fails closed"
+    );
+    assert!(coordinator.refresh().await.is_err());
+    assert_eq!(authority.reads.load(Ordering::SeqCst), reads);
+    wait_for_fixture_state(|| host.is_closed(), "expired owned gap must close").await;
+    assert_eq!(
+        receipt.await.unwrap().unwrap_err().code(),
+        syntra_core::ErrorCode::Unavailable
+    );
+    assert_eq!(host.host.execution_len(), 1, "commit work remains owned");
+    authority.release.notify_one();
+    wait_for_fixture_state(
+        || host.host.execution_len() == 0,
+        "released authority work must finish",
+    )
+    .await;
+    assert!(
+        coordinator.refresh().await.is_err(),
+        "late return cannot revive proof"
+    );
+    assert!(!coordinator.raw_allowed());
+    assert!(host.is_closed());
+    assert_eq!(authority.commits.load(Ordering::SeqCst), 1);
+    client.close().await;
+    host.close().await;
+    time.finish().await;
 }
 
 /// A changed active revision prevents conditional mutation after reservation.
