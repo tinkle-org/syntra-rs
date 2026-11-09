@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.5](https://github.com/tinkle-org/syntra-rs/compare/syntra-net-v1.0.0-rc.4...syntra-net-v1.0.0-rc.5) - 2026-11-09
+
+### Fixed
+
+- *(net)* make terminal receipt commit-gap tests deterministic ([#36](https://github.com/tinkle-org/syntra-rs/pull/36))
+- repair scheduled validation and patch bundled SQLite via Rust 1.89 ([#35](https://github.com/tinkle-org/syntra-rs/pull/35))
+
 ## [1.0.0-rc.4](https://github.com/tinkle-org/syntra-rs/compare/syntra-net-v1.0.0-rc.3...syntra-net-v1.0.0-rc.4) - 2026-11-08
 
 ### Added
