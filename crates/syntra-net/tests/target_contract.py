@@ -88,6 +88,10 @@ MANAGED_SHUTDOWN_TESTS = (
     "client::tests::managed_pending_close_wait_is_not_reported_as_failure",
     "network::tests::ordinary_and_budget_clients_share_registration_controls_and_owned_shutdown",
 )
+TERMINAL_RECEIPT_GAP_TESTS = (
+    "sibling_completion_during_owned_commit_gap_has_no_delivery_permission",
+    "owned_commit_gap_exact_freshness_expiry_cannot_be_revived",
+)
 HTTP_PROXY_TESTS = (
     "candidate::proxied::socks_connect_and_real_forward_http_https_encrypted_rpc_both_modes",
     "candidate::proxied::proxy_target_authority_kind_allowlist_and_debug_are_checked_before_inputs",
@@ -119,6 +123,23 @@ def check(*arguments):
 
 
 class TargetContract(unittest.TestCase):
+    def test_terminal_receipt_gap_regressions_execute_exactly(self):
+        """Require both synchronized commit-gap cases to execute in TCP feature graphs."""
+        for features in ("tcp", "tcp,websocket"):
+            for test in TERMINAL_RECEIPT_GAP_TESTS:
+                with self.subTest(features=features, test=test):
+                    command = ["cargo", "test", "--locked", "-p", "syntra-net", "--no-default-features",
+                               "--features", features, "--test", "terminal_receipt", test,
+                               "--", "--exact", "--color", "never"]
+                    print("$ " + " ".join(command), flush=True)
+                    result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True,
+                                            timeout=300, check=False)
+                    output = result.stdout + result.stderr
+                    print(output, end="", flush=True)
+                    self.assertEqual(result.returncode, 0, output)
+                    self.assertRegex(output, rf"(?m)^test {re.escape(test)} \.\.\. ok$", output)
+                    self.assertIn("test result: ok. 1 passed; 0 failed; 0 ignored;", output)
+
     def test_managed_shutdown_regressions_execute_exactly(self):
         for test in MANAGED_SHUTDOWN_TESTS:
             with self.subTest(test=test):

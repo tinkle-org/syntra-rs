@@ -34,6 +34,27 @@ class CiWorkflowTests(unittest.TestCase):
             (ROOT / ".github/workflows/scheduled.yml").read_text(), Loader=yaml.BaseLoader)
         cls.steps = cls.workflow["jobs"]["rust"]["steps"]
 
+    def test_pr_and_main_run_the_same_required_native_checks(self):
+        """Keep workspace tests and exact-execution contracts blocking on PRs and main."""
+        events = self.workflow["on"]
+        self.assertIn("pull_request", events)
+        self.assertFalse(events["pull_request"])
+        self.assertEqual(events["push"], {"branches": ["main"]})
+        for job_id in ("rust", "native-macos"):
+            with self.subTest(job=job_id):
+                job = self.workflow["jobs"][job_id]
+                self.assertNotIn("if", job)
+                self.assertNotIn("continue-on-error", job)
+                self.assertIn(job_id, self.workflow["jobs"]["required"]["needs"])
+                workspace, = [step for step in job["steps"]
+                              if step.get("run") == "cargo test --locked --workspace"]
+                self.assertNotIn("if", workspace)
+                self.assertNotIn("continue-on-error", workspace)
+        contract, = [step for step in self.steps
+                     if step.get("run") == "python3 crates/syntra-net/tests/target_contract.py"]
+        self.assertNotIn("if", contract)
+        self.assertNotIn("continue-on-error", contract)
+
     def test_candidate_upload_follows_its_identified_producer(self):
         producer, = [step for step in self.steps if "--run-rust" in step.get("run", "")]
         upload, = [step for step in self.steps
