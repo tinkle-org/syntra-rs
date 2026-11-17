@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.6](https://github.com/tinkle-org/syntra-rs/compare/syntra-net-v1.0.0-rc.5...syntra-net-v1.0.0-rc.6) - 2026-11-17
+
+### Other
+
+- *(deps)* bump rusqlite from 0.41.0 to 0.42.0 ([#44](https://github.com/tinkle-org/syntra-rs/pull/44))
+- *(deps)* bump criterion from 0.5.1 to 0.8.2 ([#40](https://github.com/tinkle-org/syntra-rs/pull/40))
+
 ## [1.0.0-rc.5](https://github.com/tinkle-org/syntra-rs/compare/syntra-net-v1.0.0-rc.4...syntra-net-v1.0.0-rc.5) - 2026-11-09
 
 ### Fixed
