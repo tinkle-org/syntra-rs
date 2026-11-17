@@ -108,6 +108,7 @@ class CiWorkflowTests(unittest.TestCase):
         """Check the macOS runner, timeout, permissions, and pinned actions and toolchain."""
         job = self.workflow["jobs"]["native-macos"]
         self.assertEqual(job["runs-on"], "macos-15")
+        self.assertEqual(self.scheduled["jobs"]["compat-macos"]["runs-on"], "macos-15")
         self.assertEqual(job["timeout-minutes"], "45")
         self.assertEqual(job["permissions"], {"contents": "read"})
         actions = [step for step in job["steps"] if "uses" in step]
@@ -152,7 +153,7 @@ class CiWorkflowTests(unittest.TestCase):
             exec(compile("\n".join(lines[1:-1]), "required CI status", "exec"), {})
 
     def test_required_aggregate_rejects_unsuccessful_or_missing_native_and_evidence_jobs(self):
-        """Require the aggregate gate to reject failed, cancelled, skipped, or absent validation jobs."""
+        """Reject failed, cancelled, abandoned, skipped, or absent validation jobs."""
         required = self.workflow["jobs"]["required"]
         self.assertEqual(required["if"], "always()")
         self.assertNotIn("continue-on-error", required)
@@ -163,7 +164,7 @@ class CiWorkflowTests(unittest.TestCase):
         passing = {job: {"result": "success"} for job in required["needs"]}
         self.run_required_check(passing)
         for job in ("rust", "native-macos", "generated-rust", "manifest-cases"):
-            for result in ("failure", "cancelled", "skipped", None):
+            for result in ("failure", "cancelled", "abandoned", "skipped", None):
                 with self.subTest(job=job, result=result):
                     results = {**passing, job: {"result": result}}
                     if result is None:

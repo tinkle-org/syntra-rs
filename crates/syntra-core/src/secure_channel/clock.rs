@@ -31,9 +31,10 @@ impl Default for Clock {
 }
 
 impl Clock {
-    /// Linux/Android use BOOTTIME, Apple uses mach continuous time, and WASM
-    /// preserves the browser dual-clock checks. Other native targets fail closed
-    /// unless the owner supplies a trusted suspend-inclusive source.
+    /// Linux/Android use BOOTTIME, Apple uses mach continuous time, Windows uses
+    /// interrupt time, and WASM preserves the browser dual-clock checks. Other
+    /// native targets fail closed unless the owner supplies a trusted
+    /// suspend-inclusive source.
     pub fn new() -> Self {
         #[cfg(target_arch = "wasm32")]
         return Self::with_source(Arc::new(super::browser_elapsed::Clock::new()));
@@ -100,7 +101,12 @@ struct NativeSource;
 
 #[cfg(all(
     not(target_arch = "wasm32"),
-    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "windows"
+    ))
 ))]
 impl ElapsedSource for NativeSource {
     fn elapsed(&self) -> Option<Duration> {
@@ -108,12 +114,37 @@ impl ElapsedSource for NativeSource {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn windows_ticks_to_duration(ticks: u64) -> Duration {
+    Duration::new(ticks / 10_000_000, ((ticks % 10_000_000) * 100) as u32)
+}
+
 // The only unsafe boundary is the owned-output platform clock FFI. No protocol
 // buffer, key or cipher state enters this module.
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "windows"
+))]
 #[allow(unsafe_code)]
 mod native {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    impl ElapsedSource for NativeSource {
+        fn elapsed(&self) -> Option<Duration> {
+            // Windows 10+/Server 2016+; includes sleep/hibernate, unlike unbiased time.
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn QueryInterruptTime(interrupt_time: *mut u64);
+            }
+            let mut ticks = 0;
+            // SAFETY: writes one u64 to the valid owned output; no pointer is retained.
+            unsafe { QueryInterruptTime(&mut ticks) };
+            Some(windows_ticks_to_duration(ticks))
+        }
+    }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     impl ElapsedSource for NativeSource {
@@ -163,7 +194,12 @@ mod native {
 
 #[cfg(all(
     test,
-    any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "windows"
+    )
 ))]
 #[test]
 fn native_source_is_available_and_monotonic() {
@@ -175,4 +211,27 @@ fn native_source_is_available_and_monotonic() {
         .expect("suspend-inclusive kernel clock");
     assert!(second >= first);
     assert!(Clock::new().age() < super::MAX_AGE);
+}
+
+#[cfg(test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn windows_tick_conversion_preserves_boundaries_without_overflow() {
+    for ticks in [
+        0,
+        1,
+        9_999_999,
+        10_000_000,
+        10_000_001,
+        u64::MAX / 100,
+        u64::MAX / 100 + 1,
+        u64::MAX - 1,
+        u64::MAX,
+    ] {
+        assert_eq!(
+            windows_ticks_to_duration(ticks).as_nanos(),
+            u128::from(ticks) * 100,
+            "ticks: {ticks}"
+        );
+    }
 }
