@@ -47,7 +47,7 @@ wasm-bindgen-test = "0.3"
 prost.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 
 [[bench]]
 name = "frame_codec"
