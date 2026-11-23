@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.6](https://github.com/tinkle-org/syntra-rs/compare/syntra-core-v1.0.0-rc.5...syntra-core-v1.0.0-rc.6) - 2026-11-23
+
+### Fixed
+
+- repair Windows native validation clock and harden required CI gate ([#42](https://github.com/tinkle-org/syntra-rs/pull/42))
+
+### Other
+
+- *(deps)* bump criterion from 0.5.1 to 0.8.2 ([#40](https://github.com/tinkle-org/syntra-rs/pull/40))
+
 ## [1.0.0-rc.4](https://github.com/tinkle-org/syntra-rs/compare/syntra-core-v1.0.0-rc.3...syntra-core-v1.0.0-rc.4) - 2026-11-08
 
 ### Added
