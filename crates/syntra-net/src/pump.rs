@@ -24,7 +24,7 @@ use syntra_runtime::connection::validate_close_grace;
 use syntra_runtime::elapsed::ElapsedClock;
 use syntra_runtime::recovery::wire::RecoveryService;
 use syntra_runtime::terminal::{
-    Coordinator, DriverCommand, Policy as TerminalPolicy, TerminalOutput,
+    Coordinator, DriverCommand, MethodPolicy, Policy as TerminalPolicy, TerminalOutput,
 };
 use syntra_runtime::{
     AuthError, Authenticator, ConnectionConfig, ExecutionBudget, Handler, Host, Initiator,
@@ -503,6 +503,11 @@ pub trait AuthenticatorFactory: Send + Sync {
     fn terminal_receipt(&self, _identity: &VerifiedIdentity) -> Option<TerminalPolicy> {
         None
     }
+    /// Complete per-binding table for fixed and outcome methods. By default,
+    /// preserve the legacy fixed policy. Forward this hook in factory wrappers.
+    fn terminal_methods(&self, identity: &VerifiedIdentity) -> Option<MethodPolicy> {
+        self.terminal_receipt(identity).map(Into::into)
+    }
     fn create(&self, identity: &VerifiedIdentity) -> Result<Arc<dyn Authenticator>, AuthError>;
 
     /// One process-local clock shared by establishment, Core and policy checks.
@@ -801,6 +806,9 @@ impl<F: AuthenticatorFactory> AuthenticatorFactory for RecoveryAuthenticatorFact
     /// Preserve the base factory's explicit per-binding terminal policy.
     fn terminal_receipt(&self, identity: &VerifiedIdentity) -> Option<TerminalPolicy> {
         self.base.terminal_receipt(identity)
+    }
+    fn terminal_methods(&self, identity: &VerifiedIdentity) -> Option<MethodPolicy> {
+        self.base.terminal_methods(identity)
     }
     fn create(&self, identity: &VerifiedIdentity) -> Result<Arc<dyn Authenticator>, AuthError> {
         self.base.create(identity)
@@ -2469,7 +2477,7 @@ async fn accept_records_impl<R: RecordReader, W: RecordWriter>(
         clock.clone(),
     )
     .map_err(|_| Error::Configuration)?;
-    if let Some(policy) = factory.terminal_receipt(&identity) {
+    if let Some(policy) = factory.terminal_methods(&identity) {
         if !terminal_supported || authorization.is_some() {
             return Err(Error::Configuration);
         }
@@ -2477,7 +2485,7 @@ async fn accept_records_impl<R: RecordReader, W: RecordWriter>(
         // cannot flush output from reads; the sole writer/barrier/raw gates above
         // own all protected output and bounded retirement for this connection.
         let coordinator = host
-            .install_terminal_tcp(policy)
+            .install_terminal_methods_tcp(policy)
             .map_err(|_| Error::Configuration)?;
         coordinator
             .refresh()

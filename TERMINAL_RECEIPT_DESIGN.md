@@ -1,7 +1,8 @@
 # Scoped terminal receipts
 
 A scoped terminal receipt lets one authorized, self-withdrawing operation attempt
-one fixed success result on its initiating encrypted connection. The native TCP
+one host-configured success result on its initiating encrypted connection. A method
+can have a fixed result or a bounded choice selected by fresh authority evidence. The native TCP
 path is implemented and disabled by default. Withdrawal is not delayed until
 client acknowledgement, and loss never restores authority or permits replay.
 
@@ -32,6 +33,29 @@ fn retirement_policy(authority: Arc<dyn Authority>) -> Policy {
 }
 ```
 
+For multiple methods, override `AuthenticatorFactory::terminal_methods(identity)`.
+Its default converts `terminal_receipt` without changing existing `Policy`
+literals, `Observation` matches, or `Authority` implementations. An override
+returns the **complete** table, not additions to the legacy hook. For example:
+
+```rust
+use syntra_runtime::terminal::{MethodPolicy, MethodReceipts, Policy};
+
+fn with_outcomes(fixed: Policy) -> MethodPolicy {
+    let mut policy: MethodPolicy = fixed.into();
+    policy.methods.insert("/example.Authority/Resolve".into(),
+        MethodReceipts::Outcomes(vec![vec![], b"resolved".to_vec()]));
+    policy
+}
+```
+
+Each outcome method has **1–8** non-sensitive payloads. ID 1 names the first
+entry (here, the empty encoding of a default protobuf message); ID 2 names the
+second. Zero and IDs beyond the method's table are invalid. The table is fixed
+for the binding; keep the meaning of stored IDs stable for the operation. The
+client sees only the existing correlated `RpcResult`, never the ID or table.
+Forward `terminal_methods` in custom factory wrappers to preserve this policy.
+
 The typed adapter supplies **complete operation-aware connection authority**.
 It replaces the ordinary connection guard for this connection. TCP establishment
 refuses a terminal policy combined with a separate generic
@@ -48,9 +72,10 @@ that context and lease path. `AllowAll` forwards it, but is not a production
 authorization policy.
 
 For the configured method, call `context.retire(expected_revision).await`.
-`Authority::commit` owns the application mutation, withdrawal, private owner,
-and every condition represented by the fixed receipt in the same conditional
-transaction. Do not mutate in the handler before or after this await. On success,
+`Authority::commit` owns the mutation. For a fixed method it records the
+withdrawal, private owner and every receipt condition in the same conditional
+transaction; for an outcome method follow the [distributed adapter contract](#distributed-outcome-adapters).
+Do not mutate in the handler before or after this await. On success,
 `retire` returns AFTER commit and fresh owned-evidence verification; return its
 `HandlerOutcome` promptly.
 For example, this helper can be called from the context-aware hook:
@@ -66,7 +91,7 @@ async fn retire_request(context: RequestContext, expected_revision: u64) -> Hand
 }
 ```
 
-`retire` returns the fixed outcome after the coordinated transition; it does
+`retire` returns the evidenced payload after the coordinated transition; it does
 **not** await its own output. Waiting inside the handler for receipt delivery or
 joined cleanup would block work that depends on that handler returning. A
 refusal does not authorize mutation elsewhere. Before reservation, the handler
@@ -101,7 +126,7 @@ constructed from public request IDs or transferred to a new connection.
   authenticated `Principal`, and fixed method. The adapter is already bound to
   the verified channel's scope/enrollment by its factory.
 
-Atomically compare the expected active revision and persist the complete
+For a fixed method, atomically compare the expected active revision and persist the complete
 transition owner, new revision, and every application condition represented by
 the fixed receipt. `ReservationId::as_bytes()` is for private storage only, never
 peer input, wire data, or diagnostics. The SDK cannot verify durability from a
@@ -116,6 +141,8 @@ commit/return gap without restoring ordinary authority.
 | --- | --- |
 | `Active { revision }` | Before commit, require the expected active revision; no ordinary egress after fencing |
 | `OwnedCommitted { reservation, expected_revision, revision }` | Exact owner/expected revision and strictly newer committed revision; eligible only for the reserved result |
+| `OwnedPending(withdrawal)` (outcome method) | Exact owned withdrawal is known; pin owner and revisions. Keep ordinary output fenced; never select or write a receipt. |
+| `OwnedOutcome { withdrawal, outcome_id }` (outcome method) | Require the same identity and revisions, pin the allowlisted ID, and allow only its prevalidated frame. |
 | `HardDenied` | External withdrawal, expiry, or superseding denial; sticky abort |
 | `Unknown`, timeout, stale read, or mismatched evidence | Sticky abort |
 
@@ -125,6 +152,36 @@ to `12`, even with the same owner, aborts in committed, selected, and consumed
 phases. Active after commit also aborts, and restoring old evidence cannot clear
 failure. A later external revoke must remain visible as `HardDenied`; an old
 owner tombstone alone is insufficient.
+
+### Distributed outcome adapters
+
+For an outcome method the SDK calls `Authority::observe_outcome_with_budget`
+after reservation, including the precommit barrier checks. It still calls
+`observe_with_budget(None, ...)` for ordinary connection authority. Use
+`OutcomeEvidence::Binding` for active, hard-denied or unknown state. A legacy
+`OwnedCommitted` observation is **not** outcome evidence, even for a one-entry table.
+
+1. Conditionally replace the expected active revision. Record the withdrawal,
+   its strictly newer revision and its private operation owner **atomically**.
+2. At the application store, commit the effect **and its immutable outcome ID
+   atomically**, keyed to the same operation. If adapter work must be retried,
+   use that owner idempotently: recover the recorded result, never repeat the
+   effect or choose a new ID. This is not a client retry or a receipt replay.
+3. Compose a fresh result read with fresh authoritative evidence of the exact,
+   **non-superseded** withdrawal for this binding, principal, method and owner.
+   Verify persisted owner bytes before returning the claim's `ReservationId`.
+   Never infer the application result from withdrawal, handler input, an RPC
+   acknowledgement or `commit` returning. A failed/unavailable read is `Unknown`,
+   not pending; current expiry or superseding denial wins over an old result.
+
+A monitor may see `OwnedPending` while `commit` is in flight. Fresh reads can
+maintain monitoring but cannot renew the operation cutoff. A final ID may also
+be visible before the callback returns: it is pinned immediately, even if two
+entries encode identical bytes. Neither observation permits early selection.
+After return, the SDK requires a fresh final observation; pending or active at
+that gate aborts without waiting for another result. Regression to pending or
+active, owner/revision/ID drift, and unknown or denied evidence abort stickily,
+including during a partial write. Loss does not roll back either store.
 
 Reads must cover current expiry, enrollment/key policy, and application authority.
 Stale caches or replicas cannot supply proof. `read_timeout` is **100..=250 ms**,
@@ -156,9 +213,10 @@ The runtime coordinator in `crates/syntra-runtime/src/host_terminal.rs` and nati
 pump in `crates/syntra-net/src/pump.rs` implement this sequence:
 
 1. Validate policy, native TCP support, call ownership, revision, time, and size.
-2. Copy the complete correlated success `Frame` and reserve one private owner.
-   The maximum is **1,024 serialized Frame bytes**, excluding the four-byte
-   frame-stream prefix; it is not a payload-only allowance.
+2. Encode **every** candidate success `Frame` with this call's version and request
+   ID before fencing or mutation. Each must fit **1,024 serialized Frame bytes**,
+   excluding the four-byte frame-stream prefix. Even an oversized unselected
+   candidate refuses reservation. Reserve one private owner for the call.
 3. Fence ordinary dispatch and output, notifications, recovery, and sibling
    results. Discard unstarted ordinary output.
 4. Wait for an active ordinary **whole frame**, including all its records, to
@@ -194,7 +252,7 @@ serialized handoff wins. Remote denial after the last authoritative read can rac
 even the first bytes; accepted bytes cannot be recalled. No atomic
 database-to-socket transaction or delivery guarantee is implied.
 
-The fixed payload must therefore be **non-sensitive**: a remote denial can happen
+Every configured payload must therefore be **non-sensitive**: a remote denial can happen
 after the final authoritative read but before or during TCP handoff, and bytes
 already accepted by the carrier cannot be recalled. The receipt must contain no
 secret, fresh credential, or protected application data. Local sticky denial gates
@@ -290,6 +348,12 @@ Runtime coverage includes `crates/syntra-runtime/src/host_terminal.rs`,
 
 - Exact/private ownership, stable newer revisions, disabled/unsupported preflight,
   and the 1,024/1,025-byte complete-frame boundary.
+- Both authoritative choices (including empty bytes) over encrypted native TCP,
+  with an observed pending interval and fixed/outcome methods in one policy;
+  refusal when a different candidate exceeds the frame bound or commit returns
+  while pending. Runtime classifier tests in `host_terminal_outcome_tests.rs`
+  cover invalid IDs, foreign and drifting evidence, unchanged cutoffs and ID
+  drift during handoff even for byte-identical payloads.
 - Full-frame barriers, dispatch/recovery fencing, fatal-reader publication,
   cancellation, freshness/deadline ties, partial loss and retained work.
 - `None`, zero, long and maximum-duration caps against wire/default/deployment
@@ -342,6 +406,10 @@ is marked **Implemented** for specification adoption and registration of fourtee
 conformance case groups, which remain **NOT_EXECUTED**. It records sole-maintainer
 human self-review/self-approval, not independent security review. Adoption does not
 activate host policy or establish durable application integration.
+
+The method-specific outcome table and distributed evidence hook described here
+are opt-in SDK behavior, not a change to those wire inputs or a claim of upstream
+adoption or conformance for distributed outcomes.
 
 `SNTR-RPC-004` already requires receipt-origin accounting and permits documented
 bounded host policy. The optional SDK-local request-budget hooks require no wire

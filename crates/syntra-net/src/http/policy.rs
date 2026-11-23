@@ -85,6 +85,12 @@ impl AuthenticatorFactory for LimitedFactory {
         // handler effects, instead of silently dropping host configuration.
         self.base.terminal_receipt(identity)
     }
+    fn terminal_methods(
+        &self,
+        identity: &VerifiedIdentity,
+    ) -> Option<syntra_runtime::terminal::MethodPolicy> {
+        self.base.terminal_methods(identity)
+    }
     fn create(&self, identity: &VerifiedIdentity) -> Result<Arc<dyn Authenticator>, AuthError> {
         Ok(self.wrap(self.base.create(identity)?))
     }

@@ -73,9 +73,13 @@ an application identity system or permission policy.
 
 **Opt-in native TCP terminal receipt:** `AuthenticatorFactory::terminal_receipt`
 supplies a fixed method/payload policy and a typed application authority adapter.
+Alternatively, `terminal_methods` configures fixed and outcome methods on the
+same binding. For an outcome method, fresh evidence of the durable application
+result selects one of up to eight host-configured payloads; withdrawal alone
+does not select one.
 `Handler::handle_with_context` receives a private `RequestContext`; its
 `retire(expected_revision)` fences ordinary traffic, waits for full-frame writer
-quiescence, and attempts the conditional transition before returning the fixed
+quiescence, and attempts the conditional transition before returning the evidenced
 handler outcome. Return that outcome promptly; do not await its own output.
 Only exact, fresh owned-commit evidence permits that result. The typed per-binding
 authority replaces the ordinary connection guard; combining it with an independent
