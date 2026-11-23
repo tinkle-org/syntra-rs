@@ -44,6 +44,7 @@ fn receive<T>(operation: Operation<T>) -> T {
         .wait(WAIT)
         .unwrap_or_else(|e| panic!("managed operation: {e:?}"))
 }
+#[track_caller]
 fn until(mut predicate: impl FnMut() -> bool) {
     let deadline = Instant::now() + WAIT;
     while !predicate() {
@@ -74,6 +75,7 @@ fn retry_config() -> ReconnectConfig {
         initial_network_available: true,
     }
 }
+#[track_caller]
 fn ready(client: &ManagedClient, after: u64) -> u64 {
     let mut generation = 0;
     until(|| match client.status() {
@@ -423,7 +425,7 @@ fn combined_parent_and_local_controls_retire_associations_without_offline_resume
         let client = connect(
             &network,
             server.local_addr(),
-            trust,
+            trust.clone(),
             provider(carrier, &tls),
             retry_config(),
         );
@@ -459,7 +461,14 @@ fn combined_parent_and_local_controls_retire_associations_without_offline_resume
         assert!(!Arc::ptr_eq(&old_host, &server.hosts()[0]));
         client.stop();
         until(|| server.status().associations == 0);
+        server.stop();
+        until(|| server.status().stopped);
+        assert!(clean(&server));
         for action in 0..2 {
+            // Bind under parent pause so no accept from an earlier online
+            // revision can take and discard the probe before local resume.
+            network.pause();
+            let server = listen(&network, config(&trust, provider(carrier, &tls)));
             if action == 0 {
                 server.pause();
             } else {
@@ -467,10 +476,12 @@ fn combined_parent_and_local_controls_retire_associations_without_offline_resume
             }
             let before = tls.accepts.load(Ordering::SeqCst);
             let mut socket = TcpStream::connect(server.local_addr()).unwrap();
+            network.resume();
             network.pause();
             network.resume(); // Does not override this server's local mask.
             thread::sleep(Duration::from_millis(20));
             assert_eq!(tls.accepts.load(Ordering::SeqCst), before);
+            assert!(clean(&server));
             if action == 0 {
                 server.resume();
             } else {
@@ -482,10 +493,11 @@ fn combined_parent_and_local_controls_retire_associations_without_offline_resume
             }
             network.pause();
             peer_closed(&mut socket);
-            network.resume();
+            server.stop();
+            until(|| server.status().stopped);
+            assert!(clean(&server));
         }
         shutdown(&mut network);
-        assert!(clean(&server));
     }
 }
 

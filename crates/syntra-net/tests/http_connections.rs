@@ -1167,21 +1167,26 @@ async fn native_header_byte_line_and_count_bounds_are_inclusive_and_pre_body() {
     let _serial = SERIAL.lock().await;
     let fixture = Fixture::start(Mode::Returning, Carrier::Http, false, |_| {}).await;
     let base = poll_header(&fixture);
+    // End each 431 case at the rejection boundary: unread TCP input can reset
+    // the connection on close before the client receives the response.
+    let mut over_total = header_size(&base, codec::MAX_HEADERS + 1);
+    over_total.truncate(codec::MAX_HEADERS); // No room left to complete the header.
     let mut cases = vec![
         (header_size(&base, codec::MAX_HEADERS), 410),
-        (header_size(&base, codec::MAX_HEADERS + 1), 431),
+        (over_total, 431),
     ];
     for (size, status) in [
         (codec::MAX_FIELD_LINE, 410),
         (codec::MAX_FIELD_LINE + 1, 431),
     ] {
-        cases.push((
-            extra_header(
-                &base,
-                &format!("X-Pad: {}", "p".repeat(size - "X-Pad: ".len() - 2)),
-            ),
-            status,
-        ));
+        let mut request = extra_header(
+            &base,
+            &format!("X-Pad: {}", "p".repeat(size - "X-Pad: ".len() - 2)),
+        );
+        if size > codec::MAX_FIELD_LINE {
+            request.truncate(request.len() - 2);
+        }
+        cases.push((request, status));
     }
     let fields = base
         .split("\r\n")
@@ -1193,15 +1198,21 @@ async fn native_header_byte_line_and_count_bounds_are_inclusive_and_pre_body() {
         for n in fields..count {
             request = extra_header(&request, &format!("X-Field-{n}: p"));
         }
+        if count > codec::MAX_FIELDS {
+            request.truncate(request.len() - 2);
+        }
         cases.push((request, status));
     }
+    let (_, rest) = base.split_once("\r\n").unwrap();
     for (size, status) in [
         (codec::MAX_START_LINE, 404),
         (codec::MAX_START_LINE + 1, 431),
     ] {
-        let (_, rest) = base.split_once("\r\n").unwrap();
-        let request = format!("POST /{} HTTP/1.1\r\n{rest}", "p".repeat(size - 17));
-        assert_eq!(request.split_once("\r\n").unwrap().0.len() + 2, size);
+        let mut request = format!("POST /{} HTTP/1.1\r\n", "p".repeat(size - 17));
+        assert_eq!(request.len(), size);
+        if size <= codec::MAX_START_LINE {
+            request.push_str(rest);
+        }
         cases.push((request, status));
     }
     for (request, status) in cases {
