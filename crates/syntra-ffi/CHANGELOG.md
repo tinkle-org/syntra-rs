@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.6](https://github.com/tinkle-org/syntra-rs/compare/syntra-ffi-v1.0.0-rc.5...syntra-ffi-v1.0.0-rc.6) - 2026-11-23
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [1.0.0-rc.2](https://github.com/tinkle-org/syntra-rs/compare/syntra-ffi-v1.0.0-rc.1...syntra-ffi-v1.0.0-rc.2) - 2026-11-05
 
 ### Added
