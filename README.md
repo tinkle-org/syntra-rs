@@ -401,13 +401,14 @@ receipt delivery. See [terminal deadlines](TERMINAL_RECEIPT_DESIGN.md#deadline-a
 ## Optional terminal receipt
 
 Native TCP supports a default-disabled terminal result for an authorized
-self-withdrawing operation. `AuthenticatorFactory::terminal_receipt(identity)`
-supplies a per-verified-binding fixed policy and complete typed authority adapter.
-`Handler::handle_with_context` calls `context.retire(expected_revision).await`.
-`Authority::commit` owns the conditional application mutation, withdrawal, private
-owner, and every receipt condition in the same transaction. On success, `retire`
-verifies owned evidence and returns AFTER commit; the handler returns that
-`HandlerOutcome` promptly, without further mutation or waiting for its own output.
+self-withdrawing operation. Use `AuthenticatorFactory::terminal_receipt` for a
+fixed payload, or `terminal_methods` to configure fixed and outcome methods on
+the same verified binding. An outcome method allows 1–8 non-sensitive payloads.
+The handler calls `context.retire(expected_revision).await`; the authority adapter
+owns the mutation. An owned withdrawal with a pending application result cannot
+authorize output. After `commit` returns, `retire` requires fresh final evidence:
+for an outcome method, the durable result for that same operation selects the
+payload. The handler returns that `HandlerOutcome` without waiting for delivery.
 A selected outcome, complete local writing, peer observation,
 and joined cleanup are different facts. Loss is unknown and never automatically
 retried or replayed.

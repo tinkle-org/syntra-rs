@@ -16,6 +16,7 @@ use syntra_runtime::{terminal::*, *};
 use tokio::sync::Notify;
 
 const METHOD: &str = "/example.Authority/Retire";
+const CHOICE: &str = "/example.Authority/Resolve";
 
 /// Bounded wall-time diagnostics, separate from any explicitly driven test clock.
 /// Observation events describe fixture state, not an SDK authorization verdict.
@@ -41,11 +42,12 @@ impl EventTrace {
 }
 /// Linearizable in-memory authority with explicit commit-return and denial controls.
 struct AuthorityFixture {
-    state: Mutex<(u64, Option<Transition>, bool)>,
+    state: Mutex<(u64, Option<Transition>, bool, Option<u8>)>,
     commits: AtomicUsize,
     reads: AtomicUsize,
     mode: AtomicUsize,
     committed: Notify,
+    pending_observed: Notify,
     reserved: Notify,
     release: Notify,
     trace: Arc<EventTrace>,
@@ -56,11 +58,12 @@ impl AuthorityFixture {
     /// Select one evidence/failure mode for a new active binding.
     fn new(mode: usize) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new((1, None, false)),
+            state: Mutex::new((1, None, false, None)),
             commits: AtomicUsize::new(0),
             reads: AtomicUsize::new(0),
             mode: AtomicUsize::new(mode),
             committed: Notify::new(),
+            pending_observed: Notify::new(),
             reserved: Notify::new(),
             release: Notify::new(),
             trace: Arc::new(EventTrace::new()),
@@ -70,6 +73,36 @@ impl AuthorityFixture {
     }
 }
 impl Authority for AuthorityFixture {
+    fn observe_outcome_with_budget(
+        &self,
+        _: Transition,
+        _: ElapsedDeadline,
+    ) -> BoxFuture<'_, OutcomeEvidence> {
+        Box::pin(async {
+            let s = self.state.lock().unwrap();
+            if s.2 {
+                return OutcomeEvidence::Binding(Observation::HardDenied);
+            }
+            let Some(owner) = &s.1 else {
+                return OutcomeEvidence::Binding(Observation::Active { revision: s.0 });
+            };
+            let withdrawal = OwnedWithdrawal {
+                reservation: owner.reservation.clone(),
+                expected_revision: owner.expected_revision,
+                revision: s.0,
+            };
+            match s.3 {
+                Some(outcome_id) => OutcomeEvidence::OwnedOutcome {
+                    withdrawal,
+                    outcome_id,
+                },
+                None => {
+                    self.pending_observed.notify_one();
+                    OutcomeEvidence::OwnedPending(withdrawal)
+                }
+            }
+        })
+    }
     /// Record the actual read bound while preserving legacy fixture behavior.
     fn observe_with_budget(
         &self,
@@ -155,6 +188,10 @@ impl Authority for AuthorityFixture {
             if self.mode.load(Ordering::SeqCst) == 5 {
                 self.release.notified().await;
             }
+            if let mode @ (6 | 7) = self.mode.load(Ordering::SeqCst) {
+                self.release.notified().await;
+                self.state.lock().unwrap().3 = Some(if mode == 6 { 1 } else { 2 });
+            }
         })
     }
 }
@@ -189,6 +226,14 @@ impl AuthenticatorFactory for Factory {
             read_timeout: Duration::from_millis(100),
         })
     }
+    fn terminal_methods(&self, identity: &VerifiedIdentity) -> Option<MethodPolicy> {
+        let mut policy: MethodPolicy = self.terminal_receipt(identity)?.into();
+        policy.methods.insert(
+            CHOICE.into(),
+            MethodReceipts::Outcomes(vec![vec![], self.payload.clone()]),
+        );
+        Some(policy)
+    }
 }
 /// Retire only the configured method; sibling methods exercise ordinary output.
 struct Retire;
@@ -207,7 +252,7 @@ impl Handler for Retire {
         context: RequestContext,
     ) -> HandlerFut {
         Box::pin(async move {
-            if method != METHOD {
+            if method != METHOD && method != CHOICE {
                 return HandlerOutcome::Payload(p);
             }
             context.retire(1).await.unwrap_or_else(|_| {
@@ -441,6 +486,61 @@ async fn encrypted_tcp_exact_receipt_and_retirement() {
     client.close().await;
     host.close().await;
 }
+/// The watchdog observes the owned withdrawal while the result is still unresolved.
+#[tokio::test]
+async fn encrypted_tcp_serves_the_authoritative_outcome_not_the_request_payload() {
+    for (mode, expected) in [(6, &b""[..]), (7, &b"resolved"[..])] {
+        let authority = AuthorityFixture::new(mode);
+        let (client, host) = pair(authority.clone(), b"resolved".to_vec(), true).await;
+        let conn = client.conn.clone();
+        let call = tokio::spawn(async move { conn.call(CHOICE, b"guess".to_vec(), 2000).await });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            authority.pending_observed.notified(),
+        )
+        .await
+        .unwrap();
+        assert!(!call.is_finished());
+        assert!(host.host.notify(b"ordinary".to_vec()).await.is_err());
+        authority.release.notify_one();
+        let result = call.await.unwrap().unwrap();
+        assert_eq!(result, expected);
+        closed(&host).await;
+        assert_eq!(authority.commits.load(Ordering::SeqCst), 1);
+        client.close().await;
+        host.close().await;
+    }
+}
+
+#[tokio::test]
+async fn pending_after_commit_returns_closes_without_a_result() {
+    let authority = AuthorityFixture::new(8);
+    let (client, host) = pair(authority.clone(), vec![], true).await;
+    assert!(client.conn.call(CHOICE, vec![], 2000).await.is_err());
+    closed(&host).await;
+    assert_eq!(authority.commits.load(Ordering::SeqCst), 1);
+    client.close().await;
+    host.close().await;
+}
+
+#[tokio::test]
+async fn oversized_unselected_candidate_refuses_before_fencing_or_mutation() {
+    let authority = AuthorityFixture::new(6);
+    let (client, host) = pair(authority.clone(), vec![0; 1024], true).await;
+    assert!(client.conn.call(CHOICE, vec![], 2000).await.is_err());
+    assert_eq!(authority.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        client
+            .conn
+            .call("/example.Authority/Echo", vec![1], 1000)
+            .await
+            .unwrap(),
+        [1]
+    );
+    client.close().await;
+    host.close().await;
+}
+
 /// Default-disabled retirement leaves ordinary RPCs available and commits nothing.
 #[tokio::test]
 async fn disabled_never_mutates_and_connection_remains_ordinary() {
@@ -1238,9 +1338,9 @@ struct ReturningFixture {
 }
 impl ReturningFixture {
     /// Start with one active binding and no operation or refusal observations.
-    fn new() -> Arc<Self> {
+    fn new(mode: usize) -> Arc<Self> {
         Arc::new(Self {
-            authority: AuthorityFixture::new(0),
+            authority: AuthorityFixture::new(mode),
             handlers: AtomicUsize::new(0),
             denials: AtomicUsize::new(0),
         })
@@ -1311,6 +1411,65 @@ fn returning_configs(fixture: Arc<ReturningFixture>) -> (ClientConfig, ServerCon
     server.mode = Mode::Returning;
     server.store = Some(fixture);
     (client, server)
+}
+
+/// Establish real TCP peers and check the responder's confirmed Returning binding.
+async fn returning_pair(
+    listener: &tcp::Listener,
+    server: &ServerConfig,
+    client: ClientConfig,
+    fixture: Arc<ReturningFixture>,
+) -> (tcp::HostHandle, tcp::ClientHandle) {
+    let (accepted, connected) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            listener.accept(
+                server,
+                fixture.factory(),
+                Arc::new(AllowAll(ReturningRetire(fixture))),
+                ConnectionConfig::default(),
+                Limits::default(),
+            ),
+            tcp::connect(
+                listener.local_addr().unwrap(),
+                client,
+                b"fixture".to_vec(),
+                ConnectionConfig::default(),
+                Limits::default(),
+            )
+        )
+    })
+    .await
+    .unwrap();
+    let host = accepted.unwrap();
+    assert_eq!(host.identity.context(), &returning_context());
+    (host, connected.unwrap())
+}
+
+/// Each outcome reaches its initiating Returning client; each binding retires once.
+#[tokio::test]
+async fn verified_returning_tcp_serves_both_authoritative_outcomes() {
+    for (mode, outcome_id, expected) in [(6, 1, &b""[..]), (7, 2, &b"retired"[..])] {
+        let fixture = ReturningFixture::new(mode);
+        let (client, server) = returning_configs(fixture.clone());
+        let listener = tcp::Listener::bind("127.0.0.1:0", 2).await.unwrap();
+        let (host, client) = returning_pair(&listener, &server, client, fixture.clone()).await;
+        // Let commit publish the fixture result. The request is identical in both cases.
+        fixture.authority.release.notify_one();
+        assert_eq!(
+            client
+                .conn
+                .call(CHOICE, b"guess".to_vec(), 2000)
+                .await
+                .unwrap(),
+            expected
+        );
+        closed(&host).await;
+        assert_eq!(fixture.authority.state.lock().unwrap().3, Some(outcome_id));
+        assert_eq!(fixture.handlers.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.authority.commits.load(Ordering::SeqCst), 1);
+        client.close().await;
+        host.close().await;
+    }
 }
 
 /// Inspect and replay the bounded first message through native acceptance; count
@@ -1385,7 +1544,7 @@ async fn returning_probe(
 /// Wrong-key native authentication refusal does not prove an active binding withdrew.
 #[tokio::test]
 async fn wrong_key_failure_is_not_withdrawn_binding_evidence() {
-    let fixture = ReturningFixture::new();
+    let fixture = ReturningFixture::new(0);
     let (client, server) = returning_configs(fixture.clone());
     let listener = tcp::Listener::bind("127.0.0.1:0", 2).await.unwrap();
     assert!(
@@ -1413,7 +1572,7 @@ async fn wrong_key_failure_is_not_withdrawn_binding_evidence() {
 /// refusal after retirement counts, and no refused attempt reaches the handler.
 #[tokio::test]
 async fn lookup_is_pure_and_validates_the_requested_binding() {
-    let fixture = ReturningFixture::new();
+    let fixture = ReturningFixture::new(0);
     assert_eq!(
         *fixture.lookup(&returning_context()).unwrap().expose(),
         [8; 32]
@@ -1428,27 +1587,7 @@ async fn lookup_is_pure_and_validates_the_requested_binding() {
     let (client, server) = returning_configs(fixture.clone());
     let public = client.server_public_key;
     let listener = tcp::Listener::bind("127.0.0.1:0", 2).await.unwrap();
-    let (accepted, connected) = tokio::time::timeout(Duration::from_secs(2), async {
-        tokio::join!(
-            listener.accept(
-                &server,
-                fixture.factory(),
-                Arc::new(AllowAll(ReturningRetire(fixture.clone()))),
-                ConnectionConfig::default(),
-                Limits::default(),
-            ),
-            tcp::connect(
-                listener.local_addr().unwrap(),
-                client,
-                b"fixture".to_vec(),
-                ConnectionConfig::default(),
-                Limits::default(),
-            )
-        )
-    })
-    .await
-    .unwrap();
-    let (host, client) = (accepted.unwrap(), connected.unwrap());
+    let (host, client) = returning_pair(&listener, &server, client, fixture.clone()).await;
     assert_eq!(
         client.conn.call(METHOD, vec![], 2000).await.unwrap(),
         b"retired"

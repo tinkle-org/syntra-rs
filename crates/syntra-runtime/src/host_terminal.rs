@@ -56,8 +56,33 @@ pub enum Observation {
     Unknown,
 }
 
+/// Fresh private identity of a non-superseded withdrawal, not proof of its application result.
+pub struct OwnedWithdrawal {
+    /// Owner persisted with the withdrawal (not copied from an unverified claim).
+    pub reservation: ReservationId,
+    /// Active revision replaced by this owner.
+    pub expected_revision: u64,
+    /// Strictly newer, immutable withdrawal revision.
+    pub revision: u64,
+}
+
+/// Fresh evidence for a method with host-configured outcome choices.
+pub enum OutcomeEvidence {
+    /// Ordinary authority; `OwnedCommitted` only proves a fixed-method result.
+    Binding(Observation),
+    /// Known exact withdrawal, but no durable application result yet. Never writable.
+    OwnedPending(OwnedWithdrawal),
+    /// The same withdrawal plus this operation's immutable durable result.
+    OwnedOutcome {
+        /// Fresh evidence that the withdrawal is still authoritative.
+        withdrawal: OwnedWithdrawal,
+        /// One-based index into the method's configured payloads; zero is invalid.
+        outcome_id: u8,
+    },
+}
+
 /// Trusted application durability boundary. A successful callback is deliberately
-/// not commit evidence: all gates independently call `observe`. Commit ownership
+/// not commit evidence: fresh authority reads decide eligibility. Commit ownership
 /// must be visible there before `commit` returns. Retain a lease in any spawned
 /// or blocking work until it actually ends. The SDK cannot prove DB durability.
 pub trait Authority: Send + Sync {
@@ -80,9 +105,23 @@ pub trait Authority: Send + Sync {
     ) -> BoxFuture<'_, Observation> {
         self.observe(transition)
     }
+
+    /// Fresh read for a reserved outcome method. Ordinary and fixed-method reads
+    /// still use `observe_with_budget`. Legacy evidence cannot prove an outcome ID.
+    fn observe_outcome_with_budget(
+        &self,
+        transition: Transition,
+        budget: ElapsedDeadline,
+    ) -> BoxFuture<'_, OutcomeEvidence> {
+        Box::pin(async move {
+            OutcomeEvidence::Binding(self.observe_with_budget(Some(transition), budget).await)
+        })
+    }
     /// Own the application mutation: conditionally commit expected revision,
     /// withdrawal, private owner, and every fixed-receipt condition in the same
-    /// transaction. The handler must not mutate after awaiting `retire`.
+    /// transaction. For outcome methods, persist the application effect and its
+    /// immutable result together under that same operation's private owner. The
+    /// handler must not mutate after awaiting `retire`.
     /// Return carries no proof; errors/uncertainty must be observable as Unknown.
     fn commit(&self, transition: Transition, lease: ExecutionLease) -> BoxFuture<'_, ()>;
 
@@ -117,6 +156,43 @@ pub struct Policy {
     /// it is not a scheduling guarantee or permission to use expired evidence.
     /// Reads must finish before both prior freshness and the operation cutoff.
     pub read_timeout: Duration,
+}
+
+/// Immutable, non-sensitive success payloads for one authorized method.
+#[derive(Clone)]
+pub enum MethodReceipts {
+    /// Legacy receipt, requires `OwnedCommitted`.
+    Fixed(Vec<u8>),
+    /// One to eight payloads, indexed by authority outcome IDs starting at one.
+    Outcomes(Vec<Vec<u8>>),
+}
+impl MethodReceipts {
+    fn payloads(&self) -> &[Vec<u8>] {
+        match self {
+            Self::Fixed(bytes) => std::slice::from_ref(bytes),
+            Self::Outcomes(entries) => entries,
+        }
+    }
+}
+
+/// Per-binding policy. All configured methods share one complete connection authority.
+#[derive(Clone)]
+pub struct MethodPolicy {
+    /// Only exact method names in this table may reserve a receipt.
+    pub methods: std::collections::BTreeMap<String, MethodReceipts>,
+    /// Bound to the verified identity, including all superseding denials.
+    pub authority: Arc<dyn Authority>,
+    /// Same freshness bounds as `Policy::read_timeout`.
+    pub read_timeout: Duration,
+}
+impl From<Policy> for MethodPolicy {
+    fn from(policy: Policy) -> Self {
+        Self {
+            methods: [(policy.method, MethodReceipts::Fixed(policy.payload))].into(),
+            authority: policy.authority,
+            read_timeout: policy.read_timeout,
+        }
+    }
 }
 
 /// Local reservation failure; contains no storage diagnostics or private IDs.
@@ -176,7 +252,7 @@ impl RequestContext {
     }
 
     /// Fence/quiesce, invoke `Authority::commit` for the application transaction,
-    /// verify its owned evidence, and return the fixed handler outcome AFTER
+    /// verify its owned evidence, and return the configured handler outcome AFTER
     /// commit. Return it promptly without further mutation or waiting for output.
     /// A retained SDK owner closes on loss/deadline even if this waiter is dropped.
     /// Expected revision zero or u64::MAX is refused before mutation or fencing.
@@ -190,7 +266,7 @@ impl RequestContext {
             .unwrap()
             .clone()
             .ok_or(Refused::Unsupported)?;
-        if coordinator.policy.method != self.method {
+        if !coordinator.policy.methods.contains_key(&self.method) {
             return Err(Refused::Unsupported);
         }
         let session = host
@@ -224,6 +300,7 @@ impl RequestContext {
                 return Err(Refused::Unavailable);
             }
             coordinator.reserve(
+                &self.method,
                 self.id,
                 self.version,
                 self.deadline,
@@ -264,6 +341,7 @@ impl RequestContext {
 enum Phase {
     Active,
     Reserved,
+    Committing,
     Committed,
     Selected,
     Consumed,
@@ -274,13 +352,43 @@ enum Phase {
 struct State {
     phase: Phase,
     claim: Option<Transition>,
-    /// First accepted owned revision, immutable for the reservation and its output.
-    committed_revision: Option<u64>,
+    /// First accepted withdrawal revision, pinned even before a result exists.
+    withdrawal_revision: Option<u64>,
+    /// Prevalidated correlated frames. Only the pinned entry can reach the writer.
+    frames: Vec<Vec<u8>>,
+    final_index: Option<usize>,
     id: u64,
-    bytes: Vec<u8>,
     cutoff: Instant,
     deadline: Instant,
     fresh_until: Option<Instant>,
+}
+impl State {
+    fn final_bytes(&self) -> Option<&[u8]> {
+        self.final_index.map(|i| self.frames[i].as_slice())
+    }
+
+    /// Validate and pin both halves of the proof. None is a positive pending
+    /// observation, not permission to forget a previously observed final ID.
+    fn accept_owned(&mut self, withdrawal: OwnedWithdrawal, index: Option<usize>) -> bool {
+        if !matches!(
+            self.phase,
+            Phase::Committing | Phase::Committed | Phase::Selected | Phase::Consumed
+        ) || !self.claim.as_ref().is_some_and(|claim| {
+            claim.reservation == withdrawal.reservation
+                && claim.expected_revision == withdrawal.expected_revision
+        }) || withdrawal.revision <= withdrawal.expected_revision
+            || self
+                .withdrawal_revision
+                .is_some_and(|r| r != withdrawal.revision)
+            || index.is_some_and(|i| i >= self.frames.len())
+            || (self.final_index.is_some() && self.final_index != index)
+        {
+            return false;
+        }
+        self.withdrawal_revision = Some(withdrawal.revision);
+        self.final_index = index;
+        true
+    }
 }
 
 /// Typed sole-writer message. Only a conforming native TCP driver may install
@@ -311,7 +419,7 @@ impl TerminalOutput {
 /// Shared sticky classifier used by selection, reader, writer and watchdog.
 #[doc(hidden)]
 pub struct Coordinator {
-    policy: Policy,
+    policy: MethodPolicy,
     clock: ElapsedClock,
     state: Mutex<State>,
     commands: mpsc::Sender<DriverCommand>,
@@ -390,7 +498,7 @@ impl Coordinator {
         }
         let mut s = self.state.lock().unwrap();
         if s.phase != Phase::Consumed
-            || s.bytes != output.bytes
+            || s.final_bytes() != Some(output.bytes())
             || !s
                 .claim
                 .as_ref()
@@ -421,6 +529,7 @@ impl Coordinator {
     /// Validate and pre-encode once, then install a fresh private operation owner.
     fn reserve(
         &self,
+        method: &str,
         id: u64,
         version: u32,
         request_deadline: Instant,
@@ -431,21 +540,31 @@ impl Coordinator {
         let deadline = request_deadline.min(now + Duration::from_secs(5));
         let budget = deadline.saturating_duration_since(now);
         let tail = (budget / 4).min(Duration::from_millis(250));
-        let bytes = Frame {
-            version,
-            request_id: id,
-            body: Some(Body::Result(RpcResult {
-                outcome: Some(outcome_payload(self.policy.payload.clone())),
-            })),
+        let receipts = self
+            .policy
+            .methods
+            .get(method)
+            .ok_or(Refused::Unsupported)?;
+        let mut frames = Vec::with_capacity(receipts.payloads().len());
+        for payload in receipts.payloads() {
+            let frame = Frame {
+                version,
+                request_id: id,
+                body: Some(Body::Result(RpcResult {
+                    outcome: Some(outcome_payload(payload.clone())),
+                })),
+            };
+            if frame.encoded_len() > 1024 {
+                return Err(Refused::Unavailable);
+            }
+            frames.push(frame.encode_to_vec());
         }
-        .encode_to_vec();
         let _io = self.io_gate.lock().unwrap();
         let mut s = self.state.lock().unwrap();
         if s.phase != Phase::Active
             || !self.valid(&s)
             || tail.is_zero()
             || budget <= self.policy.read_timeout * 2 + tail
-            || bytes.len() > 1024
             || revision == 0
             || revision == u64::MAX
         {
@@ -457,11 +576,11 @@ impl Coordinator {
             reservation: ReservationId(random),
             expected_revision: revision,
             principal,
-            method: self.policy.method.clone(),
+            method: method.to_owned(),
         });
         s.phase = Phase::Reserved;
         s.id = id;
-        s.bytes = bytes;
+        s.frames = frames;
         s.deadline = deadline;
         s.cutoff = deadline - tail;
         Ok(())
@@ -470,6 +589,11 @@ impl Coordinator {
     /// Fresh typed read. Reads serialize, while the mutation uses no local lock;
     /// its durable ownership record bridges the commit/callback-return interval.
     pub async fn refresh(&self) -> Result<(), Refused> {
+        self.read_evidence(false).await
+    }
+
+    /// The commit waiter alone can advance to Committed, with a fresh final read.
+    async fn read_evidence(&self, require_final: bool) -> Result<(), Refused> {
         let read_window = || {
             let _io = self.io_gate.lock().unwrap();
             let mut s = self.state.lock().unwrap();
@@ -513,15 +637,27 @@ impl Coordinator {
         // have renewed freshness; start this observation against CURRENT state.
         // Recheck sticky denial/expiry before constructing any adapter future.
         let (start, deadline, claim) = read_window()?;
-        let result = self
-            .clock
-            .timeout_until(
-                deadline,
-                self.policy
-                    .authority
-                    .observe_with_budget(claim, self.clock.deadline_at(deadline)),
-            )
-            .await;
+        let receipts = claim
+            .as_ref()
+            .and_then(|c| self.policy.methods.get(&c.method));
+        let budget = self.clock.deadline_at(deadline);
+        let read = async {
+            match (receipts, claim) {
+                (Some(MethodReceipts::Outcomes(_)), Some(c)) => {
+                    self.policy
+                        .authority
+                        .observe_outcome_with_budget(c, budget)
+                        .await
+                }
+                (_, claim) => OutcomeEvidence::Binding(
+                    self.policy
+                        .authority
+                        .observe_with_budget(claim, budget)
+                        .await,
+                ),
+            }
+        };
+        let result = self.clock.timeout_until(deadline, read).await;
         let _io = self.io_gate.lock().unwrap();
         let mut s = self.state.lock().unwrap();
         let good = if self.clock.now() >= deadline
@@ -532,49 +668,43 @@ impl Coordinator {
             false
         } else {
             match result {
-                Ok(Observation::Active { revision }) => {
+                Ok(OutcomeEvidence::Binding(Observation::Active { revision })) => {
                     s.phase == Phase::Active
-                        || (s.phase == Phase::Reserved
+                        || (matches!(s.phase, Phase::Reserved | Phase::Committing)
+                            && s.withdrawal_revision.is_none()
                             && s.claim
                                 .as_ref()
                                 .is_some_and(|c| c.expected_revision == revision))
                 }
-                Ok(Observation::OwnedCommitted {
+                Ok(OutcomeEvidence::Binding(Observation::OwnedCommitted {
                     reservation,
                     expected_revision,
                     revision,
-                }) => {
-                    let matches = s.claim.as_ref().is_some_and(|c| {
-                        c.reservation == reservation
-                            && c.expected_revision == expected_revision
-                            && revision > expected_revision
-                            && match s.committed_revision {
-                                Some(first) => revision == first,
-                                None => s.phase == Phase::Reserved,
-                            }
-                    });
-                    if matches
-                        && matches!(
-                            s.phase,
-                            Phase::Reserved | Phase::Committed | Phase::Selected | Phase::Consumed
-                        )
-                    {
-                        if s.phase == Phase::Reserved {
-                            s.committed_revision = Some(revision);
-                            s.phase = Phase::Committed;
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                }
+                })) if matches!(receipts, Some(MethodReceipts::Fixed(_))) => s.accept_owned(
+                    OwnedWithdrawal {
+                        reservation,
+                        expected_revision,
+                        revision,
+                    },
+                    Some(0),
+                ),
+                Ok(OutcomeEvidence::OwnedPending(w)) => s.accept_owned(w, None),
+                Ok(OutcomeEvidence::OwnedOutcome {
+                    withdrawal,
+                    outcome_id,
+                }) => outcome_id
+                    .checked_sub(1)
+                    .is_some_and(|i| s.accept_owned(withdrawal, Some(usize::from(i)))),
                 _ => false,
             }
         };
-        if !good {
+        if !good || (require_final && (s.phase != Phase::Committing || s.final_index.is_none())) {
             s.phase = Phase::Aborted;
             self.changed.notify_waiters();
             return Err(Refused::Unavailable);
+        }
+        if require_final {
+            s.phase = Phase::Committed;
         }
         s.fresh_until = Some(start + self.policy.read_timeout);
         Ok(())
@@ -599,10 +729,11 @@ impl Coordinator {
                 boundary.await.map_err(|_| Refused::Unavailable)?;
                 self.refresh().await?;
                 let claim = {
-                    let s = self.state.lock().unwrap();
+                    let mut s = self.state.lock().unwrap();
                     if s.phase != Phase::Reserved || !self.valid(&s) {
                         return Err(Refused::Unavailable);
                     }
+                    s.phase = Phase::Committing;
                     s.claim.clone().ok_or(Refused::Unavailable)?
                 };
                 let authority = self.policy.authority.clone();
@@ -619,11 +750,14 @@ impl Coordinator {
                 });
                 sender.shared.tasks.register(task);
                 completion.await.map_err(|_| Refused::Unavailable)?;
-                self.refresh().await?;
-                if self.state.lock().unwrap().phase != Phase::Committed {
+                self.read_evidence(true).await?;
+                let s = self.state.lock().unwrap();
+                if s.phase != Phase::Committed {
                     return Err(Refused::Unavailable);
                 }
-                Ok(HandlerOutcome::Payload(self.policy.payload.clone()))
+                Ok(HandlerOutcome::Payload(
+                    self.final_payload(&s).ok_or(Refused::Unavailable)?.to_vec(),
+                ))
             })
             .await;
         match result {
@@ -636,6 +770,15 @@ impl Coordinator {
             }
         }
     }
+    /// Payload corresponding to the immutable prevalidated frame index.
+    fn final_payload<'a>(&'a self, s: &State) -> Option<&'a [u8]> {
+        self.policy
+            .methods
+            .get(&s.claim.as_ref()?.method)?
+            .payloads()
+            .get(s.final_index?)
+            .map(Vec::as_slice)
+    }
     /// Mirror first-terminal selection; mismatched or failed outcomes abort.
     pub(super) fn select(&self, id: u64, outcome: &HandlerOutcome) {
         let mut s = self.state.lock().unwrap();
@@ -644,7 +787,7 @@ impl Coordinator {
         }
         if s.phase == Phase::Committed
             && self.valid(&s)
-            && matches!(outcome, HandlerOutcome::Payload(p) if p == &self.policy.payload)
+            && matches!(outcome, HandlerOutcome::Payload(p) if Some(p.as_slice()) == self.final_payload(&s))
         {
             s.phase = Phase::Selected;
         } else {
@@ -658,7 +801,10 @@ impl Coordinator {
         if s.id != id {
             return;
         }
-        if s.phase != Phase::Selected || s.bytes != bytes || !self.valid(&s) {
+        if s.phase != Phase::Selected
+            || s.final_bytes() != Some(bytes.as_slice())
+            || !self.valid(&s)
+        {
             drop(s);
             self.abort();
             return;
@@ -686,7 +832,7 @@ impl Coordinator {
     pub fn consume(&self, output: &TerminalOutput) -> Result<(), Refused> {
         let mut s = self.state.lock().unwrap();
         if s.phase != Phase::Selected
-            || s.bytes != output.bytes
+            || s.final_bytes() != Some(output.bytes())
             || !s
                 .claim
                 .as_ref()
@@ -731,11 +877,25 @@ impl Host {
     /// Install before hello. Other authorization monitors must remain coordinated.
     #[doc(hidden)]
     pub fn install_terminal_tcp(&self, policy: Policy) -> Result<Arc<Coordinator>, Refused> {
+        self.install_terminal_methods_tcp(policy.into())
+    }
+
+    /// Method-specific form of `install_terminal_tcp`, with the same driver obligations.
+    #[doc(hidden)]
+    pub fn install_terminal_methods_tcp(
+        &self,
+        policy: MethodPolicy,
+    ) -> Result<Arc<Coordinator>, Refused> {
         if cfg!(target_arch = "wasm32")
             || policy.read_timeout < Duration::from_millis(100)
             || policy.read_timeout > Duration::from_millis(250)
-            || syntra_core::validate_method(&policy.method).is_err()
-            || policy.payload.len() > 1024
+            || policy.methods.is_empty()
+            || policy.methods.iter().any(|(method, receipts)| {
+                let entries = receipts.payloads();
+                syntra_core::validate_method(method).is_err()
+                    || !(1..=8).contains(&entries.len())
+                    || entries.iter().any(|p| p.len() > 1024)
+            })
         {
             return Err(Refused::Unsupported);
         }
@@ -755,9 +915,10 @@ impl Host {
             state: Mutex::new(State {
                 phase: Phase::Active,
                 claim: None,
-                committed_revision: None,
+                withdrawal_revision: None,
                 id: 0,
-                bytes: vec![],
+                frames: vec![],
+                final_index: None,
                 cutoff: now,
                 deadline: now,
                 fresh_until: None,
@@ -783,6 +944,10 @@ impl Host {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "host_terminal_budget_tests.rs"]
 mod budget_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "host_terminal_outcome_tests.rs"]
+mod outcome_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
@@ -865,12 +1030,19 @@ mod tests {
     /// Reserve the fixture's fixed call with a deadline in the coordinator's domain.
     fn reserve(c: &Coordinator, seconds: u64) -> Result<(), Refused> {
         c.reserve(
+            "/example.Authority/Retire",
             123,
             1,
             c.clock.now() + Duration::from_secs(seconds),
             7,
             Principal::new("fixture"),
         )
+    }
+    /// Model the authority callback returning before the required final read.
+    async fn confirm_commit(c: &Coordinator) -> Result<(), Refused> {
+        assert!(c.state.lock().unwrap().phase == Phase::Reserved);
+        c.state.lock().unwrap().phase = Phase::Committing;
+        c.read_evidence(true).await
     }
     /// Reservation and teardown share the original non-renewable five-second cap.
     #[tokio::test(start_paused = true)]
@@ -892,6 +1064,7 @@ mod tests {
         let start = c.clock.now();
         assert_eq!(
             c.reserve(
+                "/example.Authority/Retire",
                 1,
                 1,
                 start + Duration::from_millis(200),
@@ -920,7 +1093,7 @@ mod tests {
             "same public ID on another host has no ownership"
         );
         *a1.0.lock().unwrap() = 1;
-        c1.refresh().await.unwrap();
+        confirm_commit(&c1).await.unwrap();
         assert!(c2.state.lock().unwrap().phase == Phase::Reserved);
         h1.close().await;
         h2.close().await;
@@ -964,9 +1137,9 @@ mod tests {
         let (host, c, a) = coordinator().await;
         reserve(&c, 2).unwrap();
         *a.0.lock().unwrap() = 1;
-        c.refresh().await.unwrap();
+        confirm_commit(&c).await.unwrap();
         c.select(123, &HandlerOutcome::Payload(b"retired".to_vec()));
-        let bytes = c.state.lock().unwrap().bytes.clone();
+        let bytes = c.state.lock().unwrap().final_bytes().unwrap().to_vec();
         let budget = ExecutionBudget::new(2);
         let reservation = c.state.lock().unwrap().claim.clone().unwrap().reservation;
         let output = TerminalOutput {
@@ -983,7 +1156,7 @@ mod tests {
         let (host, c, a) = coordinator().await;
         reserve(&c, 2).unwrap();
         *a.0.lock().unwrap() = 1;
-        c.refresh().await.unwrap();
+        confirm_commit(&c).await.unwrap();
         c.select(123, &HandlerOutcome::Payload(b"retired".to_vec()));
         let wrong = TerminalOutput {
             bytes: b"wrong".to_vec(),
@@ -999,12 +1172,12 @@ mod tests {
         let (host, c, a) = coordinator().await;
         reserve(&c, 2).unwrap();
         *a.0.lock().unwrap() = 1;
-        c.refresh().await.unwrap();
+        confirm_commit(&c).await.unwrap();
         c.select(123, &HandlerOutcome::Payload(b"retired".to_vec()));
         let output = {
             let s = c.state.lock().unwrap();
             TerminalOutput {
-                bytes: s.bytes.clone(),
+                bytes: s.final_bytes().unwrap().to_vec(),
                 reservation: s.claim.clone().unwrap().reservation,
                 _charge: ExecutionBudget::new(1).try_acquire().unwrap(),
             }
@@ -1024,7 +1197,7 @@ mod tests {
         let (host, c, a) = coordinator().await;
         reserve(&c, 2).unwrap();
         *a.0.lock().unwrap() = 1;
-        c.refresh().await.unwrap();
+        confirm_commit(&c).await.unwrap();
         let cancel = crate::CancelToken::new();
         let (selected, result) = oneshot::channel();
         host.calls.lock().unwrap().pending.insert(
@@ -1063,14 +1236,14 @@ mod tests {
         reserve(&c2, 2).unwrap();
         *a1.0.lock().unwrap() = 1;
         *a2.0.lock().unwrap() = 1;
-        c1.refresh().await.unwrap();
-        c2.refresh().await.unwrap();
+        confirm_commit(&c1).await.unwrap();
+        confirm_commit(&c2).await.unwrap();
         c1.select(123, &HandlerOutcome::Payload(b"retired".to_vec()));
         c2.select(123, &HandlerOutcome::Payload(b"retired".to_vec()));
         let output = {
             let s = c1.state.lock().unwrap();
             TerminalOutput {
-                bytes: s.bytes.clone(),
+                bytes: s.final_bytes().unwrap().to_vec(),
                 reservation: s.claim.clone().unwrap().reservation,
                 _charge: ExecutionBudget::new(1).try_acquire().unwrap(),
             }
@@ -1099,7 +1272,7 @@ mod tests {
     fn reserved_output(c: &Coordinator) -> TerminalOutput {
         let state = c.state.lock().unwrap();
         TerminalOutput {
-            bytes: state.bytes.clone(),
+            bytes: state.final_bytes().unwrap().to_vec(),
             reservation: state.claim.as_ref().unwrap().reservation.clone(),
             _charge: ExecutionBudget::new(1).try_acquire().unwrap(),
         }
@@ -1112,7 +1285,7 @@ mod tests {
         reserve(&c, 2).unwrap();
         *authority.0.lock().unwrap() = 5;
         assert!(
-            c.refresh().await.is_ok(),
+            confirm_commit(&c).await.is_ok(),
             "a strictly newer owned revision need not be adjacent"
         );
         c.refresh().await.unwrap(); // Stable repeated proof while committed.
@@ -1138,7 +1311,7 @@ mod tests {
             let (host, c, authority) = coordinator().await;
             reserve(&c, 2).unwrap();
             *authority.0.lock().unwrap() = 5;
-            c.refresh()
+            confirm_commit(&c)
                 .await
                 .expect("initial owned revision 11 must be accepted");
             let output = reserved_output(&c);
@@ -1178,7 +1351,7 @@ mod tests {
             let (host, c, authority) = coordinator().await;
             reserve(&c, 2).unwrap();
             *authority.0.lock().unwrap() = mode;
-            assert_eq!(c.refresh().await, Err(Refused::Unavailable));
+            assert_eq!(confirm_commit(&c).await, Err(Refused::Unavailable));
             assert!(!c.raw_allowed());
             host.close().await;
         }
