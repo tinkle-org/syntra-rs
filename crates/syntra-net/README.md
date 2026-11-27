@@ -7,23 +7,19 @@ the transport-independent `syntra-runtime` with native I/O.
 
 The implementation is experimental. Publication does not establish formal
 conformance, independent interoperability, or independent security review.
-HTTP/HTTPS and cross-carrier failover remain opt-in implementation candidates,
-not accepted-spec or conformance claims.
+HTTP/HTTPS and cross-carrier failover remain opt-in implementation candidates.
 
 ## Using TCP
 
-For an application that already owns a native Tokio runtime, select `tcp`:
+For an application that already owns a native Tokio runtime, select `tcp` and
+point Cargo at the local checkout (adjust the relative path as needed):
 
 ```toml
 [dependencies]
-syntra-net = { version = "=1.0.0-rc.2", default-features = false, features = ["tcp"] }
+syntra-net = { path = "../syntra-rs/crates/syntra-net", default-features = false, features = ["tcp"] }
 ```
 
-This is the intended dependency shape after the first net publication. Until
-that release is available, use a reviewed Git revision or a local path rather
-than assuming the registry package exists. Select the version actually released
-by the release PR, and align any direct `syntra-core` and `syntra-runtime` pins
-with it; prereleases can contain breaking changes.
+Use matching `syntra-core` and `syntra-runtime` dependencies from the same source.
 
 `syntra_net::tcp::connect` establishes an encrypted connection and returns a
 `ClientHandle` exposing the runtime `Initiator`. Provision the server public key,
@@ -53,8 +49,6 @@ dependency. Obtain the package sources and run it there; adding a dependency
 does not make its example targets part of the application's package.
 
 These demo credentials and generated keys are not deployment configuration.
-Downstream migrations from the older `syntra-ws` package need explicit connection,
-configuration, and shutdown changes; this is not a drop-in package rename.
 
 ## Feature and target boundaries
 

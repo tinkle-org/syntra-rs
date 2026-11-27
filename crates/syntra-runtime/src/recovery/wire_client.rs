@@ -31,8 +31,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use syntra_core::proto::*;
-use syntra_core::proto::{recovery_batch_trailer::Outcome, recovery_notification::Notification};
+use syntra_core::wire::*;
+use syntra_core::wire::{recovery_batch_trailer::Outcome, recovery_notification::Notification};
 use syntra_core::{ConnectionState, ErrorCode};
 use web_time::Instant;
 
@@ -113,12 +113,12 @@ pub enum SubscribeIntent {
 }
 
 pub enum Negotiation {
-    Confirmed(RecoveryNegotiateResponse),
+    Confirmed(Negotiated),
     RecoveryUnavailable,
 }
 
 pub struct Subscription {
-    pub response: RecoverySubscribeResponse,
+    pub response: SubscriptionAccepted,
     /// Full loaded application state, if resuming. The caller restores it before
     /// applying offers. No copy of application state is retained by the client.
     pub restored: Option<DurableRecord>,
@@ -232,7 +232,7 @@ pub struct RecoveryClient<S: RecoveryPersistence + Send + Sync + 'static> {
     limits: RecoveryLimits,
     inbox: Arc<RecoveryInbox>,
     interrupted: Arc<AtomicBool>,
-    negotiated: Option<RecoveryNegotiateResponse>,
+    negotiated: Option<Negotiated>,
     negotiation_attempted: bool,
     unavailable: bool,
     rounds: BTreeMap<Vec<u8>, Round>,
@@ -337,15 +337,13 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
         }
         self.negotiation_attempted = true;
         let mut guard = self.guard();
-        let request = RecoveryNegotiateRequest {
+        let request = Negotiate {
             profile_version: 1,
             min_version: 1,
             max_version: 1,
             capability: wire::CAPABILITY.into(),
         };
-        let result = self
-            .once::<_, RecoveryNegotiateResponse>(wire::NEGOTIATE, &request)
-            .await;
+        let result = self.once::<_, Negotiated>(wire::NEGOTIATE, &request).await;
         guard.finish();
         match result {
             Err(RecoveryClientError::Rpc(ErrorCode::Unimplemented)) => {
@@ -421,7 +419,7 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
         } else {
             Vec::new()
         };
-        let request = RecoverySubscribeRequest {
+        let request = Subscribe {
             profile_version: 1,
             stream_selector: selector,
             start_checkpoint: start.clone(),
@@ -431,7 +429,7 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
         let token = self.inbox.begin_subscribe()?;
         let mut guard = self.guard();
         let response = self
-            .once::<_, RecoverySubscribeResponse>(wire::SUBSCRIBE, &request)
+            .once::<_, SubscriptionAccepted>(wire::SUBSCRIBE, &request)
             .await;
         let response = match response {
             Ok(r) => r,
@@ -559,7 +557,7 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
             return Err(RecoveryClientError::InvalidState);
         }
         r.mode = Mode::Replay;
-        let request = RecoveryReplayRequest {
+        let request = Replay {
             profile_version: 1,
             subscription_handle: handle.to_vec(),
             from_checkpoint: r.replay_cursor.clone(),
@@ -584,7 +582,7 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
     fn accept_page(
         &mut self,
         handle: &[u8],
-        request: &RecoveryReplayRequest,
+        request: &Replay,
         page: &RecoveryReplayPage,
     ) -> ClientResult<()> {
         let r = self.round(handle)?;
@@ -629,7 +627,7 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
         r.mode = Mode::CatchUp;
         let mut call = r.catchup.take().unwrap_or(RetainedCall::new(
             wire::CATCH_UP,
-            &RecoveryCatchUpRequest {
+            &CatchUp {
                 profile_version: 1,
                 subscription_handle: handle.to_vec(),
             },
@@ -777,7 +775,7 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
             }
             let confirm = RetainedCall::new(
                 wire::CONFIRM,
-                &RecoveryConfirmRequest {
+                &Confirm {
                     profile_version: 1,
                     subscription_handle: handle.clone(),
                     generation: r.generation,
@@ -801,7 +799,7 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
         &mut self,
         handle: &[u8],
         application_state: Vec<u8>,
-    ) -> ClientResult<RecoveryConfirmResponse> {
+    ) -> ClientResult<Confirmed> {
         if self
             .round(handle)?
             .pending
@@ -811,7 +809,7 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
             return Err(RecoveryClientError::InvalidState);
         }
         self.persist_offer(handle, application_state).await?;
-        let response: RecoveryConfirmResponse = self.confirm_offer(handle).await?;
+        let response: Confirmed = self.confirm_offer(handle).await?;
         let r = self.round(handle)?;
         let cp = &r
             .pending
@@ -844,7 +842,7 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
         r.replay = None;
         r.catchup = None;
         r.duplicates.clear();
-        let request = RecoverySnapshotOfferRequest {
+        let request = OfferSnapshot {
             profile_version: 1,
             subscription_handle: handle.to_vec(),
             generation: r.generation,
@@ -900,7 +898,7 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
         if r.mode != Mode::Snapshot || page_index >= stage.total_pages() || r.pending.is_some() {
             return Err(RecoveryClientError::InvalidState);
         }
-        let request = RecoverySnapshotFetchRequest {
+        let request = FetchSnapshot {
             profile_version: 1,
             snapshot_handle: stage.snapshot_handle().to_vec(),
             page_index,
@@ -993,7 +991,7 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
         }
         let confirm = RetainedCall::new(
             wire::SNAPSHOT_CONFIRM,
-            &RecoverySnapshotConfirmRequest {
+            &ConfirmSnapshot {
                 profile_version: 1,
                 subscription_handle: handle.to_vec(),
                 generation: r.generation,
@@ -1130,10 +1128,7 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
 
     /// Local retirement is immediate, remote teardown is a single bounded call.
     /// Unknown Unsubscribe outcome does not resurrect H or roll back storage.
-    pub async fn unsubscribe(
-        &mut self,
-        handle: &[u8],
-    ) -> ClientResult<RecoveryUnsubscribeResponse> {
+    pub async fn unsubscribe(&mut self, handle: &[u8]) -> ClientResult<Unsubscribed> {
         self.ready()?;
         self.controls();
         let generation = self
@@ -1145,9 +1140,9 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
         self.rounds.get_mut(handle).expect("known").teardown_pending = false;
         let mut guard = self.guard();
         let result = self
-            .once::<_, RecoveryUnsubscribeResponse>(
+            .once::<_, Unsubscribed>(
                 wire::UNSUBSCRIBE,
-                &RecoveryUnsubscribeRequest {
+                &Unsubscribe {
                     profile_version: 1,
                     subscription_handle: handle.to_vec(),
                 },
@@ -1166,7 +1161,7 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
         handle: &[u8],
         error: RecoveryClientError,
     ) -> RecoveryClientError {
-        // RpcResult and Notification are distinct frames. A retention trailer
+        // CallResult and Notification are distinct frames. A retention trailer
         // can follow the failed result, so allow one finite control-only grace;
         // absence is NOT snapshot authority. Cache expiry has no such trailer.
         if error == RecoveryClientError::Rpc(ErrorCode::FailedPrecondition) {
@@ -1258,9 +1253,9 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
         // that the remote allocation was reclaimed. Core closure remains visible
         // in ready(); local deadline failure does not resurrect the retired H.
         let _teardown = self
-            .once::<_, RecoveryUnsubscribeResponse>(
+            .once::<_, Unsubscribed>(
                 wire::UNSUBSCRIBE,
-                &RecoveryUnsubscribeRequest {
+                &Unsubscribe {
                     profile_version: 1,
                     subscription_handle: handle,
                 },
@@ -1314,7 +1309,7 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
                                     self.retire(&h, Some(next));
                                 }
                             }
-                            Some(Outcome::SnapshotRequired(true)) => {
+                            Some(Outcome::SnapshotRequired) => {
                                 if r.stage.is_some()
                                     || r.pending.as_ref().is_some_and(|offer| offer.snapshot)
                                 {
@@ -1344,7 +1339,7 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
                                     handle: handle.clone(),
                                 });
                             }
-                            Some(Outcome::CatchupComplete(true)) => {
+                            Some(Outcome::CatchupComplete) => {
                                 if r.mode == Mode::Snapshot || r.snapshot_installed {
                                     continue;
                                 }

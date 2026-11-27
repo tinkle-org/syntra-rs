@@ -1,6 +1,6 @@
 //! Production ABI regressions exercise the actual shared Host/Initiator.
 use super::*;
-use prost::Message;
+use syntra_core::{decode_frame, wire::frame::Body, ValidationContext};
 
 pub(super) unsafe extern "C" fn authenticate(
     _: usize,
@@ -259,11 +259,8 @@ fn cancel_before_emission_suppresses_original_runtime_unit() {
     // Allow the runtime to enqueue before cancelling too: neither old nor new
     // unit may appear as a request after the shared handoff gate retires it.
     while let Some((emission, bytes)) = c.emit() {
-        let frame = syntra_core::Frame::decode(bytes.as_slice()).unwrap();
-        assert!(!matches!(
-            frame.body,
-            Some(syntra_core::proto::frame::Body::Request(_))
-        ));
+        let frame = decode_frame(&bytes, ValidationContext::active(1)).unwrap();
+        assert!(!matches!(frame.body, Some(Body::Call(_))));
         c.emitted(emission);
     }
     assert!(h.dispatch().is_none());
@@ -558,8 +555,8 @@ fn prepare_handoff_subtracts_queue_delay_and_cannot_be_repeated() {
     let call = c.call(1000);
     std::thread::sleep(Duration::from_millis(30));
     let (emission, bytes) = until(|| c.emit());
-    let frame = syntra_core::Frame::decode(bytes.as_slice()).unwrap();
-    let Some(syntra_core::proto::frame::Body::Request(request)) = frame.body else {
+    let frame = decode_frame(&bytes, ValidationContext::active(1)).unwrap();
+    let Some(Body::Call(request)) = frame.body else {
         panic!("request")
     };
     assert!(request.timeout_ms > 0 && request.timeout_ms <= 970);

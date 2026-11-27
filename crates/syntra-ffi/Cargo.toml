@@ -20,10 +20,7 @@ default = []
 test-fixture = ["dep:syntra-core", "dep:syntra-runtime", "dep:tokio"]
 # Sole production ABI: shared Host/Initiator/recovery, native-only. Mutually
 # exclusive with test-fixture (their intentionally separate C contracts differ).
-production = ["dep:syntra-core", "dep:prost", "dep:syntra-runtime", "dep:tokio"]
-
-[dependencies]
-prost = { workspace = true, optional = true }
+production = ["dep:syntra-core", "dep:syntra-runtime", "dep:tokio"]
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 syntra-core = { path = "../syntra-core", version = "1.0.0-rc.6", optional = true }

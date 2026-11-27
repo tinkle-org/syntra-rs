@@ -1,5 +1,5 @@
 {
-  "status": "candidate-sdd",
+  "status": "candidate",
   "domain_ascii": "syntra.1.0",
   "note": "Public context/prologue encoding fixtures only; no Noise ciphertext, runtime execution or independent interoperability verdict.",
   "contexts": [

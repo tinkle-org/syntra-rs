@@ -1,4 +1,4 @@
-//! Accepted RFC 0006 §11 wire adapter (syntra@8ede3810b29fbba4d0e6ae6751a0025ceedda140).
+//! Bebop wire adapter for the negotiated update/recovery service.
 //!
 //! Host configuration attaches this binding to admitted Core RPCs and a managed
 //! notification worker. Business semantics and durable provider history remain

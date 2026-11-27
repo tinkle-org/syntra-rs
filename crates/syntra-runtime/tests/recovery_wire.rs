@@ -10,31 +10,30 @@ use std::future::Future;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use prost::Message;
 use support::*;
-use syntra_core::proto::{recovery_batch_trailer::Outcome, recovery_notification::Notification, *};
+use syntra_core::wire::{recovery_batch_trailer::Outcome, recovery_notification::Notification, *};
 use syntra_core::ErrorCode;
 use syntra_runtime::recovery::persistence::*;
 use syntra_runtime::recovery::wire::{self, *};
 use syntra_runtime::recovery::wire_client::*;
 
-fn neg() -> RecoveryNegotiateRequest {
-    RecoveryNegotiateRequest {
+fn neg() -> Negotiate {
+    Negotiate {
         profile_version: 1,
         min_version: 1,
         max_version: 1,
         capability: wire::CAPABILITY.into(),
     }
 }
-fn sub(stream: &[u8], start: &[u8]) -> RecoverySubscribeRequest {
-    RecoverySubscribeRequest {
+fn sub(stream: &[u8], start: &[u8]) -> Subscribe {
+    Subscribe {
         profile_version: 1,
         stream_selector: stream.to_vec(),
         start_checkpoint: start.to_vec(),
     }
 }
-fn replay(s: &RecoverySubscribeResponse, from: &[u8]) -> RecoveryReplayRequest {
-    RecoveryReplayRequest {
+fn replay(s: &SubscriptionAccepted, from: &[u8]) -> Replay {
+    Replay {
         profile_version: 1,
         subscription_handle: s.subscription_handle.clone(),
         from_checkpoint: from.to_vec(),
@@ -43,22 +42,22 @@ fn replay(s: &RecoverySubscribeResponse, from: &[u8]) -> RecoveryReplayRequest {
         continuation_marker: vec![],
     }
 }
-fn catch(s: &RecoverySubscribeResponse) -> RecoveryCatchUpRequest {
-    RecoveryCatchUpRequest {
+fn catch(s: &SubscriptionAccepted) -> CatchUp {
+    CatchUp {
         profile_version: 1,
         subscription_handle: s.subscription_handle.clone(),
     }
 }
-fn confirm(s: &RecoverySubscribeResponse, cp: &[u8]) -> RecoveryConfirmRequest {
-    RecoveryConfirmRequest {
+fn confirm(s: &SubscriptionAccepted, cp: &[u8]) -> Confirm {
+    Confirm {
         profile_version: 1,
         subscription_handle: s.subscription_handle.clone(),
         generation: s.generation,
         checkpoint: cp.to_vec(),
     }
 }
-async fn raw_sub(b: &Bridge, stream: &[u8], cp: &[u8]) -> RecoverySubscribeResponse {
-    RecoverySubscribeResponse::decode(
+async fn raw_sub(b: &Bridge, stream: &[u8], cp: &[u8]) -> SubscriptionAccepted {
+    codec::decode::<SubscriptionAccepted>(
         b.raw(wire::SUBSCRIBE, sub(stream, cp))
             .await
             .unwrap()
@@ -67,8 +66,7 @@ async fn raw_sub(b: &Bridge, stream: &[u8], cp: &[u8]) -> RecoverySubscribeRespo
     .unwrap()
 }
 async fn raw_negotiate(b: &Bridge) {
-    RecoveryNegotiateResponse::decode(b.raw(wire::NEGOTIATE, neg()).await.unwrap().as_slice())
-        .unwrap();
+    codec::decode::<Negotiated>(b.raw(wire::NEGOTIATE, neg()).await.unwrap().as_slice()).unwrap();
 }
 
 #[tokio::test]
@@ -78,52 +76,52 @@ async fn local_acceptance_unconfirmed_and_unsupported_are_paired_with_fresh_conf
     let unconfirmed = Bridge::new(Some(service.clone())).await;
     // Valid raw payloads must be refused before confirmation, not interpreted as
     // implicit capability support. Core still owns IDs and result correlation.
-    let unbound = RecoverySubscribeResponse {
+    let unbound = SubscriptionAccepted {
         profile_version: 1,
         subscription_handle: b"public-unbound-h".to_vec(),
         generation: 7,
         catchup_boundary: CP[0].to_vec(),
     };
     let requests = [
-        (wire::SUBSCRIBE, sub(A, &[]).encode_to_vec()),
-        (wire::REPLAY, replay(&unbound, CP[0]).encode_to_vec()),
-        (wire::CATCH_UP, catch(&unbound).encode_to_vec()),
-        (wire::CONFIRM, confirm(&unbound, CP[0]).encode_to_vec()),
+        (wire::SUBSCRIBE, sub(A, &[]).profile_bytes()),
+        (wire::REPLAY, replay(&unbound, CP[0]).profile_bytes()),
+        (wire::CATCH_UP, catch(&unbound).profile_bytes()),
+        (wire::CONFIRM, confirm(&unbound, CP[0]).profile_bytes()),
         (
             wire::SNAPSHOT_OFFER,
-            RecoverySnapshotOfferRequest {
+            OfferSnapshot {
                 profile_version: 1,
                 subscription_handle: unbound.subscription_handle.clone(),
                 generation: 7,
             }
-            .encode_to_vec(),
+            .profile_bytes(),
         ),
         (
             wire::SNAPSHOT_FETCH,
-            RecoverySnapshotFetchRequest {
+            FetchSnapshot {
                 profile_version: 1,
                 snapshot_handle: b"public-unbound-x".to_vec(),
                 page_index: 0,
             }
-            .encode_to_vec(),
+            .profile_bytes(),
         ),
         (
             wire::SNAPSHOT_CONFIRM,
-            RecoverySnapshotConfirmRequest {
+            ConfirmSnapshot {
                 profile_version: 1,
                 subscription_handle: unbound.subscription_handle.clone(),
                 generation: 7,
                 boundary_checkpoint: CP[0].to_vec(),
             }
-            .encode_to_vec(),
+            .profile_bytes(),
         ),
         (
             wire::UNSUBSCRIBE,
-            RecoveryUnsubscribeRequest {
+            Unsubscribe {
                 profile_version: 1,
                 subscription_handle: unbound.subscription_handle,
             }
-            .encode_to_vec(),
+            .profile_bytes(),
         ),
     ];
     for (method, payload) in &requests {
@@ -141,7 +139,7 @@ async fn local_acceptance_unconfirmed_and_unsupported_are_paired_with_fresh_conf
     let n = negotiate(&mut client).await;
     assert_eq!(
         n,
-        RecoveryNegotiateResponse {
+        Negotiated {
             profile_version: 1,
             selected_version: 1,
             max_subscriptions_per_connection: 64,
@@ -152,7 +150,7 @@ async fn local_acceptance_unconfirmed_and_unsupported_are_paired_with_fresh_conf
     );
     assert_eq!(
         supported.trace.requests(wire::NEGOTIATE)[0].1,
-        neg().encode_to_vec()
+        neg().profile_bytes()
     );
     subscribe(&mut client, A, SubscribeIntent::InitialLiveOnly).await;
     supported.echo().await;
@@ -195,23 +193,36 @@ async fn local_acceptance_exact_v1_negotiation_and_connected_only_registration()
         ErrorCode::FailedPrecondition
     );
     for request in [
-        RecoveryNegotiateRequest {
+        Negotiate {
             capability: "syntra.update-recovery/2".into(),
             ..neg()
         },
-        RecoveryNegotiateRequest {
+        Negotiate {
             min_version: 2,
             max_version: 2,
             ..neg()
         },
-        RecoveryNegotiateRequest {
+        Negotiate {
             profile_version: 2,
             ..neg()
         },
     ] {
+        use bebop::Record;
+        let mut bytes = Vec::new();
+        syntra_core::generated::Negotiate {
+            profile_version: request.profile_version,
+            min_version: request.min_version,
+            max_version: request.max_version,
+            capability: &request.capability,
+        }
+        .serialize(&mut bytes)
+        .unwrap();
         assert_eq!(
-            b.raw(wire::NEGOTIATE, request).await,
-            Err(ErrorCode::FailedPrecondition)
+            bounded(b.init.call(wire::NEGOTIATE, bytes, 2000))
+                .await
+                .unwrap_err()
+                .code(),
+            ErrorCode::FailedPrecondition
         );
         assert_eq!(
             b.raw(wire::SUBSCRIBE, sub(A, &[])).await,
@@ -487,7 +498,7 @@ async fn local_acceptance_retention_snapshot_all_indices_current_g_s0_differs_fr
         .await
         .unwrap();
     assert!(c.snapshot_bytes(&s.subscription_handle).is_err());
-    let snapshot_confirm = RecoverySnapshotConfirmRequest {
+    let snapshot_confirm = ConfirmSnapshot {
         profile_version: 1,
         subscription_handle: s.subscription_handle.clone(),
         generation: 7,
@@ -594,7 +605,7 @@ async fn local_acceptance_snapshot_supersede_fresh_h_same_s0_stale_x_and_confirm
     assert_eq!(
         b.raw(
             wire::SNAPSHOT_FETCH,
-            RecoverySnapshotFetchRequest {
+            FetchSnapshot {
                 profile_version: 1,
                 snapshot_handle: first.snapshot_handle,
                 page_index: 0
@@ -606,7 +617,7 @@ async fn local_acceptance_snapshot_supersede_fresh_h_same_s0_stale_x_and_confirm
     assert_eq!(
         b.raw(
             wire::SNAPSHOT_CONFIRM,
-            RecoverySnapshotConfirmRequest {
+            ConfirmSnapshot {
                 profile_version: 1,
                 subscription_handle: old.subscription_handle,
                 generation: 7,
@@ -659,7 +670,7 @@ async fn local_acceptance_provider_loss_fences_aliases_pages_offers_confirms_not
         assert_eq!(
             b.raw(
                 wire::SNAPSHOT_OFFER,
-                RecoverySnapshotOfferRequest {
+                OfferSnapshot {
                     profile_version: 1,
                     subscription_handle: s.subscription_handle.clone(),
                     generation: 7
@@ -731,7 +742,7 @@ async fn local_acceptance_local_overflow_has_no_next_g_and_other_subscription_co
             assert_eq!(generation, 7);
             assert_eq!(next_generation, None);
             assert_eq!(t.terminate_reason, b"local-queue-exhausted");
-            assert_eq!(t.outcome, Some(Outcome::Terminated(true)));
+            assert_eq!(t.outcome, Some(Outcome::Terminated));
         }
         _ => panic!("expected local reserved overflow control"),
     }
@@ -935,13 +946,13 @@ async fn local_acceptance_wire_lost_ack_store_reopen_host_restart_reconstructs_i
         "Host really acknowledged; this is lost wire output, not an unexecuted request"
     );
     assert_eq!(
-        RecoveryConfirmResponse::decode(results[0].as_ref().unwrap().as_slice())
+        codec::decode::<Confirmed>(results[0].as_ref().unwrap().as_slice())
             .unwrap()
             .confirmed_checkpoint,
         CP[1]
     );
     assert_eq!(
-        RecoveryConfirmRequest::decode(sent[0].1.as_slice())
+        codec::decode::<Confirm>(sent[0].1.as_slice())
             .unwrap()
             .checkpoint,
         CP[1]
@@ -1000,7 +1011,7 @@ async fn local_acceptance_nonempty_catchup_pages_completion_does_not_replace_dur
     source.append(&service, A);
     let accepted = bounded(c.catch_up(&s.subscription_handle)).await.unwrap();
     assert_eq!(accepted.catchup_boundary, CP[3]);
-    b.trace.wait_matching(1, true, |n| matches!(n, Notification::Trailer(t) if t.outcome == Some(Outcome::CatchupComplete(true)))).await;
+    b.trace.wait_matching(1, true, |n| matches!(n, Notification::Trailer(t) if t.outcome == Some(Outcome::CatchupComplete))).await;
     for index in 1..=3 {
         let offered = batch(&mut c).await;
         assert_eq!(offered.predecessor_checkpoint, CP[index - 1]);
@@ -1104,7 +1115,7 @@ async fn local_acceptance_raw_paged_retry_marker_binding_and_confirm_offered_ord
     let s = raw_sub(&b, A, CP[0]).await;
     let first = replay(&s, CP[0]);
     let bytes = b.raw(wire::REPLAY, first.clone()).await.unwrap();
-    let page = RecoveryReplayPage::decode(bytes.as_slice()).unwrap();
+    let page = codec::decode::<RecoveryReplayPage>(bytes.as_slice()).unwrap();
     assert_eq!(page.batch_payloads.len(), 2);
     assert_eq!(b.raw(wire::REPLAY, first).await.unwrap(), bytes);
     assert_eq!(source.replay_calls.load(Ordering::SeqCst), 1);
@@ -1128,7 +1139,8 @@ async fn local_acceptance_raw_paged_retry_marker_binding_and_confirm_offered_ord
     );
     assert_eq!(source.replay_calls.load(Ordering::SeqCst), 1);
     let last =
-        RecoveryReplayPage::decode(b.raw(wire::REPLAY, next).await.unwrap().as_slice()).unwrap();
+        codec::decode::<RecoveryReplayPage>(b.raw(wire::REPLAY, next).await.unwrap().as_slice())
+            .unwrap();
     assert_eq!(last.result_checkpoint, CP[3]);
     assert!(last.continuation_marker.is_empty());
     for cp in &CP[1..=3] {
@@ -1298,3 +1310,10 @@ async fn local_acceptance_provider_loss_revokes_pending_offer_and_all_same_s_ali
     drop(c);
     b.finish().await;
 }
+
+trait ProfileFixture: codec::ProfileMessage {
+    fn profile_bytes(&self) -> Vec<u8> {
+        codec::encode(self).unwrap()
+    }
+}
+impl<M: codec::ProfileMessage> ProfileFixture for M {}

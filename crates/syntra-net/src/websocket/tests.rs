@@ -574,7 +574,9 @@ mod active_loss {
     use super::*;
     use crate::client::{Failure, LifecycleStatus, ReconnectConfig, ReconnectingClient};
     use crate::tls::{BoxIo, EarlyData, ProviderTlsStream, TlsFuture, TlsMetadata, TlsProvider};
-    use prost::Message as _;
+    use syntra_core::{
+        decode_frame, encode_frame, wire::frame::Body, ConnectionState, ValidationContext,
+    };
     use syntra_runtime::{AllowAnonymous, AuthError, Authenticator, FnHandler, HandlerOutcome};
 
     // Real application-provider TLS, with fixture-only roots and the normal
@@ -678,21 +680,25 @@ mod active_loss {
             .unwrap();
         assert_eq!(frames.len(), 1);
         assert!(matches!(
-            syntra_core::Frame::decode(frames[0].as_slice())
-                .unwrap()
-                .body,
-            Some(syntra_core::proto::frame::Body::Hello(_))
+            decode_frame(
+                &frames[0],
+                ValidationContext::pre_handshake(ConnectionState::Connected)
+            )
+            .unwrap()
+            .body,
+            Some(Body::Hello(_))
         ));
-        let ready = syntra_core::Frame {
-            version: 1,
-            request_id: 0,
-            body: Some(syntra_core::proto::frame::Body::Ready(
-                syntra_core::ServerReady {
+        let ready = encode_frame(
+            &syntra_core::Frame {
+                version: 1,
+                request_id: 0,
+                body: Some(Body::Ready(syntra_core::ServerReady {
                     connection_id: "active-loss-fixture".into(),
-                },
-            )),
-        }
-        .encode_to_vec();
+                })),
+            },
+            ValidationContext::pre_handshake(ConnectionState::Negotiating),
+        )
+        .unwrap();
         let ready = channel
             .encrypt(&syntra_core::secure_channel::frame_plaintext(&ready).unwrap())
             .unwrap();
@@ -977,17 +983,18 @@ async fn joined_connection_close_does_not_wait_for_an_unrelated_process_dns_job(
             _ => panic!("hello"),
         };
         channel.decrypt(&hello).unwrap();
-        use prost::Message as _;
-        let ready = syntra_core::Frame {
-            version: 1,
-            request_id: 0,
-            body: Some(syntra_core::proto::frame::Body::Ready(
-                syntra_core::ServerReady {
+        use syntra_core::{encode_frame, wire::frame::Body, ConnectionState, ValidationContext};
+        let ready = encode_frame(
+            &syntra_core::Frame {
+                version: 1,
+                request_id: 0,
+                body: Some(Body::Ready(syntra_core::ServerReady {
                     connection_id: "test-joined-close".into(),
-                },
-            )),
-        }
-        .encode_to_vec();
+                })),
+            },
+            ValidationContext::pre_handshake(ConnectionState::Negotiating),
+        )
+        .unwrap();
         let ready = channel
             .encrypt(&syntra_core::secure_channel::frame_plaintext(&ready).unwrap())
             .unwrap();

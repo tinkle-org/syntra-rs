@@ -1,8 +1,8 @@
-//! Source-independent host/codec tests using ordinary protobuf payloads.
+//! Source-independent host/codec tests using Bebop recovery payloads.
 //! SDK-owned transport integration and FFI contract tests run separately.
 
 use super::*;
-use prost::Message;
+use codec::{FixtureRecord, ProfileMessage};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -10,7 +10,31 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
-use syntra_core::proto::*;
+use syntra_core::wire::*;
+
+#[test]
+fn recovery_records_match_wire_examples() {
+    // profile 1, one-byte stream selector, empty initial checkpoint
+    let subscription = Subscribe {
+        profile_version: 1,
+        stream_selector: vec![0xff],
+        start_checkpoint: vec![],
+    };
+    let bytes = b"\x01\0\0\0\x01\0\0\0\xff\0\0\0\0";
+    assert_eq!(codec::encode(&subscription).unwrap(), bytes);
+    assert_eq!(codec::decode::<Subscribe>(bytes).unwrap(), subscription);
+
+    // profile 1, handle 'h', checkpoint 'c', little-endian generation
+    let confirmation = Confirmed {
+        profile_version: 1,
+        subscription_handle: vec![b'h'],
+        confirmed_checkpoint: vec![b'c'],
+        generation: 0x0102_0304_0506_0708,
+    };
+    let bytes = b"\x01\0\0\0\x01\0\0\0h\x01\0\0\0c\x08\x07\x06\x05\x04\x03\x02\x01";
+    assert_eq!(codec::encode(&confirmation).unwrap(), bytes);
+    assert_eq!(codec::decode::<Confirmed>(bytes).unwrap(), confirmation);
+}
 
 #[derive(Default)]
 struct Fixture {
@@ -184,7 +208,8 @@ impl RecoverySource for Source {
                 result_checkpoint: b.result.clone(),
                 batch_payload: b.payload.clone(),
             }
-            .encoded_len();
+            .fixture_bytes()
+            .len();
             if bytes + encoded > budget.max_entry_total_bytes {
                 break;
             }
@@ -260,19 +285,19 @@ fn setup(
     negotiate(&session);
     (source, service, session, principal)
 }
-fn call<R: Message + Default>(
+fn call<R: ProfileMessage>(
     s: &RecoveryHostSession,
     method: &str,
-    request: &impl Message,
+    request: &impl ProfileMessage,
 ) -> Result<R, ProviderError> {
-    let reply = s.handle(method, &request.encode_to_vec())?;
-    Ok(R::decode(reply.as_slice()).unwrap())
+    let reply = s.handle(method, &request.fixture_bytes())?;
+    Ok(codec::decode(&reply).unwrap())
 }
 fn negotiate(s: &RecoveryHostSession) {
-    let n: RecoveryNegotiateResponse = call(
+    let n: Negotiated = call(
         s,
         NEGOTIATE,
-        &RecoveryNegotiateRequest {
+        &Negotiate {
             profile_version: 1,
             min_version: 1,
             max_version: 1,
@@ -283,15 +308,11 @@ fn negotiate(s: &RecoveryHostSession) {
     assert_eq!(n.selected_version, 1);
     assert_eq!(n.max_pending_rpcs_per_connection, 16);
 }
-fn subscribe(
-    s: &RecoveryHostSession,
-    p: &Principal,
-    start: Option<usize>,
-) -> RecoverySubscribeResponse {
+fn subscribe(s: &RecoveryHostSession, p: &Principal, start: Option<usize>) -> SubscriptionAccepted {
     call(
         s,
         SUBSCRIBE,
-        &RecoverySubscribeRequest {
+        &Subscribe {
             profile_version: 1,
             stream_selector: b"s".to_vec(),
             start_checkpoint: start.map_or_else(Vec::new, |n| checkpoint(p, b"s", 7, n)),
@@ -299,8 +320,8 @@ fn subscribe(
     )
     .unwrap()
 }
-fn replay(h: &[u8], p: &Principal, n: usize, marker: &[u8], max: u32) -> RecoveryReplayRequest {
-    RecoveryReplayRequest {
+fn replay(h: &[u8], p: &Principal, n: usize, marker: &[u8], max: u32) -> Replay {
+    Replay {
         profile_version: 1,
         subscription_handle: h.to_vec(),
         from_checkpoint: checkpoint(p, b"s", 7, n),
@@ -309,14 +330,14 @@ fn replay(h: &[u8], p: &Principal, n: usize, marker: &[u8], max: u32) -> Recover
         max_bytes: 262_144,
     }
 }
-fn catchup(h: &[u8]) -> RecoveryCatchUpRequest {
-    RecoveryCatchUpRequest {
+fn catchup(h: &[u8]) -> CatchUp {
+    CatchUp {
         profile_version: 1,
         subscription_handle: h.to_vec(),
     }
 }
-fn offer(h: &[u8]) -> RecoverySnapshotOfferRequest {
-    RecoverySnapshotOfferRequest {
+fn offer(h: &[u8]) -> OfferSnapshot {
+    OfferSnapshot {
         profile_version: 1,
         subscription_handle: h.to_vec(),
         generation: 7,
@@ -334,15 +355,11 @@ fn trailer(s: &RecoveryHostSession) -> RecoveryBatchTrailer {
         _ => panic!("expected trailer"),
     }
 }
-fn confirm(
-    s: &RecoveryHostSession,
-    h: &[u8],
-    c: &[u8],
-) -> Result<RecoveryConfirmResponse, ProviderError> {
+fn confirm(s: &RecoveryHostSession, h: &[u8], c: &[u8]) -> Result<Confirmed, ProviderError> {
     call(
         s,
         CONFIRM,
-        &RecoveryConfirmRequest {
+        &Confirm {
             profile_version: 1,
             subscription_handle: h.to_vec(),
             generation: 7,
@@ -359,13 +376,13 @@ fn negotiation_is_connection_local_and_has_exact_methods() {
         assert_eq!(m.bytes().filter(|b| *b == b'/').count(), 2);
     }
     let other = service.open_connection(p.clone()).unwrap();
-    let request = RecoverySubscribeRequest {
+    let request = Subscribe {
         profile_version: 1,
         stream_selector: b"s".to_vec(),
         start_checkpoint: vec![],
     };
     assert_eq!(
-        other.handle(SUBSCRIBE, &request.encode_to_vec()),
+        other.handle(SUBSCRIBE, &request.fixture_bytes()),
         Err(ProviderError::Unimplemented)
     );
     assert_eq!(
@@ -384,24 +401,24 @@ fn negotiation_is_connection_local_and_has_exact_methods() {
         s.handle(SUBSCRIBE, &[8, 2, 18, 1, b's']),
         Err(ProviderError::FailedPrecondition)
     );
-    let no_overlap = RecoveryNegotiateRequest {
+    let no_overlap = Negotiate {
         profile_version: 1,
         min_version: 2,
         max_version: 2,
         capability: CAPABILITY.into(),
     };
     assert_eq!(
-        other.handle(NEGOTIATE, &no_overlap.encode_to_vec()),
+        other.handle(NEGOTIATE, &no_overlap.fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
     negotiate(&other);
     assert_eq!(
-        other.handle(NEGOTIATE, &no_overlap.encode_to_vec()),
+        other.handle(NEGOTIATE, &no_overlap.fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
     source.data.lock().unwrap().denied.insert(p.subject.clone());
     assert_eq!(
-        s.handle(SUBSCRIBE, &request.encode_to_vec()),
+        s.handle(SUBSCRIBE, &request.fixture_bytes()),
         Err(ProviderError::PermissionDenied)
     );
 }
@@ -417,18 +434,16 @@ fn pages_are_bare_bounded_fixed_b_and_decoded_retries_do_not_advance() {
     assert_eq!(batch.batch_payload, b"echo");
     assert_eq!(batch.subscription_handle, h.subscription_handle);
     assert_eq!(s.pop_notification().unwrap(), None); // page was not a notification
-    let mut unknown_retry = first.encode_to_vec();
-    unknown_retry.extend_from_slice(&[0xa0, 0x06, 0x01]); // ignored field 100
-    let retry = s.handle(REPLAY, &unknown_retry).unwrap();
-    assert_eq!(retry, page.encode_to_vec());
+    let retry = s.handle(REPLAY, &first.fixture_bytes()).unwrap();
+    assert_eq!(retry, page.fixture_bytes());
     assert_eq!(source.replay_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
-        s.handle(CATCH_UP, &catchup(&h.subscription_handle).encode_to_vec()),
+        s.handle(CATCH_UP, &catchup(&h.subscription_handle).fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
     let wrong = replay(&h.subscription_handle, &p, 1, b"wrong", 1);
     assert_eq!(
-        s.handle(REPLAY, &wrong.encode_to_vec()),
+        s.handle(REPLAY, &wrong.fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
     // Live progress cannot move the fixed boundary or leak before completion.
@@ -449,7 +464,7 @@ fn pages_are_bare_bounded_fixed_b_and_decoded_retries_do_not_advance() {
     );
     assert_eq!(source.replay_calls.load(Ordering::SeqCst), 2);
     assert_eq!(
-        s.handle(REPLAY, &first.encode_to_vec()),
+        s.handle(REPLAY, &first.fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
     let new = subscribe(&s, &p, Some(3));
@@ -483,13 +498,13 @@ fn confirms_are_stop_and_wait_and_not_authority_for_resume() {
     assert_eq!(
         fresh.handle(
             CONFIRM,
-            &RecoveryConfirmRequest {
+            &Confirm {
                 profile_version: 1,
                 subscription_handle: resumed.subscription_handle,
                 generation: 7,
                 checkpoint: c1
             }
-            .encode_to_vec()
+            .fixture_bytes()
         ),
         Err(ProviderError::FailedPrecondition)
     );
@@ -503,27 +518,27 @@ fn principal_and_resolved_stream_scope_are_checked_not_selector_equality() {
     source.scope(&p, b"other", 7, 3);
     let foreign = service.open_connection(q.clone()).unwrap();
     negotiate(&foreign);
-    let stolen = RecoverySubscribeRequest {
+    let stolen = Subscribe {
         profile_version: 1,
         stream_selector: b"s".to_vec(),
         start_checkpoint: checkpoint(&p, b"s", 7, 1),
     };
     assert_eq!(
-        foreign.handle(SUBSCRIBE, &stolen.encode_to_vec()),
+        foreign.handle(SUBSCRIBE, &stolen.fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
-    let other_stream = RecoverySubscribeRequest {
+    let other_stream = Subscribe {
         stream_selector: b"other".to_vec(),
         ..stolen.clone()
     };
     assert_eq!(
-        s.handle(SUBSCRIBE, &other_stream.encode_to_vec()),
+        s.handle(SUBSCRIBE, &other_stream.fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
-    let h: RecoverySubscribeResponse = call(
+    let h: SubscriptionAccepted = call(
         &s,
         SUBSCRIBE,
-        &RecoverySubscribeRequest {
+        &Subscribe {
             stream_selector: b"alias".to_vec(),
             start_checkpoint: vec![],
             ..stolen
@@ -539,7 +554,7 @@ fn principal_and_resolved_stream_scope_are_checked_not_selector_equality() {
     );
     assert_eq!(foreign.pop_notification().unwrap(), None);
     assert_eq!(
-        foreign.handle(CATCH_UP, &catchup(&h.subscription_handle).encode_to_vec()),
+        foreign.handle(CATCH_UP, &catchup(&h.subscription_handle).fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
 }
@@ -553,10 +568,10 @@ fn catchup_is_pull_driven_bounded_and_exact_acceptance_retries_are_effect_free()
     let (source, _, s, p) = setup(limits);
     let h = subscribe(&s, &p, Some(0));
     let r = catchup(&h.subscription_handle);
-    let accepted = s.handle(CATCH_UP, &r.encode_to_vec()).unwrap();
+    let accepted = s.handle(CATCH_UP, &r.fixture_bytes()).unwrap();
     assert_eq!(source.replay_calls.load(Ordering::SeqCst), 1);
     assert_eq!(s.queue_counts().unwrap().data_messages, 1);
-    assert_eq!(s.handle(CATCH_UP, &r.encode_to_vec()).unwrap(), accepted);
+    assert_eq!(s.handle(CATCH_UP, &r.fixture_bytes()).unwrap(), accepted);
     assert_eq!(source.replay_calls.load(Ordering::SeqCst), 1);
     for n in 1..=3 {
         assert!(
@@ -567,16 +582,16 @@ fn catchup_is_pull_driven_bounded_and_exact_acceptance_retries_are_effect_free()
     let done = trailer(&s);
     assert_eq!(
         done.outcome,
-        Some(recovery_batch_trailer::Outcome::CatchupComplete(true))
+        Some(recovery_batch_trailer::Outcome::CatchupComplete)
     );
     assert_eq!(done.boundary_checkpoint, h.catchup_boundary);
-    assert_eq!(s.handle(CATCH_UP, &r.encode_to_vec()).unwrap(), accepted);
+    assert_eq!(s.handle(CATCH_UP, &r.fixture_bytes()).unwrap(), accepted);
     assert_eq!(trailer(&s), done);
     assert_eq!(source.replay_calls.load(Ordering::SeqCst), 3);
     assert_eq!(
         s.handle(
             REPLAY,
-            &replay(&h.subscription_handle, &p, 0, &[], 1).encode_to_vec()
+            &replay(&h.subscription_handle, &p, 0, &[], 1).fixture_bytes()
         ),
         Err(ProviderError::FailedPrecondition)
     );
@@ -589,7 +604,7 @@ fn initial_skips_replay_and_requires_explicit_baseline_completion() {
     assert_eq!(
         s.handle(
             REPLAY,
-            &replay(&h.subscription_handle, &p, 0, &[], 64).encode_to_vec()
+            &replay(&h.subscription_handle, &p, 0, &[], 64).fixture_bytes()
         ),
         Err(ProviderError::FailedPrecondition)
     );
@@ -597,7 +612,7 @@ fn initial_skips_replay_and_requires_explicit_baseline_completion() {
     let _: RecoveryCatchUpAccepted = call(&s, CATCH_UP, &catchup(&h.subscription_handle)).unwrap();
     assert_eq!(
         trailer(&s).outcome,
-        Some(recovery_batch_trailer::Outcome::CatchupComplete(true))
+        Some(recovery_batch_trailer::Outcome::CatchupComplete)
     );
     assert_eq!(source.replay_calls.load(Ordering::SeqCst), 0);
 }
@@ -609,9 +624,9 @@ fn retention_miss_has_failed_result_and_snapshot_required_at_unchanged_g() {
         source.data.lock().unwrap().retention_miss = true;
         let h = subscribe(&s, &p, Some(0));
         let payload = if method == REPLAY {
-            replay(&h.subscription_handle, &p, 0, &[], 64).encode_to_vec()
+            replay(&h.subscription_handle, &p, 0, &[], 64).fixture_bytes()
         } else {
-            catchup(&h.subscription_handle).encode_to_vec()
+            catchup(&h.subscription_handle).fixture_bytes()
         };
         assert_eq!(
             s.handle(method, &payload),
@@ -621,7 +636,7 @@ fn retention_miss_has_failed_result_and_snapshot_required_at_unchanged_g() {
         assert_eq!(t.generation, 7);
         assert_eq!(
             t.outcome,
-            Some(recovery_batch_trailer::Outcome::SnapshotRequired(true))
+            Some(recovery_batch_trailer::Outcome::SnapshotRequired)
         );
         assert!(t.terminate_reason.is_empty());
         let _: RecoverySnapshotDescriptor =
@@ -632,7 +647,7 @@ fn retention_miss_has_failed_result_and_snapshot_required_at_unchanged_g() {
 fn snapshot(s: &RecoveryHostSession, h: &[u8]) -> RecoverySnapshotDescriptor {
     let d: RecoverySnapshotDescriptor = call(s, SNAPSHOT_OFFER, &offer(h)).unwrap();
     for i in 0..d.total_pages {
-        let r = RecoverySnapshotFetchRequest {
+        let r = FetchSnapshot {
             profile_version: 1,
             snapshot_handle: d.snapshot_handle.clone(),
             page_index: i,
@@ -648,8 +663,8 @@ fn snapshot(s: &RecoveryHostSession, h: &[u8]) -> RecoverySnapshotDescriptor {
     }
     d
 }
-fn install_request(h: &[u8], d: &RecoverySnapshotDescriptor) -> RecoverySnapshotConfirmRequest {
-    RecoverySnapshotConfirmRequest {
+fn install_request(h: &[u8], d: &RecoverySnapshotDescriptor) -> ConfirmSnapshot {
+    ConfirmSnapshot {
         profile_version: 1,
         subscription_handle: h.to_vec(),
         generation: 7,
@@ -665,7 +680,7 @@ fn snapshots_bind_s0_and_same_g_with_no_wire_complete_and_retained_install_retry
         call(&s, SNAPSHOT_OFFER, &offer(&h.subscription_handle)).unwrap();
     let r = install_request(&h.subscription_handle, &d);
     assert_eq!(
-        s.handle(SNAPSHOT_CONFIRM, &r.encode_to_vec()),
+        s.handle(SNAPSHOT_CONFIRM, &r.fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
     assert_eq!(snapshot(&s, &h.subscription_handle), d);
@@ -675,18 +690,18 @@ fn snapshots_bind_s0_and_same_g_with_no_wire_complete_and_retained_install_retry
         s.handle("/syntra.v1.UpdateRecovery/SnapshotComplete", &[]),
         Err(ProviderError::Unimplemented)
     );
-    let installed = s.handle(SNAPSHOT_CONFIRM, &r.encode_to_vec()).unwrap();
+    let installed = s.handle(SNAPSHOT_CONFIRM, &r.fixture_bytes()).unwrap();
     let decoded: RecoverySnapshotInstalled = codec::decode(&installed).unwrap();
     assert_eq!(decoded.generation, 7);
     assert_eq!(decoded.boundary_checkpoint, d.boundary_checkpoint);
     assert_eq!(
-        s.handle(SNAPSHOT_CONFIRM, &r.encode_to_vec()).unwrap(),
+        s.handle(SNAPSHOT_CONFIRM, &r.fixture_bytes()).unwrap(),
         installed
     );
     let mut wrong = r.clone();
     wrong.generation = 8;
     assert_eq!(
-        s.handle(SNAPSHOT_CONFIRM, &wrong.encode_to_vec()),
+        s.handle(SNAPSHOT_CONFIRM, &wrong.fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
     assert_eq!(s.pop_notification().unwrap(), None); // Installed is the gate, not a B completion.
@@ -717,19 +732,19 @@ fn supersede_retires_h_and_x_even_at_equal_s0() {
     assert_eq!(
         s.handle(
             SNAPSHOT_FETCH,
-            &RecoverySnapshotFetchRequest {
+            &FetchSnapshot {
                 profile_version: 1,
                 snapshot_handle: d.snapshot_handle.clone(),
                 page_index: 0
             }
-            .encode_to_vec()
+            .fixture_bytes()
         ),
         Err(ProviderError::FailedPrecondition)
     );
     assert_eq!(
         s.handle(
             SNAPSHOT_CONFIRM,
-            &install_request(&h.subscription_handle, &d).encode_to_vec()
+            &install_request(&h.subscription_handle, &d).fixture_bytes()
         ),
         Err(ProviderError::FailedPrecondition)
     );
@@ -754,7 +769,7 @@ fn s0_different_from_b_opens_empty_snapshot_live_gate_without_old_completion() {
     assert_eq!(s.queue_counts().unwrap().offered_checkpoints, 0);
     assert_eq!(s.pop_notification().unwrap(), None); // queued old ReplayComplete was discarded
     assert_eq!(
-        s.handle(REPLAY, &request.encode_to_vec()),
+        s.handle(REPLAY, &request.fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
     let install = install_request(&h.subscription_handle, &d);
@@ -789,11 +804,11 @@ fn s0_different_from_b_opens_empty_snapshot_live_gate_without_old_completion() {
         acknowledged
     );
     assert_eq!(
-        s.handle(REPLAY, &request.encode_to_vec()),
+        s.handle(REPLAY, &request.fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
     assert_eq!(
-        s.handle(CATCH_UP, &catchup(&h.subscription_handle).encode_to_vec()),
+        s.handle(CATCH_UP, &catchup(&h.subscription_handle).fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
     assert_eq!(source.current_generation(&p, b"s").unwrap(), 7);
@@ -843,7 +858,7 @@ fn snapshot_confirm_drops_only_the_held_prefix_proven_through_s0() {
             assert_eq!(s.pop_notification().unwrap(), None); // no old completion may release held data
             let install = install_request(&h.subscription_handle, &d);
             let installed = s
-                .handle(SNAPSHOT_CONFIRM, &install.encode_to_vec())
+                .handle(SNAPSHOT_CONFIRM, &install.fixture_bytes())
                 .unwrap();
             let after = s.queue_counts().unwrap();
             assert_eq!(after.data_messages, usize::from(retain_suffix));
@@ -860,7 +875,8 @@ fn snapshot_confirm_drops_only_the_held_prefix_proven_through_s0() {
                         batch_payload: vec![b'e'; 16],
                     })),
                 }
-                .encoded_len()
+                .fixture_bytes()
+                .len()
             } else {
                 0
             };
@@ -876,7 +892,7 @@ fn snapshot_confirm_drops_only_the_held_prefix_proven_through_s0() {
                 );
             }
             assert_eq!(
-                s.handle(SNAPSHOT_CONFIRM, &install.encode_to_vec())
+                s.handle(SNAPSHOT_CONFIRM, &install.fixture_bytes())
                     .unwrap(),
                 installed
             );
@@ -893,7 +909,7 @@ fn snapshot_confirm_drops_only_the_held_prefix_proven_through_s0() {
                 );
             }
             assert_eq!(
-                s.handle(SNAPSHOT_CONFIRM, &install.encode_to_vec())
+                s.handle(SNAPSHOT_CONFIRM, &install.fixture_bytes())
                     .unwrap(),
                 installed
             );
@@ -934,7 +950,7 @@ fn snapshot_confirm_keeps_a_held_chain_already_starting_at_s0_not_old_b() {
     assert_eq!(s.pop_notification().unwrap(), None);
     let install = install_request(&h.subscription_handle, &d);
     let installed = s
-        .handle(SNAPSHOT_CONFIRM, &install.encode_to_vec())
+        .handle(SNAPSHOT_CONFIRM, &install.fixture_bytes())
         .unwrap();
     assert_eq!(s.queue_counts().unwrap().data_bytes, before.data_bytes);
     // The old batch confirmation of these same bytes was retired by the offer;
@@ -954,7 +970,7 @@ fn snapshot_confirm_keeps_a_held_chain_already_starting_at_s0_not_old_b() {
         );
     }
     assert_eq!(
-        s.handle(SNAPSHOT_CONFIRM, &install.encode_to_vec())
+        s.handle(SNAPSHOT_CONFIRM, &install.fixture_bytes())
             .unwrap(),
         installed
     );
@@ -984,7 +1000,7 @@ async fn irreconcilable_snapshot_held_chain_terminates_only_h_and_requires_a_fre
     assert_eq!(s.queue_counts().unwrap().data_messages, 1); // offer must not silently erase it
     let install = install_request(&h.subscription_handle, &d);
     assert_eq!(
-        s.handle(SNAPSHOT_CONFIRM, &install.encode_to_vec()),
+        s.handle(SNAPSHOT_CONFIRM, &install.fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
     let counts = s.queue_counts().unwrap();
@@ -1003,24 +1019,21 @@ async fn irreconcilable_snapshot_held_chain_terminates_only_h_and_requires_a_fre
     };
     assert_eq!(t.subscription_handle, h.subscription_handle);
     assert_eq!(t.generation, 7);
-    assert_eq!(
-        t.outcome,
-        Some(recovery_batch_trailer::Outcome::Terminated(true))
-    );
+    assert_eq!(t.outcome, Some(recovery_batch_trailer::Outcome::Terminated));
     assert_eq!(t.terminate_reason, b"snapshot-chain-gap");
     assert_eq!(
-        s.handle(SNAPSHOT_CONFIRM, &install.encode_to_vec()),
+        s.handle(SNAPSHOT_CONFIRM, &install.fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
     assert_eq!(
         s.handle(
             SNAPSHOT_FETCH,
-            &RecoverySnapshotFetchRequest {
+            &FetchSnapshot {
                 profile_version: 1,
                 snapshot_handle: d.snapshot_handle,
                 page_index: 0,
             }
-            .encode_to_vec()
+            .fixture_bytes()
         ),
         Err(ProviderError::FailedPrecondition)
     );
@@ -1083,10 +1096,7 @@ fn local_overflow_terminates_only_the_slow_handle_and_reserves_control_capacity(
     let t = trailer(&slow);
     assert_eq!(t.subscription_handle, hs.subscription_handle);
     assert_eq!(t.generation, 7);
-    assert_eq!(
-        t.outcome,
-        Some(recovery_batch_trailer::Outcome::Terminated(true))
-    );
+    assert_eq!(t.outcome, Some(recovery_batch_trailer::Outcome::Terminated));
     assert_eq!(t.terminate_reason, b"local-queue-exhausted");
     assert_eq!(source.current_generation(&p, b"s").unwrap(), 7);
     assert_eq!(fast.queue_counts().unwrap().subscriptions, 1);
@@ -1115,14 +1125,14 @@ fn provider_loss_fences_old_generation_only_in_the_declared_principal_scope() {
     assert_eq!(
         s.handle(
             SNAPSHOT_CONFIRM,
-            &install_request(&h.subscription_handle, &d).encode_to_vec()
+            &install_request(&h.subscription_handle, &d).fixture_bytes()
         ),
         Err(ProviderError::FailedPrecondition)
     );
     assert_eq!(
         s.handle(
             REPLAY,
-            &replay(&h.subscription_handle, &p, 0, &[], 64).encode_to_vec()
+            &replay(&h.subscription_handle, &p, 0, &[], 64).fixture_bytes()
         ),
         Err(ProviderError::FailedPrecondition)
     );
@@ -1145,10 +1155,7 @@ fn revocation_is_rechecked_before_emission_and_never_manufactures_an_epoch() {
     source.data.lock().unwrap().denied.insert(p.subject.clone());
     let t = trailer(&s);
     assert_eq!(t.generation, 7);
-    assert_eq!(
-        t.outcome,
-        Some(recovery_batch_trailer::Outcome::Terminated(true))
-    );
+    assert_eq!(t.outcome, Some(recovery_batch_trailer::Outcome::Terminated));
     assert_eq!(t.terminate_reason, b"authorization-ended");
     assert_eq!(s.queue_counts().unwrap().data_bytes, 0);
 }
@@ -1165,13 +1172,13 @@ fn aggregate_principal_quotas_drop_and_close_release_state() {
     negotiate(&second);
     let h = subscribe(&s, &p, None);
     subscribe(&second, &p, None);
-    let request = RecoverySubscribeRequest {
+    let request = Subscribe {
         profile_version: 1,
         stream_selector: b"s".to_vec(),
         start_checkpoint: vec![],
     };
     assert_eq!(
-        s.handle(SUBSCRIBE, &request.encode_to_vec()),
+        s.handle(SUBSCRIBE, &request.fixture_bytes()),
         Err(ProviderError::ResourceExhausted)
     );
     assert!(matches!(
@@ -1182,17 +1189,17 @@ fn aggregate_principal_quotas_drop_and_close_release_state() {
     subscribe(&s, &p, None);
     s.close();
     assert_eq!(
-        s.handle(CATCH_UP, &catchup(&h.subscription_handle).encode_to_vec()),
+        s.handle(CATCH_UP, &catchup(&h.subscription_handle).fixture_bytes()),
         Err(ProviderError::Unavailable)
     );
     let fresh = service.open_connection(p).unwrap();
     assert_eq!(
-        fresh.handle(CATCH_UP, &catchup(&h.subscription_handle).encode_to_vec()),
+        fresh.handle(CATCH_UP, &catchup(&h.subscription_handle).fixture_bytes()),
         Err(ProviderError::Unimplemented)
     );
     negotiate(&fresh);
     assert_eq!(
-        fresh.handle(CATCH_UP, &catchup(&h.subscription_handle).encode_to_vec()),
+        fresh.handle(CATCH_UP, &catchup(&h.subscription_handle).fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
 }
@@ -1207,18 +1214,18 @@ fn retained_reply_expiry_and_retry_budget_never_repeat_installation_or_catchup()
     let (source, _, s, p) = setup(limits);
     let h = subscribe(&s, &p, None);
     let r = catchup(&h.subscription_handle);
-    s.handle(CATCH_UP, &r.encode_to_vec()).unwrap();
-    s.handle(CATCH_UP, &r.encode_to_vec()).unwrap();
+    s.handle(CATCH_UP, &r.fixture_bytes()).unwrap();
+    s.handle(CATCH_UP, &r.fixture_bytes()).unwrap();
     assert_eq!(
-        s.handle(CATCH_UP, &r.encode_to_vec()),
+        s.handle(CATCH_UP, &r.fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
     let d = snapshot(&s, &h.subscription_handle);
     let r = install_request(&h.subscription_handle, &d);
-    s.handle(SNAPSHOT_CONFIRM, &r.encode_to_vec()).unwrap();
+    s.handle(SNAPSHOT_CONFIRM, &r.fixture_bytes()).unwrap();
     std::thread::sleep(Duration::from_millis(250));
     assert_eq!(
-        s.handle(SNAPSHOT_CONFIRM, &r.encode_to_vec()),
+        s.handle(SNAPSHOT_CONFIRM, &r.fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
     assert_eq!(source.snapshot_calls.load(Ordering::SeqCst), 1);
@@ -1236,10 +1243,10 @@ fn handles_and_snapshot_handles_never_reuse_and_exhaustion_is_checked() {
     let h = subscribe(&s, &p, None);
     let _: RecoverySnapshotDescriptor =
         call(&s, SNAPSHOT_OFFER, &offer(&h.subscription_handle)).unwrap();
-    let _: RecoveryUnsubscribeResponse = call(
+    let _: Unsubscribed = call(
         &s,
         UNSUBSCRIBE,
-        &RecoveryUnsubscribeRequest {
+        &Unsubscribe {
             profile_version: 1,
             subscription_handle: h.subscription_handle.clone(),
         },
@@ -1249,17 +1256,17 @@ fn handles_and_snapshot_handles_never_reuse_and_exhaustion_is_checked() {
     assert_eq!(
         s.handle(
             SUBSCRIBE,
-            &RecoverySubscribeRequest {
+            &Subscribe {
                 profile_version: 1,
                 stream_selector: b"s".to_vec(),
                 start_checkpoint: vec![]
             }
-            .encode_to_vec()
+            .fixture_bytes()
         ),
         Err(ProviderError::ResourceExhausted)
     );
     assert_eq!(
-        s.handle(CATCH_UP, &catchup(&h.subscription_handle).encode_to_vec()),
+        s.handle(CATCH_UP, &catchup(&h.subscription_handle).fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
 }
@@ -1271,7 +1278,7 @@ fn invalid_provider_outputs_and_deadline_do_not_expose_partial_pages() {
     source.data.lock().unwrap().wrong_page = true;
     let r = replay(&h.subscription_handle, &p, 0, &[], 64);
     assert_eq!(
-        s.handle(REPLAY, &r.encode_to_vec()),
+        s.handle(REPLAY, &r.fixture_bytes()),
         Err(ProviderError::Internal)
     );
     assert_eq!(s.queue_counts().unwrap().offered_checkpoints, 0);
@@ -1279,12 +1286,12 @@ fn invalid_provider_outputs_and_deadline_do_not_expose_partial_pages() {
     *source.after_replay.lock().unwrap() =
         Some(Box::new(|| std::thread::sleep(Duration::from_millis(5))));
     assert_eq!(
-        s.handle_with_deadline(REPLAY, &r.encode_to_vec(), Duration::from_millis(1)),
+        s.handle_with_deadline(REPLAY, &r.fixture_bytes(), Duration::from_millis(1)),
         Err(ProviderError::DeadlineExceeded)
     );
     assert_eq!(s.queue_counts().unwrap().offered_checkpoints, 0);
     assert_eq!(
-        s.handle_with_deadline(REPLAY, &r.encode_to_vec(), Duration::ZERO),
+        s.handle_with_deadline(REPLAY, &r.fixture_bytes(), Duration::ZERO),
         Err(ProviderError::DeadlineExceeded)
     );
     let _: RecoveryReplayPage = call(&s, REPLAY, &r).unwrap();
@@ -1314,7 +1321,7 @@ fn close_and_generation_change_during_provider_callback_fence_the_result() {
         assert_eq!(
             s.handle(
                 REPLAY,
-                &replay(&h.subscription_handle, &p, 0, &[], 64).encode_to_vec()
+                &replay(&h.subscription_handle, &p, 0, &[], 64).fixture_bytes()
             ),
             Err(error)
         );
@@ -1412,10 +1419,10 @@ fn pending_profile_quota_one_is_accepted_and_negotiated() {
     )
     .unwrap();
     let session = service.open_connection(Principal::new("p")).unwrap();
-    let response: RecoveryNegotiateResponse = call(
+    let response: Negotiated = call(
         &session,
         NEGOTIATE,
-        &RecoveryNegotiateRequest {
+        &Negotiate {
             profile_version: 1,
             min_version: 1,
             max_version: 1,
@@ -1426,165 +1433,94 @@ fn pending_profile_quota_one_is_accepted_and_negotiated() {
     assert_eq!(response.max_pending_rpcs_per_connection, 1);
 }
 
-fn len_field(tag: u32, bytes: &[u8]) -> Vec<u8> {
-    fn var(mut n: u64, out: &mut Vec<u8>) {
-        while n >= 128 {
-            out.push((n as u8 & 127) | 128);
-            n >>= 7;
-        }
-        out.push(n as u8);
+#[test]
+fn positional_subscribe_checks_declared_lengths_and_exact_consumption() {
+    let bytes = b"\x01\0\0\0\x01\0\0\0s\x01\0\0\0c";
+    let value = codec::decode::<Subscribe>(bytes).unwrap();
+    assert_eq!(value.stream_selector, b"s");
+    assert_eq!(value.start_checkpoint, b"c");
+    assert_eq!(codec::encode(&value).unwrap(), bytes);
+    for end in 0..bytes.len() {
+        assert!(codec::decode::<Subscribe>(&bytes[..end]).is_err());
     }
-    let mut v = Vec::new();
-    var(u64::from(tag) << 3 | 2, &mut v);
-    var(bytes.len() as u64, &mut v);
-    v.extend(bytes);
-    v
+    let mut trailing = bytes.to_vec();
+    trailing.push(0);
+    assert!(codec::decode::<Subscribe>(&trailing).is_err());
+    let mut huge = bytes.to_vec();
+    huge[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(codec::decode::<Subscribe>(&huge).is_err());
 }
 
 #[test]
-fn codec_preflight_checks_types_lengths_recursion_and_unknown_fields() {
-    let valid = RecoverySubscribeRequest {
+fn positional_subscribe_checks_field_size_limits() {
+    let subscribe = |selector_len, checkpoint_len| Subscribe {
         profile_version: 1,
-        stream_selector: vec![1; 1024],
-        start_checkpoint: vec![1; 4096],
+        stream_selector: vec![b's'; selector_len],
+        start_checkpoint: vec![b'c'; checkpoint_len],
     };
-    assert_eq!(
-        codec::decode::<RecoverySubscribeRequest>(&valid.encode_to_vec()).unwrap(),
-        valid
-    );
-    let too_big = RecoverySubscribeRequest {
-        stream_selector: vec![1; 1025],
-        ..valid.clone()
-    };
-    assert!(codec::decode::<RecoverySubscribeRequest>(&too_big.encode_to_vec()).is_err());
-    assert!(codec::decode::<RecoverySubscribeRequest>(&[8, 1, 16, 1]).is_err()); // bytes with varint type
-    assert!(codec::decode::<RecoverySubscribeRequest>(&[8, 1, 18, 0xff, 0xff]).is_err()); // truncated length
-    assert!(codec::decode::<RecoverySubscribeRequest>(&[8, 1, 0]).is_err()); // tag zero
-    assert!(codec::decode::<RecoverySubscribeRequest>(&[8, 0xff, 0xff, 0xff, 0xff, 0x1f]).is_err()); // u32 overflow
-    let mut unknown = valid.encode_to_vec();
-    unknown.extend(len_field(100, &[0xff, 0]));
-    assert_eq!(
-        codec::decode::<RecoverySubscribeRequest>(&unknown).unwrap(),
-        valid
-    );
-    unknown.extend_from_slice(&[0xab, 0x06, 8, 1, 0xac, 0x06]); // unknown group tag 101
-    assert_eq!(
-        codec::decode::<RecoverySubscribeRequest>(&unknown).unwrap(),
-        valid
-    );
-    let mut group = vec![];
-    for _ in 0..34 {
-        group.extend_from_slice(&[0xab, 0x06]);
+    let max = subscribe(1024, 4096);
+    assert_eq!(codec::decode::<Subscribe>(&max.fixture_bytes()), Ok(max));
+    for oversized in [subscribe(1025, 4096), subscribe(1024, 4097)] {
+        assert_eq!(
+            codec::decode::<Subscribe>(&oversized.fixture_bytes()),
+            Err(ProviderError::FailedPrecondition)
+        );
     }
-    for _ in 0..34 {
-        group.extend_from_slice(&[0xac, 0x06]);
-    }
-    assert!(codec::decode::<RecoverySubscribeRequest>(&group).is_err());
-    let nested = len_field(2, &[8, 1, 18, 0xff, 0xff, 0x7f]);
-    assert!(codec::decode::<RecoveryNotification>(&[vec![8, 1], nested].concat()).is_err());
-    assert!(codec::decode::<RecoveryNotification>(&[8, 1]).is_err()); // unset arm
-    assert_eq!(
-        codec::decode::<RecoveryNotification>(&vec![0; syntra_core::MAX_FRAME_BYTES]),
-        Err(ProviderError::ResourceExhausted)
-    );
 }
 
 #[test]
-fn profile_oneofs_follow_protobuf_last_arm_semantics_not_core_raw_partition() {
-    let complete = RecoveryReplayComplete {
+fn notification_preflight_checks_arm_discriminator_and_exact_extent() {
+    let message = RecoveryNotification {
+        profile_version: 1,
+        notification: Some(recovery_notification::Notification::ReplayComplete(
+            RecoveryReplayComplete {
+                profile_version: 1,
+                subscription_handle: vec![1],
+                generation: 7,
+                live_boundary_checkpoint: vec![2],
+            },
+        )),
+    };
+    let bytes = codec::encode(&message).unwrap();
+    assert_eq!(bytes[8], 3);
+    for size in [0, u32::MAX] {
+        let mut bad = bytes.clone();
+        bad[4..8].copy_from_slice(&size.to_le_bytes());
+        assert!(codec::decode::<RecoveryNotification>(&bad).is_err());
+    }
+    let mut unknown = bytes;
+    unknown[8] = 255;
+    assert!(codec::decode::<RecoveryNotification>(&unknown).is_err());
+}
+
+#[test]
+fn packed_page_checks_entry_count_and_inner_lengths() {
+    let batch = codec::encode(&RecoveryBatch {
         profile_version: 1,
         subscription_handle: vec![1],
-        generation: 7,
-        live_boundary_checkpoint: vec![2],
-    };
-    let trailer = RecoveryBatchTrailer {
+        generation: 1,
+        predecessor_checkpoint: vec![2],
+        result_checkpoint: vec![2],
+        batch_payload: vec![],
+    })
+    .unwrap();
+    let mut page = RecoveryReplayPage {
         profile_version: 1,
         subscription_handle: vec![1],
-        generation: 7,
-        boundary_checkpoint: vec![2],
-        outcome: Some(recovery_batch_trailer::Outcome::SnapshotRequired(true)),
-        terminate_reason: vec![],
+        predecessor_checkpoint: vec![2],
+        result_checkpoint: vec![2],
+        catchup_boundary: vec![2],
+        continuation_marker: vec![],
+        batch_payloads: vec![batch.clone(); 64],
     };
-    let bytes = [
-        vec![8, 1],
-        len_field(3, &complete.encode_to_vec()),
-        len_field(4, &trailer.encode_to_vec()),
-    ]
-    .concat();
-    let n: RecoveryNotification = codec::decode(&bytes).unwrap();
     assert_eq!(
-        n.notification,
-        Some(recovery_notification::Notification::Trailer(trailer))
+        codec::decode::<RecoveryReplayPage>(&codec::encode(&page).unwrap()).unwrap(),
+        page
     );
-    // Same message arm merges ordinary fields across occurrences.
-    let split = [
-        vec![8, 1],
-        len_field(3, &[8, 1, 18, 1, 1]),
-        len_field(3, &[24, 7, 34, 1, 2]),
-    ]
-    .concat();
-    assert_eq!(
-        codec::decode::<RecoveryNotification>(&split)
-            .unwrap()
-            .notification,
-        Some(recovery_notification::Notification::ReplayComplete(
-            complete
-        ))
-    );
-}
-
-#[test]
-fn pinned_payload_field_mapping_vectors_are_envelope_neutral() {
-    // Literal protobuf field mappings from the pinned accepted IDL, not an
-    // encode/decode roundtrip generated by the implementation under test.
-    let negotiate = b"\x08\x01\x10\x01\x18\x01\x22\x18syntra.update-recovery/1";
-    assert_eq!(
-        codec::decode::<RecoveryNegotiateRequest>(negotiate)
-            .unwrap()
-            .capability,
-        CAPABILITY
-    );
-    let subscribe = b"\x08\x01\x12\x01s\x1a\x01c";
-    assert_eq!(
-        codec::decode::<RecoverySubscribeRequest>(subscribe)
-            .unwrap()
-            .start_checkpoint,
-        b"c"
-    );
-    let batch = b"\x08\x01\x12\x01h\x18\x07\x22\x01c\x2a\x01d\x32\x04echo";
-    let decoded: RecoveryBatch = codec::decode(batch).unwrap();
-    assert_eq!(decoded.batch_payload, b"echo");
-    assert_eq!(decoded.predecessor_checkpoint, b"c");
-    assert_eq!(decoded.result_checkpoint, b"d");
-    let page = [
-        b"\x08\x01\x12\x01h\x1a\x01c\x22\x01d\x32\x01d\x3a\x13".as_slice(),
-        batch,
-    ]
-    .concat();
-    assert_eq!(
-        codec::decode::<RecoveryReplayPage>(&page)
-            .unwrap()
-            .batch_payloads,
-        vec![batch.to_vec()]
-    );
-    let notification = [b"\x08\x01\x12\x13".as_slice(), batch].concat();
-    assert_eq!(
-        codec::decode::<RecoveryNotification>(&notification)
-            .unwrap()
-            .notification,
-        Some(recovery_notification::Notification::Batch(decoded))
-    );
-    let local_full = b"\x08\x01\x12\x01h\x18\x07\x40\x01\x4a\x15local-queue-exhausted";
-    let t: RecoveryBatchTrailer = codec::decode(local_full).unwrap();
-    assert_eq!(
-        t.outcome,
-        Some(recovery_batch_trailer::Outcome::Terminated(true))
-    );
-    let loss: RecoveryBatchTrailer = codec::decode(b"\x08\x01\x12\x01h\x18\x07\x28\x08").unwrap();
-    assert_eq!(
-        loss.outcome,
-        Some(recovery_batch_trailer::Outcome::NextGeneration(8))
-    );
+    page.batch_payloads.push(batch);
+    assert!(codec::decode::<RecoveryReplayPage>(&page.fixture_bytes()).is_err());
+    page.batch_payloads = vec![vec![0; 4]];
+    assert!(codec::decode::<RecoveryReplayPage>(&page.fixture_bytes()).is_err());
 }
 
 #[test]
@@ -1597,15 +1533,15 @@ fn serialized_entry_limits_include_tags_and_page_overhead_is_separate_core_bound
         result_checkpoint: vec![b'd'],
         batch_payload: vec![0; 262_120],
     };
-    while b.encoded_len() != 262_144 {
-        let length = b.batch_payload.len() as isize + 262_144 - b.encoded_len() as isize;
+    while b.fixture_bytes().len() != 262_144 {
+        let length = b.batch_payload.len() as isize + 262_144 - b.fixture_bytes().len() as isize;
         b.batch_payload.resize(length as usize, 0);
     }
     let exact = codec::encode(&b).unwrap();
     assert_eq!(exact.len(), 262_144);
     b.batch_payload.push(0);
     assert!(codec::encode(&b).is_err());
-    assert!(codec::decode::<RecoveryBatch>(&b.encode_to_vec()).is_err());
+    assert!(codec::decode::<RecoveryBatch>(&b.fixture_bytes()).is_err());
     let mut page = RecoveryReplayPage {
         profile_version: 1,
         subscription_handle: vec![b'h'],
@@ -1620,7 +1556,7 @@ fn serialized_entry_limits_include_tags_and_page_overhead_is_separate_core_bound
     assert!(encoded.len() <= codec::MAX_PAYLOAD_BYTES);
     assert!(codec::decode::<RecoveryReplayPage>(&encoded).is_ok());
     page.batch_payloads.push(vec![0]);
-    assert!(codec::decode::<RecoveryReplayPage>(&page.encode_to_vec()).is_err());
+    assert!(codec::decode::<RecoveryReplayPage>(&page.fixture_bytes()).is_err());
 }
 
 #[test]
@@ -1661,7 +1597,7 @@ fn aggregate_queue_and_retained_reply_count_overflow_remain_targeted() {
     assert_eq!(
         s.handle(
             CATCH_UP,
-            &catchup(&second.subscription_handle).encode_to_vec()
+            &catchup(&second.subscription_handle).fixture_bytes()
         ),
         Err(ProviderError::ResourceExhausted)
     );
@@ -1685,7 +1621,7 @@ fn callback_reentrancy_is_fail_fast_and_provider_panics_propagate_and_close() {
     *source.after_replay.lock().unwrap() = Some(Box::new(|| panic!("test-only provider panic")));
     let next = replay(&h.subscription_handle, &p, 1, &page.continuation_marker, 1);
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-        || s.handle(REPLAY, &next.encode_to_vec())
+        || s.handle(REPLAY, &next.fixture_bytes())
     ))
     .is_err());
     assert!(s.is_closed());
@@ -1700,7 +1636,7 @@ fn snapshot_chunk_bounds_and_cross_connection_x_are_checked_without_partial_inst
     let h = subscribe(&s, &p, Some(0));
     let d: RecoverySnapshotDescriptor =
         call(&s, SNAPSHOT_OFFER, &offer(&h.subscription_handle)).unwrap();
-    let fetch = RecoverySnapshotFetchRequest {
+    let fetch = FetchSnapshot {
         profile_version: 1,
         snapshot_handle: d.snapshot_handle.clone(),
         page_index: 0,
@@ -1708,35 +1644,35 @@ fn snapshot_chunk_bounds_and_cross_connection_x_are_checked_without_partial_inst
     let other = service.open_connection(p.clone()).unwrap();
     negotiate(&other);
     assert_eq!(
-        other.handle(SNAPSHOT_FETCH, &fetch.encode_to_vec()),
+        other.handle(SNAPSHOT_FETCH, &fetch.fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
     source.data.lock().unwrap().oversized_snapshot = true;
     assert_eq!(
-        s.handle(SNAPSHOT_FETCH, &fetch.encode_to_vec()),
+        s.handle(SNAPSHOT_FETCH, &fetch.fixture_bytes()),
         Err(ProviderError::Internal)
     );
     assert_eq!(
         s.handle(
             SNAPSHOT_CONFIRM,
-            &install_request(&h.subscription_handle, &d).encode_to_vec()
+            &install_request(&h.subscription_handle, &d).fixture_bytes()
         ),
         Err(ProviderError::FailedPrecondition)
     );
     source.data.lock().unwrap().oversized_snapshot = false;
     let _: RecoverySnapshotChunk = call(&s, SNAPSHOT_FETCH, &fetch).unwrap();
-    let invalid = RecoverySnapshotFetchRequest {
+    let invalid = FetchSnapshot {
         page_index: 2,
         ..fetch
     };
     assert_eq!(
-        s.handle(SNAPSHOT_FETCH, &invalid.encode_to_vec()),
+        s.handle(SNAPSHOT_FETCH, &invalid.fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
     assert_eq!(
         s.handle(
             SNAPSHOT_CONFIRM,
-            &install_request(&h.subscription_handle, &d).encode_to_vec()
+            &install_request(&h.subscription_handle, &d).fixture_bytes()
         ),
         Err(ProviderError::FailedPrecondition)
     );
@@ -1747,7 +1683,7 @@ fn popped_live_batch(
     service: &RecoveryService,
     session: &RecoveryHostSession,
     principal: &Principal,
-) -> (RecoverySubscribeResponse, Vec<u8>) {
+) -> (SubscriptionAccepted, Vec<u8>) {
     let h = subscribe(session, principal, None);
     let _: RecoveryCatchUpAccepted =
         call(session, CATCH_UP, &catchup(&h.subscription_handle)).unwrap();
@@ -1785,7 +1721,7 @@ async fn egress_reauthorization_after_writer_barrier_denies_popped_batch_and_tar
     assert!(
         matches!(t.notification, Some(recovery_notification::Notification::Trailer(t))
         if t.subscription_handle == h.subscription_handle && t.generation == 7
-            && t.outcome == Some(recovery_batch_trailer::Outcome::Terminated(true))
+            && t.outcome == Some(recovery_batch_trailer::Outcome::Terminated)
             && t.terminate_reason == b"authorization-ended")
     );
     let _: RecoveryCatchUpAccepted =
@@ -1924,7 +1860,7 @@ fn egress_snapshot_required_is_active_control_and_old_b_completion_cannot_bypass
     assert_eq!(
         s.handle(
             REPLAY,
-            &replay(&h.subscription_handle, &p, 0, &[], 64).encode_to_vec()
+            &replay(&h.subscription_handle, &p, 0, &[], 64).fixture_bytes()
         ),
         Err(ProviderError::ProviderRetentionMiss)
     );
@@ -1953,7 +1889,7 @@ fn egress_rejects_cross_session_protected_and_terminal_payloads_and_invalid_name
         b.generation = 8;
     }
     assert_eq!(
-        s.revalidate_notification(&wrong_g.encode_to_vec()),
+        s.revalidate_notification(&wrong_g.fixture_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
     s.retire(&h.subscription_handle).unwrap();
@@ -1967,7 +1903,7 @@ fn egress_rejects_cross_session_protected_and_terminal_payloads_and_invalid_name
         other.revalidate_notification(&terminal),
         Err(ProviderError::FailedPrecondition)
     );
-    let template: RecoveryNotification = codec::decode(&terminal).unwrap();
+    let mut template: RecoveryNotification = codec::decode(&terminal).unwrap();
     for handle in [
         vec![0; 31],
         {
@@ -1991,20 +1927,33 @@ fn egress_rejects_cross_session_protected_and_terminal_payloads_and_invalid_name
             t.subscription_handle = handle;
         }
         assert_eq!(
-            s.revalidate_notification(&invalid.encode_to_vec()),
+            s.revalidate_notification(&invalid.fixture_bytes()),
             Err(ProviderError::FailedPrecondition)
         );
     }
-    let mut unset = template;
-    if let Some(recovery_notification::Notification::Trailer(t)) = &mut unset.notification {
-        t.outcome = None;
-    }
+    let Some(recovery_notification::Notification::Trailer(t)) = &mut template.notification else {
+        panic!("expected terminal trailer");
+    };
+    // Terminated has no payload: its tag immediately precedes the length-prefixed reason.
+    let tag = terminal.len() - t.terminate_reason.len() - 4 - 1;
+    assert_eq!(terminal[tag], 8);
+    t.outcome = None;
     assert_eq!(
-        s.revalidate_notification(&unset.encode_to_vec()),
+        codec::encode(&template),
+        Err(ProviderError::FailedPrecondition)
+    );
+    let mut unknown = terminal.clone();
+    unknown[tag] = 0; // No wire arm for an unset outcome; keep both union lengths intact.
+    assert_eq!(
+        s.revalidate_notification(&unknown),
         Err(ProviderError::FailedPrecondition)
     );
     assert_eq!(
-        s.revalidate_notification(&[8, 1]),
+        s.revalidate_notification(&terminal[..terminal.len() - 1]),
+        Err(ProviderError::FailedPrecondition)
+    );
+    assert_eq!(
+        s.revalidate_notification(&1_u32.to_le_bytes()),
         Err(ProviderError::FailedPrecondition)
     );
     assert_eq!(
@@ -2078,7 +2027,7 @@ fn egress_unauthenticated_is_sticky_on_authorize_and_generation_callbacks() {
         assert!(
             matches!(t.notification, Some(recovery_notification::Notification::Trailer(t))
             if t.subscription_handle == h.subscription_handle && t.generation == 7
-                && t.outcome == Some(recovery_batch_trailer::Outcome::Terminated(true)))
+                && t.outcome == Some(recovery_batch_trailer::Outcome::Terminated))
         );
         source.data.lock().unwrap().unauthenticated.clear();
         source.data.lock().unwrap().generation_error = None;
@@ -2240,10 +2189,10 @@ fn provider_loss_verification_unauthenticated_fans_out_to_all_actual_sessions_fo
     source.scope(&p, b"other", 7, 3);
     let other_stream = service.open_connection(p.clone()).unwrap();
     negotiate(&other_stream);
-    let _: RecoverySubscribeResponse = call(
+    let _: SubscriptionAccepted = call(
         &other_stream,
         SUBSCRIBE,
-        &RecoverySubscribeRequest {
+        &Subscribe {
             profile_version: 1,
             stream_selector: b"other".to_vec(),
             start_checkpoint: vec![],
@@ -2332,7 +2281,7 @@ fn application_source_unauthenticated_fanout_also_reaches_a_busy_session() {
         assert_eq!(
             busy.handle(
                 REPLAY,
-                &replay(&h.subscription_handle, &p, 0, &[], 64).encode_to_vec()
+                &replay(&h.subscription_handle, &p, 0, &[], 64).fixture_bytes()
             ),
             Err(ProviderError::Unauthenticated)
         );
@@ -2364,10 +2313,7 @@ fn publication_permission_denial_is_targeted_and_other_source_errors_are_not_wit
             let t = trailer(&s);
             assert_eq!(t.subscription_handle, h.subscription_handle);
             assert_eq!(t.generation, 7);
-            assert_eq!(
-                t.outcome,
-                Some(recovery_batch_trailer::Outcome::Terminated(true))
-            );
+            assert_eq!(t.outcome, Some(recovery_batch_trailer::Outcome::Terminated));
             assert_eq!(t.terminate_reason, b"authorization-ended");
         } else {
             assert_eq!(s.queue_counts().unwrap().subscriptions, 1);
@@ -2447,7 +2393,7 @@ fn pop_source_unauthenticated_error_and_deadline_conversion_keep_sticky_withdraw
     }));
     let request = replay(&h.subscription_handle, &p, 0, &[], 64);
     assert_eq!(
-        s.handle_with_deadline(REPLAY, &request.encode_to_vec(), Duration::from_millis(1)),
+        s.handle_with_deadline(REPLAY, &request.fixture_bytes(), Duration::from_millis(1)),
         Err(ProviderError::DeadlineExceeded)
     );
     assert_eq!(s.terminal_error(), Some(ProviderError::Unauthenticated));

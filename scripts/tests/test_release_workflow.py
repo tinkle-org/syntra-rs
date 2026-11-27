@@ -1,6 +1,8 @@
 """Release automation must preserve merge events and publication gates."""
 
 from pathlib import Path
+import subprocess
+import tempfile
 import tomllib
 import unittest
 
@@ -90,22 +92,52 @@ class ReleaseWorkflowTests(unittest.TestCase):
                       '.merged_at != null', '.base.ref == "main"',
                       '.merge_commit_sha == env.RELEASE_COMMIT', 'startswith("release-plz-")'):
             self.assertIn(guard, proof["run"])
-        candidate = next(step for step in steps if "--release-revision" in step.get("run", ""))
-        self.assertLess(steps.index(proof), steps.index(candidate))
+        eligibility, = [step for step in steps if "schemas/v1/syntra.bop" in step.get("run", "")]
+        self.assertEqual(eligibility["if"], "github.event_name == 'workflow_dispatch'")
+        setup, = [step for step in steps if step.get("uses") == "./.github/actions/setup-bebopc"]
+        self.assertLess(steps.index(proof), steps.index(eligibility))
+        self.assertLess(steps.index(eligibility), steps.index(setup))
         for name in ("validate-release", "release-plz-release"):
             checkout, = [step for step in jobs[name]["steps"] if step.get("uses", "").startswith("actions/checkout@")]
             self.assertEqual(checkout["with"]["ref"], "${{ inputs.release_commit || github.sha }}")
             self.assertEqual(checkout["with"]["persist-credentials"], "false")
+            if name == "validate-release":
+                self.assertLess(steps.index(checkout), steps.index(proof))
 
-    def test_validation_checks_candidate_before_builds(self):
-        """Require pinned release validation to verify the candidate before mandatory Cargo checks."""
+    def test_retry_target_must_supply_its_own_generation_inputs(self):
+        steps = self.workflow["jobs"]["validate-release"]["steps"]
+        guard, = [step["run"] for step in steps if "schemas/v1/syntra.bop" in step.get("run", "")]
+        with tempfile.TemporaryDirectory() as target:
+            inputs = [Path(target) / name for name in (
+                "schemas/v1/syntra.bop", "bebop.json", "scripts/check-generated.py",
+                ".github/actions/setup-bebopc/action.yml",
+            )]
+            for path in inputs:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            subprocess.run(["bash", "-ec", guard], cwd=target, check=True)
+            for path in inputs:
+                with self.subTest(missing=path.name):
+                    path.unlink()
+                    result = subprocess.run(["bash", "-ec", guard], cwd=target, capture_output=True, text=True)
+                    path.touch()
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(path.relative_to(target).as_posix(), result.stderr)
+
+    def test_validation_checks_local_contract_and_generated_sources_before_builds(self):
         validation = self.workflow["jobs"]["validate-release"]
         self.assertEqual(self.workflow["env"]["RUSTUP_TOOLCHAIN"], "1.89.0")
         steps = validation["steps"]
         runs = [step["run"] for step in steps if "run" in step]
-        candidate, = [run for run in runs if "--release-revision" in run]
-        self.assertIn('--release --upstream "$SYNTRA_SDD_ROOT"', candidate)
-        self.assertLess(runs.index(candidate), next(i for i, run in enumerate(runs) if "cargo test" in run))
+        setup, = [step for step in steps if step.get("uses") == "./.github/actions/setup-bebopc"]
+        drift, = [step for step in steps if "python3 scripts/check-generated.py" in step.get("run", "").splitlines()]
+        self.assertEqual(drift["run"].splitlines(), [
+            "python3 scripts/check-generated.py", "python3 -B scripts/conformance_evidence.py",
+        ])
+        self.assertLess(steps.index(setup), steps.index(drift))
+        self.assertLess(steps.index(drift), next(i for i, step in enumerate(steps) if "cargo test" in step.get("run", "")))
+        for gate in (validation, setup, drift):
+            self.assertNotIn("if", gate)
         checks = "\n".join(runs)
         for required in (
             "cargo test --locked\n", "cargo test --locked --workspace",

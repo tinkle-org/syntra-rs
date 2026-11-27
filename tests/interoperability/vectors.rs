@@ -1,33 +1,13 @@
-//! Deterministic interoperability vectors.
-//!
-//! Byte-level constants transcribed from
-//! pinned upstream `conformance/test-vectors/websocket/fixtures.yaml`.
-//! scripts/conformance_evidence.py verifies these transcriptions against the
-//! exact upstream Git blobs, not a deleted/vendored document directory.
-//! Constants alone are neither execution nor a transport-independence proof
-//! (SNTR-WIRE-901). Live adapter tests have their own execution scope: no TCP
-//! length prefix inside WS messages, one complete binary message per `Frame`.
+//! WebSocket control bytes and frame bounds are checked against `fixtures/transport.yaml`.
+//! `bebop` contains independent SDK-local envelope examples, not carrier records.
 
-/// A CONNECTED-state hello with anonymous credentials from the
-/// no-length-prefix proof (VEC-WS-009, same protobuf as tcp/V1).
-pub const NO_LENGTH_PREFIX_GOOD_HEX: &str = "0801520408011001";
+/// Historical hello bytes, retained as a rejection case for the Bebop decoder.
+pub fn no_length_prefix_rejected() -> Vec<u8> {
+    hex_to_bytes(include_str!("fixtures/ws-no-length-prefix.hex").trim_end())
+}
 
-/// The same frame with an appended unknown field (field 90,
-/// length-delimited `x`): accepted as the same logical `Frame`
-/// (SNTR-SER-003 — unknown fields tolerated).
-pub const UNKNOWN_FIELD_SUFFIX_HEX: &str = "d2050178";
-
-/// `[length][protobuf]` with a varint length prepended: MUST be
-/// rejected as malformed (no prefix stripping).
-pub const VARINT_PREFIXED_HEX: &str = "080801520408011001";
-
-/// `[length][protobuf]` with a u32 big-endian length prepended: MUST be
-/// rejected (illegal field-zero tag at the start).
-pub const U32_PREFIXED_HEX: &str = "000000080801520408011001";
-
-/// A valid frame with a malformed suffix appended (field-zero tag):
-/// MUST be rejected.
-pub const SUFFIXED_HEX: &str = "080152040801100100";
+#[path = "fixtures/bebop-envelope.rs"]
+pub mod bebop;
 
 /// Ping wire bytes, host -> client (VEC-WS-005, FIN=1, opcode 0x9).
 pub const PING_WIRE_HEX: &str = "890670696e672d31";

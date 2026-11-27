@@ -30,8 +30,6 @@ use tokio::{
 const ROUTE: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 // Handwritten public-encoding transcriptions from Draft RFC0013's isolated
 // rfcs/0013-http-tls/context-vectors.json, R13-CONTEXT-01 through -04, in order.
-// No include_str! outside the package, fixture hash override, or upstream pin
-// change. This is *not* a verified immutable source/provenance record.
 const CONTEXTS: [&str; 4] = [
     "73796e7472612e312e3001040000000000000000000000000000000000000000000161",
     "73796e7472612e312e3002040102030400000000000000010102030405060708000f6578616d706c652e73657276696365",

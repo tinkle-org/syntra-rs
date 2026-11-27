@@ -1,6 +1,5 @@
 #![cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
 use futures_util::{SinkExt, StreamExt};
-use prost::Message as _;
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -9,6 +8,9 @@ use std::{
     time::Duration,
 };
 use syntra_core::secure_channel::*;
+use syntra_core::{
+    decode_frame, encode_frame, wire::frame::Body, ConnectionState, ValidationContext,
+};
 use syntra_net::{websocket as ws, AuthenticatorFactory, Limits};
 use syntra_runtime::{
     AuthError, Authenticator, ConnectionConfig, FnHandler, Handler, HandlerOutcome, Principal,
@@ -316,21 +318,23 @@ async fn protected_peer(
     let plaintext = channel.decrypt(&hello).unwrap();
     let frames = FrameDecoder::default().push(&plaintext).unwrap();
     assert_eq!(frames.len(), 1);
-    let hello = syntra_core::Frame::decode(frames[0].as_slice()).unwrap();
-    assert!(matches!(
-        hello.body,
-        Some(syntra_core::proto::frame::Body::Hello(_))
-    ));
-    let ready = syntra_core::Frame {
-        version: 1,
-        request_id: 0,
-        body: Some(syntra_core::proto::frame::Body::Ready(
-            syntra_core::ServerReady {
+    let hello = decode_frame(
+        &frames[0],
+        ValidationContext::pre_handshake(ConnectionState::Connected),
+    )
+    .unwrap();
+    assert!(matches!(hello.body, Some(Body::Hello(_))));
+    let ready = encode_frame(
+        &syntra_core::Frame {
+            version: 1,
+            request_id: 0,
+            body: Some(Body::Ready(syntra_core::ServerReady {
                 connection_id: "protected-lifecycle-test".into(),
-            },
-        )),
-    }
-    .encode_to_vec();
+            })),
+        },
+        ValidationContext::pre_handshake(ConnectionState::Negotiating),
+    )
+    .unwrap();
     let record = channel.encrypt(&frame_plaintext(&ready).unwrap()).unwrap();
     socket.send(Message::Binary(record.into())).await.unwrap();
     (socket, channel)
@@ -356,24 +360,22 @@ async fn protected_record_bounds_and_active_message_faults_both_modes() {
                     let mut notification = syntra_core::Frame {
                         version: 1,
                         request_id: 0,
-                        body: Some(syntra_core::proto::frame::Body::Notification(
-                            syntra_core::Notification {
-                                payload: vec![0x5a; MAX_PLAINTEXT],
-                            },
-                        )),
+                        body: Some(Body::Notification(syntra_core::Notification {
+                            payload: vec![0x5a; MAX_PLAINTEXT],
+                        })),
                     };
-                    let overhead = frame_plaintext(&notification.encode_to_vec())
-                        .unwrap()
-                        .len()
-                        - MAX_PLAINTEXT;
-                    let Some(syntra_core::proto::frame::Body::Notification(body)) =
-                        notification.body.as_mut()
-                    else {
+                    let overhead = 4 + notification.encoded_len() - MAX_PLAINTEXT;
+                    let Some(Body::Notification(body)) = notification.body.as_mut() else {
                         unreachable!()
                     };
                     body.payload.truncate(MAX_PLAINTEXT - overhead);
                     let record = channel
-                        .encrypt(&frame_plaintext(&notification.encode_to_vec()).unwrap())
+                        .encrypt(
+                            &frame_plaintext(
+                                &encode_frame(&notification, ValidationContext::active(1)).unwrap(),
+                            )
+                            .unwrap(),
+                        )
                         .unwrap();
                     assert_eq!(record.len(), MAX_CIPHERTEXT);
                     if fault == 3 {
@@ -561,11 +563,8 @@ async fn protected_socket_loss_fails_pending_calls_and_handle_drop_closes_clones
                     let plaintext = channel.decrypt(&record).unwrap();
                     let frames = FrameDecoder::default().push(&plaintext).unwrap();
                     assert_eq!(frames.len(), 1);
-                    let call = syntra_core::Frame::decode(frames[0].as_slice()).unwrap();
-                    assert!(matches!(
-                        call.body,
-                        Some(syntra_core::proto::frame::Body::Request(_))
-                    ));
+                    let call = decode_frame(&frames[0], ValidationContext::active(1)).unwrap();
+                    assert!(matches!(call.body, Some(Body::Call(_))));
                     request_seen.send(()).unwrap();
                     if !remote_loss {
                         // Owner drop is abortive: no WS closing handshake is promised.

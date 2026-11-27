@@ -623,16 +623,15 @@ async fn surviving_authority_work_keeps_execution_charge_after_deadline() {
 /// The size ceiling counts the complete serialized result frame, not just its payload.
 #[tokio::test]
 async fn complete_frame_limit_is_1024_not_payload_limit() {
-    use prost::Message;
     use syntra_core::{
-        proto::{frame::Body, rpc_result::Outcome},
-        Frame, RpcResult,
+        wire::{call_result::Outcome, frame::Body},
+        CallResult, Frame,
     };
     let size = |n| {
         Frame {
             version: 1,
             request_id: 1,
-            body: Some(Body::Result(RpcResult {
+            body: Some(Body::Result(CallResult {
                 outcome: Some(Outcome::Payload(vec![0; n])),
             })),
         }
@@ -999,15 +998,16 @@ async fn partial_ordinary_frame_finishes_before_commit_and_queued_notifications_
     assert!(client.conn.next_notification().await.is_none());
     // Prove the barrier waited for every record, not just the initially blocked
     // record. Count actual underlying TCP bytes handed off before commit entry.
-    let plaintext = 4 + prost::Message::encoded_len(&syntra_core::Frame {
+    let plaintext = 4 + syntra_core::Frame {
         version: client.version,
         request_id: 1,
-        body: Some(syntra_core::proto::frame::Body::Result(
-            syntra_core::RpcResult {
-                outcome: Some(syntra_core::proto::rpc_result::Outcome::Payload(result)),
+        body: Some(syntra_core::wire::frame::Body::Result(
+            syntra_core::CallResult {
+                outcome: Some(syntra_core::wire::call_result::Outcome::Payload(result)),
             },
         )),
-    });
+    }
+    .encoded_len();
     let expected_wire_bytes =
         plaintext + plaintext.div_ceil(MAX_PLAINTEXT) * (2 + MAX_CIPHERTEXT - MAX_PLAINTEXT);
     {

@@ -97,7 +97,7 @@ pub fn build_hello(
     min_version: u32,
     max_version: u32,
     credential: Vec<u8>,
-) -> Result<crate::proto::ClientHello, SyntraError> {
+) -> Result<crate::wire::ClientHello, SyntraError> {
     validate_hello_range(min_version, max_version)?;
     if credential.len() > MAX_CREDENTIAL_BYTES {
         return Err(SyntraError::Protocol {
@@ -105,7 +105,7 @@ pub fn build_hello(
             message: "credential exceeds bound".to_string(),
         });
     }
-    Ok(crate::proto::ClientHello {
+    Ok(crate::wire::ClientHello {
         min_version,
         max_version,
         credential,

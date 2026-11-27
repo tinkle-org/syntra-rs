@@ -27,7 +27,7 @@ homepage = "https://github.com/tinkle-org/syntra-rs"
 documentation = "https://docs.rs/syntra-core"
 
 [workspace.dependencies]
-prost = "=0.14.6"
+bebop = { version = "=3.2.3", default-features = false }
 bytes = "1"
 thiserror = "2"
 tracing = "0.1"

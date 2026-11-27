@@ -7,7 +7,7 @@ import re
 import subprocess
 import tempfile
 
-from sdd_inputs import regular_file
+from local_inputs import regular_file
 
 KERNEL = "crates/syntra-core/src/secure_channel/mod.rs"
 NATIVE_FIXTURES = "crates/syntra-core/tests/fixtures/syntra_1_0_context.rs"
@@ -29,12 +29,48 @@ def one(pattern, text, label, flags=0):
     return matches[0]
 
 
+RUST_TOKEN = re.compile(
+    r'\s+|//[^\n]*|/\*|[bc]?r(?P<hashes>#*)".*?"(?P=hashes)|[bc]?"(?:\\.|[^"\\])*"'
+    r"|b?'(?:[^'\\\n]|\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}|.))'"
+    r"|'?(?:r#)?\w+|::|!=|==|=>|.", re.S)
+COMMENT_DELIMITER = re.compile(r"/\*|\*/")
+
+
+def rust_tokens(text):
+    """Source tokens for the reviewed snippets, with literal spelling and offsets intact."""
+    pos = 0
+    while pos < len(text):
+        token = RUST_TOKEN.match(text, pos)
+        assert token is not None  # The final alternative matches any single character.
+        pos = token.end()
+        if token[0] == "/*":
+            depth = 1
+            for delimiter in COMMENT_DELIMITER.finditer(text, pos):
+                depth += 1 if delimiter[0] == "/*" else -1
+                if depth == 0:
+                    pos = delimiter.end()
+                    break
+            else:
+                raise ValueError("unterminated Rust block comment")
+        elif not token[0].isspace() and not token[0].startswith("//"):
+            yield token
+
+
+def token_starts(tokens, snippet):
+    needle = [t[0] for t in rust_tokens(snippet)]
+    return [i for i, token in enumerate(tokens) if token[0] == needle[0]
+            and [t[0] for t in tokens[i:i + len(needle)]] == needle]
+
+
 def block(text, marker):
-    """Extract a known Rust block, ignoring braces in comments/quoted strings."""
-    match = one(r"(?m)^" + re.escape(marker) + r"\s*\{", text, marker)
-    start, depth, index = match.start(), 1, match.end()
-    token = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|[{}]', re.S)
-    for part in token.finditer(text, index):
+    """Extract a known top-level Rust block without interpreting literal contents as code."""
+    tokens = list(rust_tokens(text))
+    starts = [i for i in token_starts(tokens, marker + " {")
+              if tokens[i].start() == 0 or text[tokens[i].start() - 1] == "\n"]
+    if len(starts) != 1:
+        raise ValueError(f"expected one reviewed Rust boundary: {marker}; found {len(starts)}")
+    start, depth = tokens[starts[0]].start(), 0
+    for part in tokens[starts[0]:]:
         if part[0] == "{":
             depth += 1
         elif part[0] == "}":
@@ -71,7 +107,7 @@ def negative_bytes(row, base, layout):
     elif mutation == "truncated": value.pop()
     elif mutation == "trailing": value.append(0)
     elif mutation == "invalid-utf8": value[scope:] = b"\xff"
-    elif mutation == "scope-byte-length": value[scope_len[0]:scope_len[1]] = (1).to_bytes(2, "big")
+    elif mutation == "scope-byte-length": value[scope_len[0]:scope_len[1]] = len(base["scope"]).to_bytes(2, "big")
     else: raise ValueError(f"unreviewed negative recipe: {mutation}")
     return value
 
@@ -151,7 +187,7 @@ def probe(root, contexts, negatives, layout):
     expected = one(r'let expected\s*=\s*(b"(?:\\.|[^"\\])*")\s*;', records, RECORD_FIXTURES)[1]
     code.append('println!("{{\\\"kind\\\":\\\"record_fixture\\\",\\\"hex\\\":{:?}}}", hex(' + expected + '));')
     code.append("}")
-    with tempfile.TemporaryDirectory(prefix="syntra-candidate-probe-") as directory:
+    with tempfile.TemporaryDirectory(prefix="syntra-context-probe-") as directory:
         source, binary = Path(directory) / "probe.rs", Path(directory) / "probe"
         source.write_text('\n'.join(code), encoding="utf-8")
         env = {**os.environ, "RUSTUP_TOOLCHAIN": "1.89.0"}
@@ -169,15 +205,14 @@ def binding_sources(root, contract):
         for name, value in ((endpoint, contract["websocket_endpoint"]), ("SUBPROTOCOL", contract["websocket_subprotocol"])):
             literal = one(r'(?m)^pub const ' + name + r': &str = ("[^"\n]+");', text, name)[1]
             if json.loads(literal) != value:
-                raise ValueError(f"Rust {name} disagrees with candidate contract")
-    compact = lambda text: re.sub(r"\s+", "", re.sub(r"//[^\n]*", "", text))
+                raise ValueError(f"Rust {name} disagrees with protocol contract")
     guards = {
-        "native WSS carrier": '"wss"ifcarrier==Carrier::SecureWebSocket=>{}',
-        "native WS carrier": '"ws"ifcarrier==Carrier::WebSocket=>{',
-        "WS loopback dial": 'if!loopback{returnErr(Error::Configuration);}',
-        "WS accepted peer": 'if!peer.ip().is_loopback(){returnErr(Error::Configuration);}',
-        "WS stream cannot assert WSS": 'ifsecurity.carrier!=Carrier::WebSocket{returnErr(Error::Configuration);}',
-        "owned TLS binding": 'ifsecurity.carrier!=Carrier::SecureWebSocket{returnErr(Error::Configuration);}',
+        "native WSS carrier": '"wss" if carrier == Carrier::SecureWebSocket => {}',
+        "native WS carrier": '"ws" if carrier == Carrier::WebSocket => {',
+        "WS loopback dial": 'if !loopback { return Err(Error::Configuration); }',
+        "WS accepted peer": 'if !peer.ip().is_loopback() { return Err(Error::Configuration); }',
+        "WS stream cannot assert WSS": 'if security.carrier != Carrier::WebSocket { return Err(Error::Configuration); }',
+        "owned TLS binding": 'if security.carrier != Carrier::SecureWebSocket { return Err(Error::Configuration); }',
         "TLS 1.3 only": '.with_protocol_versions(&[&rustls::version::TLS13])',
         "negotiated TLS 1.3": 'protocol_version()!=Some(rustls::ProtocolVersion::TLSv1_3)',
         "exact native endpoint": 'parsed.path()!=ENDPOINT_PATH',
@@ -185,12 +220,13 @@ def binding_sources(root, contract):
         "provider server role and authority": 'tls::validate(&metadata,authority,TlsRole::Server)?;',
         "provider retains original budget": 'let(stream,metadata,budget)=stream.into_parts();',
     }
-    normalized = compact(native)
+    tokens = list(rust_tokens(native))
     for label, guard in guards.items():
-        if guard not in normalized:
+        matches = token_starts(tokens, guard)
+        if not matches:
             raise ValueError(f"reviewed transport binding guard changed/missing: {label}")
-    if normalized.count(guards["TLS 1.3 only"]) != 2:
-        raise ValueError("both client and server must retain reviewed TLS 1.3-only builders")
+        if label == "TLS 1.3 only" and len(matches) != 2:
+            raise ValueError("both client and server must retain reviewed TLS 1.3-only builders")
     provider_guards = {
         "provider authority": 'metadata.authority!=*authority',
         "provider role": 'metadata.role!=role',
@@ -200,9 +236,9 @@ def binding_sources(root, contract):
         "provider result checked": 'validate(&result.metadata,&authority,role)?;',
         "provider I/O deadline gate": 'inner:result.stream,budget:budget.io.clone(),',
     }
-    normalized_provider = compact(provider)
+    tokens = list(rust_tokens(provider))
     for label, guard in provider_guards.items():
-        if guard not in normalized_provider:
+        if not token_starts(tokens, guard):
             raise ValueError(f"reviewed TLS provider binding guard changed/missing: {label}")
     return {"kind": "source_guard_agreement_not_carrier_execution", "native_guards": sorted(guards),
             "provider_guards": sorted(provider_guards),

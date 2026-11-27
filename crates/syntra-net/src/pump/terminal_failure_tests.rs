@@ -111,7 +111,6 @@ impl RecordWriter for CountRecord {
 
 /// Publish one fatal input while withholding parent cleanup, then repoll ciphertext.
 async fn fatal_reader_defeats_retained_receipt(fault: usize) {
-    use syntra_core::{proto::ClientHello, Frame, RpcRequest};
     let clock = ElapsedClock::lifecycle_driven();
     let (host, mut ordinary) = Host::try_new_with_clock(
         ConnectionConfig::default(),
@@ -130,16 +129,7 @@ async fn fatal_reader_defeats_retained_receipt(fault: usize) {
         .unwrap();
     coordinator.refresh().await.unwrap();
     let (mut client_channel, mut host_channel) = channels();
-    let hello = Frame {
-        version: 1,
-        request_id: 0,
-        body: Some(Body::Hello(ClientHello {
-            min_version: 1,
-            max_version: 1,
-            credential: b"fixture".to_vec(),
-        })),
-    }
-    .encode_to_vec();
+    let hello = hello_bytes(1, 1, b"fixture".to_vec());
     let authenticated = host_channel
         .decrypt(
             &client_channel
@@ -150,16 +140,19 @@ async fn fatal_reader_defeats_retained_receipt(fault: usize) {
     host.ingest(&authenticated[4..]).await;
     ordinary.recv().await.unwrap();
     let mut commands = host.take_terminal_commands().unwrap();
-    let request = Frame {
-        version: 1,
-        request_id: 1,
-        body: Some(Body::Request(RpcRequest {
-            method: "/example.Authority/Retire".into(),
-            payload: vec![],
-            timeout_ms: 2000,
-        })),
-    }
-    .encode_to_vec();
+    let request = encode_frame(
+        &Frame {
+            version: 1,
+            request_id: 1,
+            body: Some(Body::Call(Call {
+                method: "/example.Authority/Retire".into(),
+                payload: vec![],
+                timeout_ms: 2000,
+            })),
+        },
+        ValidationContext::active(1),
+    )
+    .unwrap();
     let authenticated = host_channel
         .decrypt(
             &client_channel
@@ -551,7 +544,6 @@ impl Authority for HandoffAuthority {
 
 /// Drive the actual writer across nonce consumption, final proof, and partial raw I/O.
 async fn actual_writer_final_gate(deny_final: bool) {
-    use syntra_core::{proto::ClientHello, Frame, RpcRequest};
     let encrypted = Arc::new(AtomicBool::new(false));
     let authority = Arc::new(HandoffAuthority {
         owned: Mutex::new(None),
@@ -587,31 +579,25 @@ async fn actual_writer_final_gate(deny_final: bool) {
     )
     .unwrap();
     let mut remote = client_handshake.finish(&second).unwrap();
-    let hello = Frame {
-        version: 1,
-        request_id: 0,
-        body: Some(Body::Hello(ClientHello {
-            min_version: 1,
-            max_version: 1,
-            credential: b"fixture".to_vec(),
-        })),
-    }
-    .encode_to_vec();
+    let hello = hello_bytes(1, 1, b"fixture".to_vec());
     let hello = channel
         .decrypt(&remote.encrypt(&frame_plaintext(&hello).unwrap()).unwrap())
         .unwrap();
     host.ingest(&hello[4..]).await;
     outbound.recv().await.unwrap(); // Ready is outside the selected receipt.
-    let request = Frame {
-        version: 1,
-        request_id: 1,
-        body: Some(Body::Request(RpcRequest {
-            method: "/example.Authority/Retire".into(),
-            payload: vec![],
-            timeout_ms: 2000,
-        })),
-    }
-    .encode_to_vec();
+    let request = encode_frame(
+        &Frame {
+            version: 1,
+            request_id: 1,
+            body: Some(Body::Call(Call {
+                method: "/example.Authority/Retire".into(),
+                payload: vec![],
+                timeout_ms: 2000,
+            })),
+        },
+        ValidationContext::active(1),
+    )
+    .unwrap();
     let request = channel
         .decrypt(&remote.encrypt(&frame_plaintext(&request).unwrap()).unwrap())
         .unwrap();
@@ -703,7 +689,7 @@ async fn actual_writer_final_gate(deny_final: bool) {
         let length = usize::from(u16::from_be_bytes([wire[0], wire[1]]));
         assert_eq!(wire.len(), length + 2);
         let plaintext = remote.decrypt(&wire[2..]).unwrap();
-        let frame = Frame::decode(&plaintext[4..]).unwrap();
+        let frame = decode_frame(&plaintext[4..], ValidationContext::active(1)).unwrap();
         assert_eq!(frame.request_id, 1);
         assert!(matches!(frame.body, Some(Body::Result(_))));
         assert_eq!(

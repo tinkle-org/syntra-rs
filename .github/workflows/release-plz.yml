@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       release_commit:
-        description: Full SHA of a merged release-PR commit on main to retry
+        description: Full SHA of a release-PR squash merge on main with the current Bebop release inputs
         required: true
         type: string
 
@@ -54,8 +54,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-    env:
-      SYNTRA_SDD_ROOT: ${{ github.workspace }}/../syntra-sdd
     steps:
       - name: Validate manual retry input
         if: github.event_name == 'workflow_dispatch'
@@ -84,31 +82,28 @@ jobs:
           gh api "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_COMMIT}/pulls" \
             --jq 'any(.[]; .merged_at != null and .base.ref == "main" and .merge_commit_sha == env.RELEASE_COMMIT and (.head.ref | startswith("release-plz-")))' \
             | python3 -c 'import sys; sys.exit(0 if sys.stdin.read().strip() == "true" else "commit must be the merge of a release-plz PR on main")'
+      - name: Require current Bebop inputs in the retry target
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          for path in schemas/v1/syntra.bop bebop.json scripts/check-generated.py .github/actions/setup-bebopc/action.yml; do
+            test -f "$path" || { echo "Release commit is ineligible for retry: missing $path" >&2; exit 1; }
+          done
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
           toolchain: "1.89.0"
           targets: wasm32-unknown-unknown
-      - name: Install Python and Buf
+      - name: Install Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
-      - name: Setup Buf
-        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
-        with:
-          version: "1.59.0"
-          github_token: ${{ github.token }}
-      - name: Install pinned candidate parser
+      - uses: ./.github/actions/setup-bebopc
+      - name: Install pinned fixture parser
         run: python3 -m pip install -r scripts/requirements-evidence.txt
-      - name: Require and verify a committed candidate pin before publication
-        # A dirty worktree record deliberately fails here. Release-plz stays
-        # enabled; neither baseline HEAD nor local digests authorize publication.
+      - name: Validate generated sources and repository protocol fixtures
         run: |
-          candidate_revision="$(python3 -B scripts/protocol_contract.py --release-revision)"
-          git init "$SYNTRA_SDD_ROOT"
-          git -C "$SYNTRA_SDD_ROOT" remote add origin https://github.com/tinkle-org/syntra.git
-          git -C "$SYNTRA_SDD_ROOT" fetch origin "$candidate_revision"
-          python3 -B scripts/protocol_contract.py --release --upstream "$SYNTRA_SDD_ROOT"
+          python3 scripts/check-generated.py
+          python3 -B scripts/conformance_evidence.py
       - name: Locked default and workspace tests
         run: |
           cargo test --locked
@@ -130,11 +125,6 @@ jobs:
           cargo check --locked -p syntra-core -p syntra-runtime --target wasm32-unknown-unknown
           python3 crates/syntra-net/tests/target_contract.py
           python3 crates/syntra-ffi/tests/build_contract.py
-      - name: Generated sources and upstream pin
-        run: |
-          python3 scripts/check-generated.py
-          git -C "$SYNTRA_SDD_ROOT" fetch --depth=1 origin 8ede3810b29fbba4d0e6ae6751a0025ceedda140
-          python3 scripts/check-upstream-pin.py
       - name: Dependency security policy
         run: |
           cargo install --locked cargo-deny --version 0.20.2

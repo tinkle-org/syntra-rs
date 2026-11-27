@@ -5,21 +5,15 @@ part of the protocol. The `syntra_core::secure_channel` module owns cryptographi
 state within core, separate from runtime scheduling and socket policy.
 Encryption is integral to every connection.
 
-This guide describes the current worktree. The v2 candidate contract in
-[`protocol-contract.json`](protocol-contract.json) records source provenance,
-domain, carrier bindings and context layout, with raw source hashes separate from
-derived artifact hashes. Its `CARRIER` bindings describe one protocol. The record
-pins the exact candidate inputs at upstream commit
-`3f7e8ea037fefcc5c86101d23e7722c83e28a0d3`. See
-[CONTRIBUTING.md](CONTRIBUTING.md#input-provenance-and-authority) for the separate
-pinned upstream inputs. No formal conformance or independent security-review
-verdict is claimed here.
+The [Bebop schemas](CONTRIBUTING.md#schema-and-generated-code) define message
+bytes. The authenticated context, Noise messages, protected record stream, and
+carrier framing have separate encodings, described below.
 
 ## Layer and crate ownership
 
 | Layer | Implementation | Responsibility |
 | --- | --- | --- |
-| Message mechanics | `syntra-core` | Protobuf envelope codec, validation, message handshake, connection state and RPC rules |
+| Message mechanics | `syntra-core` | Frame codec, validation, message handshake, connection state, and RPC rules |
 | Message runtime | `syntra-runtime` | Initiator/Host execution, queues, authentication/authorization hooks, recovery and lifecycle |
 | Encryption | `syntra_core::secure_channel` | Authenticated context, Noise handshake, ordered cipher state, protected record bounds and frame-stream assembly |
 | Native I/O | `syntra-net` | Record driver, TCP/WebSocket I/O, TLS provider composition, optional rustls WSS, managed runtime/listeners and proxy helpers |
@@ -111,6 +105,13 @@ failure blocks automatic continuation. See the
 
 ## Records and carriers
 
+The runtime and the production frame-pump ABI exchange **one serialized frame**
+at a time, without a carrier or stream prefix. The record driver prefixes those
+bytes before encryption. Bebop's little-endian lengths inside a message do not
+replace the big-endian stream and TCP lengths below. RPC application payloads
+stay opaque; only the selected service interprets them (including negotiated
+update/recovery messages).
+
 The encryption kernel accepts at most 65,519 plaintext bytes per record, producing
 at most 65,535 ciphertext bytes including the 16-byte authentication tag. Empty
 records are rejected. Each serialized message frame is at most 1 MiB and has an
@@ -132,7 +133,7 @@ framing and HTTP upgrade, with no production TLS implementation dependency;
 `reconnect` adds the opt-in connection manager. `managed` enables TCP, reconnect
 and a library-owned multithreaded runtime through `network`. `proxy` enables TCP
 and explicit tunnel helpers. `tcp` also exposes explicit client `routes`.
-`http` independently enables the Draft RFC0013 candidate HTTP/HTTPS connection
+`http` independently enables the candidate HTTP/HTTPS connection
 path, `syntra-core/http-candidate`, `getrandom` and application `tls` composition,
 without implying `websocket` or a TLS implementation. `native-enrollment` adds
 a native host reference. All high-level connection drivers use Syntra encryption.
@@ -148,10 +149,9 @@ policy API. It does not implicitly enable `http`, `websocket`, `tls-rustls`,
 
 The WebSocket endpoint is `/syntra/1.0/ws`, with exact subprotocol `syntra.1.0`.
 TLS protects the WSS carrier; it does not replace Syntra's handshake or encrypted
-records. HTTP/HTTPS are not registered carriers. HTTP upgrade and CONNECT
+records. HTTP/HTTPS require the separate `http` feature. HTTP upgrade and CONNECT
 tunneling are bounded setup steps; forward-request metadata alone does not
-implement an HTTP proxy carrier. RFC0013 is Draft upstream. Adoption remains
-unresolved separately; these APIs make no conformance claim.
+implement an HTTP proxy carrier.
 
 Native clients select the exact endpoint and subprotocol, reject URL credentials,
 queries and fragments, and send no HTTP credentials or cookies. The client checks
@@ -236,7 +236,8 @@ readiness. It adds no DNS discovery, redirects or retry loop; the owning
 
 ### Candidate cross-carrier failover
 
-The new opt-in API is
+Ordinary routes require one carrier. Mixed-carrier retry is a draft exception
+to `SNTR-TSEC-007`; it has neither protocol adoption nor security approval. To opt in, use
 `routes::client_routes_cross_carrier(RouteConfig, CrossCarrierPolicy, inputs)`,
 where `CrossCarrierPolicy { permitted_carriers: Vec<Carrier> }` has no default
 permissions and `inputs` has shape
@@ -299,12 +300,7 @@ automatic enrollment permission expansion. Every successor has fresh Noise,
 cipher state, authentication and explicitly negotiated recovery. RPCs and live
 connections do not migrate; loss leaves unfinished RPC outcomes unknown.
 
-Upstream `SNTR-TSEC-007`, `SNTR-WS-202` and `SNTR-WSS-201` currently forbid
-automatic carrier fallback, and Draft RFC0013 `R13-26` retains same-carrier
-failover. This candidate proposes a narrow explicit-policy exception; it does
-not edit active contract pins, source hashes or the protocol registry and records
-no formal adoption or security approval. See the
-[proposed normative delta](CROSS-CARRIER.md#proposed-normative-delta) and
+See the [route policy](CROSS-CARRIER.md#route-policy) and
 [validation commands](CROSS-CARRIER.md#validation).
 
 ### Candidate HTTP/HTTPS connections
@@ -312,10 +308,7 @@ no formal adoption or security approval. See the
 The `http` opt-in supplies full candidate connections over two persistent streams:
 Noise, encrypted hello/ready, `ClientHandle`/`HostHandle` and RPC use the shared
 kernel/runtime/pump. Candidate `Carrier::Http`/`Https` use codes 4/5 through
-`syntra-core/http-candidate`; default core parsing rejects both. The active
-contract still has three carriers. RFC0013 remains Draft, with adoption and
-registration unresolved. These connections provide local implementation evidence,
-not human security approval, shippable accepted-spec support or conformance.
+`syntra-core/http-candidate`; default core parsing rejects both.
 
 | API | Candidate capability |
 | --- | --- |
@@ -487,9 +480,6 @@ are separate from compilation. Public context fixtures establish encoding
 agreement, not independent cryptographic vectors.
 For separate Noise-suite and primitive checks through Syntra's resolver, see the
 [known-answer fixtures](crates/syntra-core/tests/fixtures/resolver_kats/README.md).
-SDK-local round trips and candidate contract checks do not establish formal
-conformance or independent security review. Preserve the revision and scope of
-each recorded result. The
-[unified implementation-evidence runner](CONTRIBUTING.md#implementation-evidence)
-checks declared inputs and optional candidate agreement separately from its local
-execution lanes. Its formal-conformance gate remains `NOT_EXECUTED`.
+Record the revision and scope of each [verification result](CONTRIBUTING.md#implementation-evidence).
+A round trip between two instances of this SDK does not establish independent
+interoperability or security review.

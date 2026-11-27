@@ -1,301 +1,232 @@
-"""Unified evidence scope, provenance, transcription and exact execution checks."""
+"""Evidence must come from local fixtures and an observed exact test run."""
 
 import contextlib
 import io
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
 
-sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 import conformance_evidence as evidence
 import protocol_contract
 
 
-class ReportTests(unittest.TestCase):
-    def setUp(self):
-        self.source = {"proto/input.proto": b"exact source bytes"}
-        self.provenance = {"upstream_files": 11, "provenance": "exact_committed_git_blobs"}
-        self.identity = {"head": "pinned", "worktree_sha256": "snapshot", "files": {"input": "a"}}
-        self.transcription = {"kind": "fixture_transcription_only", "verdict": "PASS",
-                              "formal_conformance": False}
+class FixtureTests(unittest.TestCase):
+    def test_actual_contexts_and_negative_recipes(self):
+        report = protocol_contract.verify()
+        self.assertEqual((report['contexts'], report['negative_recipes']), (9, 36))
+        self.assertEqual(len(report['carriers']), 3)
 
-    def invoke(self, arguments=(), *, identities=None, local=()):
-        with mock.patch.object(sys, "argv", ["conformance_evidence.py", *arguments]), \
-                mock.patch.object(evidence, "verify_inputs", return_value=(self.provenance, self.source)) as verify, \
-                mock.patch.object(evidence, "verify_transcriptions", return_value=self.transcription) as transcription, \
-                mock.patch.object(evidence, "implementation_identity", side_effect=identities or [self.identity] * 2), \
-                mock.patch.object(evidence, "run_local", side_effect=local) as run, \
-                contextlib.redirect_stdout(io.StringIO()) as output:
-            status = evidence.main()
-        verify.assert_called_once_with(evidence.ROOT, None)
-        transcription.assert_called_once_with(self.source)
-        return status, json.loads(output.getvalue()), run
+    def test_missing_and_misassigned_manifest_recipes_fail(self):
+        root = evidence.ROOT
+        fixtures = root / evidence.FIXTURES
+        contract = json.loads((root / 'protocol-contract.json').read_text())
+        vectors = json.loads((fixtures / 'syntra-1.0-context.json').read_text())
+        for wrong in (None, 'SYNTRA-N15'):
+            cases = json.loads((fixtures / 'context-cases.json').read_text())
+            recipes = cases['SYNTRA-1.0-TCP']['recipes']
+            recipes.pop()
+            if wrong:
+                recipes.append(wrong)
+            with self.subTest(wrong=wrong), self.assertRaises(ValueError):
+                protocol_contract.coverage(contract, vectors, cases)
 
-    def test_report_is_unified_implementation_evidence_with_no_formal_results(self):
-        status, report, run = self.invoke()
-        self.assertEqual(status, 0)
-        self.assertEqual(report["format_version"], 2)
-        self.assertEqual(report["kind"], "implementation_evidence_not_conformance_declaration")
-        self.assertEqual(report["scope"], {"protocol": "Syntra 1.0"})
-        self.assertFalse(report["formal_conformance_claimed"])
-        self.assertIsNone(report["candidate_agreement"])
-        self.assertEqual(report["supplemental_results"], [])
-        self.assertEqual(report["fixture_verification"], self.transcription)
-        self.assertTrue(all(row["verdict"] == "NOT_EXECUTED" for row in report["external_gates"].values()))
-        self.assertIn("formal_conformance", report["external_gates"])
-        for removed in ("formal_summary", "results", "suite_schema_issues", "contract_alignment"):
-            self.assertNotIn(removed, report)
-        self.assertEqual(report["pins"]["implementation_before"], self.identity)
-        self.assertEqual(report["pins"]["implementation_after"], self.identity)
-        self.assertEqual(report["pins"]["implementation_inputs"], {
-            **self.provenance, "sha256": {name: evidence.digest(data) for name, data in self.source.items()}})
-        run.assert_not_called()
-
-    def test_report_gates_cover_sdk_validation_scope(self):
-        """Report only the remaining protocol, platform and review limits."""
-        status, report, _ = self.invoke()
-        self.assertEqual(status, 0)
-        self.assertEqual(set(report["external_gates"]), {
-            "formal_conformance", "physical_ios_android", "browser",
-            "direct_host_tls13_wss", "independent_noise_vectors",
-            "device_budgets_and_soak", "independent_security_review",
-            "specification_freeze",
-        })
-
-    def test_current_candidate_verification_adds_only_current_contract_carriers(self):
-        agreement = {"verdict": "PASS", "kind": "encoding_agreement", "publication_authorized": False}
-        carriers = {"SYNTRA-1.0-TCP": {}, "SYNTRA-1.0-WS": {}, "SYNTRA-1.0-WSS": {}}
-        for mode in ("offline", "worktree", "release"):
-            with self.subTest(mode=mode), \
-                    mock.patch.object(protocol_contract, "verify_candidate", return_value=agreement) as verify, \
-                    mock.patch.object(protocol_contract, "load_record", return_value={"contract": {"carriers": carriers}}):
-                status, report, _ = self.invoke(["--candidate-agreement", mode])
-            verify.assert_called_once_with(evidence.ROOT, None, mode)
-            self.assertEqual(status, 0)
-            self.assertEqual(report["candidate_agreement"], agreement)
-            self.assertEqual(report["scope"], {"protocol": "Syntra 1.0", "carriers": sorted(carriers)})
-            self.assertFalse(report["formal_conformance_claimed"])
-            self.assertEqual(report["external_gates"]["formal_conformance"]["verdict"], "NOT_EXECUTED")
-
-    def test_supplemental_success_keeps_formal_gate_unexecuted_and_deduplicates_lanes(self):
-        supplemental = {"kind": "supplemental_local_scenario", "lane": "wss-envelope",
-                        "carrier_id": "SYNTRA-1.0-WSS", "formal_conformance": False, "verdict": "PASS"}
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "evidence"
-            status, summary, run = self.invoke([
-                "--run-local", "wss-envelope", "--run-local", "wss-envelope", "--output", str(output)],
-                local=[supplemental])
-            report = json.loads((output / "report.json").read_text())
-            self.assertEqual(sorted(path.name for path in output.iterdir()), ["report.json"])
-        self.assertEqual(status, 0)
-        run.assert_called_once_with("wss-envelope", output)
-        self.assertEqual(report["supplemental_results"], [supplemental])
-        self.assertEqual(summary["kind"], report["kind"])
-        self.assertFalse(summary["formal_conformance_claimed"])
-        self.assertEqual(report["external_gates"]["formal_conformance"]["verdict"], "NOT_EXECUTED")
-
-    def test_failed_or_incomplete_requested_lanes_fail_the_command(self):
-        for verdict in ("FAIL", "SKIP", "NOT_EXECUTED"):
-            with self.subTest(verdict=verdict), tempfile.TemporaryDirectory() as directory:
-                status, _, _ = self.invoke(["--run-local", "corpus", "--output", str(Path(directory) / "evidence")],
-                    local=[{"verdict": verdict, "formal_conformance": False}])
-            self.assertEqual(status, 1)
-
-    def test_worktree_drift_is_reported_even_without_local_commands(self):
-        changed = {**self.identity, "files": {"input": "b", "new": "c"}}
-        status, report, _ = self.invoke(identities=[self.identity, changed])
-        self.assertEqual(status, 1)
-        self.assertTrue(report["worktree_changed_during_run"])
-        self.assertEqual(report["worktree_changed_files"], ["input", "new"])
-
-    def test_supplemental_pass_is_withdrawn_if_worktree_changes(self):
-        changed = {**self.identity, "head": "changed"}
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "evidence"
-            status, _, _ = self.invoke(["--run-local", "wss-envelope", "--output", str(output)],
-                identities=[self.identity, changed], local=[{"verdict": "PASS", "formal_conformance": False}])
-            report = json.loads((output / "report.json").read_text())
-        self.assertEqual(status, 1)
-        self.assertEqual(report["supplemental_results"][0]["verdict"], "NOT_EXECUTED")
-
-    def test_input_or_candidate_verification_failure_creates_no_artifacts(self):
-        for target in ("verify_inputs", "verify_transcriptions", "candidate"):
-            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
-                output = Path(directory) / "evidence"
-                owner, name = (protocol_contract, "verify_candidate") if target == "candidate" else (evidence, target)
-                arguments = ["conformance_evidence.py", "--output", str(output)]
-                if target == "candidate":
-                    arguments += ["--candidate-agreement", "offline"]
-                with mock.patch.object(sys, "argv", arguments), \
-                        mock.patch.object(evidence, "implementation_identity", return_value=self.identity), \
-                        mock.patch.object(evidence, "verify_inputs", return_value=(self.provenance, self.source)), \
-                        mock.patch.object(owner, name, side_effect=ValueError("input drift")), \
-                        mock.patch.object(evidence, "run_local") as run:
-                    with self.assertRaisesRegex(ValueError, "input drift"):
-                        evidence.main()
-                self.assertFalse(output.exists())
-                run.assert_not_called()
-
-    def test_release_candidate_failure_never_falls_back_to_offline_or_runs_lanes(self):
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "evidence"
-            arguments = ["conformance_evidence.py", "--candidate-agreement", "release",
-                         "--run-local", "corpus", "--output", str(output)]
-            with mock.patch.object(sys, "argv", arguments), \
-                    mock.patch.object(evidence, "implementation_identity", return_value=self.identity), \
-                    mock.patch.object(evidence, "verify_inputs", return_value=(self.provenance, self.source)), \
-                    mock.patch.object(protocol_contract, "verify_candidate", side_effect=ValueError("release pin blocked")) as verify, \
-                    mock.patch.object(evidence, "run_local") as run:
-                with self.assertRaisesRegex(ValueError, "release pin blocked"):
-                    evidence.main()
-            verify.assert_called_once_with(evidence.ROOT, None, "release")
-            self.assertFalse(output.exists())
-            run.assert_not_called()
-
-
-class CliTests(unittest.TestCase):
-    def test_removed_selectors_are_rejected_before_reads_or_writes(self):
-        for selector in ("--profile", "--capability", "--case", "--unsupported-profile", "--role",
-                         "--require-complete", "--execute"):
-            with self.subTest(selector=selector), tempfile.TemporaryDirectory() as directory:
-                output = Path(directory) / "evidence"
-                arguments = ["conformance_evidence.py", "--output", str(output), selector]
-                if selector not in ("--require-complete", "--execute"):
-                    arguments.append("invalid-token")
-                with mock.patch.object(sys, "argv", arguments), \
-                        mock.patch.object(evidence, "verify_inputs") as verify, \
-                        mock.patch.object(evidence, "implementation_identity") as identity, \
-                        mock.patch.object(evidence, "run_local") as run, \
-                        contextlib.redirect_stderr(io.StringIO()) as stderr:
-                    with self.assertRaises(SystemExit) as error:
-                        evidence.main()
-                self.assertEqual(error.exception.code, 2)
-                self.assertIn("unrecognized arguments", stderr.getvalue())
-                verify.assert_not_called()
-                identity.assert_not_called()
-                run.assert_not_called()
-                self.assertFalse(output.exists())
-
-    def test_local_execution_requires_output_before_reading_inputs(self):
-        with mock.patch.object(sys, "argv", ["conformance_evidence.py", "--run-local", "corpus"]), \
-                mock.patch.object(evidence, "verify_inputs") as verify, \
-                contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit) as error:
-                evidence.main()
-        self.assertEqual(error.exception.code, 2)
-        verify.assert_not_called()
-
-    def test_existing_symlink_or_worktree_outputs_are_refused_without_writes(self):
-        with tempfile.TemporaryDirectory() as directory:
-            existing = Path(directory) / "existing"
-            existing.mkdir()
-            sentinel = existing / "report.json"
-            sentinel.write_text("original")
-            link = Path(directory) / "link"
-            link.symlink_to(Path(directory) / "missing", target_is_directory=True)
-            for output in (existing, link, evidence.ROOT / "invalid-evidence-output"):
-                with self.subTest(output=output), \
-                        mock.patch.object(sys, "argv", ["conformance_evidence.py", "--output", str(output)]), \
-                        mock.patch.object(evidence, "verify_inputs") as verify:
-                    with self.assertRaises(ValueError):
-                        evidence.main()
-                verify.assert_not_called()
-            self.assertEqual(sentinel.read_text(), "original")
-            self.assertTrue(link.is_symlink())
-            self.assertFalse((evidence.ROOT / "invalid-evidence-output").exists())
-
-
-class ExecutionProofTests(unittest.TestCase):
-    def test_zero_selected_tests_is_not_pass(self):
-        status, _ = evidence.local_verdict(0, "test result: ok. 0 passed; 0 failed; 0 ignored;", "test_name")
-        self.assertEqual(status, "NOT_EXECUTED")
-
-    def test_ignored_is_skip_not_pass(self):
-        status, _ = evidence.local_verdict(0, "test result: ok. 0 passed; 0 failed; 1 ignored;", "test_name")
-        self.assertEqual(status, "SKIP")
-
-    def test_exit_zero_without_exact_named_test_is_not_pass(self):
-        for text in ["", "test wrong_test ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;",
-                     "test test_name ... ok\ntest result: ok. 2 passed; 0 failed; 0 ignored;",
-                     "test test_name ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n"
-                     "test result: ok. 0 passed; 0 failed; 0 ignored;"]:
-            self.assertEqual(evidence.local_verdict(0, text, "test_name")[0], "NOT_EXECUTED")
-
-    def test_only_exact_single_test_with_zero_exit_passes_supplemental_lane(self):
-        text = "test test_name ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;"
-        self.assertEqual(evidence.local_verdict(0, text, "test_name")[0], "PASS")
-        self.assertEqual(evidence.local_verdict(101, text, "test_name")[0], "FAIL")
-
-    def test_subprocess_is_exact_locked_and_preserves_log(self):
-        """Check exact locked lane execution, toolchain pinning, and preserved log hashes."""
-        for lane, name in evidence.LOCAL_LANES.items():
-            def run(command, **kwargs):
-                """Validate the lane command and write a successful single-test log."""
-                for arg in ("--exact", "--locked", "--no-default-features", "syntra-runtime", name):
-                    self.assertIn(arg, command)
-                self.assertEqual(kwargs["env"]["RUSTUP_TOOLCHAIN"], "1.89.0")
-                kwargs["stdout"].write(f"test {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;")
-                return subprocess.CompletedProcess(command, 0)
-            with self.subTest(lane=lane), tempfile.TemporaryDirectory() as directory, \
-                    mock.patch.object(evidence.subprocess, "run", side_effect=run):
-                row = evidence.run_local(lane, Path(directory))
-                self.assertEqual(row["verdict"], "PASS")
-                self.assertFalse(row["formal_conformance"])
-                self.assertEqual(row["artifact_sha256"], evidence.digest((Path(directory) / row["artifact"]).read_bytes()))
-
-    def test_missing_tool_or_timeout_never_passes(self):
-        for error in [FileNotFoundError(), subprocess.TimeoutExpired(["cargo"], 300)]:
-            with tempfile.TemporaryDirectory() as directory, mock.patch.object(evidence.subprocess, "run", side_effect=error):
-                self.assertEqual(evidence.run_local("corpus", Path(directory))["verdict"], "NOT_EXECUTED")
-
-
-class ParserTests(unittest.TestCase):
-    def test_duplicate_or_non_string_yaml_keys_are_rejected(self):
-        for text in ("verdict: FAIL\nverdict: PASS\n", "1: invalid\n"):
-            with self.subTest(text=text), self.assertRaises(ValueError):
+    def test_ambiguous_yaml_keys_raise_value_error(self):
+        for text in ('x: 1\nx: 2', '1: x'):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, 'non-string or duplicate YAML key'):
                 evidence.load_yaml(text)
 
-    def test_arbitrary_yaml_python_tags_are_rejected(self):
-        with self.assertRaises(evidence.yaml.YAMLError):
-            evidence.load_yaml("!!python/object/apply:os.system ['false']")
+    def test_unsupported_yaml_tags_raise_constructor_error(self):
+        for tag, text in [('omap', '!!omap [{x: 1}, {x: 2}]'), ('pairs', 'nested: !!pairs [{1: x}]'),
+                          ('omap', '<<: !!omap [{x: 1}]'), ('python/object', '!!python/object/apply:os.system [false]')]:
+            with self.subTest(text=text), self.assertRaisesRegex(evidence.yaml.constructor.ConstructorError, tag):
+                evidence.load_yaml(text)
 
 
 class TranscriptionTests(unittest.TestCase):
     def setUp(self):
-        # Only the two source blobs actually consumed by the transcription check.
-        self.source = {
-            "conformance/test-vectors/websocket/fixtures.yaml": b"fixtures:\n"
-            b"- {id: websocket/VEC-WS-009, frame_hex: '0801520408011001', unknown_field_good: 'Append d2050178 (unknown)'}\n"
-            b"- {id: websocket/VEC-WS-005, server_wire_hex: '890670696e672d31', client_wire_hex: '8a8637fa213d47934f5a1acb'}\n"
-            b"- {id: websocket/VEC-WS-006, client_wire_hex: '888237fa213d3412', server_wire_hex: '880203e8'}\n"
-            b"- id: websocket/VEC-WS-007\n  mapping:\n"
-            b"    a: {code: 1001}\n    b: {code: 1002}\n    c: {code: 1003}\n"
-            b"    d: {code: 1007}\n    e: {code: 1008}\n    f: {code: 1009}\n    g: {code: 1011}\n"
-            b"  asserts: ['codes 1005, 1006, 1015 MUST NEVER appear']\n",
-            "conformance/test-vectors/tcp/byte-vectors.yaml": b"default_max_frame_bytes: 1048576\n",
-        }
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.transport = evidence.FIXTURES / 'transport.yaml'
+        self.rejection = evidence.FIXTURES / 'ws-no-length-prefix.hex'
+        self.vectors = Path('tests/interoperability/vectors.rs')
+        for rel in (self.transport, self.rejection, self.vectors):
+            (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(evidence.ROOT / rel, self.root / rel)
 
-    def test_handwritten_constants_match_origins_but_do_not_claim_execution(self):
-        result = evidence.verify_transcriptions(self.source)
-        self.assertEqual(result["verdict"], "PASS")
-        self.assertFalse(result["formal_conformance"])
-        self.assertEqual(result["origins"], {name: evidence.digest(data) for name, data in self.source.items()})
+    def test_local_transport_fixture_matches_rust_and_detects_drift(self):
+        report = evidence.verify_transcriptions(self.root)
+        self.assertEqual(report['kind'], 'fixture_transcription_only')
+        self.assertEqual(report['verdict'], 'PASS')
+        self.assertFalse(report['formal_conformance'])
+        f = self.root / self.transport
+        self.assertEqual(report['origins'], {p.as_posix(): evidence.digest((self.root / p).read_bytes())
+                                             for p in (self.transport, self.rejection)})
+        self.assertEqual(report['source_sha256'], evidence.digest((self.root / self.vectors).read_bytes()))
+        original = f.read_text()
+        for value in ('890670696e672d31', '1005', '1001', '1048576'):
+            f.write_text(original.replace(value, '9999'))
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'transcription drift'):
+                evidence.verify_transcriptions(self.root)
 
-    def test_changed_origins_do_not_silently_keep_transcribed_constants(self):
-        for origin, old, new in (
-            ("conformance/test-vectors/websocket/fixtures.yaml", b"890670696e672d31", b"8900"),
-            ("conformance/test-vectors/tcp/byte-vectors.yaml", b"1048576", b"2048"),
-        ):
-            source = {**self.source, origin: self.source[origin].replace(old, new)}
-            with self.subTest(origin=origin), self.assertRaisesRegex(ValueError, "transcription drift"):
-                evidence.verify_transcriptions(source)
+    def test_only_reviewed_hex_declarations_and_values_pass(self):
+        vectors = self.root / self.vectors
+        original = vectors.read_text()
+        ping = next(line for line in original.splitlines() if line.startswith('pub const PING_WIRE_HEX'))
+        for change, edited in [('extra', original + '\npub const EXTRA_HEX: &str = "ff";'),
+                               ('nonliteral extra', original + '\npub const EXTRA_HEX: &str = PING_WIRE_HEX;'),
+                               ('duplicate', original + '\n' + ping), ('commented out', original.replace(ping, '//' + ping))]:
+            vectors.write_text(edited)
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'WS vector transcription drift'):
+                evidence.verify_transcriptions(self.root)
+
+    def test_changed_rejection_bytes_fail_without_a_change_to_the_origin_pin(self):
+        (self.root / self.rejection).write_text('00\n')
+        with self.assertRaisesRegex(ValueError, 'VEC-WS-009 rejection fixture drift'):
+            evidence.verify_transcriptions(self.root)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class EvidenceTests(unittest.TestCase):
+    def setUp(self):
+        path = evidence.SCENARIO_FIXTURE
+        self.identity = {'files': {path.as_posix(): evidence.digest((evidence.ROOT / path).read_bytes())}}
+
+    def test_scenario_fixture_must_match_initial_worktree_identity(self):
+        path = evidence.SCENARIO_FIXTURE.as_posix()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'evidence'
+            with mock.patch.object(sys, 'argv', ['evidence', '--output', str(output), '--run-local', 'corpus']), \
+                    mock.patch.object(evidence, 'implementation_identity', return_value={'files': {path: 'other digest'}}), \
+                    mock.patch.object(evidence, 'run_local') as run, self.assertRaisesRegex(ValueError, 'fixture digest'):
+                evidence.main()
+            run.assert_not_called()
+            self.assertFalse(output.exists())
+
+    def test_execution_requires_one_named_test(self):
+        summary = 'test result: ok. 1 passed; 0 failed; 0 ignored;'
+        for text, expected in (('test wanted ... ok\n' + summary, 'PASS'),
+                               ('test other ... ok\n' + summary, 'NOT_EXECUTED'),
+                               (summary.replace('1 passed', '0 passed'), 'NOT_EXECUTED'),
+                               ('test wanted ... ok\n' + summary + '\n' + summary, 'NOT_EXECUTED'),
+                               ('test result: ok. 0 passed; 0 failed; 1 ignored;', 'SKIP')):
+            with self.subTest(text=text):
+                self.assertEqual(evidence.local_verdict(0, text, 'wanted')[0], expected)
+        self.assertEqual(evidence.local_verdict(101, 'test wanted ... ok\n' + summary, 'wanted')[0], 'FAIL')
+
+    def test_local_command_is_locked_exact_and_hashes_the_observed_log(self):
+        for lane, target, test in [('corpus', 'syntra-runtime --test conformance_runner', 'sc_wire_vectors_decode'),
+                                   ('echo', 'syntra-runtime --test conformance_runner', 'sc_echo'),
+                                   ('native-tls13', 'syntra-net --features tls-rustls --test wss',
+                                    'wss_server_rejects_tls12_client_before_authentication')]:
+            log = f'test {test} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n'
+
+            def cargo(command, **kwargs):
+                kwargs['stdout'].write(log)
+                return subprocess.CompletedProcess(command, 0)
+
+            with self.subTest(lane=lane), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(evidence.subprocess, 'run', side_effect=cargo) as run:
+                row = evidence.run_local(lane, Path(directory))
+                self.assertEqual((row['verdict'], row['exit_code'], row['formal_conformance']), ('PASS', 0, False))
+                command, = run.call_args.args
+                self.assertEqual(command, ['cargo', 'test', '--locked', '--no-default-features', '-p', *target.split(),
+                                           test, '--', '--exact', '--show-output', '--color', 'never'])
+                self.assertEqual(row['command'], command)
+                self.assertEqual(run.call_args.kwargs['cwd'], evidence.ROOT)
+                self.assertEqual(run.call_args.kwargs['env']['RUSTUP_TOOLCHAIN'], '1.89.0')
+                self.assertEqual(run.call_args.kwargs['stderr'], subprocess.STDOUT)
+                self.assertEqual((Path(directory) / row['artifact']).read_bytes(), log.encode())
+                self.assertEqual(row['artifact_sha256'], evidence.digest(log.encode()))
+
+    def test_local_missing_tool_and_timeout_are_not_executed(self):
+        for error in (FileNotFoundError(), subprocess.TimeoutExpired(['cargo'], 300)):
+            with self.subTest(error=type(error)), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(evidence.subprocess, 'run', side_effect=error):
+                row = evidence.run_local('corpus', Path(directory))
+                self.assertEqual(row['verdict'], 'NOT_EXECUTED')
+                self.assertIn(type(error).__name__, row['reason'])
+                self.assertNotIn('exit_code', row)
+
+    def test_stdout_report_uses_current_contract_and_gates(self):
+        scope = {'protocol': 'Syntra 1.0', 'carriers': ['SYNTRA-1.0-TCP', 'SYNTRA-1.0-WS', 'SYNTRA-1.0-WSS'],
+                 'contexts': 9, 'negative_recipes': 36}
+        with mock.patch.object(sys, 'argv', ['evidence']), contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                mock.patch.object(evidence, 'verify_protocol', return_value=scope), \
+                mock.patch.object(evidence, 'implementation_identity', return_value=self.identity):
+            self.assertEqual(evidence.main(), 0)
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(report['format_version'], 3)
+        self.assertEqual(report['kind'], 'implementation_evidence_not_conformance_declaration')
+        self.assertFalse(report['formal_conformance_claimed'])
+        self.assertEqual(report['implementation_wire_contract'], evidence.IMPLEMENTATION_WIRE_CONTRACT)
+        self.assertEqual(report['scope'], scope)
+        self.assertEqual(report['implementation']['before'], self.identity)
+        self.assertEqual(report['implementation']['after'], self.identity)
+        self.assertEqual(report['supplemental_results'], [])
+        self.assertEqual(report['fixture_verification'], evidence.verify_transcriptions())
+        self.assertFalse(report['worktree_changed_during_run'])
+        self.assertEqual(report['worktree_changed_files'], [])
+        self.assertEqual(set(report['external_gates']), {'formal_conformance', 'physical_ios_android', 'browser',
+                         'direct_host_tls13_wss', 'independent_noise_vectors', 'device_budgets_and_soak',
+                         'independent_security_review'})
+        self.assertTrue(all(row['verdict'] == 'NOT_EXECUTED' and row['reason'] for row in report['external_gates'].values()))
+        self.assertTrue({'formal_summary', 'results', 'suite_schema_issues', 'contract_alignment',
+                         'candidate_agreement', 'pins'}.isdisjoint(report))
+
+    def test_drift_without_requested_lanes_still_fails(self):
+        after = {'files': {**self.identity['files'], 'new': 'digest'}}
+        with mock.patch.object(sys, 'argv', ['evidence']), contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                mock.patch.object(evidence, 'verify_protocol', return_value={}), \
+                mock.patch.object(evidence, 'implementation_identity', side_effect=[self.identity, after]):
+            self.assertEqual(evidence.main(), 1)
+        report = json.loads(stdout.getvalue())
+        self.assertTrue(report['worktree_changed_during_run'])
+        self.assertEqual(report['worktree_changed_files'], ['new'])
+
+    def test_changed_worktree_or_unsuccessful_lane_invalidates_report(self):
+        files = self.identity['files']
+        for changed, verdict, expected in [(False, 'PASS', 0), (True, 'PASS', 1), (False, 'SKIP', 1),
+                                           (False, 'FAIL', 1), (False, 'NOT_EXECUTED', 1)]:
+            with self.subTest(changed=changed, verdict=verdict), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / 'evidence'
+                args = ['evidence', '--output', str(output), '--run-local', 'corpus', '--run-local', 'corpus']
+                with mock.patch.object(sys, 'argv', args), contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                        mock.patch.object(evidence, 'verify_protocol', return_value={}), \
+                        mock.patch.object(evidence, 'implementation_identity', side_effect=[{'files': files}, {'files': {**files, 'x': 1} if changed else files}]), \
+                        mock.patch.object(evidence, 'run_local', return_value={'verdict': verdict}) as run:
+                    self.assertEqual(evidence.main(), expected)
+                run.assert_called_once_with('corpus', output)
+                report = json.loads((output / 'report.json').read_text())
+                summary = json.loads(stdout.getvalue())
+                self.assertEqual(summary, {'artifact': str(output / 'report.json'), 'kind': report['kind'],
+                                           'formal_conformance_claimed': False, 'supplemental_results': report['supplemental_results']})
+                self.assertFalse(report['formal_conformance_claimed'])
+                self.assertEqual(report['external_gates']['formal_conformance']['verdict'], 'NOT_EXECUTED')
+                self.assertEqual(report['worktree_changed_files'], ['x'] if changed else [])
+                self.assertEqual(report['supplemental_results'][0]['verdict'], 'NOT_EXECUTED' if changed else verdict)
+
+    def test_cli_refuses_removed_options_and_requires_output_for_lanes(self):
+        for args in (['--execute'], ['--profile', 'x'], ['--upstream', '.'], ['--candidate-agreement', 'offline'],
+                     ['--run-local', 'corpus']):
+            with self.subTest(args=args), mock.patch.object(sys, 'argv', ['evidence', *args]), \
+                    contextlib.redirect_stderr(io.StringIO()), mock.patch.object(evidence, 'implementation_identity') as identity, \
+                    self.assertRaises(SystemExit) as error:
+                evidence.main()
+            self.assertEqual(error.exception.code, 2)
+            identity.assert_not_called()
+
+    def test_existing_symlink_and_inside_worktree_outputs_are_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            link = Path(directory) / 'link'
+            link.symlink_to(Path(directory) / 'missing')
+            for path, reason in ((directory, 'new directory'), (link, 'new directory'),
+                                 (evidence.ROOT / 'invalid-evidence-output', 'outside the implementation worktree')):
+                with self.subTest(path=path), mock.patch.object(sys, 'argv', ['evidence', '--output', str(path)]), \
+                        self.assertRaisesRegex(ValueError, reason):
+                    evidence.main()

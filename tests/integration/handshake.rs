@@ -5,34 +5,42 @@
 //! second `hello`, and `connection_id`-as-credential rejection. Expected
 //! outcomes are codes + transitions, never message text.
 
-use syntra_core::proto::{frame::Body, ClientHello, Frame, ServerReady};
+use bebop::{Record, SliceWrapper};
+use syntra_core::generated::{Frame, FrameBody};
+
+// Test input is serialized without semantic checks; the receiving peer validates it.
+fn handshake_frame(version: u32, body: FrameBody<'_>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    Frame {
+        version,
+        request_id: 0,
+        body,
+    }
+    .serialize(&mut bytes)
+    .unwrap();
+    bytes
+}
 
 /// Encode a `hello` envelope (first Syntra unit on the transport).
 pub fn hello_bytes(min_version: u32, max_version: u32, credential: Vec<u8>) -> Vec<u8> {
-    use prost::Message;
-    Frame {
-        version: max_version,
-        request_id: 0,
-        body: Some(Body::Hello(ClientHello {
-            min_version,
-            max_version,
-            credential: credential.into(),
-        })),
-    }
-    .encode_to_vec()
+    handshake_frame(
+        max_version.max(1), // Even a malformed offer is tested inside a nonzero-version frame.
+        FrameBody::ClientHello {
+            min_version: Some(min_version),
+            max_version: Some(max_version),
+            credential: (!credential.is_empty()).then(|| SliceWrapper::from_cooked(&credential)),
+        },
+    )
 }
 
 /// Encode a `ready` envelope as a host would send it.
 pub fn ready_bytes(version: u32, connection_id: &str) -> Vec<u8> {
-    use prost::Message;
-    Frame {
+    handshake_frame(
         version,
-        request_id: 0,
-        body: Some(Body::Ready(ServerReady {
-            connection_id: connection_id.to_string(),
-        })),
-    }
-    .encode_to_vec()
+        FrameBody::ServerReady {
+            connection_id: Some(connection_id),
+        },
+    )
 }
 
 /// Version-range cases: (min, max) with no overlap against host [1, 1].

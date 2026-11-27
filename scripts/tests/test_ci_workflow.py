@@ -4,6 +4,8 @@ from contextlib import redirect_stdout
 import io
 import json
 from pathlib import Path
+import shlex
+import sys
 import unittest
 from unittest import mock
 
@@ -55,14 +57,18 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertNotIn("if", contract)
         self.assertNotIn("continue-on-error", contract)
 
-    def test_candidate_upload_follows_its_identified_producer(self):
-        producer, = [step for step in self.steps if "--run-rust" in step.get("run", "")]
-        upload, = [step for step in self.steps
-                   if step.get("with", {}).get("name") == "candidate-rust-agreement"]
-        self.assertEqual(producer.get("id"), "candidate_agreement")
-        self.assertLess(self.steps.index(producer), self.steps.index(upload))
-        self.assertIn('--output "$RUNNER_TEMP/candidate-rust-agreement"', producer["run"])
-        self.assertEqual(upload["with"]["path"], "${{ runner.temp }}/candidate-rust-agreement")
+    def test_generation_check_uses_verified_bebopc(self):
+        job = self.workflow['jobs']['generated-rust']
+        steps = job['steps']
+        setup, = [s for s in steps if s.get('uses') == './.github/actions/setup-bebopc']
+        check, = [s for s in steps if s.get('run') == 'python3 scripts/check-generated.py']
+        self.assertLess(steps.index(setup), steps.index(check))
+        for gate in (job, setup, check):
+            self.assertNotIn('if', gate)
+            self.assertNotIn('continue-on-error', gate)
+        install = (ROOT / '.github/actions/setup-bebopc/action.yml').read_text()
+        self.assertIn('/releases/download/v3.2.3/', install)
+        self.assertRegex(install, r"'[0-9a-f]{64}  bebopc.zip' \| sha256sum --check")
 
     def test_parser_budgets_and_main_only_benchmark_trigger(self):
         for workflow, seconds in ((self.workflow, "60"), (self.scheduled, "900")):
@@ -75,8 +81,8 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(set(bench["on"]["push"]["paths"]), {
             "crates/**/src/**/*.rs",
             "crates/**/benches/**/*.rs",
-            "crates/**/*.bop",
-            "proto/**/*.proto",
+            "schemas/**/*.bop",
+            "bebop.json",
             "crates/syntra-core/tests/bench_allocations.rs",
             "scripts/benchmark_baseline.py",
             "crates/**/build.rs",
@@ -102,24 +108,26 @@ class CiWorkflowTests(unittest.TestCase):
             "cancel-in-progress": "true",
         })
 
-    def test_candidate_upload_requires_execution_but_preserves_failure_evidence(self):
-        upload, = [step for step in self.steps
-                   if step.get("with", {}).get("name") == "candidate-rust-agreement"]
-        # An earlier test failure skips the producer; success and failure both
-        # attempt evidence preservation, but skipped/absent/cancelled do not.
-        self.assertEqual(
-            upload["if"],
-            "${{ !cancelled() && (steps.candidate_agreement.outcome == 'success' || "
-            "steps.candidate_agreement.outcome == 'failure') }}")
-        self.assertEqual(upload["with"]["if-no-files-found"], "error")
-
-    def test_candidate_validation_and_rust_job_remain_required(self):
-        producer, = [step for step in self.steps if "--run-rust" in step.get("run", "")]
-        self.assertNotIn("if", producer)
-        self.assertNotIn("continue-on-error", producer)
-        self.assertIn("--offline", producer["run"])
-        self.assertIn("rust", self.workflow["jobs"]["required"]["needs"])
-        self.assertNotIn("continue-on-error", self.workflow["jobs"]["rust"])
+    def test_every_wss_scenario_runs_and_preserves_observations(self):
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        from conformance_evidence import CHANNEL_LANES, SUPPLEMENTAL_SCENARIOS
+        job = self.workflow['jobs']['manifest-cases']
+        steps = job['steps']
+        run, = [s for s in steps if 'scripts/conformance_evidence.py' in s.get('run', '')]
+        for gate in (job, run):
+            self.assertNotIn('if', gate)
+            self.assertNotIn('continue-on-error', gate)
+        # The folded YAML step must be one invocation, not flags in comments or another command.
+        argv, = [words for line in run['run'].splitlines()
+                 if (words := shlex.split(line, comments=True))]
+        self.assertEqual(argv[:3], ['python3', '-B', 'scripts/conformance_evidence.py'])
+        lanes = SUPPLEMENTAL_SCENARIOS.keys() | CHANNEL_LANES.keys()
+        expected = [('--run-local', lane) for lane in lanes] + [('--output', '$RUNNER_TEMP/manifest-cases')]
+        self.assertCountEqual(zip(argv[3::2], argv[4::2], strict=True), expected)
+        upload, = [s for s in steps if 'upload-artifact' in s.get('uses', '')]
+        self.assertLess(steps.index(run), steps.index(upload))
+        self.assertEqual(upload['with']['path'], '${{ runner.temp }}/manifest-cases')
+        self.assertEqual(upload['with']['if-no-files-found'], 'error')
 
     def test_native_commands_are_identical_ordered_and_individually_blocking(self):
         """Require identical ordered native commands with no optional jobs or steps."""

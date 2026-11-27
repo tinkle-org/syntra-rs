@@ -26,11 +26,11 @@ pub fn bounded_diagnostic(message: impl Into<String>) -> String {
     message
 }
 
-/// Wire error codes. Mirrors `syntra.v1.ErrorCode` (errors.proto).
+/// Registered error codes. Unknown raw wire numbers remain diagnostic data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i32)]
 pub enum ErrorCode {
-    Unspecified = 0,
+    Invalid = 0,
     Cancelled = 1,
     Unknown = 2,
     InvalidArgument = 3,
@@ -55,7 +55,7 @@ impl ErrorCode {
     /// number is preserved by the caller for diagnostics.
     pub fn from_i32_lossy(v: i32) -> (Self, Option<i32>) {
         match v {
-            0 => (Self::Unspecified, None),
+            0 => (Self::Invalid, None),
             1 => (Self::Cancelled, None),
             2 => (Self::Unknown, None),
             3 => (Self::InvalidArgument, None),
@@ -98,7 +98,7 @@ impl ErrorCode {
             | Self::DataLoss
             | Self::PermissionDenied
             | Self::Unauthenticated => RetryClass::NotSafeToRetry,
-            Self::Internal | Self::Unknown | Self::Unspecified => RetryClass::UnknownOutcome,
+            Self::Internal | Self::Unknown | Self::Invalid => RetryClass::UnknownOutcome,
         }
     }
 }
@@ -111,7 +111,7 @@ pub enum RetryClass {
     UnknownOutcome,
 }
 
-/// Public typed failure: `{code, message}` (errors.proto `RpcError`).
+/// Public typed failure with the classified and original code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcError {
     pub code: ErrorCode,
@@ -134,7 +134,7 @@ impl RpcError {
 /// All failures surfaced by the Syntra core and runtime.
 #[derive(Debug, Error, Clone)]
 pub enum SyntraError {
-    /// A terminal `RpcResult{error}` from the host.
+    /// A terminal `CallResult` error from the host.
     #[error("rpc failed [{code:?}]: {message}")]
     Rpc {
         code: ErrorCode,
@@ -213,6 +213,43 @@ impl From<RpcError> for SyntraError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registered_error_codes_match_the_schema() {
+        use crate::generated::ErrorCode as SchemaCode;
+
+        // Match exhaustively in both directions so adding to either enum requires a decision.
+        macro_rules! check_codes {
+            ($($name:ident),+ $(,)?) => {
+                for code in [$(ErrorCode::$name),+] {
+                    let schema = match code { $(ErrorCode::$name => SchemaCode::$name),+ };
+                    let raw = i32::from(schema);
+                    assert_eq!(code.as_i32(), raw, "{code:?}");
+                    let expected = match schema { $(SchemaCode::$name => ErrorCode::$name),+ };
+                    assert_eq!(ErrorCode::from_i32_lossy(raw), (expected, None));
+                }
+            };
+        }
+        check_codes!(
+            Invalid,
+            Cancelled,
+            Unknown,
+            InvalidArgument,
+            DeadlineExceeded,
+            NotFound,
+            AlreadyExists,
+            PermissionDenied,
+            ResourceExhausted,
+            FailedPrecondition,
+            Aborted,
+            OutOfRange,
+            Unimplemented,
+            Internal,
+            Unavailable,
+            DataLoss,
+            Unauthenticated,
+        );
+    }
 
     #[test]
     fn rpc_unknown_outcome_is_conservative_for_loss_deadline_and_internal_errors() {

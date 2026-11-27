@@ -117,20 +117,6 @@ jobs:
         run: |
           cargo test --locked -p syntra-core --no-default-features --test http_candidate_context
           cargo test --locked -p syntra-core --no-default-features --features http-candidate --test http_candidate_context
-      - name: Install pinned evidence parser for exact execution proof
-        run: python3 -m pip install -r scripts/requirements-evidence.txt
-      - name: Candidate offline agreement (no uncommitted SDD required)
-        id: candidate_agreement
-        run: python3 -B scripts/protocol_contract.py --offline --run-rust --output "$RUNNER_TEMP/candidate-rust-agreement"
-      - name: Preserve candidate agreement scope and exact command logs
-        # Preserve attempted checks, but do not report missing evidence when an
-        # earlier failure skipped its producer. Missing attempted output is fatal.
-        if: ${{ !cancelled() && (steps.candidate_agreement.outcome == 'success' || steps.candidate_agreement.outcome == 'failure') }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: candidate-rust-agreement
-          path: ${{ runner.temp }}/candidate-rust-agreement
-          if-no-files-found: error
       - name: Isolated network-free transport defaults
         run: cargo test --locked -p syntra-net
       - name: Explicit TCP carrier regressions
@@ -219,13 +205,11 @@ jobs:
         run: cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
 
   generated-rust:
-    name: generation drift + upstream pin
+    name: Bebop generation drift and protocol contract
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
-    env:
-      SYNTRA_SDD_ROOT: ${{ github.workspace }}/../syntra-sdd
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -236,25 +220,15 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
-      - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
-        with:
-          version: "1.59.0"
-          github_token: ${{ github.token }}
+      - uses: ./.github/actions/setup-bebopc
       - name: Pinned Rust generation drift check
         run: python3 scripts/check-generated.py
-      - name: Fetch accepted SDD Git objects (not floating HEAD or local documents)
-        run: |
-          git init "$SYNTRA_SDD_ROOT"
-          git -C "$SYNTRA_SDD_ROOT" remote add origin https://github.com/tinkle-org/syntra.git
-          git -C "$SYNTRA_SDD_ROOT" fetch --depth=1 origin 8ede3810b29fbba4d0e6ae6751a0025ceedda140
       - name: Install pinned manifest parser
         run: python3 -m pip install -r scripts/requirements-evidence.txt
-      - name: Upstream provenance and implementation test-asset check
-        run: python3 scripts/check-upstream-pin.py
-      - name: Snapshot checker regression tests
+      - name: Script regression tests
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
-      - name: Unified Syntra implementation evidence (no formal conformance claim)
-        run: python3 -B scripts/conformance_evidence.py --candidate-agreement offline --output "$RUNNER_TEMP/syntra-evidence"
+      - name: Local context and transport fixture checks
+        run: python3 -B scripts/conformance_evidence.py --output "$RUNNER_TEMP/syntra-evidence"
       - name: Upload implementation evidence (not a conformance declaration)
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -263,13 +237,11 @@ jobs:
           if-no-files-found: error
 
   manifest-cases:
-    name: unified Syntra validation + ten supplemental WSS scenarios
+    name: unified Syntra validation + supplemental WSS scenarios
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
-    env:
-      SYNTRA_SDD_ROOT: ${{ github.workspace }}/../syntra-sdd
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -280,22 +252,16 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
-      - name: Fetch exact implementation input objects and install parser
-        run: |
-          git init "$SYNTRA_SDD_ROOT"
-          git -C "$SYNTRA_SDD_ROOT" remote add origin https://github.com/tinkle-org/syntra.git
-          git -C "$SYNTRA_SDD_ROOT" fetch --depth=1 origin 8ede3810b29fbba4d0e6ae6751a0025ceedda140
-          python3 -m pip install -r scripts/requirements-evidence.txt
-      - name: Unified implementation evidence regression tests
+      - name: Install pinned fixture parser
+        run: python3 -m pip install -r scripts/requirements-evidence.txt
+      - name: Exact channel regressions and local WSS scenarios
         run: >-
-          python3 -B -m unittest
-          scripts/tests/test_conformance_evidence.py scripts/tests/test_manifest_adapters.py -v
-      - name: Current WSS scenarios (supplemental only, no formal verdicts)
-        run: >-
-          python3 -B scripts/conformance_evidence.py --candidate-agreement offline
+          python3 -B scripts/conformance_evidence.py
+          --run-local kernel-contexts --run-local wss-context --run-local native-binding
+          --run-local native-tls13 --run-local loopback-ws
           --run-local wss-envelope --run-local wss-unknown-field --run-local wss-ready
           --run-local wss-reserved-method --run-local wss-payloads --run-local wss-duplicate-id
-          --run-local wss-deadline --run-local wss-internal-error
+          --run-local wss-deadline --run-local wss-internal-error --run-local wss-authorization-denied
           --run-local wss-reverse-completion --run-local wss-recovery-isolation
           --output "$RUNNER_TEMP/manifest-cases"
       - name: Preserve implementation evidence and supplemental observations
@@ -325,10 +291,6 @@ jobs:
         run: python3 scripts/cargo_contracts.py package
       - name: Rustdoc (no deps, warnings informational)
         run: cargo doc --locked --workspace --no-deps
-      - name: Public API surface check (no accidental changes)
-        run: |
-          cargo doc --locked -p syntra-core --no-deps
-          git diff --exit-code -- crates/syntra-core/src/generated || (echo "generated drift; run buf generate" >&2; exit 1)
 
   security:
     name: dependency security (deny + audit)

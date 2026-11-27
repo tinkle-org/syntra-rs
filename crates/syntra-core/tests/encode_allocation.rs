@@ -2,8 +2,10 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use prost::Message;
-use syntra_core::proto::{frame::Body, rpc_result::Outcome, Frame, Notification, RpcResult};
+#[path = "fixtures/bebop.rs"]
+mod bebop;
+
+use syntra_core::wire::{call_result::Outcome, frame::Body, CallResult, Frame, Notification};
 use syntra_core::{
     decode_frame, encode_frame, missing_result_outcome_id, validate_wire_structure,
     ConnectionState, ErrorCode, ValidationContext, MAX_CONNECTION_ID_BYTES, MAX_CREDENTIAL_BYTES,
@@ -53,26 +55,12 @@ fn observed<T>(minimum_size: usize, operation: impl FnOnce() -> T) -> (T, usize)
     (result, LARGE_ALLOCATIONS.load(Ordering::Relaxed))
 }
 
-fn varint(mut value: usize) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    while value >= 128 {
-        bytes.push(value as u8 | 0x80);
-        value >>= 7;
-    }
-    bytes.push(value as u8);
-    bytes
-}
-
-fn len(field: usize, value: &[u8]) -> Vec<u8> {
-    [varint(field << 3 | 2), varint(value.len()), value.to_vec()].concat()
-}
-
 #[test]
 fn codec_bounds_are_enforced_before_allocation() {
     // This binary deliberately has one test so observation cannot count a
     // concurrent test's large input allocation.
     for body in [
-        Body::Result(RpcResult {
+        Body::Result(CallResult {
             outcome: Some(Outcome::Payload(vec![0; MAX_FRAME_BYTES])),
         }),
         Body::Notification(Notification {
@@ -95,96 +83,52 @@ fn codec_bounds_are_enforced_before_allocation() {
         assert_eq!(allocations, 0);
     }
 
-    for (body, field, limit, context, code) in [
+    for (body, limit, context, code) in [
         (
             10,
-            3,
             MAX_CREDENTIAL_BYTES,
             ValidationContext::pre_handshake(ConnectionState::Connected),
             ErrorCode::ResourceExhausted,
         ),
         (
             11,
-            1,
             MAX_CONNECTION_ID_BYTES,
             ValidationContext::pre_handshake(ConnectionState::Negotiating),
             ErrorCode::InvalidArgument,
         ),
         (
             13,
-            2,
             MAX_DIAGNOSTIC_BYTES,
             ValidationContext::active(1),
             ErrorCode::InvalidArgument,
         ),
     ] {
-        // Build every raw input before arming. Include an oversized earlier
-        // value that prost would otherwise allocate and then overwrite.
-        let oversized = len(field, &vec![b'x'; limit + 1]);
-        let bounded = len(field, b"ok");
-        let values = [
-            oversized.clone(),
-            [oversized.clone(), bounded.clone()].concat(),
-            [bounded, oversized].concat(),
-            len(field, &vec![b'x'; limit]),
-        ];
-        for (index, value) in values.into_iter().enumerate() {
-            let inner = match body {
-                10 => [vec![8, 1, 16, 1], value].concat(),
-                13 => len(2, &[vec![8, 13], value].concat()),
-                _ => value,
-            };
-            let header = if body == 13 {
-                vec![8, 1, 16, 7]
-            } else {
-                vec![8, 1]
-            };
-            let raw = [header, len(body, &inner)].concat();
-            let (result, allocations) = observed(limit + 1, || decode_frame(&raw, context));
-            assert_eq!(allocations, 0, "body={body}, duplicate case={index}");
-            if index == 3 {
-                // Exact boundary is admitted. This positive control proves the
-                // observer sees generated field allocation when it is armed.
-                assert!(result.is_ok());
-                let (result, allocations) = observed(limit, || decode_frame(&raw, context));
-                assert!(result.is_ok());
-                assert!(
-                    allocations > 0,
-                    "body={body}: observer must see exact-limit allocation"
-                );
-            } else {
-                assert_eq!(result.unwrap_err().code(), code);
-                let (result, allocations) = observed(limit + 1, || validate_wire_structure(&raw));
-                assert_eq!(result.unwrap_err().code(), code);
-                assert_eq!(allocations, 0);
-            }
-            let (id, allocations) =
-                observed(limit + 1, || missing_result_outcome_id(&raw, context));
-            assert_eq!(id, None);
-            assert_eq!(allocations, 0);
-        }
+        // A positive control observes the owned field copy at its exact limit.
+        let good = bebop::field_frame(body, &vec![b'x'; limit]);
+        let (result, allocations) = observed(limit, || decode_frame(&good, context));
+        result.unwrap();
+        assert!(allocations > 0, "body={body}: did not see the field copy");
+
+        let bad = bebop::field_frame(body, &vec![b'x'; limit + 1]);
+        let (result, allocations) = observed(limit + 1, || decode_frame(&bad, context));
+        assert_eq!(result.unwrap_err().code(), code);
+        assert_eq!(allocations, 0, "body={body}: copied over-limit field");
+        let (result, allocations) = observed(limit + 1, || validate_wire_structure(&bad));
+        assert_eq!(result.unwrap_err().code(), code);
+        assert_eq!(allocations, 0);
+        let (id, allocations) = observed(limit + 1, || missing_result_outcome_id(&bad, context));
+        assert_eq!(id, None);
+        assert_eq!(allocations, 0);
     }
 
-    // The reviewer's exact 8,193-byte credential reproduction, not a generated
-    // approximation. Construction is outside the allocation observation window.
-    let mut raw = vec![
-        0x08, 0x01, 0x52, 0x88, 0x40, 0x08, 0x01, 0x10, 0x01, 0x1a, 0x81, 0x40,
-    ];
-    raw.extend(vec![0; 8_193]);
-    let (result, allocations) = observed(8_193, || {
-        decode_frame(
-            &raw,
-            ValidationContext::pre_handshake(ConnectionState::Connected),
-        )
+    // A valid first field doesn't justify copying its payload before checking
+    // the enclosing message's terminator and the rest of the frame.
+    let mut message = vec![1];
+    message.extend(bebop::sized(&vec![0xff; 64 * 1024]));
+    let raw = bebop::frame(1, 0, 15, &bebop::sized(&message));
+    let (result, allocations) = observed(64 * 1024, || {
+        decode_frame(&raw, ValidationContext::active(1))
     });
-    assert_eq!(result.unwrap_err().code(), ErrorCode::ResourceExhausted);
+    assert_eq!(result.unwrap_err().code(), ErrorCode::InvalidArgument);
     assert_eq!(allocations, 0);
-
-    // Independently check the raw reproduction's decoded shape, with observation
-    // off: generated decoding alone accepts and allocates the oversized field.
-    let decoded = Frame::decode(raw.as_slice()).unwrap();
-    match decoded.body.unwrap() {
-        Body::Hello(hello) => assert_eq!(hello.credential.len(), 8_193),
-        other => panic!("unexpected reproduction body {other:?}"),
-    }
 }

@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import conformance_evidence as evidence
 import manifest_adapters as adapters
-from upstream_snapshot import digest
+from local_inputs import digest
 
 
 class AdapterTests(unittest.TestCase):
@@ -94,6 +94,29 @@ class AdapterTests(unittest.TestCase):
             self.assertNotEqual(digest(adapters.canonical(scenario)), self.request['scenario_sha256'])
         self.assertNotEqual(adapters.request_for('wss-unknown-field')['nonce'], self.request['nonce'])
 
+    def test_request_cannot_mutate_or_replace_the_fixture_oracle(self):
+        self.request['scenario']['expected']['frames'][0]['payload_b64'] = '/w=='
+        fresh = adapters.request_for('wss-unknown-field')
+        self.assertEqual(fresh['scenario']['expected']['frames'][0]['payload_b64'], 'aGk=')
+        self.request['scenario_sha256'] = digest(adapters.canonical(self.request['scenario']))
+        result = self.result()
+        result['observation']['frames'][0]['payload_hex'] = 'ff'
+        with self.assertRaisesRegex(ValueError, 'request differs'):
+            adapters.validate_result(self.request, result)
+
+    def test_verification_binds_raw_fixture_and_captured_cases(self):
+        source = (adapters.ROOT / adapters.SCENARIO_FIXTURE).read_bytes() + b'\n# updated\n'
+        with mock.patch.object(adapters, 'regular_file', return_value=source):
+            self.request['fixture_sha256'] = digest(source)
+            with self.assertRaisesRegex(ValueError, 'fixture digest'):
+                adapters.validate_result(self.request, self.result())
+        identifier = self.request['scenario_id']
+        changed = {**self.request['scenario'], 'notes': 'not in fixture'}
+        with mock.patch.dict(adapters.SUPPLEMENTAL_SCENARIOS, {identifier: changed}):
+            request = adapters.request_for(identifier)
+            with self.assertRaisesRegex(ValueError, 'differ from fixture data'):
+                adapters.validate_result(request, self.result(request))
+
     def test_declared_assertions_without_an_oracle_are_refused(self):
         scenario = copy.deepcopy(self.request['scenario'])
         scenario['expected']['transport'] = {'must_be_observed': True}
@@ -103,13 +126,53 @@ class AdapterTests(unittest.TestCase):
 
     def test_fixture_encoder_preserves_unknown_field_and_empty_selection(self):
         frame = self.request['scenario']['input']['frames'][0]
-        self.assertTrue(adapters.frame_bytes(frame).endswith(bytes.fromhex('d2050178')))
+        self.assertTrue(adapters.frame_bytes(frame).endswith(bytes.fromhex('5a010000007800')))
         frame = {**frame, 'payload_b64': '', 'unknown_fields': []}
-        self.assertIn(bytes.fromhex('1200'), adapters.frame_bytes(frame))
-        no_timeout = {key: value for key, value in frame.items() if key != 'timeout_ms'}
-        self.assertEqual(adapters.frame_bytes(no_timeout), adapters.frame_bytes({**frame, 'timeout_ms': 0}))
+        self.assertIn(bytes.fromhex('020000000003'), adapters.frame_bytes(frame))
         with self.assertRaises(ValueError):
             adapters.frame_bytes({**frame, 'unreviewed': True})
+
+    def test_zero_or_missing_timeout_omits_the_wire_field(self):
+        frame = {'request_id': 1, 'body': 'request', 'method': '/a/B', 'payload_b64': '/wA='}
+        envelope = '01000000 0100000000000000 '
+        method_payload = '01 04000000 2f612f42 02 02000000 ff00 '
+        for timeout, lengths, tail in [({}, '15000000 0c 11000000 ', '00'),
+                                      ({'timeout_ms': 0}, '15000000 0c 11000000 ', '00'),
+                                      ({'timeout_ms': 500}, '1a000000 0c 16000000 ', '03 f4010000 00')]:
+            with self.subTest(timeout=timeout):
+                self.assertEqual(adapters.frame_bytes({**frame, **timeout}),
+                                 bytes.fromhex(envelope + lengths + method_payload + tail))
+
+    def test_payload_variants_are_correlated_results_of_only_the_declared_sends(self):
+        request = adapters.request_for('wss-payloads')
+        result = self.result(request)
+        got = result['observation']
+        got['frames'] += [{'request_id': 8, 'body': 'result', 'payload_hex': ''},
+                          {'request_id': 9, 'body': 'result', 'payload_hex': '000102ffff'}]
+        adapters.validate_result(request, result)
+        got['sent_frames_hex'].insert(-1, request['frames_hex'][-1])
+        with self.assertRaisesRegex(ValueError, 'only setup, declared calls and followup'):
+            adapters.validate_result(request, result)
+        del got['sent_frames_hex'][-2]
+        got['frames'][2]['payload_hex'] = '000102'
+        with self.assertRaisesRegex(ValueError, 'payload mismatch'):
+            adapters.validate_result(request, result)
+
+    def test_policy_denial_checks_the_wire_message_for_the_injected_detail(self):
+        request = adapters.request_for('wss-authorization-denied')
+        result = self.result(request)
+        got = result['observation']
+        error = {'code': 'PERMISSION_DENIED', 'message': 'access denied'}
+        got['frames'] = [{'request_id': 7, 'body': 'result', 'error': error}]
+        adapters.validate_result(request, result)
+        got['error'] = error.copy()  # a clean local diagnostic must not mask a wire leak
+        detail = request['scenario']['input']['faults']['policy_denial_message']
+        error['message'] += ': ' + detail.upper()
+        with self.assertRaisesRegex(ValueError, 'forbidden diagnostic'):
+            adapters.validate_result(request, result)
+        del error['message']
+        with self.assertRaisesRegex(ValueError, 'missing wire diagnostic'):
+            adapters.validate_result(request, result)
 
     def run_fake(self, text, returncode=0, artifact=True, tamper=None):
         """Return a mocked supplemental lane result with configurable logs and observations."""
@@ -239,10 +302,10 @@ class AdapterTests(unittest.TestCase):
             unconfirmed_captures=0, control_captures=1, probe_after_control={'error': {'code': 'UNIMPLEMENTED'}})
         got['control_connection'] = {'connection_state': 'ACTIVE', 'session_state': 'unchanged',
             'sent_frames_hex': ['setup', *request['control_frames_hex']],
-            'frames': [{'request_id': 1, 'body': 'result', 'shape': 'RecoveryNegotiateResponse', 'decoded': {
+            'frames': [{'request_id': 1, 'body': 'result', 'shape': 'Negotiated', 'decoded': {
                 'profile_version': 1, 'selected_version': 1, 'max_subscriptions_per_connection': 64,
                 'max_pending_rpcs_per_connection': 16, 'max_page_bytes': 262144, 'max_snapshot_pages': 256}},
-                {'request_id': 3, 'body': 'result', 'shape': 'RecoverySubscribeResponse', 'decoded': {
+                {'request_id': 3, 'body': 'result', 'shape': 'SubscriptionAccepted', 'decoded': {
                     'profile_version': 1, 'generation': 7, 'subscription_handle_hex': 'abcd',
                     'catchup_boundary_hex': b'boundary-A'.hex()}}]}
         adapters.validate_result(request, result)
