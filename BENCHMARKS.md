@@ -116,9 +116,15 @@ If the push creates `main`, the job skips because there is no previous tip.
 An incompatible build, missing case, or unreadable comparison fails the job.
 
 The gate covers only the two request round trips and three warm records above.
-Each gets 0.5 s warmup, 1 s measurement and 30 samples on each side. The
-decision uses Criterion's two-sided 95% bootstrap interval for the relative
-change in **mean time per operation** (new/old − 1), not throughput or a
+Each gets 0.5 s warmup, 1 s measurement and 30 samples on each side. CI builds
+both revisions with symbols stripped and records each benchmark executable's
+SHA-256 in `comparison.txt`. These workloads use in-memory fixtures. If an
+executable is byte-identical across checkouts, its timings are still collected
+and validated, but a timing difference cannot be attributed to the push. The
+same-tree calibration still checks for noise even with identical executables.
+
+For changed executables the decision uses Criterion's two-sided 95% bootstrap
+interval for the relative change in **mean time per operation** (new/old − 1), not throughput or a
 tail-latency percentile. Only a lower bound **strictly above +10%** triggers
 a second fresh old/new pair. The same case must cross that bound twice to
 fail for regression. Review the raw samples before attributing a slowdown.
