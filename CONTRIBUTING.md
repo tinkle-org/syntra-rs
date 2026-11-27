@@ -308,8 +308,11 @@ directly to `main`. Open a pull request and wait for its current revision's CI
 and Integration checks to pass before squash-merging. The same check requirement
 applies to the generated release PR, including approving its workflow runs.
 
-On pushes to `main`, Release-plz opens or updates a release PR. With
-`release_always = false`, publication is attempted only when a release PR merges,
+On pushes to `main`, Release-plz opens or updates a release PR. The same job
+then updates `fuzz/Cargo.lock` on the generated branch: the standalone parser
+workspace depends on the local core and runtime crates, but Release-plz only
+updates the root workspace lockfile. Review and run checks on the final PR head.
+With `release_always = false`, publication is attempted only when a release PR merges,
 and requires release validation to pass. The
 release job publishes Cargo packages, creates immutable per-package tags, and
 creates matching GitHub Releases with changelog notes. `git_release_type = "auto"`
