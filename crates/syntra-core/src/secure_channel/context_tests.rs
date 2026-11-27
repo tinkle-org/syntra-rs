@@ -7,7 +7,7 @@ use std::sync::{
 #[path = "../../tests/fixtures/syntra_1_0_context.rs"]
 mod fixtures;
 
-fn hex(input: &str) -> Vec<u8> {
+pub(super) fn hex(input: &str) -> Vec<u8> {
     assert_eq!(input.len() % 2, 0);
     input
         .as_bytes()

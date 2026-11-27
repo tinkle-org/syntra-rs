@@ -18,6 +18,11 @@ env:
   CARGO_NET_RETRY: 10
 
 jobs:
+  parser-checks:
+    uses: ./.github/workflows/parser-checks.yml
+    with:
+      seconds: 60
+
   fmt:
     name: rustfmt check
     runs-on: ubuntu-24.04
@@ -343,7 +348,11 @@ jobs:
           cargo install --locked cargo-deny --version 0.20.2
           cargo install --locked cargo-audit --version 0.22.2
       - name: cargo-audit (RustSec)
-        run: cargo audit --deny warnings
+        run: |
+          cargo audit --deny warnings
+          cargo audit --deny warnings --file fuzz/Cargo.lock
+      - name: Fuzz workspace dependency policy
+        run: cargo deny --manifest-path fuzz/Cargo.toml --locked check advisories licenses sources
       - name: cargo-deny (licenses, advisories, sources)
         run: cargo deny --locked check advisories licenses sources
       - name: Native enrollment dependency policy (optional graph is not covered by defaults)
@@ -441,7 +450,7 @@ jobs:
 
   required:
     name: required CI status
-    needs: [clippy, rust, native-macos, generated-rust, manifest-cases, package, security, actionlint, dependency-review]
+    needs: [clippy, rust, native-macos, generated-rust, manifest-cases, package, security, parser-checks, actionlint, dependency-review]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -463,7 +472,7 @@ jobs:
                   raise SystemExit(f"required jobs did not all succeed: {bad}")
           # Native validation and evidence jobs are hard requirements: skipped is not success.
           # fmt is informational and does not gate this aggregate check.
-          for hard in ("rust", "native-macos", "generated-rust", "manifest-cases"):
+          for hard in ("rust", "native-macos", "generated-rust", "manifest-cases", "parser-checks", "security"):
               if bad.get(hard) != "success":
                   raise SystemExit(f"hard-required job {hard} was {bad.get(hard)}")
           # Include dependency-review when it was applicable: fail required

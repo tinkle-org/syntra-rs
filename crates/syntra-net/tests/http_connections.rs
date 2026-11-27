@@ -1524,7 +1524,7 @@ mod review_fixes {
         clock: ElapsedClock,
         phase: &'static str,
         execution: ExecutionBudget,
-        validity_panic: Arc<AtomicBool>,
+        validity: Option<Arc<FixValidity>>,
         lane: Option<Arc<tokio::sync::Semaphore>>,
     }
     struct FixAuth(bool);
@@ -1534,11 +1534,19 @@ mod review_fixes {
             Ok(Principal::new("http-review-fix-principal"))
         }
     }
-    struct FixValidity(Arc<AtomicBool>);
+    #[derive(Default)]
+    struct FixValidity {
+        checks: AtomicUsize,
+        armed: AtomicBool,
+    }
     impl ConnectionAuthorization for FixValidity {
         fn check(&self) -> futures_util::future::BoxFuture<'_, Result<(), AuthError>> {
             Box::pin(async {
-                assert!(!self.0.load(Ordering::SeqCst), "fixture validity panic");
+                assert!(
+                    !self.armed.swap(false, Ordering::SeqCst),
+                    "fixture validity panic"
+                );
+                self.checks.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })
         }
@@ -1577,10 +1585,10 @@ mod review_fixes {
             &self,
             _: &VerifiedIdentity,
         ) -> Result<Option<Arc<dyn ConnectionAuthorization>>, AuthError> {
-            Ok((self.phase == "validity").then(|| {
-                Arc::new(FixValidity(self.validity_panic.clone()))
-                    as Arc<dyn ConnectionAuthorization>
-            }))
+            Ok(self
+                .validity
+                .clone()
+                .map(|v| v as Arc<dyn ConnectionAuthorization>))
         }
     }
     fn factory_with_clock(clock: ElapsedClock) -> Arc<FixFactory> {
@@ -1588,7 +1596,7 @@ mod review_fixes {
             clock,
             phase: "none",
             execution: ExecutionBudget::new(16),
-            validity_panic: Arc::new(AtomicBool::new(false)),
+            validity: None,
             lane: None,
         })
     }
@@ -2201,13 +2209,22 @@ mod review_fixes {
             "validity",
         ] {
             let provider = Arc::new(FixTls::new(None));
-            let validity_panic = Arc::new(AtomicBool::new(false));
+            let validity = Arc::new(FixValidity::default());
+            let source = Arc::new(FixSource(AtomicU64::new(0)));
+            let clock = if phase == "validity" {
+                let clock = ElapsedClock::with_source(source.clone());
+                // ElapsedClock takes max(source, scheduler); keep fixture time ahead.
+                source.0.store(60_000, Ordering::SeqCst);
+                clock
+            } else {
+                ElapsedClock::new()
+            };
             let execution = ExecutionBudget::new(16);
             let factory = Arc::new(FixFactory {
-                clock: ElapsedClock::new(),
+                clock: clock.clone(),
                 phase,
                 execution: execution.clone(),
-                validity_panic: validity_panic.clone(),
+                validity: (phase == "validity").then(|| validity.clone()),
                 lane: None,
             });
             let (leases, mut received) = tokio::sync::mpsc::unbounded_channel();
@@ -2249,7 +2266,13 @@ mod review_fixes {
                         server.hosts()[0].notify(vec![1]).await.unwrap();
                     }
                     "validity" => {
-                        validity_panic.store(true, Ordering::SeqCst);
+                        // Two establishment reads, then the watchdog's first refresh.
+                        settled(|| validity.checks.load(Ordering::SeqCst) >= 3).await;
+                        validity.armed.store(true, Ordering::SeqCst);
+                        source
+                            .0
+                            .fetch_add(validity.interval().as_millis() as u64, Ordering::SeqCst);
+                        clock.wake();
                     }
                     _ => {
                         assert!(client
@@ -2263,6 +2286,10 @@ mod review_fixes {
                     }
                 }
                 settled(|| client.is_closed()).await;
+                assert!(
+                    !validity.armed.load(Ordering::SeqCst),
+                    "closed without the armed validity check"
+                );
                 client.close().await;
             }
             if external.is_some() {
@@ -2327,7 +2354,7 @@ mod review_fixes {
             clock: ElapsedClock::new(),
             phase: "none",
             execution: ExecutionBudget::new(16),
-            validity_panic: Arc::new(AtomicBool::new(false)),
+            validity: None,
             lane: Some(lane.clone()),
         });
         let (mut config, public) = server_config(factory, echo(), provider.clone());

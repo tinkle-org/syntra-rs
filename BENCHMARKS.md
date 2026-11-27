@@ -4,7 +4,7 @@ Use **Rust 1.89.0** for current benchmarks and the current CI configuration,
 selecting it with `export RUSTUP_TOOLCHAIN=1.89.0`. The crate MSRV floor of 1.89
 is a build compatibility constraint; production binaries need a security-patched
 toolchain.
-Benchmarks use Criterion 0.5 with `--bench` targets and report timing plus
+Benchmarks use the locked Criterion 0.8 with `--bench` targets and report timing plus
 throughput. Root benchmarks require no Docker. Session cases exercise the
 linked Tokio runtime; channel and transport cases exercise local Syntra 1.0
 record protection.
@@ -31,10 +31,11 @@ benchmark success does not authorize publication or satisfy the formal-conforman
   64B, 1KiB and 64KiB payloads. Notification/result round-trip fixtures cap
   payloads at 1KiB. The near-limit request payload is `1_048_448 - 128`
   (1,048,320 bytes), below the 1MiB frame limit including its envelope.
-  Fixture creation happens outside timing. `Throughput::Bytes` is set from
-  each request's serialized size (and the near-limit request's size); the
-  notification/result cases inherit that setting rather than measuring their
-  own byte counts. Scans skip opaque contents: their MB/s is logical envelope
+  `frame/roundtrip_request/{0,1048320}` decodes and re-encodes a prebuilt
+  request, including validation, owned buffers and destruction. Byte equality
+  is checked outside timing. Each frame case counts one serialized envelope
+  per operation, not the sum of reads and writes. Fixture creation is untimed.
+  Scans skip opaque contents: their MB/s is logical envelope
   throughput, not memory bandwidth.
 - `syntra-core/channel` measures canonical context encoding and
   parsing, full NK bootstrap handshakes plus one client-to-server verified
@@ -62,8 +63,8 @@ and pipe establishment under `connection`.
   `channel::parse_context` times parsing a prebuilt M1-sized public wrapper,
   including owned scope reconstruction and validation. The parser suffix is
   dummy bytes, not a Noise vector. `Throughput::Bytes` counts context bytes.
-- `channel::handshake_bootstrap` times a full NK handshake with real OS
-  randomness and server-key/config setup inside timing, followed by one
+- `channel::handshake_bootstrap` uses batched setup: server-key/config creation
+  and client handshake start are untimed. It times the response and client finish, then one
   client-to-server encrypted record and payload comparison. Channel destruction
   is included; there is no measured server-to-client confirmation record.
 - `channel::record_warm/*` measures one returning-mode client-to-server
@@ -101,23 +102,49 @@ To smoke-test every benchmark in the workspace:
 cargo bench --locked --workspace --features syntra-net/tcp -- --test
 ```
 
-## Benchmark workflow
+## Main-push CPU baseline
 
-`.github/workflows/benchmarks.yml` uses Rust 1.89.0 and runs the three
-Criterion benchmark targets with short report-only settings (the compile
-step still covers every bench target with the harness-neutral `--test`
-selector, since Criterion timing flags are rejected by the default libtest
-harness):
+When source or build inputs change on `main`, `benchmarks.yml` checks out the
+SHA before the push (not `HEAD^`) and the pushed SHA on one
+`blacksmith-4vcpu-ubuntu-2404-arm` runner. Both builds use default features,
+the optimized bench profile, Rust 1.89.0 and each revision's lockfile. On the
+introducing push only, it copies the measurement harnesses into the old checkout
+and measures that same revision twice to check noise on the actual runner.
+Thereafter each harness compiles against its own codec; keep the five workloads
+and timing boundaries stable across the migration. No prior artifact is needed.
+If the push creates `main`, the job skips because there is no previous tip.
+An incompatible build, missing case, or unreadable comparison fails the job.
+
+The gate covers only the two request round trips and three warm records above.
+Each gets 0.5 s warmup, 1 s measurement and 30 samples on each side. The
+decision uses Criterion's two-sided 95% bootstrap interval for the relative
+change in **mean time per operation** (new/old − 1), not throughput or a
+tail-latency percentile. Only a lower bound **strictly above +10%** triggers
+a second fresh old/new pair. The same case must cross that bound twice to
+fail for regression. Review the raw samples before attributing a slowdown.
+
+`bench_allocations` runs separately for each checkout. It reports allocation,
+zeroed-allocation and reallocation calls combined per operation on the executing
+thread. Fixture construction, handshake RNG, session teardown and reporting
+are excluded; the timed benchmarks never install the counting allocator.
+Counts are diagnostic, not a timing threshold. Artifacts retain both revisions,
+worktree status, runner/toolchain, counts, samples and intervals for 14 days.
+
+To reproduce an unchanged comparison locally, start with a fresh output directory:
 
 ```sh
-cargo bench --locked -p syntra-core --bench frame_codec -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
-cargo bench --locked -p syntra-core --bench channel -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
-cargo bench --locked -p syntra-net --no-default-features --features tcp --bench pipe -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
+cargo test --locked --release -p syntra-core --test bench_allocations -- --ignored --nocapture
+python3 scripts/benchmark_baseline.py . . "$(mktemp -d)"
+python3 -m unittest scripts.tests.test_benchmark_baseline
 ```
 
-The artifact records raw samples, source revision and toolchain. Timing is
-report-only: no fixed ns/op threshold or automatic baseline-comparison gate
-is used; execution errors still fail the job.
+Local calibration, not a Blacksmith baseline: on an AC-powered Apple M4
+(Darwin 27.2.0, arm64), both sides used the same dirty `dd76d45` checkout,
+Rust 1.89.0 and the settings above. The 95% relative mean-time intervals
+were [−4.03%, +1.00%] and [+0.12%, +1.70%] for the two frames;
+[−0.71%, +0.86%], [−0.24%, +1.20%] and [−0.51%, −0.00%] for the three
+records in ascending size order. None triggered a repeat. The separate
+allocation counts were 6, 8 and 2, 2, 2 respectively.
 
 ## Comparing changes
 

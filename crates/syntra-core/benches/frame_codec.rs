@@ -1,22 +1,15 @@
 #[cfg(not(target_arch = "wasm32"))]
+#[path = "fixtures/frame.rs"]
+mod fixture;
+
+#[cfg(not(target_arch = "wasm32"))]
 mod native {
+    use super::fixture::{request_frame, roundtrip, ROUNDTRIP_SIZES};
     use criterion::{BenchmarkId, Criterion, Throughput};
     use prost::Message;
     use syntra_core::proto::frame::Body;
-    use syntra_core::proto::{Frame, Notification, RpcRequest, RpcResult};
+    use syntra_core::proto::{Frame, Notification, RpcResult};
     use syntra_core::{decode_frame, encode_frame, validate_wire_structure, ValidationContext};
-
-    fn request_frame(payload_len: usize) -> Frame {
-        Frame {
-            version: 1,
-            request_id: 7,
-            body: Some(Body::Request(RpcRequest {
-                method: "/example.Echo/Echo".into(),
-                payload: vec![0xAB; payload_len],
-                timeout_ms: 5000,
-            })),
-        }
-    }
 
     fn notification_frame(payload_len: usize) -> Frame {
         Frame {
@@ -48,63 +41,48 @@ mod native {
             let bytes = frame.encode_to_vec();
             group.throughput(Throughput::Bytes(bytes.len() as u64));
             group.bench_with_input(BenchmarkId::new("scan", size), &bytes, |b, bytes| {
-                b.iter(|| {
-                    let _ = validate_wire_structure(bytes);
-                });
+                b.iter(|| validate_wire_structure(bytes).unwrap());
             });
             group.bench_with_input(
                 BenchmarkId::new("decode_request", size),
                 &bytes,
                 |b, bytes| {
-                    b.iter(|| {
-                        let _ = decode_frame(bytes, ctx);
-                    });
+                    b.iter(|| decode_frame(bytes, ctx).unwrap());
                 },
             );
             group.bench_with_input(
                 BenchmarkId::new("encode_request", size),
                 &frame,
                 |b, frame| {
-                    b.iter(|| {
-                        let _ = encode_frame(frame, ctx);
-                    });
-                },
-            );
-            let notif = notification_frame(size.min(1024));
-            let notif_bytes = notif.encode_to_vec();
-            group.bench_with_input(
-                BenchmarkId::new("roundtrip_notification", size.min(1024)),
-                &notif_bytes,
-                |b, bytes| {
-                    b.iter(|| {
-                        let f = decode_frame(bytes, ctx).unwrap();
-                        let _ = encode_frame(&f, ctx).unwrap();
-                    });
-                },
-            );
-            let success = success_frame(size.min(1024));
-            let success_bytes = success.encode_to_vec();
-            group.bench_with_input(
-                BenchmarkId::new("roundtrip_result", size.min(1024)),
-                &success_bytes,
-                |b, bytes| {
-                    b.iter(|| {
-                        let f = decode_frame(bytes, ctx).unwrap();
-                        let _ = encode_frame(&f, ctx).unwrap();
-                    });
+                    b.iter(|| encode_frame(frame, ctx).unwrap());
                 },
             );
         }
-        // Near-limit envelope exercises multi-record segmentation budgets without
-        // allocating a full 1MiB payload in every sample.
-        let near_limit = request_frame(1_048_448 - 128);
-        let near_bytes = near_limit.encode_to_vec();
-        group.throughput(Throughput::Bytes(near_bytes.len() as u64));
-        group.bench_function("decode_near_1MiB", |b| {
-            b.iter(|| {
-                let _ = decode_frame(&near_bytes, ctx);
+        for size in [0, 64, 1024] {
+            for (name, frame) in [
+                ("roundtrip_notification", notification_frame(size)),
+                ("roundtrip_result", success_frame(size)),
+            ] {
+                let bytes = frame.encode_to_vec();
+                group.throughput(Throughput::Bytes(bytes.len() as u64));
+                group.bench_function(BenchmarkId::new(name, size), |b| {
+                    b.iter(|| roundtrip(&bytes, ctx));
+                });
+            }
+        }
+        for size in ROUNDTRIP_SIZES {
+            let bytes = request_frame(size).encode_to_vec();
+            assert_eq!(roundtrip(&bytes, ctx), bytes);
+            group.throughput(Throughput::Bytes(bytes.len() as u64));
+            group.bench_function(BenchmarkId::new("roundtrip_request", size), |b| {
+                b.iter(|| roundtrip(&bytes, ctx));
             });
-        });
+            if size != 0 {
+                group.bench_function("decode_near_1MiB", |b| {
+                    b.iter(|| decode_frame(&bytes, ctx).unwrap());
+                });
+            }
+        }
         group.finish();
     }
 }

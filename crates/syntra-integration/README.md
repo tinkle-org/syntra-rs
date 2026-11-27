@@ -168,6 +168,6 @@ with `SYNTRA_INTEGRATION_REQUIRE_DOCKER=1`. It is a separate check; branch
 protection must require `Integration / integration` if integration should
 gate merging.
 
-`.github/workflows/benchmarks.yml` runs the in-memory benchmark suite with
-Criterion smoke/reporting settings; timing is report-only and no container
-or baseline comparison gate is used.
+The separate [benchmark workflow](../../BENCHMARKS.md#main-push-cpu-baseline)
+compares CPU-only framing and record operations after source merges. It does
+not time containers or network throughput.

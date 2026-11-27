@@ -27,6 +27,11 @@ allow = [
 ]
 confidence-threshold = 0.8
 
+# LLVM's bundled fuzzer is tooling in the non-publishable fuzz workspace only.
+[[licenses.exceptions]]
+crate = "libfuzzer-sys@0.4.13"
+allow = ["NCSA"]
+
 [licenses.private]
 ignore = false
 

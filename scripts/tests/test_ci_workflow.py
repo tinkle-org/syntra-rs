@@ -64,6 +64,44 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertIn('--output "$RUNNER_TEMP/candidate-rust-agreement"', producer["run"])
         self.assertEqual(upload["with"]["path"], "${{ runner.temp }}/candidate-rust-agreement")
 
+    def test_parser_budgets_and_main_only_benchmark_trigger(self):
+        for workflow, seconds in ((self.workflow, "60"), (self.scheduled, "900")):
+            self.assertEqual(workflow["jobs"]["parser-checks"], {
+                "uses": "./.github/workflows/parser-checks.yml", "with": {"seconds": seconds},
+            })
+        bench = yaml.load((ROOT / ".github/workflows/benchmarks.yml").read_text(), Loader=yaml.BaseLoader)
+        self.assertEqual(set(bench["on"]), {"push"})
+        self.assertEqual(bench["on"]["push"]["branches"], ["main"])
+        self.assertEqual(set(bench["on"]["push"]["paths"]), {
+            "crates/**/src/**/*.rs",
+            "crates/**/benches/**/*.rs",
+            "crates/**/*.bop",
+            "proto/**/*.proto",
+            "crates/syntra-core/tests/bench_allocations.rs",
+            "scripts/benchmark_baseline.py",
+            "crates/**/build.rs",
+            "Cargo.toml",
+            "Cargo.lock",
+            "crates/**/Cargo.toml",
+            "crates/**/Cargo.lock",
+            ".cargo/config",
+            ".cargo/config.toml",
+            "rust-toolchain.toml",
+        })
+        job = bench["jobs"]["benches"]
+        self.assertEqual(job["runs-on"], "blacksmith-4vcpu-ubuntu-2404-arm")
+        no_previous_tip = "0" * 40
+        self.assertEqual(job["if"], f"${{{{ github.event.before && github.event.before != '{no_previous_tip}' }}}}")
+        old, = [step for step in job["steps"] if step.get("with", {}).get("path") == "old"]
+        self.assertEqual(old["with"]["ref"], "${{ github.event.before }}")
+
+    def test_codeql_cancels_stale_scans_without_cross_event_cancellation(self):
+        codeql = yaml.load((ROOT / ".github/workflows/codeql.yml").read_text(), Loader=yaml.BaseLoader)
+        self.assertEqual(codeql["concurrency"], {
+            "group": "codeql-${{ github.event_name }}-${{ github.ref }}",
+            "cancel-in-progress": "true",
+        })
+
     def test_candidate_upload_requires_execution_but_preserves_failure_evidence(self):
         upload, = [step for step in self.steps
                    if step.get("with", {}).get("name") == "candidate-rust-agreement"]
@@ -126,7 +164,7 @@ class CiWorkflowTests(unittest.TestCase):
                 self.assertNotIn("1.88", (ROOT / f".github/workflows/{name}.yml").read_text())
                 self.assertEqual(workflow["env"]["RUSTUP_TOOLCHAIN"], "1.89.0")
                 for job in workflow["jobs"].values():
-                    for step in job["steps"]:
+                    for step in job.get("steps", []):  # reusable workflow callers have no steps
                         action = step.get("uses", "")
                         if action.startswith("dtolnay/rust-toolchain@"):
                             self.assertEqual(step["with"]["toolchain"], "1.89.0")
@@ -159,11 +197,11 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", required)
         self.assertEqual(required["needs"], [
             "clippy", "rust", "native-macos", "generated-rust", "manifest-cases",
-            "package", "security", "actionlint", "dependency-review",
+            "package", "security", "parser-checks", "actionlint", "dependency-review",
         ])
         passing = {job: {"result": "success"} for job in required["needs"]}
         self.run_required_check(passing)
-        for job in ("rust", "native-macos", "generated-rust", "manifest-cases"):
+        for job in ("rust", "native-macos", "generated-rust", "manifest-cases", "parser-checks", "security"):
             for result in ("failure", "cancelled", "abandoned", "skipped", None):
                 with self.subTest(job=job, result=result):
                     results = {**passing, job: {"result": result}}
