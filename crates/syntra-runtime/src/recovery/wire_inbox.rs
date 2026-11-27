@@ -9,7 +9,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use prost::Message;
 use syntra_core::proto::{recovery_batch_trailer::Outcome, recovery_notification::Notification};
 use syntra_core::proto::{RecoveryBatch, RecoveryBatchTrailer, RecoveryNotification};
 use tokio::sync::Notify;
@@ -24,9 +23,19 @@ pub struct InboxCounts {
     pub handles: usize,
 }
 
-struct Queued {
-    batch: RecoveryBatch,
+pub(super) struct Queued {
+    pub(super) batch: RecoveryBatch,
     bytes: usize,
+}
+
+impl Queued {
+    pub(super) fn from_replay_entry(entry: &[u8]) -> Result<Self, ProviderError> {
+        Ok(Self {
+            batch: codec::decode(entry)?,
+            // Original batch bytes, including unknown fields, plus the fixed replay allowance.
+            bytes: entry.len() + 40,
+        })
+    }
 }
 
 struct Slot {
@@ -183,8 +192,7 @@ impl RecoveryInbox {
         };
         match n {
             Notification::Batch(batch) => {
-                // Include a conservative core Notification/Frame overhead;
-                // unknown fields are charged at their original encoded size.
+                // Original RecoveryNotification payload plus a fixed allowance for the core envelope.
                 let bytes = payload.len().saturating_add(32);
                 if slot.bytes.saturating_add(bytes) > self.limits.queued_bytes_per_stream
                     || total.saturating_add(bytes) > self.limits.queued_bytes_per_connection
@@ -326,7 +334,7 @@ impl RecoveryInbox {
     pub(super) fn replay_page(
         &self,
         handle: &[u8],
-        batches: Vec<RecoveryBatch>,
+        batches: Vec<Queued>,
     ) -> Result<(), ProviderError> {
         let mut s = self.state.lock().expect("recovery inbox poisoned");
         let total = counts(&s).data_bytes;
@@ -337,7 +345,7 @@ impl RecoveryInbox {
         if slot.fenced || !slot.registered || !slot.replay.is_empty() {
             return Err(ProviderError::FailedPrecondition);
         }
-        let bytes = batches.iter().map(|b| b.encoded_len() + 40).sum::<usize>();
+        let bytes = batches.iter().map(|q| q.bytes).sum::<usize>();
         if slot.bytes.saturating_add(bytes) > self.limits.queued_bytes_per_stream
             || total.saturating_add(bytes) > self.limits.queued_bytes_per_connection
             || slot.data.len() + batches.len() + usize::from(slot.leased != 0)
@@ -350,15 +358,12 @@ impl RecoveryInbox {
         }
         if batches
             .iter()
-            .any(|b| b.subscription_handle != handle || b.generation != slot.generation)
+            .any(|q| q.batch.subscription_handle != handle || q.batch.generation != slot.generation)
         {
             return Err(ProviderError::FailedPrecondition);
         }
         slot.bytes += bytes;
-        slot.replay.extend(batches.into_iter().map(|batch| Queued {
-            bytes: batch.encoded_len() + 40,
-            batch,
-        }));
+        slot.replay.extend(batches);
         drop(s);
         self.changed.notify_waiters();
         Ok(())

@@ -229,8 +229,9 @@ manifest). Preserve source provenance when updating schemas and fixtures.
 
 The `.proto` files in [`proto/syntra/v1`](proto/syntra/v1) restore this
 repository's `syntra.v1` schema from `b99f56b`, before the Bebop change in
-[#54](https://github.com/tinkle-org/syntra-rs/pull/54). The checked-in schema
-is the input for this implementation. That revision identifies the schema's
+[#54](https://github.com/tinkle-org/syntra-rs/pull/54), with local corrections
+to the schema comments. The checked-in schema is the input for this
+implementation. That revision identifies the schema's
 history; it does not import an external protocol pin, test suite, or verdict.
 Both encodings use Core wire version 1. Upgrade peers together; changing
 carrier or negotiating recovery does not select a codec.

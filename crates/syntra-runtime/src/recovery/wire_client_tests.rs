@@ -447,6 +447,7 @@ fn inbox_version_wrapper_unknown_fields_and_registration_window() {
     payload.extend_from_slice(&[0xa0, 0x06, 1]); // ignorable field 100, varint
     inbox.push(&payload).unwrap();
     assert_eq!(inbox.counts().data_messages, 1);
+    assert_eq!(inbox.counts().data_bytes, payload.len() + 32);
     drop(pending);
     assert_eq!(inbox.counts().handles, 0);
     let pending = inbox.begin_subscribe().unwrap();
@@ -639,6 +640,41 @@ async fn replay_and_live_use_same_pipeline_with_durable_boundary_and_duplicates(
         Err(ProviderError::FailedPrecondition)
     );
     assert_eq!(store.load(&scope(b"S")).unwrap().unwrap().checkpoint, b"L");
+}
+
+#[tokio::test]
+async fn replay_charges_original_entry_until_offer_is_released() {
+    let expected = batch(b"H", b"A", b"B");
+    let mut page = final_page(b"H", b"A", b"B", vec![expected.clone()]);
+    page.batch_payloads[0].extend_from_slice(&[0xa0, 0x06, 1]); // ignorable field 100, varint
+    let charge = page.batch_payloads[0].len() + 40;
+    let limits = RecoveryLimits {
+        queued_bytes_per_stream: charge,
+        ..RecoveryLimits::default()
+    };
+    let mut peer = Peer::active().await;
+    let mut store = Store::default();
+    seed(&mut store, b"S", 7, b"A");
+    let mut client = peer.client(store, limits).await;
+    peer.subscribe(
+        &mut client,
+        b"H",
+        b"B",
+        b"S",
+        SubscribeIntent::ResumeDurable,
+    )
+    .await;
+    peer.rpc(client.replay_page(b"H"), wire::REPLAY, |_| bytes(&page))
+        .await
+        .unwrap();
+    assert_eq!(client.inbox.counts().data_bytes, charge);
+    let RecoveryEvent::Batch { batch } = event(&mut client).await else {
+        panic!("expected replay offer");
+    };
+    assert_eq!(batch, expected);
+    assert_eq!(client.inbox.counts().data_bytes, charge);
+    peer.persist(&mut client, b"H", b"B", b"state at B").await;
+    assert_eq!(client.inbox.counts().data_bytes, 0);
 }
 
 #[tokio::test]

@@ -148,23 +148,33 @@ async fn malformed_correlated_outcomes_settle_only_their_rpc_once() {
     }
 }
 
+fn structural_fault(mut bytes: Vec<u8>, suffix: Option<&[u8]>) -> Vec<u8> {
+    if let Some(suffix) = suffix {
+        bytes.extend_from_slice(suffix);
+        // Prost alone accepts duplicate bodies and reserved fields.
+        assert!(Frame::decode(bytes.as_slice()).is_ok());
+    } else {
+        bytes.pop().unwrap();
+        assert!(Frame::decode(bytes.as_slice()).is_err());
+    }
+    assert!(syntra_core::validate_wire_structure(&bytes).is_err());
+    bytes
+}
+
 #[tokio::test]
 async fn structurally_invalid_results_never_supply_correlation() {
-    for reserved in [false, true] {
+    for suffix in [Some(&[0x6a, 0][..]), Some(&[0x80, 0x01, 0]), None] {
         let (client, mut writer) = client().await;
         let mut call = Box::pin(client.call(METHOD, vec![], 5000));
         assert!(futures_util::poll!(&mut call).is_pending());
         let id = Frame::decode(writer.recv().await.unwrap().as_slice())
             .unwrap()
             .request_id;
-        let mut bytes = frame(id, Body::Result(RpcResult { outcome: None })).encode_to_vec();
-        if reserved {
-            bytes.extend_from_slice(&[0x80, 0x01, 0]);
-        } else {
-            bytes.extend_from_slice(&[0x6a, 0]);
-        }
-        assert!(syntra_core::validate_wire_structure(&bytes).is_err());
-        assert!(Frame::decode(bytes.as_slice()).is_ok());
+        let outcome = suffix.is_none().then(|| Outcome::Payload(vec![1]));
+        let bytes = structural_fault(
+            frame(id, Body::Result(RpcResult { outcome })).encode_to_vec(),
+            suffix,
+        );
         client.ingest(&bytes).await;
         assert_eq!(client.pending_len(), 1);
         assert!(futures_util::poll!(&mut call).is_pending());
@@ -301,9 +311,9 @@ async fn active_version_mismatch_preserves_an_already_selected_result() {
 
 #[tokio::test]
 async fn structural_request_faults_are_not_semantic_rpc_errors() {
-    for reserved in [false, true] {
+    for suffix in [Some(&[0x62, 0][..]), Some(&[0x88, 0x01, 0]), None] {
         let (host, mut writer) = host(ConnectionConfig::default(), blocked()).await;
-        let mut bad = frame(
+        let encoded = frame(
             77,
             Body::Request(RpcRequest {
                 method: "malformed".into(),
@@ -312,12 +322,7 @@ async fn structural_request_faults_are_not_semantic_rpc_errors() {
             }),
         )
         .encode_to_vec();
-        if reserved {
-            bad.extend_from_slice(&[0x88, 0x01, 0]);
-        } else {
-            bad.extend_from_slice(&[0x62, 0]);
-        }
-        assert!(Frame::decode(bad.as_slice()).is_ok());
+        let bad = structural_fault(encoded, suffix);
         host.ingest(&bad).await;
         assert!(
             writer.try_recv().is_err(),

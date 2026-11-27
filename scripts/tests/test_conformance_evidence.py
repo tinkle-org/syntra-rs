@@ -93,11 +93,17 @@ class TranscriptionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'VEC-WS-009 hello fixture drift'):
             evidence.verify_transcriptions(self.root)
 
-    def test_historical_protobuf_corpus_is_pinned(self):
+    def test_local_protobuf_corpus_pins_ids_bytes_and_metadata(self):
         corpus = self.root / self.corpus
-        corpus.write_bytes(corpus.read_bytes().replace(b'GOLD-PROT-HELLO-01', b'other'))
-        with self.assertRaisesRegex(ValueError, 'Protobuf corpus drift'):
-            evidence.verify_transcriptions(self.root)
+        crlf = corpus.read_bytes().replace(b'\r\n', b'\n').replace(b'\n', b'\r\n')
+        corpus.write_bytes(crlf)
+        report = evidence.verify_transcriptions(self.root)
+        self.assertEqual(report['origins'][self.corpus.as_posix()], evidence.digest(crlf))
+        for old, new in [(b'GOLD-PROT-HELLO-01', b'other'), (b'd2050178', b'd2050179'),
+                         (b'unknown_field_scope: Frame', b'unknown_field_scope: RpcRequest')]:
+            corpus.write_bytes(crlf.replace(old, new))
+            with self.subTest(old=old), self.assertRaisesRegex(ValueError, 'local Protobuf corpus drift'):
+                evidence.verify_transcriptions(self.root)
 
 
 class EvidenceTests(unittest.TestCase):

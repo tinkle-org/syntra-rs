@@ -107,9 +107,14 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def test_retry_target_must_supply_its_own_generation_inputs(self):
         steps = self.workflow["jobs"]["validate-release"]["steps"]
         guard, = [step["run"] for step in steps if "buf.gen.yaml" in step.get("run", "")]
+        # Discover from the current modules, not the incomplete retry checkout or the guard's list.
+        modules = yaml.safe_load((ROOT / "buf.yaml").read_text())["modules"]
+        schemas = sorted(path.relative_to(ROOT) for module in modules
+                         for path in (ROOT / module["path"]).rglob("*.proto"))
+        self.assertTrue(schemas, "expected .proto inputs in the Buf modules")
         with tempfile.TemporaryDirectory() as target:
             inputs = [Path(target) / name for name in (
-                "proto/syntra/v1/envelope.proto", "buf.yaml", "buf.gen.yaml",
+                *schemas, "buf.yaml", "buf.gen.yaml",
                 "scripts/check-generated.py", "scripts/local_inputs.py",
             )]
             for path in inputs:

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use prost::Message;
 use syntra_core::proto::{frame::Body, recovery_notification::Notification, *};
-use syntra_core::{ConnectionState, ErrorCode};
+use syntra_core::{decode_frame_structure, ConnectionState, ErrorCode};
 use syntra_runtime::recovery::persistence::*;
 use syntra_runtime::recovery::wire::*;
 use syntra_runtime::recovery::wire_client::*;
@@ -286,7 +286,7 @@ pub struct Trace {
 }
 impl Trace {
     fn push(&self, to_host: bool, bytes: &[u8], delivered: bool) {
-        let frame = Frame::decode(bytes).unwrap();
+        let frame = decode_frame_structure(bytes).unwrap();
         if !matches!(
             frame.body,
             Some(Body::Request(_) | Body::Result(_) | Body::Notification(_))
@@ -351,7 +351,7 @@ impl Trace {
             .filter_map(|r| match &r.frame.body {
                 Some(Body::Notification(n)) if !delivered_only || r.delivered => {
                     assert_eq!(r.frame.request_id, 0);
-                    RecoveryNotification::decode(n.payload.as_slice())
+                    codec::decode::<RecoveryNotification>(&n.payload)
                         .unwrap()
                         .notification
                 }
@@ -405,7 +405,7 @@ impl Trace {
             "fresh increasing Core IDs required"
         );
         for r in frames.iter() {
-            assert_eq!(Frame::decode(r.bytes.as_slice()).unwrap(), r.frame);
+            assert_eq!(decode_frame_structure(&r.bytes).unwrap(), r.frame);
         }
     }
 }
@@ -459,15 +459,18 @@ impl Bridge {
         tasks.spawn(async move {
             let (mut ic, mut hc) = (i.subscribe_close(), h.subscribe_close());
             loop {
-                if i.is_closed() || h.is_closed() { break; }
+                if i.is_closed() || h.is_closed() {
+                    break;
+                }
                 tokio::select! { biased;
                     _ = ic.changed() => break,
                     _ = hc.changed() => break,
                     bytes = init_rx.recv() => match bytes {
                         Some(original) => if let Some(bytes) = i.prepare_outbound(original) {
                             let received = tokio::time::Instant::now().into_std();
-                            if let Some(Body::Request(q)) = Frame::decode(bytes.as_slice()).unwrap().body {
-                                m.lock().unwrap().insert(Frame::decode(bytes.as_slice()).unwrap().request_id, q.method);
+                            let frame = decode_frame_structure(&bytes).unwrap();
+                            if let Some(Body::Request(q)) = frame.body {
+                                m.lock().unwrap().insert(frame.request_id, q.method);
                             }
                             t.push(true, &bytes, true);
                             h.ingest_received_at(&bytes, received).await;
@@ -495,8 +498,8 @@ impl Bridge {
                     },
                     bytes = host_rx.recv() => match bytes {
                         Some(bytes) => {
-                            let frame = Frame::decode(bytes.as_slice()).unwrap();
-                            let completion = match &frame.body { Some(Body::Notification(n)) => match RecoveryNotification::decode(n.payload.as_slice()).unwrap().notification {
+                            let frame = decode_frame_structure(&bytes).unwrap();
+                            let completion = match &frame.body { Some(Body::Notification(n)) => match codec::decode::<RecoveryNotification>(&n.payload).unwrap().notification {
                                 Some(Notification::ReplayComplete(_)) => true,
                                 Some(Notification::Trailer(t)) => t.outcome == Some(recovery_batch_trailer::Outcome::CatchupComplete(true)),
                                 _ => false,

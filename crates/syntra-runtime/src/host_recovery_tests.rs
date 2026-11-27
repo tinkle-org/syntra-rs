@@ -10,7 +10,7 @@ use crate::session::StaticToken;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use syntra_core::proto::*;
-use syntra_core::ErrorCode;
+use syntra_core::{decode_frame_structure, ErrorCode};
 
 #[derive(Default)]
 struct Source {
@@ -158,7 +158,7 @@ async fn receive(writer: &mut mpsc::Receiver<Vec<u8>>) -> Frame {
         .await
         .unwrap()
         .unwrap();
-    Frame::decode(bytes.as_slice()).unwrap()
+    decode_frame_structure(&bytes).unwrap()
 }
 
 async fn send(host: &Host, id: u64, method: &str, payload: Vec<u8>, timeout_ms: u32) {
@@ -354,7 +354,7 @@ async fn terminal_reservation_retires_actual_recovery_attachment_before_transiti
         panic!("expected exact typed result")
     };
     assert_eq!(
-        result(Frame::decode(output.bytes()).unwrap(), 3).unwrap(),
+        result(decode_frame_structure(output.bytes()).unwrap(), 3).unwrap(),
         b"retired"
     );
     coordinator.refresh().await.unwrap();
@@ -769,14 +769,7 @@ async fn notification_worker_emits_without_application_consumer_or_rpc_completio
             result(frame, 3).unwrap();
             results += 1;
         } else {
-            assert_eq!(frame.request_id, 0);
-            let Some(Body::Notification(n)) = frame.body else {
-                panic!("notification expected")
-            };
-            assert!(RecoveryNotification::decode(n.payload.as_slice())
-                .unwrap()
-                .notification
-                .is_some());
+            recovery_event(frame);
             notifications += 1;
         }
     }
@@ -884,12 +877,7 @@ async fn notification_permission_denial_retires_only_the_target_stream() {
         Err(ProviderError::PermissionDenied)
     );
     let frame = receive(&mut writer).await;
-    assert_eq!(frame.request_id, 0);
-    let Some(Body::Notification(n)) = frame.body else {
-        panic!("expected targeted terminal")
-    };
-    let n = RecoveryNotification::decode(n.payload.as_slice()).unwrap();
-    let Some(recovery_notification::Notification::Trailer(t)) = n.notification else {
+    let recovery_notification::Notification::Trailer(t) = recovery_event(frame) else {
         panic!("expected terminal trailer")
     };
     assert_eq!(t.subscription_handle, denied_handle);

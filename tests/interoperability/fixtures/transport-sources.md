@@ -4,7 +4,7 @@ These fixtures are maintained here. `transport.yaml` retains the TCP inner frame
 and the RFC 6455 control bytes and close codes from `tcp/byte-vectors.yaml` and
 `websocket/fixtures.yaml` at `tinkle-org/syntra` commit `8ede3810b29fbba4d0e6ae6751a0025ceedda140`.
 `ws-no-length-prefix.hex` is the `frame_hex` input from `websocket/VEC-WS-009` in
-that same revision. It is a valid, unprefixed Protobuf `ClientHello` envelope. Its entry in
+that same revision. It is a valid, unprefixed Protobuf `Frame` containing a `ClientHello`. Its entry in
 `transport.yaml` pins the digest of the decoded bytes, independent of line endings.
 
 `context-cases.json` keeps the carrier-specific recipe lists from `conformance/manifest/connection.yaml`

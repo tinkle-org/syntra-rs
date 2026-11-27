@@ -20,7 +20,7 @@ syntra-net = { path = "../syntra-rs/crates/syntra-net", default-features = false
 ```
 
 Use matching `syntra-core` and `syntra-runtime` dependencies from the same source.
-Upgrade clients and hosts together when moving from #54's Bebop encoding.
+Upgrade clients and hosts together when moving from the Bebop encoding in [#54](https://github.com/tinkle-org/syntra-rs/pull/54).
 TCP and WebSocket both carry the Protobuf envelope; wire version 1 does not
 negotiate between the two encodings.
 

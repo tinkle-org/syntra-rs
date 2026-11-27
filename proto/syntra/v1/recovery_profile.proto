@@ -85,15 +85,18 @@ option go_package = "github.com/tinklehq/syntra/bindings/go/gen/syntra/v1;syntra
 // predecessor/result/boundary emptiness is governed by each field comment.
 // Unknown profile operations (method strings) MUST be rejected
 // with UNIMPLEMENTED.
+
+// RecoveryNegotiateRequest offers an inclusive range of profile versions.
+// A v1 host selects version 1 on success and rejects a range that excludes
+// version 1 with FAILED_PRECONDITION.
 message RecoveryNegotiateRequest {
   // profile_version is the profile payload version. Valid value is 1.
   // Required.
   uint32 profile_version = 1;
-  // min_version is the lowest offered profile version. Valid value is 1.
-  // Required.
+  // min_version is the lowest offered profile version. Required; must be nonzero.
   uint32 min_version = 2;
-  // max_version is the highest offered profile version. Valid value is 1,
-  // MUST be >= min_version. Required.
+  // max_version is the highest offered profile version. Required; must be at
+  // least min_version.
   uint32 max_version = 3;
   // capability is the ASCII capability identifier. Non-empty, at most 256
   // bytes. Required.

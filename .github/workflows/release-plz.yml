@@ -85,7 +85,9 @@ jobs:
       - name: Require Buf and local evidence inputs in the retry target
         if: github.event_name == 'workflow_dispatch'
         run: |
-          for path in proto/syntra/v1/envelope.proto buf.yaml buf.gen.yaml scripts/check-generated.py scripts/local_inputs.py; do
+          # Name the expected inputs: globbing the older checkout would miss deleted files.
+          for path in proto/syntra/v1/{capabilities,envelope,errors,events,handshake,recovery_profile,rpc,session}.proto \
+                      buf.yaml buf.gen.yaml scripts/check-generated.py scripts/local_inputs.py; do
             test -f "$path" || { echo "Release commit is ineligible for retry: missing $path" >&2; exit 1; }
           done
       - name: Install Rust toolchain

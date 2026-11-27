@@ -74,6 +74,32 @@ class CiWorkflowTests(unittest.TestCase):
             'out': 'crates/syntra-core/src/generated',
         }])
 
+    def test_buf_checks_compare_candidate_to_immutable_event_base(self):
+        job = self.workflow['jobs']['generated-rust']
+        steps = job['steps']
+        self.assertEqual(job['permissions'], {'contents': 'read'})
+        self.assertEqual(job['env']['BUF_BASE_SHA'],
+                         "${{ github.event_name == 'push' && github.event.before == '" + '0' * 40 + "' "
+                         "&& 'b99f56bf66cfc60e5c883fce5ec707e8581364a2' || github.event.pull_request.base.sha || github.event.before }}")
+        base, candidate = [s for s in steps if s.get('uses', '').startswith('actions/checkout@')]
+        self.assertEqual(base['with'], {'ref': '${{ env.BUF_BASE_SHA }}', 'fetch-depth': '0',
+                                        'persist-credentials': 'false'})
+        self.assertEqual(candidate['with'], {'persist-credentials': 'false'})  # checkout event SHA
+        setup, = [s for s in steps if s.get('uses', '').startswith('bufbuild/buf-setup-action@')]
+        build, = [s for s in steps if 'buf build' in s.get('run', '')]
+        image = '"$RUNNER_TEMP/buf-base.binpb"'
+        self.assertIn(f'buf build ".git#ref=$base" -o {image}', build['run'].splitlines())
+        check, = [s for s in steps if s.get('run', '').splitlines() == [
+            'buf lint', f'buf breaking --against {image}']]
+        order = [base, setup, build, candidate, check]
+        self.assertEqual(order, sorted(order, key=steps.index))
+        for gate in order:
+            self.assertNotIn('if', gate)
+            self.assertNotIn('continue-on-error', gate)
+        config = yaml.safe_load((ROOT / 'buf.yaml').read_text())
+        self.assertEqual(config['lint'], {'use': ['STANDARD']})
+        self.assertEqual(config['breaking'], {'use': ['FILE']})
+
     def test_parser_budgets_and_main_only_benchmark_trigger(self):
         for workflow, seconds in ((self.workflow, "60"), (self.scheduled, "900")):
             self.assertEqual(workflow["jobs"]["parser-checks"], {

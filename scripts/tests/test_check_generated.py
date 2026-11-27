@@ -21,8 +21,10 @@ if sys.argv[1:] == ["--version"]:
     print(os.environ["STUB_VERSION"])
 elif sys.argv[1] == "generate":
     root = Path(__file__).resolve().parent
-    assert sys.argv[2:] == [str(root), "--template", str(root / "buf.gen.yaml")]
-    assert Path.cwd() != root
+    if sys.argv[2:] != [str(root), "--template", str(root / "buf.gen.yaml")]:
+        sys.exit("unexpected buf generate arguments")
+    if Path.cwd() == root:
+        sys.exit("buf generate must not write in the repository")
     shutil.copytree(root / "stub-output", "crates/syntra-core/src/generated")
 else:
     sys.exit("unexpected buf arguments")
@@ -34,7 +36,7 @@ class CheckGeneratedTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.root = Path(tmp.name)
+        self.root = Path(tmp.name).resolve()
         self.script = self.root / "scripts/check-generated.py"
         self.script.parent.mkdir()
         shutil.copyfile(ROOT / "scripts/check-generated.py", self.script)
@@ -60,6 +62,17 @@ class CheckGeneratedTests(unittest.TestCase):
     def snapshot(self):
         return {p.relative_to(self.output).as_posix(): p.read_bytes()
                 for p in self.output.rglob("*") if p.is_file()}
+
+    def test_stub_rejects_wrong_arguments_and_cwd_under_optimization(self):
+        args = [str(self.root), "--template", str(self.root / "buf.gen.yaml")]
+        for cwd, argv, message in [(self.script.parent, args[:-1], "unexpected buf generate arguments"),
+                                   (self.root, args, "buf generate must not write in the repository")]:
+            with self.subTest(cwd=cwd):
+                result = subprocess.run([self.root / "buf", "generate", *argv], cwd=cwd,
+                                        env={**self.env, "PYTHONOPTIMIZE": "1"},
+                                        capture_output=True, text=True, timeout=30)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stderr.strip(), message)
 
     def test_repeated_generation_and_check(self):
         self.output.mkdir(parents=True)

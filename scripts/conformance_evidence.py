@@ -60,9 +60,9 @@ def verify_transcriptions(root=ROOT):
     """Check local Protobuf and WS fixture inputs, not runtime behavior."""
     corpus_origin = FIXTURES / "protobuf-vectors.yaml"
     corpus = regular_file(root, corpus_origin)
-    # Pin the historical b99f56b blob, allowing checkout line endings only.
-    if digest(corpus.replace(b"\r\n", b"\n")) != "614e7ae45cd1739f3e0bc66b89b5d657ba607856104b59d73d93fbe8ade15360":
-        raise ValueError("historical Protobuf corpus drift")
+    # Pin the reviewed local corpus: b99f56b wire vectors with corrected metadata.
+    if digest(corpus.replace(b"\r\n", b"\n")) != "8f167157e08c6ddc0e49a438390222675e40dc1cf9aad7e72593cc23b4f8b3ea":
+        raise ValueError("local Protobuf corpus drift")
     gold = {row['id']: row for row in load_yaml(corpus)['vectors']}
     unknown_suffix = gold['GOLD-PROT-UNKNOWN-FIELD-01']['frame_hex'].removeprefix(gold['GOLD-PROT-REQ-01']['frame_hex'])
     origin = FIXTURES / "transport.yaml"

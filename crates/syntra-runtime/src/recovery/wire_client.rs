@@ -602,9 +602,9 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
         let batches = page
             .batch_payloads
             .iter()
-            .map(|b| codec::decode::<RecoveryBatch>(b))
+            .map(|entry| inbox::Queued::from_replay_entry(entry))
             .collect::<Result<Vec<_>, _>>()?;
-        if batches.iter().any(|b| b.generation != r.generation) {
+        if batches.iter().any(|q| q.batch.generation != r.generation) {
             self.retire(handle, None);
             return Err(RecoveryClientError::RecoveryNeeded);
         }

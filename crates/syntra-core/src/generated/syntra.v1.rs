@@ -243,87 +243,91 @@ pub mod frame {
         Notification(super::Notification),
     }
 }
-/// Update/recovery profile payloads for ordered delivery, bounded replay,
-/// snapshot recovery, and committed progress (SYN-URP-001..007,
-/// SYN-URP-010..026; SYN-URP-008/009 reserved).
-///
-/// RFC 0006 is accepted (2026-10-30 via docs/decisions/0002-sdd-acceptance-
-/// wave.md, §11 decision amendment authoritative). Comments aligned to that
-/// amendment (release-safe recovery semantics). Do not claim execution: these
-/// comments describe accepted-decision semantics awaiting implementations and
-/// conformance execution; generated codecs alone do not enforce them, and
-/// implementation and conformance evidence remain pending as separation of
-/// authority from evidence. No conformance or release claim may cite these
-/// comments as executed evidence.
-///
-/// Release inclusion versus wire optionality (RFC 0006 §11.1): standardized
-/// recovery is required in the target release bundle. On the wire the
-/// `syntra.update-recovery/1` capability remains optional and explicitly
-/// negotiated after ACTIVE, independently on every connection; no envelope
-/// changes introduce any wire pressure here.
-///
-/// All payloads are versioned bytes carried inside the existing request,
-/// result, and notification envelopes with no envelope changes. Identity is
-/// scoped (RFC 0006 §11.2): a subscription is one delivery instance routed by
-/// a fresh connection-scoped handle; the stream identity and principal scope
-/// and continuity generation belong to the provider-resolved scope (P, S), and
-/// checkpoints bind to (P, S, G). Generation G is the provider's continuity
-/// epoch for that scope: it changes only on true provider history loss or an
-/// explicit shared rebase — never from subscriber-local overflow, ordinary
-/// retention-window pruning, or targeted revocation termination without
-/// policy-driven history reset. Every recovery round is identified by
-/// connection + handle and holds one fixed boundary; a subscribe accept yields
-/// a fresh handle and a newly captured boundary (RFC 0006 §11.3). Checkpoints,
-/// handles, selectors, markers, and boundaries are opaque bytes. Confirmation
-/// proves only persistence through the application persistence point; the
-/// three progress observations (locally durable checkpoint, Confirm sent,
-/// peer-acknowledged checkpoint) stay distinct, and the resume checkpoint is
-/// the durable known-safe checkpoint, which may be newer than the last
-/// acknowledged one (RFC 0006 §11.6). Bounds below are deployment-documented
-/// defaults: at most 64 subscriptions per connection, at most 256 per
-/// principal, at most 16 pending profile calls per connection, at most
-/// 262144 queued notification bytes per stream, at most 1048576 per
-/// connection, at most 64 serialized batches and 262144 total bytes per
-/// replay page with each serialized entry at most 262144 bytes, at most
-/// 262144 bytes per snapshot page, at most 256 pages per snapshot offer,
-/// effective deadline 5 s where the request carries no explicit bounded
-/// deadline.
-///
-/// Canonical generic RPC methods (SNTR-RPC-001, exactly two slashes) are:
-/// `/syntra.v1.UpdateRecovery/Negotiate`,
-/// `/syntra.v1.UpdateRecovery/Subscribe`,
-/// `/syntra.v1.UpdateRecovery/Replay`,
-/// `/syntra.v1.UpdateRecovery/CatchUp`,
-/// `/syntra.v1.UpdateRecovery/Confirm` (batch variant
-/// `RecoveryConfirmRequest`/`RecoveryConfirmResponse`),
-/// `/syntra.v1.UpdateRecovery/SnapshotConfirm` (snapshot-boundary variant
-/// `RecoverySnapshotConfirmRequest`/`RecoverySnapshotInstalled`),
-/// `/syntra.v1.UpdateRecovery/SnapshotOffer`
-/// (`RecoverySnapshotOfferRequest`/`RecoverySnapshotDescriptor`),
-/// `/syntra.v1.UpdateRecovery/SnapshotFetch`,
-/// `/syntra.v1.UpdateRecovery/Unsubscribe`
-/// (`RecoveryUnsubscribeRequest`/`RecoveryUnsubscribeResponse`).
-/// Notification payloads are versioned `RecoveryNotification` bytes carrying
-/// exactly one of `RecoveryBatch`, `RecoveryReplayComplete`, or
-/// `RecoveryBatchTrailer` with matching profile_version, inside the existing
-/// `Notification.payload` with no envelope changes.
-///
-/// Wire compatibility (SNTR-SER-003, SNTR-VER-004): unknown Protobuf fields
-/// inside profile payloads MUST be ignored on receipt unless a field comment
-/// explicitly marks that field `Critical`. Fields explicitly marked
-/// `Ignorable` in their comments MUST be ignored on receipt. Defined fields
-/// are validated per their field comments: profile_version and routing/identity
-/// fields (stream_selector, subscription_handle, snapshot_handle, capability,
-/// versions) missing or mismatched MUST be rejected with FAILED_PRECONDITION,
-/// never silently applied. Checkpoint/boundary/marker fields follow per-field
-/// emptiness rules, not a blanket non-empty rule: `start_checkpoint` empty
-/// means initial (SYN-URP-024: initial subscriptions skip Replay and start live
-/// at the subscribed boundary), `continuation_marker` empty means first request
-/// or no further page (SYN-URP-022), `terminate_reason` empty means no
-/// termination unless the terminated outcome is selected (SYN-URP-026), and
-/// predecessor/result/boundary emptiness is governed by each field comment.
-/// Unknown profile operations (method strings) MUST be rejected
-/// with UNIMPLEMENTED.
+// Update/recovery profile payloads for ordered delivery, bounded replay,
+// snapshot recovery, and committed progress (SYN-URP-001..007,
+// SYN-URP-010..026; SYN-URP-008/009 reserved).
+//
+// RFC 0006 is accepted (2026-10-30 via docs/decisions/0002-sdd-acceptance-
+// wave.md, §11 decision amendment authoritative). Comments aligned to that
+// amendment (release-safe recovery semantics). Do not claim execution: these
+// comments describe accepted-decision semantics awaiting implementations and
+// conformance execution; generated codecs alone do not enforce them, and
+// implementation and conformance evidence remain pending as separation of
+// authority from evidence. No conformance or release claim may cite these
+// comments as executed evidence.
+//
+// Release inclusion versus wire optionality (RFC 0006 §11.1): standardized
+// recovery is required in the target release bundle. On the wire the
+// `syntra.update-recovery/1` capability remains optional and explicitly
+// negotiated after ACTIVE, independently on every connection; no envelope
+// changes introduce any wire pressure here.
+//
+// All payloads are versioned bytes carried inside the existing request,
+// result, and notification envelopes with no envelope changes. Identity is
+// scoped (RFC 0006 §11.2): a subscription is one delivery instance routed by
+// a fresh connection-scoped handle; the stream identity and principal scope
+// and continuity generation belong to the provider-resolved scope (P, S), and
+// checkpoints bind to (P, S, G). Generation G is the provider's continuity
+// epoch for that scope: it changes only on true provider history loss or an
+// explicit shared rebase — never from subscriber-local overflow, ordinary
+// retention-window pruning, or targeted revocation termination without
+// policy-driven history reset. Every recovery round is identified by
+// connection + handle and holds one fixed boundary; a subscribe accept yields
+// a fresh handle and a newly captured boundary (RFC 0006 §11.3). Checkpoints,
+// handles, selectors, markers, and boundaries are opaque bytes. Confirmation
+// proves only persistence through the application persistence point; the
+// three progress observations (locally durable checkpoint, Confirm sent,
+// peer-acknowledged checkpoint) stay distinct, and the resume checkpoint is
+// the durable known-safe checkpoint, which may be newer than the last
+// acknowledged one (RFC 0006 §11.6). Bounds below are deployment-documented
+// defaults: at most 64 subscriptions per connection, at most 256 per
+// principal, at most 16 pending profile calls per connection, at most
+// 262144 queued notification bytes per stream, at most 1048576 per
+// connection, at most 64 serialized batches and 262144 total bytes per
+// replay page with each serialized entry at most 262144 bytes, at most
+// 262144 bytes per snapshot page, at most 256 pages per snapshot offer,
+// effective deadline 5 s where the request carries no explicit bounded
+// deadline.
+//
+// Canonical generic RPC methods (SNTR-RPC-001, exactly two slashes) are:
+// `/syntra.v1.UpdateRecovery/Negotiate`,
+// `/syntra.v1.UpdateRecovery/Subscribe`,
+// `/syntra.v1.UpdateRecovery/Replay`,
+// `/syntra.v1.UpdateRecovery/CatchUp`,
+// `/syntra.v1.UpdateRecovery/Confirm` (batch variant
+// `RecoveryConfirmRequest`/`RecoveryConfirmResponse`),
+// `/syntra.v1.UpdateRecovery/SnapshotConfirm` (snapshot-boundary variant
+// `RecoverySnapshotConfirmRequest`/`RecoverySnapshotInstalled`),
+// `/syntra.v1.UpdateRecovery/SnapshotOffer`
+// (`RecoverySnapshotOfferRequest`/`RecoverySnapshotDescriptor`),
+// `/syntra.v1.UpdateRecovery/SnapshotFetch`,
+// `/syntra.v1.UpdateRecovery/Unsubscribe`
+// (`RecoveryUnsubscribeRequest`/`RecoveryUnsubscribeResponse`).
+// Notification payloads are versioned `RecoveryNotification` bytes carrying
+// exactly one of `RecoveryBatch`, `RecoveryReplayComplete`, or
+// `RecoveryBatchTrailer` with matching profile_version, inside the existing
+// `Notification.payload` with no envelope changes.
+//
+// Wire compatibility (SNTR-SER-003, SNTR-VER-004): unknown Protobuf fields
+// inside profile payloads MUST be ignored on receipt unless a field comment
+// explicitly marks that field `Critical`. Fields explicitly marked
+// `Ignorable` in their comments MUST be ignored on receipt. Defined fields
+// are validated per their field comments: profile_version and routing/identity
+// fields (stream_selector, subscription_handle, snapshot_handle, capability,
+// versions) missing or mismatched MUST be rejected with FAILED_PRECONDITION,
+// never silently applied. Checkpoint/boundary/marker fields follow per-field
+// emptiness rules, not a blanket non-empty rule: `start_checkpoint` empty
+// means initial (SYN-URP-024: initial subscriptions skip Replay and start live
+// at the subscribed boundary), `continuation_marker` empty means first request
+// or no further page (SYN-URP-022), `terminate_reason` empty means no
+// termination unless the terminated outcome is selected (SYN-URP-026), and
+// predecessor/result/boundary emptiness is governed by each field comment.
+// Unknown profile operations (method strings) MUST be rejected
+// with UNIMPLEMENTED.
+
+/// RecoveryNegotiateRequest offers an inclusive range of profile versions.
+/// A v1 host selects version 1 on success and rejects a range that excludes
+/// version 1 with FAILED_PRECONDITION.
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RecoveryNegotiateRequest {
@@ -331,12 +335,11 @@ pub struct RecoveryNegotiateRequest {
     /// Required.
     #[prost(uint32, tag="1")]
     pub profile_version: u32,
-    /// min_version is the lowest offered profile version. Valid value is 1.
-    /// Required.
+    /// min_version is the lowest offered profile version. Required; must be nonzero.
     #[prost(uint32, tag="2")]
     pub min_version: u32,
-    /// max_version is the highest offered profile version. Valid value is 1,
-    /// MUST be >= min_version. Required.
+    /// max_version is the highest offered profile version. Required; must be at
+    /// least min_version.
     #[prost(uint32, tag="3")]
     pub max_version: u32,
     /// capability is the ASCII capability identifier. Non-empty, at most 256
