@@ -182,7 +182,7 @@ cancel for PRs):
   vulnerability scans (does not gate PR/main validation).
 - `Integration` – separate Docker-based connectivity checks; see
   [crates/syntra-integration/README.md](crates/syntra-integration/README.md).
-- `Benchmarks` – same-runner Criterion comparisons for source changes on `main`,
+- `Benchmarks` – same-runner Criterion comparisons for source and Cargo build-input changes on `main`,
   covering frame round trips and protected records; see [BENCHMARKS.md](BENCHMARKS.md).
 - `CodeQL` – Rust and Actions analysis. After the initial scan, administrators
   should require CodeQL results on `main` with security severity **High or higher**.

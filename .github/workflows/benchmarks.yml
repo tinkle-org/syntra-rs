@@ -11,6 +11,13 @@ on:
       - 'crates/syntra-core/tests/bench_allocations.rs'
       - 'scripts/benchmark_baseline.py'
       - 'crates/**/build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**/Cargo.toml'
+      - 'crates/**/Cargo.lock'
+      - '.cargo/config'
+      - '.cargo/config.toml'
+      - 'rust-toolchain.toml'
 
 permissions:
   contents: read
@@ -20,6 +27,8 @@ env:
 
 jobs:
   benches:
+    # A branch-creation push has no previous tip to compare.
+    if: ${{ github.event.before && github.event.before != '0000000000000000000000000000000000000000' }}
     runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     timeout-minutes: 20
     steps:

@@ -72,8 +72,23 @@ class CiWorkflowTests(unittest.TestCase):
         bench = yaml.load((ROOT / ".github/workflows/benchmarks.yml").read_text(), Loader=yaml.BaseLoader)
         self.assertEqual(set(bench["on"]), {"push"})
         self.assertEqual(bench["on"]["push"]["branches"], ["main"])
-        self.assertIn("crates/**/src/**/*.rs", bench["on"]["push"]["paths"])
-        self.assertEqual(bench["jobs"]["benches"]["runs-on"], "blacksmith-4vcpu-ubuntu-2404-arm")
+        self.assertLessEqual({
+            "crates/**/src/**/*.rs", "Cargo.toml", "Cargo.lock", "crates/**/Cargo.toml",
+            "crates/**/Cargo.lock", ".cargo/config", ".cargo/config.toml", "rust-toolchain.toml",
+        }, set(bench["on"]["push"]["paths"]))
+        job = bench["jobs"]["benches"]
+        self.assertEqual(job["runs-on"], "blacksmith-4vcpu-ubuntu-2404-arm")
+        no_previous_tip = "0" * 40
+        self.assertEqual(job["if"], f"${{{{ github.event.before && github.event.before != '{no_previous_tip}' }}}}")
+        old, = [step for step in job["steps"] if step.get("with", {}).get("path") == "old"]
+        self.assertEqual(old["with"]["ref"], "${{ github.event.before }}")
+
+    def test_codeql_cancels_stale_scans_without_cross_event_cancellation(self):
+        codeql = yaml.load((ROOT / ".github/workflows/codeql.yml").read_text(), Loader=yaml.BaseLoader)
+        self.assertEqual(codeql["concurrency"], {
+            "group": "codeql-${{ github.event_name }}-${{ github.ref }}",
+            "cancel-in-progress": "true",
+        })
 
     def test_candidate_upload_requires_execution_but_preserves_failure_evidence(self):
         upload, = [step for step in self.steps

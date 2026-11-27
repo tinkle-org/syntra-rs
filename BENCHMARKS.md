@@ -104,16 +104,16 @@ cargo bench --locked --workspace --features syntra-net/tcp -- --test
 
 ## Main-push CPU baseline
 
-On source changes merged to `main`, `benchmarks.yml` checks out the SHA
-before the push (not `HEAD^`) and the pushed SHA on one
+When source or build inputs change on `main`, `benchmarks.yml` checks out the
+SHA before the push (not `HEAD^`) and the pushed SHA on one
 `blacksmith-4vcpu-ubuntu-2404-arm` runner. Both builds use default features,
 the optimized bench profile, Rust 1.89.0 and each revision's lockfile. On the
 introducing push only, it copies the measurement harnesses into the old checkout
 and measures that same revision twice to check noise on the actual runner.
 Thereafter each harness compiles against its own codec; keep the five workloads
-and timing boundaries stable across the migration. No
-prior artifact is needed. An incompatible build, missing case, or unreadable
-comparison fails the job. There is no fallback to a passing empty baseline.
+and timing boundaries stable across the migration. No prior artifact is needed.
+If the push creates `main`, the job skips because there is no previous tip.
+An incompatible build, missing case, or unreadable comparison fails the job.
 
 The gate covers only the two request round trips and three warm records above.
 Each gets 0.5 s warmup, 1 s measurement and 30 samples on each side. The
