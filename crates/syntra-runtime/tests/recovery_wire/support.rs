@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 
-use syntra_core::wire::{frame::Body, recovery_notification::Notification, *};
+use prost::Message;
+use syntra_core::proto::{frame::Body, recovery_notification::Notification, *};
 use syntra_core::{ConnectionState, ErrorCode};
 use syntra_runtime::recovery::persistence::*;
 use syntra_runtime::recovery::wire::*;
@@ -285,10 +286,10 @@ pub struct Trace {
 }
 impl Trace {
     fn push(&self, to_host: bool, bytes: &[u8], delivered: bool) {
-        let frame = syntra_core::decode_frame_structure(bytes).unwrap();
+        let frame = Frame::decode(bytes).unwrap();
         if !matches!(
             frame.body,
-            Some(Body::Call(_) | Body::Result(_) | Body::Notification(_))
+            Some(Body::Request(_) | Body::Result(_) | Body::Notification(_))
         ) {
             return;
         }
@@ -309,7 +310,7 @@ impl Trace {
             .unwrap()
             .iter()
             .filter_map(|r| match &r.frame.body {
-                Some(Body::Call(q)) if r.to_host && q.method == method => {
+                Some(Body::Request(q)) if r.to_host && q.method == method => {
                     Some((r.frame.request_id, q.payload.clone()))
                 }
                 _ => None,
@@ -331,11 +332,11 @@ impl Trace {
                     return None;
                 }
                 match &r.frame.body {
-                    Some(Body::Result(CallResult {
-                        outcome: Some(call_result::Outcome::Payload(p)),
+                    Some(Body::Result(RpcResult {
+                        outcome: Some(rpc_result::Outcome::Payload(p)),
                     })) => Some(Ok(p.clone())),
-                    Some(Body::Result(CallResult {
-                        outcome: Some(call_result::Outcome::Error(e)),
+                    Some(Body::Result(RpcResult {
+                        outcome: Some(rpc_result::Outcome::Error(e)),
                     })) => Some(Err(ErrorCode::from_i32_lossy(e.code).0)),
                     _ => None,
                 }
@@ -350,7 +351,7 @@ impl Trace {
             .filter_map(|r| match &r.frame.body {
                 Some(Body::Notification(n)) if !delivered_only || r.delivered => {
                     assert_eq!(r.frame.request_id, 0);
-                    codec::decode::<RecoveryNotification>(n.payload.as_slice())
+                    RecoveryNotification::decode(n.payload.as_slice())
                         .unwrap()
                         .notification
                 }
@@ -391,7 +392,7 @@ impl Trace {
         let ids = frames
             .iter()
             .filter_map(|r| {
-                if r.to_host && matches!(r.frame.body, Some(Body::Call(_))) {
+                if r.to_host && matches!(r.frame.body, Some(Body::Request(_))) {
                     Some(r.frame.request_id)
                 } else {
                     None
@@ -404,10 +405,7 @@ impl Trace {
             "fresh increasing Core IDs required"
         );
         for r in frames.iter() {
-            assert_eq!(
-                syntra_core::decode_frame_structure(r.bytes.as_slice()).unwrap(),
-                r.frame
-            );
+            assert_eq!(Frame::decode(r.bytes.as_slice()).unwrap(), r.frame);
         }
     }
 }
@@ -468,8 +466,8 @@ impl Bridge {
                     bytes = init_rx.recv() => match bytes {
                         Some(original) => if let Some(bytes) = i.prepare_outbound(original) {
                             let received = tokio::time::Instant::now().into_std();
-                            if let Some(Body::Call(q)) = syntra_core::decode_frame_structure(bytes.as_slice()).unwrap().body {
-                                m.lock().unwrap().insert(syntra_core::decode_frame_structure(bytes.as_slice()).unwrap().request_id, q.method);
+                            if let Some(Body::Request(q)) = Frame::decode(bytes.as_slice()).unwrap().body {
+                                m.lock().unwrap().insert(Frame::decode(bytes.as_slice()).unwrap().request_id, q.method);
                             }
                             t.push(true, &bytes, true);
                             h.ingest_received_at(&bytes, received).await;
@@ -497,10 +495,10 @@ impl Bridge {
                     },
                     bytes = host_rx.recv() => match bytes {
                         Some(bytes) => {
-                            let frame = syntra_core::decode_frame_structure(bytes.as_slice()).unwrap();
-                            let completion = match &frame.body { Some(Body::Notification(n)) => match codec::decode::<RecoveryNotification>(n.payload.as_slice()).unwrap().notification {
+                            let frame = Frame::decode(bytes.as_slice()).unwrap();
+                            let completion = match &frame.body { Some(Body::Notification(n)) => match RecoveryNotification::decode(n.payload.as_slice()).unwrap().notification {
                                 Some(Notification::ReplayComplete(_)) => true,
-                                Some(Notification::Trailer(t)) => t.outcome == Some(recovery_batch_trailer::Outcome::CatchupComplete),
+                                Some(Notification::Trailer(t)) => t.outcome == Some(recovery_batch_trailer::Outcome::CatchupComplete(true)),
                                 _ => false,
                             }, _ => false };
                             let drop_result = matches!(frame.body, Some(Body::Result(_))) && f.drop_results.lock().unwrap().is_some_and(|method| methods.lock().unwrap().get(&frame.request_id).is_some_and(|m| m == method));
@@ -553,17 +551,10 @@ impl Bridge {
             b"public core control"
         );
     }
-    pub async fn raw<M: codec::ProfileMessage>(
-        &self,
-        method: &str,
-        request: M,
-    ) -> Result<Vec<u8>, ErrorCode> {
-        bounded(
-            self.init
-                .call(method, codec::encode(&request).unwrap(), 2000),
-        )
-        .await
-        .map_err(|e| e.code())
+    pub async fn raw<M: Message>(&self, method: &str, request: M) -> Result<Vec<u8>, ErrorCode> {
+        bounded(self.init.call(method, request.encode_to_vec(), 2000))
+            .await
+            .map_err(|e| e.code())
     }
     pub async fn finish(mut self) {
         self.trace.assert_ids();
@@ -578,7 +569,9 @@ impl Bridge {
         assert!(self.host.is_closed() && self.init.is_closed());
     }
 }
-pub async fn negotiate<S: RecoveryPersistence + 'static>(c: &mut RecoveryClient<S>) -> Negotiated {
+pub async fn negotiate<S: RecoveryPersistence + 'static>(
+    c: &mut RecoveryClient<S>,
+) -> RecoveryNegotiateResponse {
     match bounded(c.negotiate()).await.unwrap() {
         Negotiation::Confirmed(n) => n,
         _ => panic!("fixture supports profile"),
@@ -588,7 +581,7 @@ pub async fn subscribe<S: RecoveryPersistence + 'static>(
     c: &mut RecoveryClient<S>,
     stream: &[u8],
     intent: SubscribeIntent,
-) -> SubscriptionAccepted {
+) -> RecoverySubscribeResponse {
     bounded(c.subscribe(
         stream.to_vec(),
         if stream == ALIAS { A } else { stream }.to_vec(),

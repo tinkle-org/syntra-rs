@@ -26,11 +26,11 @@ pub fn bounded_diagnostic(message: impl Into<String>) -> String {
     message
 }
 
-/// Registered error codes. Unknown raw wire numbers remain diagnostic data.
+/// Wire error codes. Mirrors `syntra.v1.ErrorCode` (errors.proto).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i32)]
 pub enum ErrorCode {
-    Invalid = 0,
+    Unspecified = 0,
     Cancelled = 1,
     Unknown = 2,
     InvalidArgument = 3,
@@ -55,7 +55,7 @@ impl ErrorCode {
     /// number is preserved by the caller for diagnostics.
     pub fn from_i32_lossy(v: i32) -> (Self, Option<i32>) {
         match v {
-            0 => (Self::Invalid, None),
+            0 => (Self::Unspecified, None),
             1 => (Self::Cancelled, None),
             2 => (Self::Unknown, None),
             3 => (Self::InvalidArgument, None),
@@ -98,7 +98,7 @@ impl ErrorCode {
             | Self::DataLoss
             | Self::PermissionDenied
             | Self::Unauthenticated => RetryClass::NotSafeToRetry,
-            Self::Internal | Self::Unknown | Self::Invalid => RetryClass::UnknownOutcome,
+            Self::Internal | Self::Unknown | Self::Unspecified => RetryClass::UnknownOutcome,
         }
     }
 }
@@ -111,7 +111,7 @@ pub enum RetryClass {
     UnknownOutcome,
 }
 
-/// Public typed failure with the classified and original code.
+/// Public typed failure: `{code, message}` (errors.proto `RpcError`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcError {
     pub code: ErrorCode,
@@ -134,7 +134,7 @@ impl RpcError {
 /// All failures surfaced by the Syntra core and runtime.
 #[derive(Debug, Error, Clone)]
 pub enum SyntraError {
-    /// A terminal `CallResult` error from the host.
+    /// A terminal `RpcResult{error}` from the host.
     #[error("rpc failed [{code:?}]: {message}")]
     Rpc {
         code: ErrorCode,
@@ -216,14 +216,14 @@ mod tests {
 
     #[test]
     fn registered_error_codes_match_the_schema() {
-        use crate::generated::ErrorCode as SchemaCode;
+        use crate::proto::ErrorCode as SchemaCode;
 
-        // Match exhaustively in both directions so adding to either enum requires a decision.
+        // Exhaustive in both directions: new codes require an explicit decision.
         macro_rules! check_codes {
             ($($name:ident),+ $(,)?) => {
                 for code in [$(ErrorCode::$name),+] {
                     let schema = match code { $(ErrorCode::$name => SchemaCode::$name),+ };
-                    let raw = i32::from(schema);
+                    let raw = schema as i32;
                     assert_eq!(code.as_i32(), raw, "{code:?}");
                     let expected = match schema { $(SchemaCode::$name => ErrorCode::$name),+ };
                     assert_eq!(ErrorCode::from_i32_lossy(raw), (expected, None));
@@ -231,7 +231,7 @@ mod tests {
             };
         }
         check_codes!(
-            Invalid,
+            Unspecified,
             Cancelled,
             Unknown,
             InvalidArgument,

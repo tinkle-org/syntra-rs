@@ -1,30 +1,29 @@
 //! Observe allocation at the codec boundary, not just its eventual error.
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::cell::Cell;
 
-#[path = "fixtures/bebop.rs"]
-mod bebop;
-
-use syntra_core::wire::{call_result::Outcome, frame::Body, CallResult, Frame, Notification};
+use syntra_core::proto::{frame::Body, rpc_result::Outcome, Frame, Notification, RpcResult};
 use syntra_core::{
-    decode_frame, encode_frame, missing_result_outcome_id, validate_wire_structure,
-    ConnectionState, ErrorCode, ValidationContext, MAX_CONNECTION_ID_BYTES, MAX_CREDENTIAL_BYTES,
-    MAX_DIAGNOSTIC_BYTES, MAX_FRAME_BYTES,
+    decode_frame, encode_frame, missing_result_outcome_id, validate_frame, validate_wire_structure,
+    ConnectionState, ErrorCode, RpcRequest, ValidationContext, MAX_CONNECTION_ID_BYTES,
+    MAX_CREDENTIAL_BYTES, MAX_DIAGNOSTIC_BYTES, MAX_FRAME_BYTES,
 };
 
 struct ObservedAllocator;
-static OBSERVE: AtomicBool = AtomicBool::new(false);
-static LARGE_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-static MIN_OBSERVED_SIZE: AtomicUsize = AtomicUsize::new(MAX_FRAME_BYTES);
+thread_local! {
+    static OBSERVATION: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+}
 
 fn observe(size: usize) {
-    if OBSERVE.load(Ordering::Relaxed) && size >= MIN_OBSERVED_SIZE.load(Ordering::Relaxed) {
-        LARGE_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+    if let Some((minimum, count)) = OBSERVATION.get() {
+        if size >= minimum {
+            OBSERVATION.set(Some((minimum, count + 1)));
+        }
     }
 }
 
 // SAFETY: All allocation operations delegate unchanged to System. Observation
-// uses only atomics and never allocates or changes the allocator contract.
+// uses a nonallocating thread-local counter and does not change the allocator contract.
 unsafe impl GlobalAlloc for ObservedAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         observe(layout.size());
@@ -47,20 +46,52 @@ unsafe impl GlobalAlloc for ObservedAllocator {
 static ALLOCATOR: ObservedAllocator = ObservedAllocator;
 
 fn observed<T>(minimum_size: usize, operation: impl FnOnce() -> T) -> (T, usize) {
-    LARGE_ALLOCATIONS.store(0, Ordering::Relaxed);
-    MIN_OBSERVED_SIZE.store(minimum_size, Ordering::Relaxed);
-    OBSERVE.store(true, Ordering::Relaxed);
+    OBSERVATION.set(Some((minimum_size, 0)));
     let result = operation();
-    OBSERVE.store(false, Ordering::Relaxed);
-    (result, LARGE_ALLOCATIONS.load(Ordering::Relaxed))
+    (result, OBSERVATION.take().unwrap().1)
+}
+
+fn varint(mut value: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    while value >= 128 {
+        bytes.push(value as u8 | 0x80);
+        value >>= 7;
+    }
+    bytes.push(value as u8);
+    bytes
+}
+
+fn len(field: usize, value: &[u8]) -> Vec<u8> {
+    [varint(field << 3 | 2), varint(value.len()), value.to_vec()].concat()
+}
+
+#[test]
+fn valid_request_allocates_only_the_encoded_output() {
+    let ctx = ValidationContext::active(1);
+    for size in [0, MAX_FRAME_BYTES - 256] {
+        let frame = Frame {
+            version: 1,
+            request_id: 7,
+            body: Some(Body::Request(RpcRequest {
+                method: "/example.Echo/Echo".into(),
+                payload: vec![0; size],
+                timeout_ms: 500,
+            })),
+        };
+        let (_, allocations) = observed(1, || validate_frame(&frame, ctx).unwrap());
+        assert_eq!(allocations, 0, "validating a request");
+        let (bytes, allocations) = observed(1, || encode_frame(&frame, ctx).unwrap());
+        assert_eq!(allocations, 1, "encoding a request");
+        assert_eq!(bytes.capacity(), bytes.len());
+        let (_, allocations) = observed(1, || validate_wire_structure(&bytes).unwrap());
+        assert_eq!(allocations, 0, "scanning a request");
+    }
 }
 
 #[test]
 fn codec_bounds_are_enforced_before_allocation() {
-    // This binary deliberately has one test so observation cannot count a
-    // concurrent test's large input allocation.
     for body in [
-        Body::Result(CallResult {
+        Body::Result(RpcResult {
             outcome: Some(Outcome::Payload(vec![0; MAX_FRAME_BYTES])),
         }),
         Body::Notification(Notification {
@@ -83,49 +114,79 @@ fn codec_bounds_are_enforced_before_allocation() {
         assert_eq!(allocations, 0);
     }
 
-    for (body, limit, context, code) in [
+    for (body, field, limit, context, code) in [
         (
             10,
+            3,
             MAX_CREDENTIAL_BYTES,
             ValidationContext::pre_handshake(ConnectionState::Connected),
             ErrorCode::ResourceExhausted,
         ),
         (
             11,
+            1,
             MAX_CONNECTION_ID_BYTES,
             ValidationContext::pre_handshake(ConnectionState::Negotiating),
             ErrorCode::InvalidArgument,
         ),
         (
             13,
+            2,
             MAX_DIAGNOSTIC_BYTES,
             ValidationContext::active(1),
             ErrorCode::InvalidArgument,
         ),
     ] {
-        // A positive control observes the owned field copy at its exact limit.
-        let good = bebop::field_frame(body, &vec![b'x'; limit]);
-        let (result, allocations) = observed(limit, || decode_frame(&good, context));
-        result.unwrap();
-        assert!(allocations > 0, "body={body}: did not see the field copy");
-
-        let bad = bebop::field_frame(body, &vec![b'x'; limit + 1]);
-        let (result, allocations) = observed(limit + 1, || decode_frame(&bad, context));
-        assert_eq!(result.unwrap_err().code(), code);
-        assert_eq!(allocations, 0, "body={body}: copied over-limit field");
-        let (result, allocations) = observed(limit + 1, || validate_wire_structure(&bad));
-        assert_eq!(result.unwrap_err().code(), code);
-        assert_eq!(allocations, 0);
-        let (id, allocations) = observed(limit + 1, || missing_result_outcome_id(&bad, context));
-        assert_eq!(id, None);
-        assert_eq!(allocations, 0);
+        // Build every raw input before arming. Include an oversized earlier
+        // value that prost would otherwise allocate and then overwrite.
+        let oversized = len(field, &vec![b'x'; limit + 1]);
+        let bounded = len(field, b"ok");
+        let values = [
+            oversized.clone(),
+            [oversized.clone(), bounded.clone()].concat(),
+            [bounded, oversized].concat(),
+            len(field, &vec![b'x'; limit]),
+        ];
+        for (index, value) in values.into_iter().enumerate() {
+            let inner = match body {
+                10 => [vec![8, 1, 16, 1], value].concat(),
+                13 => len(2, &[vec![8, 13], value].concat()),
+                _ => value,
+            };
+            let header = if body == 13 {
+                vec![8, 1, 16, 7]
+            } else {
+                vec![8, 1]
+            };
+            let raw = [header, len(body, &inner)].concat();
+            let (result, allocations) = observed(limit + 1, || decode_frame(&raw, context));
+            assert_eq!(allocations, 0, "body={body}, duplicate case={index}");
+            if index == 3 {
+                // Exact boundary is admitted. This positive control proves the
+                // observer sees generated field allocation when it is armed.
+                assert!(result.is_ok());
+                let (result, allocations) = observed(limit, || decode_frame(&raw, context));
+                assert!(result.is_ok());
+                assert!(
+                    allocations > 0,
+                    "body={body}: observer must see exact-limit allocation"
+                );
+            } else {
+                assert_eq!(result.unwrap_err().code(), code);
+                let (result, allocations) = observed(limit + 1, || validate_wire_structure(&raw));
+                assert_eq!(result.unwrap_err().code(), code);
+                assert_eq!(allocations, 0);
+            }
+            let (id, allocations) =
+                observed(limit + 1, || missing_result_outcome_id(&raw, context));
+            assert_eq!(id, None);
+            assert_eq!(allocations, 0);
+        }
     }
 
-    // A valid first field doesn't justify copying its payload before checking
-    // the enclosing message's terminator and the rest of the frame.
-    let mut message = vec![1];
-    message.extend(bebop::sized(&vec![0xff; 64 * 1024]));
-    let raw = bebop::frame(1, 0, 15, &bebop::sized(&message));
+    // A complete payload is not copied until the entire envelope is admitted.
+    let mut raw = [vec![8, 1], len(15, &len(1, &vec![0; 64 * 1024]))].concat();
+    raw.push(0); // Invalid field after the notification.
     let (result, allocations) = observed(64 * 1024, || {
         decode_frame(&raw, ValidationContext::active(1))
     });

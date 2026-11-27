@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use syntra_core::secure_channel::{
     generate_server_key, Carrier, Context, KeyStore, Mode, Secret32,
 };
-use syntra_core::{encode_frame, Call, Frame};
+use syntra_core::{encode_frame, Frame, RpcRequest};
 use syntra_runtime::{
     AllowAll, AllowAnonymous, CancelToken, ExecutionLease, FnHandler, HandlerFut, HandlerOutcome,
 };
@@ -1224,7 +1224,7 @@ async fn host_peer_uses_receipt_time_not_later_delivery_time() {
         &Frame {
             version: 1,
             request_id: 1,
-            body: Some(Body::Call(Call {
+            body: Some(Body::Request(RpcRequest {
                 method: "/test.Service/Echo".into(),
                 payload: vec![],
                 timeout_ms: 10,
@@ -1243,8 +1243,8 @@ async fn host_peer_uses_receipt_time_not_later_delivery_time() {
     .unwrap();
     assert_eq!(frame.request_id, 1);
     assert!(
-        matches!(frame.body, Some(Body::Result(syntra_core::CallResult {
-        outcome: Some(syntra_core::wire::call_result::Outcome::Error(error)),
+        matches!(frame.body, Some(Body::Result(syntra_core::RpcResult {
+        outcome: Some(syntra_core::proto::rpc_result::Outcome::Error(error)),
     })) if error.code == syntra_core::ErrorCode::DeadlineExceeded.as_i32())
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -3294,9 +3294,8 @@ mod establishment_regressions {
     #[tokio::test(start_paused = true)]
     async fn local_first_envelope_causes_are_typed_sanitized_and_never_sent_to_the_peer() {
         for mode in [Mode::Bootstrap, Mode::Returning] {
-            let mut future_body = hello(1, 1);
-            // Frame's fixed version, request ID and union length precede the discriminator.
-            future_body[16] = 18;
+            // Version 1 with an unknown body (length-delimited field 18).
+            let future_body = vec![0x08, 0x01, 0x92, 0x01, 0x00];
             let mut truncated = hello(1, 1);
             truncated.pop();
             for (frame, expected, expected_auth_calls) in [

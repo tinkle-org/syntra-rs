@@ -36,19 +36,19 @@
 //!   (SNTR-RPC-002/006/030); a second `result` for the same id is never
 //!   sent.
 
-#[cfg(test)]
-use crate::frame_fixture::FrameFixture;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use web_time::{Duration, Instant};
 
 use futures_util::FutureExt;
+#[cfg(test)]
+use prost::Message;
 use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::{debug, warn};
 
 use syntra_core::{
-    decode_frame, validate_frame, wire::frame::Body, Call, CallResult, ConnectionState, ErrorCode,
-    Frame, StateEvent, SyntraError,
+    decode_frame, encode_frame, proto::frame::Body, validate_frame, ConnectionState, ErrorCode,
+    Frame, RpcRequest, RpcResult, StateEvent, SyntraError,
 };
 
 use crate::connection::{
@@ -804,14 +804,14 @@ impl Host {
             if st == ConnectionState::Closing {
                 return;
             }
-            if let Some(Body::Call(req)) = &frame.body {
+            if let Some(Body::Request(req)) = &frame.body {
                 if frame.request_id != 0 {
                     let code = e.code();
                     if code == ErrorCode::InvalidArgument
                         && st == ConnectionState::Active
                         && syntra_core::validate_method(&req.method).is_err()
                     {
-                        // Size, structure, state, version and ID passed for the original call.
+                        // Size, structure, state, version and ID passed for the original request.
                         if self.consume_request_id(frame.request_id).await {
                             self.reject_request(
                                 frame.request_id,
@@ -881,7 +881,7 @@ impl Host {
                 self.protocol_violation(ErrorCode::FailedPrecondition, "unexpected ready")
                     .await;
             }
-            Some(Body::Call(req)) => {
+            Some(Body::Request(req)) => {
                 if !st.is_active() {
                     self.protocol_violation(ErrorCode::FailedPrecondition, "request before ACTIVE")
                         .await;
@@ -961,7 +961,7 @@ impl Host {
         self.shutdown_tasks().await;
     }
 
-    async fn on_hello(&self, frame_version: u32, hello: syntra_core::wire::ClientHello) {
+    async fn on_hello(&self, frame_version: u32, hello: syntra_core::proto::ClientHello) {
         if frame_version != hello.max_version {
             self.fail_handshake_and_close(
                 ErrorCode::InvalidArgument,
@@ -1035,11 +1035,11 @@ impl Host {
         let ready = Frame {
             version: selected,
             request_id: 0,
-            body: Some(Body::Ready(syntra_core::wire::ServerReady {
+            body: Some(Body::Ready(syntra_core::proto::ServerReady {
                 connection_id: connection_id.clone(),
             })),
         };
-        let Ok(ready_bytes) = syntra_core::encode_frame(&ready, self.conn.ctx().await) else {
+        let Ok(ready_bytes) = encode_frame(&ready, self.conn.ctx().await) else {
             self.fail_handshake_and_close(
                 ErrorCode::Internal,
                 "ready validation failed".to_string(),
@@ -1153,7 +1153,7 @@ impl Host {
     /// Admit a decoded request for colocated tests, sampling receipt before the
     /// ordered gate. Real input uses the bounded decode path in `ingest_received_at`.
     #[cfg(test)]
-    async fn on_request(&self, id: u64, version: u32, req: Call) {
+    async fn on_request(&self, id: u64, version: u32, req: RpcRequest) {
         let received_at = now();
         let _ordered = self.admission.lock().await;
         if self.consume_request_id(id).await {
@@ -1177,7 +1177,13 @@ impl Host {
 
     /// Apply the effective timeout from complete-frame receipt before initial
     /// authorization, retaining that deadline through admission and dispatch.
-    async fn on_request_received_at(&self, id: u64, version: u32, req: Call, received_at: Instant) {
+    async fn on_request_received_at(
+        &self,
+        id: u64,
+        version: u32,
+        req: RpcRequest,
+        received_at: Instant,
+    ) {
         let timeout = self.request_timeout(&req);
         let mut deadline = received_at + timeout;
         let state = self.conn.shared.state.read().await;
@@ -1330,8 +1336,14 @@ impl Host {
         if *state != ConnectionState::Active || self.conn.is_closed() {
             return;
         }
-        let admitted =
-            self.start_request(id, version, Call::default(), deadline, Some(outcome), None);
+        let admitted = self.start_request(
+            id,
+            version,
+            RpcRequest::default(),
+            deadline,
+            Some(outcome),
+            None,
+        );
         drop(state);
         if !admitted {
             self.output_exhausted().await;
@@ -1354,7 +1366,7 @@ impl Host {
         &self,
         id: u64,
         version: u32,
-        req: Call,
+        req: RpcRequest,
         deadline: Instant,
         mut rejection: Option<HandlerOutcome>,
         profile: Option<recovery::Call>,
@@ -1601,14 +1613,13 @@ impl Host {
         let frame = Frame {
             version,
             request_id: id,
-            body: Some(Body::Result(CallResult {
+            body: Some(Body::Result(RpcResult {
                 outcome: Some(outcome),
             })),
         };
         // Selection is immutable BEFORE this wait. Withdrawal may close delivery
         // but cannot fence away/replace an earlier selected success with an error.
-        let Ok(bytes) =
-            syntra_core::encode_frame(&frame, syntra_core::ValidationContext::active(version))
+        let Ok(bytes) = encode_frame(&frame, syntra_core::ValidationContext::active(version))
         else {
             sender.on_transport_lost().await;
             return;
@@ -1670,11 +1681,11 @@ impl Host {
         let frame = Frame {
             version,
             request_id: 0,
-            body: Some(Body::Notification(syntra_core::wire::Notification {
+            body: Some(Body::Notification(syntra_core::proto::Notification {
                 payload,
             })),
         };
-        let bytes = syntra_core::encode_frame(&frame, self.conn.ctx().await)?;
+        let bytes = encode_frame(&frame, self.conn.ctx().await)?;
         let permit = match self.conn.reserve_writer().await {
             Ok(permit) => permit,
             Err(error) => {
@@ -2006,8 +2017,8 @@ impl Drop for Host {
     }
 }
 
-fn outcome_payload(b: Vec<u8>) -> syntra_core::wire::call_result::Outcome {
-    syntra_core::wire::call_result::Outcome::Payload(b)
+fn outcome_payload(b: Vec<u8>) -> syntra_core::proto::rpc_result::Outcome {
+    syntra_core::proto::rpc_result::Outcome::Payload(b)
 }
 
 fn bounded_outcome(id: u64, version: u32, outcome: HandlerOutcome) -> HandlerOutcome {
@@ -2017,15 +2028,15 @@ fn bounded_outcome(id: u64, version: u32, outcome: HandlerOutcome) -> HandlerOut
             let frame = Frame {
                 version,
                 request_id: id,
-                body: Some(Body::Result(CallResult {
+                body: Some(Body::Result(RpcResult {
                     outcome: Some(outcome_payload(payload)),
                 })),
             };
-            if frame.encoded_len() > syntra_core::MAX_FRAME_BYTES {
+            if prost::Message::encoded_len(&frame) > syntra_core::MAX_FRAME_BYTES {
                 HandlerOutcome::error(ErrorCode::ResourceExhausted, "result exceeds bound")
             } else {
-                let Some(Body::Result(CallResult {
-                    outcome: Some(syntra_core::wire::call_result::Outcome::Payload(payload)),
+                let Some(Body::Result(RpcResult {
+                    outcome: Some(syntra_core::proto::rpc_result::Outcome::Payload(payload)),
                 })) = frame.body
                 else {
                     unreachable!("constructed payload result")
@@ -2036,18 +2047,18 @@ fn bounded_outcome(id: u64, version: u32, outcome: HandlerOutcome) -> HandlerOut
     }
 }
 
-fn outcome_error(code: ErrorCode, message: &str) -> syntra_core::wire::call_result::Outcome {
-    syntra_core::wire::call_result::Outcome::Error(syntra_core::wire::RpcError {
+fn outcome_error(code: ErrorCode, message: &str) -> syntra_core::proto::rpc_result::Outcome {
+    syntra_core::proto::rpc_result::Outcome::Error(syntra_core::proto::RpcError {
         code: sanitize_code(code).as_i32(),
         message: syntra_core::bounded_diagnostic(message),
     })
 }
 
-/// INVALID (0) MUST NOT appear in a failure outcome (SNTR-ERR-001);
+/// UNSPECIFIED (0) MUST NOT appear in a failure outcome (SNTR-ERR-001);
 /// normalize it to UNKNOWN defensively.
 fn sanitize_code(code: ErrorCode) -> ErrorCode {
     match code {
-        ErrorCode::Invalid => ErrorCode::Unknown,
+        ErrorCode::Unspecified => ErrorCode::Unknown,
         other => other,
     }
 }
@@ -2096,7 +2107,7 @@ mod request_admission_tests;
 mod tests {
     use super::*;
     use crate::session::{AllowAnonymous, RejectAll};
-    use syntra_core::wire::ClientHello;
+    use syntra_core::proto::ClientHello;
     use syntra_core::ValidationContext;
 
     fn hello_frame(min: u32, max: u32, cred: Vec<u8>) -> Vec<u8> {
@@ -2109,7 +2120,7 @@ mod tests {
                 credential: cred,
             })),
         }
-        .fixture_bytes()
+        .encode_to_vec()
     }
 
     fn echo_handler() -> Arc<dyn Handler> {
@@ -2128,10 +2139,9 @@ mod tests {
             Arc::new(AllowAnonymous),
             echo_handler(),
         );
-        let mut frame =
-            syntra_core::decode_frame_structure(hello_frame(1, 1, vec![]).as_slice()).unwrap();
+        let mut frame = Frame::decode(hello_frame(1, 1, vec![]).as_slice()).unwrap();
         frame.version = 2;
-        host.ingest(&frame.fixture_bytes()).await;
+        host.ingest(&frame.encode_to_vec()).await;
         assert!(host.is_closed());
         assert_eq!(host.sessions.count(), 0);
         assert!(writer.try_recv().is_err());
@@ -2182,7 +2192,7 @@ mod tests {
         host.on_request(
             1,
             1,
-            Call {
+            RpcRequest {
                 method: "/example.Echo/Echo".into(),
                 payload: vec![],
                 timeout_ms: 500,
@@ -2193,9 +2203,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let frame = syntra_core::decode_frame_structure(bytes.as_slice()).unwrap();
+        let frame = Frame::decode(bytes.as_slice()).unwrap();
         assert!(
-            matches!(frame.body, Some(Body::Result(CallResult { outcome: Some(syntra_core::wire::call_result::Outcome::Error(e)) })) if e.code == ErrorCode::PermissionDenied.as_i32())
+            matches!(frame.body, Some(Body::Result(RpcResult { outcome: Some(syntra_core::proto::rpc_result::Outcome::Error(e)) })) if e.code == ErrorCode::PermissionDenied.as_i32())
         );
         assert_eq!(host.state().await, ConnectionState::Active);
         host.close().await;
@@ -2228,7 +2238,7 @@ mod tests {
             .on_request(
                 1,
                 1,
-                Call {
+                RpcRequest {
                     method: "/example.Echo/Echo".into(),
                     payload: b"deny-me".to_vec(),
                     timeout_ms: 500,
@@ -2239,9 +2249,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let frame = syntra_core::decode_frame_structure(bytes.as_slice()).unwrap();
+        let frame = Frame::decode(bytes.as_slice()).unwrap();
         assert!(
-            matches!(frame.body, Some(Body::Result(CallResult { outcome: Some(syntra_core::wire::call_result::Outcome::Error(e)) })) if e.code == ErrorCode::PermissionDenied.as_i32())
+            matches!(frame.body, Some(Body::Result(RpcResult { outcome: Some(syntra_core::proto::rpc_result::Outcome::Error(e)) })) if e.code == ErrorCode::PermissionDenied.as_i32())
         );
         assert_eq!(
             effects.load(std::sync::atomic::Ordering::SeqCst),
@@ -2263,7 +2273,7 @@ mod tests {
             .on_request(
                 2,
                 1,
-                Call {
+                RpcRequest {
                     method: "/example.Echo/Echo".into(),
                     payload: b"allow-me".to_vec(),
                     timeout_ms: 500,
@@ -2274,9 +2284,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let frame = syntra_core::decode_frame_structure(bytes.as_slice()).unwrap();
+        let frame = Frame::decode(bytes.as_slice()).unwrap();
         assert!(
-            matches!(frame.body, Some(Body::Result(CallResult { outcome: Some(syntra_core::wire::call_result::Outcome::Payload(p)) })) if p == b"allow-me".to_vec())
+            matches!(frame.body, Some(Body::Result(RpcResult { outcome: Some(syntra_core::proto::rpc_result::Outcome::Payload(p)) })) if p == b"allow-me".to_vec())
         );
         assert_eq!(
             effects.load(std::sync::atomic::Ordering::SeqCst),
@@ -2307,7 +2317,7 @@ mod tests {
         host.on_request(
             1,
             1,
-            Call {
+            RpcRequest {
                 method: "/example.Echo/Echo".into(),
                 payload: b"explicit".to_vec(),
                 timeout_ms: 500,
@@ -2318,9 +2328,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let frame = syntra_core::decode_frame_structure(bytes.as_slice()).unwrap();
+        let frame = Frame::decode(bytes.as_slice()).unwrap();
         assert!(
-            matches!(frame.body, Some(Body::Result(CallResult { outcome: Some(syntra_core::wire::call_result::Outcome::Payload(p)) })) if p == b"explicit".to_vec())
+            matches!(frame.body, Some(Body::Result(RpcResult { outcome: Some(syntra_core::proto::rpc_result::Outcome::Payload(p)) })) if p == b"explicit".to_vec())
         );
         host.close().await;
     }
@@ -2339,7 +2349,7 @@ mod tests {
         host.on_request(
             1,
             1,
-            Call {
+            RpcRequest {
                 method: "/example.Echo/Echo".into(),
                 payload: b"fn".to_vec(),
                 timeout_ms: 500,
@@ -2350,9 +2360,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let frame = syntra_core::decode_frame_structure(bytes.as_slice()).unwrap();
+        let frame = Frame::decode(bytes.as_slice()).unwrap();
         assert!(
-            matches!(frame.body, Some(Body::Result(CallResult { outcome: Some(syntra_core::wire::call_result::Outcome::Payload(p)) })) if p == b"fn".to_vec())
+            matches!(frame.body, Some(Body::Result(RpcResult { outcome: Some(syntra_core::proto::rpc_result::Outcome::Payload(p)) })) if p == b"fn".to_vec())
         );
         host.close().await;
     }
@@ -2521,7 +2531,7 @@ mod tests {
         host.on_request(
             1,
             1,
-            Call {
+            RpcRequest {
                 method: "/example.Echo/Echo".into(),
                 payload: vec![],
                 timeout_ms: 5000,
@@ -2561,7 +2571,7 @@ mod tests {
         host.on_request(
             1,
             1,
-            Call {
+            RpcRequest {
                 method: "/example.Echo/Echo".into(),
                 payload: vec![],
                 timeout_ms: 5000,
@@ -2603,7 +2613,7 @@ mod tests {
         host.on_request(
             1,
             1,
-            Call {
+            RpcRequest {
                 method: "/example.Echo/Echo".into(),
                 payload: vec![],
                 timeout_ms: 5000,
@@ -2669,13 +2679,13 @@ mod tests {
         let req = Frame {
             version: 1,
             request_id: 7,
-            body: Some(Body::Call(Call {
+            body: Some(Body::Request(RpcRequest {
                 method: "/example.Echo/Echo".into(),
                 payload: vec![],
                 timeout_ms: 100,
             })),
         }
-        .fixture_bytes();
+        .encode_to_vec();
         host.inject(&req).await;
         assert!(host.conn.is_closed());
     }
@@ -2693,32 +2703,31 @@ mod tests {
         );
         host.inject(&hello_frame(1, 1, vec![])).await;
         let _ready = wrx.recv().await.unwrap();
-        let call = |id, method: &str, payload| {
-            Frame {
-                version: 1,
-                request_id: id,
-                body: Some(Body::Call(Call {
-                    method: method.into(),
-                    payload,
-                    timeout_ms: 100,
-                })),
-            }
-            .fixture_bytes()
+        let call = |id, method: &str, payload| Frame {
+            version: 1,
+            request_id: id,
+            body: Some(Body::Request(RpcRequest {
+                method: method.into(),
+                payload,
+                timeout_ms: 100,
+            })),
         };
-        let overhead = call(9, "nope", vec![]).len();
-        let bad = call(9, "nope", vec![0; syntra_core::MAX_FRAME_BYTES - overhead]);
-        assert_eq!(bad.len(), syntra_core::MAX_FRAME_BYTES);
-        for (id, bytes, code) in [
-            (9, bad, ErrorCode::InvalidArgument),
-            (10, call(10, UNKNOWN, vec![]), ErrorCode::Unimplemented),
+        // Measure with full-width length varints so the original frame is exactly at the bound.
+        let max = syntra_core::MAX_FRAME_BYTES;
+        let overhead = call(9, "nope", vec![0; max]).encoded_len() - max;
+        let bad = call(9, "nope", vec![0; max - overhead]);
+        assert_eq!(bad.encoded_len(), max);
+        for (frame, code) in [
+            (bad, ErrorCode::InvalidArgument),
+            (call(10, UNKNOWN, vec![]), ErrorCode::Unimplemented),
         ] {
-            host.inject(&bytes).await;
-            assert_eq!(*host.highwater.lock().unwrap(), id);
+            host.inject(&frame.encode_to_vec()).await;
+            assert_eq!(*host.highwater.lock().unwrap(), frame.request_id);
             let out = wrx.recv().await.expect("terminal result");
             let res = decode_frame(&out, ValidationContext::active(1)).unwrap();
-            assert_eq!(res.request_id, id);
-            assert!(matches!(res.body, Some(Body::Result(CallResult {
-                outcome: Some(syntra_core::wire::call_result::Outcome::Error(e)),
+            assert_eq!(res.request_id, frame.request_id);
+            assert!(matches!(res.body, Some(Body::Result(RpcResult {
+                outcome: Some(syntra_core::proto::rpc_result::Outcome::Error(e)),
             })) if e.code == code.as_i32()));
         }
         assert_eq!(host.state().await, ConnectionState::Active);
@@ -2754,7 +2763,7 @@ mod tests {
                         .on_request(
                             id,
                             1,
-                            Call {
+                            RpcRequest {
                                 method: "/example.Echo/Echo".into(),
                                 payload: vec![],
                                 timeout_ms: 5000,
@@ -2770,8 +2779,8 @@ mod tests {
                 let frame = decode_frame(&bytes, ValidationContext::active(1)).unwrap();
                 assert!(matches!(
                     frame.body,
-                    Some(Body::Result(CallResult {
-                        outcome: Some(syntra_core::wire::call_result::Outcome::Payload(_))
+                    Some(Body::Result(RpcResult {
+                        outcome: Some(syntra_core::proto::rpc_result::Outcome::Payload(_))
                     }))
                 ));
                 window.add_permits(1);
@@ -2802,7 +2811,7 @@ mod tests {
         host.on_request(
             1,
             1,
-            Call {
+            RpcRequest {
                 method: "/example.Test/Wait".into(),
                 payload: vec![],
                 timeout_ms: 5000,
@@ -2818,8 +2827,8 @@ mod tests {
             .unwrap();
         let frame = decode_frame(&bytes, ValidationContext::active(1)).unwrap();
         match frame.body {
-            Some(Body::Result(CallResult {
-                outcome: Some(syntra_core::wire::call_result::Outcome::Error(e)),
+            Some(Body::Result(RpcResult {
+                outcome: Some(syntra_core::proto::rpc_result::Outcome::Error(e)),
             })) => assert_eq!(e.code, ErrorCode::Cancelled.as_i32()),
             other => panic!("expected CANCELLED result, got {other:?}"),
         }

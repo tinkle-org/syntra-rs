@@ -1,7 +1,6 @@
 //! Request-wide local caps through the real bounded host admission path.
 use super::*;
 use crate::elapsed::{ElapsedClock, ElapsedDeadline, ElapsedSource};
-use crate::frame_fixture::FrameFixture;
 use std::sync::atomic::AtomicU64;
 
 /// Advance trusted elapsed time without sleeping or blocking a callback.
@@ -284,7 +283,7 @@ async fn invalid_envelopes_methods_and_recovery_never_reach_classifier() {
     host.ingest(&request(7, "invalid", 1000)).await;
     error(result(&mut writer, 7).await, ErrorCode::InvalidArgument);
     let mut malformed = call(8);
-    malformed.push(0); // bytes after the complete call
+    malformed.extend([0x62, 0]);
     host.ingest(&malformed).await;
     assert_eq!(policy.selections.load(Ordering::SeqCst), 0);
     host.ingest(&request(9, "/syntra.v1.UpdateRecovery/Unknown", 1000))
@@ -295,13 +294,13 @@ async fn invalid_envelopes_methods_and_recovery_never_reach_classifier() {
         &Frame {
             version: 1,
             request_id: 10,
-            body: Some(Body::Call(Call {
+            body: Some(Body::Request(RpcRequest {
                 method: "/example.Echo/Echo".into(),
                 payload: vec![0; syntra_core::MAX_FRAME_BYTES],
                 timeout_ms: 1000,
             })),
         }
-        .fixture_bytes(),
+        .encode_to_vec(),
     )
     .await;
     assert!(host.is_closed());

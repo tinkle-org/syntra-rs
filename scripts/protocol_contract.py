@@ -81,6 +81,8 @@ def verify_independent(rows, reference):
 
 def verify(root=ROOT):
     contract = read_json(root, 'protocol-contract.json')
+    require((contract['encoding'], contract['schema']) == ('Protobuf', 'proto/syntra/v1'),
+            'unexpected envelope encoding or schema directory')
     fixture = read_json(root, FIXTURES / 'syntra-1.0-context.json')
     cases = read_json(root, FIXTURES / 'context-cases.json')
     coverage(contract, fixture, cases)
@@ -122,7 +124,7 @@ def verify(root=ROOT):
     record, = observations("record_fixture")
     require(any(row["carrier"] == 3 and row["context_hex"] == record["hex"] for row in rows), "record WSS fixture drift")
     return {"kind": "compiled_source_encoding_agreement_not_full_crate_or_carrier_execution",
-            "protocol": contract["protocol"], "carriers": sorted(cases), "contexts": len(rows),
+            "protocol": contract["protocol"], "encoding": contract["encoding"], "carriers": sorted(cases), "contexts": len(rows),
             "negative_recipes": len(negatives), "bindings": binding_sources(root, contract),
             "record_fixture_bounds": record_fixture_bounds(root, contract)}
 

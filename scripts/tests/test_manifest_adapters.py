@@ -124,24 +124,33 @@ class AdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'lacks an oracle'):
                 adapters.request_for('wss-unknown-field')
 
-    def test_fixture_encoder_preserves_unknown_field_and_empty_selection(self):
+    def test_fixture_encoder_matches_historical_request_vectors(self):
+        corpus = adapters.load_yaml((adapters.ROOT / adapters.FIXTURES / 'protobuf-vectors.yaml').read_bytes())
+        gold = {row['id']: row for row in corpus['vectors']}
         frame = self.request['scenario']['input']['frames'][0]
-        self.assertTrue(adapters.frame_bytes(frame).endswith(bytes.fromhex('5a010000007800')))
-        frame = {**frame, 'payload_b64': '', 'unknown_fields': []}
-        self.assertIn(bytes.fromhex('020000000003'), adapters.frame_bytes(frame))
+        for id_, vector in [('GOLD-PROT-UNKNOWN-FIELD-01', {**frame, 'payload_b64': 'aGVsbG8='}),
+                            ('GOLD-PROT-REQ-EMPTY-01', {**frame, 'request_id': 13, 'payload_b64': '', 'unknown_fields': []})]:
+            with self.subTest(id=id_):
+                self.assertEqual(adapters.frame_bytes(vector).hex(), gold[id_]['frame_hex'])
+        with self.assertRaisesRegex(ValueError, 'unreviewed unknown-field'):
+            adapters.frame_bytes({**frame, 'unknown_fields': [{**frame['unknown_fields'][0], 'wire_type': 0}]})
         with self.assertRaises(ValueError):
             adapters.frame_bytes({**frame, 'unreviewed': True})
 
+    def test_ready_stimulus_is_the_unprefixed_hello(self):
+        expected = (adapters.ROOT / adapters.FIXTURES / 'ws-no-length-prefix.hex').read_text().strip()
+        self.assertEqual(adapters.request_for('wss-ready')['frames_hex'], [expected])
+
     def test_zero_or_missing_timeout_omits_the_wire_field(self):
         frame = {'request_id': 1, 'body': 'request', 'method': '/a/B', 'payload_b64': '/wA='}
-        envelope = '01000000 0100000000000000 '
-        method_payload = '01 04000000 2f612f42 02 02000000 ff00 '
-        for timeout, lengths, tail in [({}, '15000000 0c 11000000 ', '00'),
-                                      ({'timeout_ms': 0}, '15000000 0c 11000000 ', '00'),
-                                      ({'timeout_ms': 500}, '1a000000 0c 16000000 ', '03 f4010000 00')]:
+        for timeout, length, tail in [({}, '0a', ''), ({'timeout_ms': 0}, '0a', ''),
+                                      ({'timeout_ms': 500}, '0d', '18f403')]:
             with self.subTest(timeout=timeout):
                 self.assertEqual(adapters.frame_bytes({**frame, **timeout}),
-                                 bytes.fromhex(envelope + lengths + method_payload + tail))
+                                 bytes.fromhex('0801100162' + length + '0a042f612f421202ff00' + tail))
+        for invalid in (-1, 2**32, True):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, 'uint32'):
+                adapters.frame_bytes({**frame, 'timeout_ms': invalid})
 
     def test_payload_variants_are_correlated_results_of_only_the_declared_sends(self):
         request = adapters.request_for('wss-payloads')
@@ -172,6 +181,16 @@ class AdapterTests(unittest.TestCase):
             adapters.validate_result(request, result)
         del error['message']
         with self.assertRaisesRegex(ValueError, 'missing wire diagnostic'):
+            adapters.validate_result(request, result)
+
+    def test_internal_error_requires_the_public_wire_diagnostic(self):
+        request = adapters.request_for('wss-internal-error')
+        result = self.result(request)
+        error = {'code': 'INTERNAL', 'message': 'operation failed'}
+        result['observation']['frames'] = [{'request_id': 7, 'body': 'result', 'error': error}]
+        adapters.validate_result(request, result)
+        error['message'] = 'another diagnostic'
+        with self.assertRaisesRegex(ValueError, 'error message mismatch'):
             adapters.validate_result(request, result)
 
     def run_fake(self, text, returncode=0, artifact=True, tamper=None):

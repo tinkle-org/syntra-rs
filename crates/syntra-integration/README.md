@@ -4,8 +4,10 @@
 
 `syntra-integration` is an unpublished Docker fixture peer and connectivity
 test package. Its current harness is `tests/syntra_containers.rs`. Maintain
-the peer and its tests together; a successful run is same-implementation
-connectivity evidence, not a conformance verdict.
+the peer and its tests together. Both ends use this checkout's committed prost
+bindings for [`syntra.v1`](../../proto/syntra/v1). A successful run checks
+same-implementation connectivity, not compatibility with #54 peers or
+independent protocol conformance.
 
 SDK-owned tests and tooling must run without another SDK checkout, toolchain or
 release. Keep developer experiments and their evidence in a developer-local cache

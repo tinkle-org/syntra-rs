@@ -1,4 +1,4 @@
-//! Bebop wire adapter for the negotiated update/recovery service.
+//! Protobuf wire adapter for the negotiated update/recovery service.
 //!
 //! Host configuration attaches this binding to admitted Core RPCs and a managed
 //! notification worker. Business semantics and durable provider history remain

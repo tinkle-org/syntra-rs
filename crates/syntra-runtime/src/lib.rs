@@ -252,6 +252,3 @@ mod tests {
         assert_eq!(out, b"hello");
     }
 }
-#[cfg(test)]
-#[path = "../tests/support/frame.rs"]
-mod frame_fixture;

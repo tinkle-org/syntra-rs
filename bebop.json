@@ -1,6 +1,0 @@
-{
-  "include": ["schemas/v1/syntra.bop"],
-  "generators": {
-    "rust": { "outFile": "crates/syntra-core/src/generated/syntra.rs" }
-  }
-}

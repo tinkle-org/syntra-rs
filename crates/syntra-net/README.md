@@ -20,6 +20,9 @@ syntra-net = { path = "../syntra-rs/crates/syntra-net", default-features = false
 ```
 
 Use matching `syntra-core` and `syntra-runtime` dependencies from the same source.
+Upgrade clients and hosts together when moving from #54's Bebop encoding.
+TCP and WebSocket both carry the Protobuf envelope; wire version 1 does not
+negotiate between the two encodings.
 
 `syntra_net::tcp::connect` establishes an encrypted connection and returns a
 `ClientHandle` exposing the runtime `Initiator`. Provision the server public key,

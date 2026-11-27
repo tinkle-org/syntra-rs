@@ -1,8 +1,8 @@
 {
   "protocol": "Syntra 1.0",
   "core_wire_version": 1,
-  "schema": "schemas/v1",
-  "encoding": "Bebop",
+  "schema": "proto/syntra/v1",
+  "encoding": "Protobuf",
   "domain_ascii": "syntra.1.0",
   "websocket_endpoint": "/syntra/1.0/ws",
   "websocket_subprotocol": "syntra.1.0",

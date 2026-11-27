@@ -1,13 +1,16 @@
 //! WebSocket control bytes and frame bounds are checked against `fixtures/transport.yaml`.
-//! `bebop` contains independent SDK-local envelope examples, not carrier records.
+//! The Protobuf examples below are serialized envelopes, not protected records.
 
-/// Historical hello bytes, retained as a rejection case for the Bebop decoder.
-pub fn no_length_prefix_rejected() -> Vec<u8> {
-    hex_to_bytes(include_str!("fixtures/ws-no-length-prefix.hex").trim_end())
-}
+/// Valid CONNECTED-state anonymous hello, without a stream length prefix (VEC-WS-009).
+pub const NO_LENGTH_PREFIX_GOOD_HEX: &str = "0801520408011001";
 
-#[path = "fixtures/bebop-envelope.rs"]
-pub mod bebop;
+/// Appending this length-delimited field 90 leaves the logical frame unchanged.
+pub const UNKNOWN_FIELD_SUFFIX_HEX: &str = "d2050178";
+
+/// Historical length-prefixed and suffixed variants are not valid envelopes.
+pub const VARINT_PREFIXED_HEX: &str = "080801520408011001";
+pub const U32_PREFIXED_HEX: &str = "000000080801520408011001";
+pub const SUFFIXED_HEX: &str = "080152040801100100";
 
 /// Ping wire bytes, host -> client (VEC-WS-005, FIN=1, opcode 0x9).
 pub const PING_WIRE_HEX: &str = "890670696e672d31";

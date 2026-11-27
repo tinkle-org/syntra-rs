@@ -30,16 +30,16 @@
 //!   gate. A previously selected result survives later expiry and teardown;
 //!   unvalidated buffered bytes do not win retroactively.
 
-#[cfg(test)]
-use crate::frame_fixture::FrameFixture;
 use web_time::Duration;
 
+#[cfg(test)]
+use prost::Message;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 
 use syntra_core::{
-    wire::frame::Body, Call, Cancel, ClientHello, ConnectionState, ErrorCode, Frame,
-    PendingOutcome, StateEvent, SyntraError, ValidationContext,
+    encode_frame, proto::frame::Body, Cancel, ClientHello, ConnectionState, ErrorCode, Frame,
+    PendingOutcome, RpcRequest, StateEvent, SyntraError, ValidationContext,
 };
 
 use crate::connection::{Connection, ConnectionConfig, HandshakeDone, Role, Shared};
@@ -293,7 +293,7 @@ impl Initiator {
             request_id: 0,
             body: Some(Body::Hello(hello)),
         };
-        let bytes = syntra_core::encode_frame(
+        let bytes = encode_frame(
             &frame,
             ValidationContext::pre_handshake(ConnectionState::Connected),
         )?;
@@ -389,7 +389,7 @@ impl Initiator {
         }
         // CONF-RPC-010 permits one narrowly defined local correlation failure:
         // an otherwise valid result envelope with zero raw outcomes. Never
-        // recover an ID from malformed or future union arms.
+        // recover an ID from malformed/duplicate/future raw choices via Prost.
         if let Some(id) = syntra_core::missing_result_outcome_id(raw, self.conn.ctx().await) {
             self.conn.shared.fail_rpc(
                 id,
@@ -400,7 +400,8 @@ impl Initiator {
             );
             return;
         }
-        // Correlation and envelope classification require structurally valid bytes.
+        // Correlation and envelope classification require structurally valid
+        // bytes: Prost alone merges duplicate oneofs and ignores reserved tags.
         if let Ok(frame) = syntra_core::decode_frame_structure(raw) {
             if matches!(frame.body, Some(Body::Hello(_)) | Some(Body::Ready(_)))
                 || Some(frame.version) != self.conn.negotiated_version().await
@@ -410,7 +411,7 @@ impl Initiator {
             }
             if let Some(Body::Result(ref result)) = frame.body {
                 let invalid_outcome = result.outcome.is_none()
-                    || matches!(result.outcome, Some(syntra_core::wire::call_result::Outcome::Error(ref error)) if error.code == 0);
+                    || matches!(result.outcome, Some(syntra_core::proto::rpc_result::Outcome::Error(ref error)) if error.code == 0);
                 if frame.request_id != 0 && invalid_outcome {
                     self.conn.shared.fail_rpc(
                         frame.request_id,
@@ -456,7 +457,7 @@ impl Initiator {
         let kind = match &frame.body {
             Some(Body::Hello(_)) => "hello",
             Some(Body::Ready(_)) => "ready",
-            Some(Body::Call(_)) => "request",
+            Some(Body::Request(_)) => "request",
             Some(Body::Result(_)) => "result",
             Some(Body::Cancel(_)) => "cancel",
             Some(Body::Notification(_)) => "notification",
@@ -618,7 +619,7 @@ impl Initiator {
         // Missing outcome was already rejected by validation; unknown ids
         // are ignored with a diagnostic (no error storm).
         let withdrawal = matches!(&result.outcome,
-            Some(syntra_core::wire::call_result::Outcome::Error(error))
+            Some(syntra_core::proto::rpc_result::Outcome::Error(error))
                 if error.code == ErrorCode::Unauthenticated as i32);
         let correlated = self.conn.shared.complete_rpc(frame.request_id, result);
         if withdrawal && correlated {
@@ -866,18 +867,13 @@ impl Initiator {
             let frame = Frame {
                 version,
                 request_id: id,
-                body: Some(Body::Call(Call {
+                body: Some(Body::Request(RpcRequest {
                     method: method.to_string(),
                     payload,
                     timeout_ms,
                 })),
             };
-            let bytes = syntra_core::encode_frame(&frame, ValidationContext::active(version))?;
-            if bytes.len() > syntra_core::MAX_FRAME_BYTES {
-                return Err(SyntraError::ResourceExhausted(
-                    "request exceeds maximum envelope size".to_string(),
-                ));
-            }
+            let bytes = encode_frame(&frame, ValidationContext::active(version))?;
             let permit = tokio::select! {
                 biased;
                 Ok(error) = &mut failure => return Err(error),
@@ -964,9 +960,7 @@ impl Initiator {
                         request_id: id,
                         body: Some(Body::Cancel(Cancel {})),
                     };
-                    if let Ok(bytes) =
-                        syntra_core::encode_frame(&frame, ValidationContext::active(version))
-                    {
+                    if let Ok(bytes) = encode_frame(&frame, ValidationContext::active(version)) {
                         let _ = self.conn.shared.writer.try_send(bytes);
                     }
                 }
@@ -1040,7 +1034,7 @@ impl Initiator {
             body: Some(Body::Cancel(Cancel {})),
         };
         // Send best-effort; ignore transport errors for unknown ids.
-        let bytes = syntra_core::encode_frame(&frame, ValidationContext::active(version))?;
+        let bytes = encode_frame(&frame, ValidationContext::active(version))?;
         let _state = self.conn.shared.state.read().await;
         if self.conn.is_closed() || self.conn.writer_is_fenced() {
             return Ok(());
@@ -1181,8 +1175,8 @@ fn map_outcome(method: &str, outcome: PendingOutcome) -> Result<Vec<u8>, SyntraE
             "{method} lost: transport closed (outcome unknown)"
         ))),
         PendingOutcome::Result(res) => match res.outcome {
-            Some(syntra_core::wire::call_result::Outcome::Payload(b)) => Ok(b.to_vec()),
-            Some(syntra_core::wire::call_result::Outcome::Error(e)) => {
+            Some(syntra_core::proto::rpc_result::Outcome::Payload(b)) => Ok(b.to_vec()),
+            Some(syntra_core::proto::rpc_result::Outcome::Error(e)) => {
                 let (code, raw) = ErrorCode::from_i32_lossy(e.code);
                 Err(SyntraError::Rpc {
                     code,
@@ -1201,8 +1195,8 @@ fn map_outcome(method: &str, outcome: PendingOutcome) -> Result<Vec<u8>, SyntraE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use syntra_core::wire::call_result::Outcome;
-    use syntra_core::wire::{CallResult, RpcError as WireError};
+    use syntra_core::proto::rpc_result::Outcome;
+    use syntra_core::proto::{RpcError as ProtoError, RpcResult};
 
     #[tokio::test]
     async fn concurrent_handshake_does_not_replace_original_waiter() {
@@ -1379,7 +1373,7 @@ mod tests {
         Frame {
             version,
             request_id: 0,
-            body: Some(Body::Ready(syntra_core::wire::ServerReady {
+            body: Some(Body::Ready(syntra_core::proto::ServerReady {
                 connection_id: "conn-test-1".to_string(),
             })),
         }
@@ -1403,14 +1397,14 @@ mod tests {
         // Collect the two request ids.
         let b1 = wrx.recv().await.unwrap();
         let b2 = wrx.recv().await.unwrap();
-        let f1 = syntra_core::decode_frame_structure(&*b1).unwrap();
-        let f2 = syntra_core::decode_frame_structure(&*b2).unwrap();
+        let f1 = Frame::decode(&*b1).unwrap();
+        let f2 = Frame::decode(&*b2).unwrap();
         assert_ne!(f1.request_id, f2.request_id);
         // Complete second first (out-of-order legal; FIFO must not be assumed).
         c.inject_frame(Frame {
             version: 1,
             request_id: f2.request_id,
-            body: Some(Body::Result(CallResult {
+            body: Some(Body::Result(RpcResult {
                 outcome: Some(Outcome::Payload(b"B".to_vec())),
             })),
         })
@@ -1418,7 +1412,7 @@ mod tests {
         c.inject_frame(Frame {
             version: 1,
             request_id: f1.request_id,
-            body: Some(Body::Result(CallResult {
+            body: Some(Body::Result(RpcResult {
                 outcome: Some(Outcome::Payload(b"A".to_vec())),
             })),
         })
@@ -1433,7 +1427,7 @@ mod tests {
         c.inject_frame(Frame {
             version: 1,
             request_id: 9999,
-            body: Some(Body::Result(CallResult {
+            body: Some(Body::Result(RpcResult {
                 outcome: Some(Outcome::Payload(vec![].into())),
             })),
         })
@@ -1464,12 +1458,12 @@ mod tests {
             async move { c.call("/example.KV/Get", b"k".to_vec(), 5000).await }
         });
         let b = wrx.recv().await.unwrap();
-        let f = syntra_core::decode_frame_structure(&*b).unwrap();
+        let f = Frame::decode(&*b).unwrap();
         c.inject_frame(Frame {
             version: 1,
             request_id: f.request_id,
-            body: Some(Body::Result(CallResult {
-                outcome: Some(Outcome::Error(WireError {
+            body: Some(Body::Result(RpcResult {
+                outcome: Some(Outcome::Error(ProtoError {
                     code: 5, // NOT_FOUND
                     message: "missing".into(),
                 })),
@@ -1522,7 +1516,7 @@ mod tests {
         c.inject_frame(Frame {
             version: 1,
             request_id: 7,
-            body: Some(Body::Result(CallResult {
+            body: Some(Body::Result(RpcResult {
                 outcome: Some(Outcome::Payload(vec![].into())),
             })),
         })
@@ -1546,11 +1540,11 @@ mod tests {
             let frame = Frame {
                 version: 1,
                 request_id: 0,
-                body: Some(Body::Notification(syntra_core::wire::Notification {
+                body: Some(Body::Notification(syntra_core::proto::Notification {
                     payload,
                 })),
             };
-            c.ingest(&frame.fixture_bytes()).await;
+            c.ingest(&frame.encode_to_vec()).await;
         }
         let (dropped, dropped_bytes) = c.notification_loss();
         assert_eq!(dropped, 1);
@@ -1565,7 +1559,7 @@ mod tests {
         Frame {
             version: 1,
             request_id: 0,
-            body: Some(Body::Notification(syntra_core::wire::Notification {
+            body: Some(Body::Notification(syntra_core::proto::Notification {
                 payload: payload.to_vec(),
             })),
         }

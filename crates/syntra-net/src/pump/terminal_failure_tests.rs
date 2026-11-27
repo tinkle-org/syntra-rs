@@ -144,7 +144,7 @@ async fn fatal_reader_defeats_retained_receipt(fault: usize) {
         &Frame {
             version: 1,
             request_id: 1,
-            body: Some(Body::Call(Call {
+            body: Some(Body::Request(RpcRequest {
                 method: "/example.Authority/Retire".into(),
                 payload: vec![],
                 timeout_ms: 2000,
@@ -589,7 +589,7 @@ async fn actual_writer_final_gate(deny_final: bool) {
         &Frame {
             version: 1,
             request_id: 1,
-            body: Some(Body::Call(Call {
+            body: Some(Body::Request(RpcRequest {
                 method: "/example.Authority/Retire".into(),
                 payload: vec![],
                 timeout_ms: 2000,

@@ -14,13 +14,15 @@ the three checks run sequentially. Setup and compilation are additional.
 Rust 1.89 builds the CLI; the dated nightly builds the instrumented targets
 from this workspace's `Cargo.lock`, not the production workspace lockfile.
 
-Each `seeds/*.hex` line is one synthetic input. Frame seeds exercise Bebop
-envelopes, including both success and error results. Recovery seeds target the
-service payload decoder, not the outer envelope. Stream seeds exercise
+Each `seeds/*.hex` line is one synthetic input. Frame seeds exercise the
+bounded Protobuf envelope decoder. Recovery seeds target the service's own
+Protobuf payload decoder, not the outer `Frame`. Both use the local
+[`syntra.v1` schema](../proto/syntra/v1). Stream seeds exercise
 byte-at-a-time and coalesced delivery of two nonempty bodies.
 The stream target varies the chunk width and frame boundary and checks
 partial state, output order and contents. Frame and recovery targets check
-that accepted values survive encoding and decoding in the same context.
+that accepted values survive encoding and decoding in the same context; they
+compare decoded values, not byte-for-byte identity with the fuzz input.
 
 Inputs are capped at 4 KiB. Only the reviewed seeds persist: mutations and
 runtime logs stay in private temporary directories and are discarded after

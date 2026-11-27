@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package syntra.v1;
+
+option go_package = "github.com/tinklehq/syntra/bindings/go/gen/syntra/v1;syntrav1";
+
+// ClientHello presents opaque credentials; no human-account model is assumed
+// (SNTR-AUTH-001/002, SNTR-ASEC-003/004). Public deployments require a verified
+// secure transport before presentation (SNTR-TSEC-001/004/009).
+message ClientHello {
+  // min_version is the nonzero minimum supported version (SNTR-HS-020).
+  uint32 min_version = 1;
+  // max_version is the nonzero maximum, at least min_version (SNTR-HS-020).
+  uint32 max_version = 2;
+  // credential is sensitive opaque bytes, not URL metadata. Generated debug,
+  // string, JSON, or reflection output can expose it: do not log such output
+  // (SNTR-ASEC-001/003). Empty is an attempt subject to host policy.
+  bytes credential = 3;
+}
+
+// ServerReady confirms acceptance and establishes the connection's principal
+// binding (SNTR-HS-004, SNTR-AUTH-007). The selected version is Frame.version.
+// There is no separate ServerHello or resumable-session handle. Capability/limit
+// negotiation and typed handshake rejection need an approved binding (RFC 0001).
+message ServerReady {
+  // connection_id is an opaque UTF-8 diagnostic identifier, never an
+  // authenticator or resume token (SNTR-SESS-002, SNTR-ASEC-010).
+  string connection_id = 1;
+}

@@ -9,8 +9,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use syntra_core::wire::{recovery_batch_trailer::Outcome, recovery_notification::Notification};
-use syntra_core::wire::{RecoveryBatch, RecoveryBatchTrailer, RecoveryNotification};
+use prost::Message;
+use syntra_core::proto::{recovery_batch_trailer::Outcome, recovery_notification::Notification};
+use syntra_core::proto::{RecoveryBatch, RecoveryBatchTrailer, RecoveryNotification};
 use tokio::sync::Notify;
 
 use super::super::wire::{codec, ProviderError, RecoveryLimits};
@@ -75,7 +76,7 @@ impl Slot {
             subscription_handle: handle.to_vec(),
             generation: self.generation,
             boundary_checkpoint: Vec::new(),
-            outcome: Some(Outcome::Terminated),
+            outcome: Some(Outcome::Terminated(true)),
             terminate_reason: b"local-queue-exhausted".to_vec(),
         }));
     }
@@ -183,7 +184,7 @@ impl RecoveryInbox {
         match n {
             Notification::Batch(batch) => {
                 // Include a conservative core Notification/Frame overhead;
-                // charge the complete encoded notification.
+                // unknown fields are charged at their original encoded size.
                 let bytes = payload.len().saturating_add(32);
                 if slot.bytes.saturating_add(bytes) > self.limits.queued_bytes_per_stream
                     || total.saturating_add(bytes) > self.limits.queued_bytes_per_connection
@@ -208,7 +209,7 @@ impl RecoveryInbox {
                 }
             }
             Notification::Trailer(ref trailer) => match trailer.outcome {
-                Some(Outcome::CatchupComplete) => {
+                Some(Outcome::CatchupComplete(true)) => {
                     if slot
                         .completion
                         .as_ref()
@@ -222,7 +223,7 @@ impl RecoveryInbox {
                 _ => {
                     slot.clear_data();
                     slot.revision = slot.revision.saturating_add(1);
-                    slot.fenced = !matches!(trailer.outcome, Some(Outcome::SnapshotRequired));
+                    slot.fenced = !matches!(trailer.outcome, Some(Outcome::SnapshotRequired(true)));
                     slot.terminal = Some(n);
                 }
             },
@@ -336,10 +337,7 @@ impl RecoveryInbox {
         if slot.fenced || !slot.registered || !slot.replay.is_empty() {
             return Err(ProviderError::FailedPrecondition);
         }
-        let bytes = batches
-            .iter()
-            .map(|b| codec::batch_size(b) + 40)
-            .sum::<usize>();
+        let bytes = batches.iter().map(|b| b.encoded_len() + 40).sum::<usize>();
         if slot.bytes.saturating_add(bytes) > self.limits.queued_bytes_per_stream
             || total.saturating_add(bytes) > self.limits.queued_bytes_per_connection
             || slot.data.len() + batches.len() + usize::from(slot.leased != 0)
@@ -358,7 +356,7 @@ impl RecoveryInbox {
         }
         slot.bytes += bytes;
         slot.replay.extend(batches.into_iter().map(|batch| Queued {
-            bytes: codec::batch_size(&batch) + 40,
+            bytes: batch.encoded_len() + 40,
             batch,
         }));
         drop(s);

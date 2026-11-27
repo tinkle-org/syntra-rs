@@ -11,10 +11,16 @@ runtime scheduling and socket policy. Encryption is integral to the protocol. Se
 
 The implementation is experimental and distributed as release-candidate crates.
 No formal conformance or independent security-review verdict is claimed.
-`syntra-rs` is the source of truth for the protocol. Its Bebop schemas are in
-`schemas/v1/*.bop`; the Rust implementation defines validation, session
-behavior, record protection, and carrier bindings. See the
-[schema conventions](CONTRIBUTING.md#schema-and-generated-code) before changing the wire format.
+`syntra-rs` owns its wire contract. The historical Protobuf schema from this
+repository's `b99f56b` revision is in [`proto/syntra/v1`](proto/syntra/v1).
+`syntra_core::proto` exposes its prost types, including `Frame`, `RpcRequest`,
+and `RpcResult`. The Rust implementation defines validation, session behavior,
+record protection, and carrier bindings.
+
+**Upgrading from [#54](https://github.com/tinkle-org/syntra-rs/pull/54):** the
+Bebop and Protobuf encodings are incompatible, but both use wire version **1**.
+Coordinate the switch on clients, hosts, and any application-owned frame pumps.
+There is no format negotiation, dual decoder, or fallback for a mixed deployment.
 
 Use **Rust 1.89.0** for production builds and current verification. The
 crate MSRV floor is **1.89**; it is a build compatibility constraint, not a
@@ -23,7 +29,7 @@ security-patched toolchain. Current dependency pins are:
 
 | Dependency | Version |
 | --- | --- |
-| `bebop` | =3.2.3 |
+| `prost` | =0.14.6 |
 | `snow` | =0.10.0 |
 | `getrandom` | 0.3 |
 | `tokio` | 1 |
@@ -38,8 +44,7 @@ Each package is released separately on crates.io, not as a workspace bundle.
 ## Default: native async workspace
 
 The default build needs no CGO or native library beyond the Rust toolchain.
-`cargo build` fetches crates sources only; this repository never downloads
-native binaries.
+`cargo build` uses the committed bindings; it does not download a schema compiler.
 
 ```sh
 export RUSTUP_TOOLCHAIN=1.89.0
@@ -338,11 +343,11 @@ they do not select a different encryption protocol.
   execution lease until it stops. See
   [CONNECTION.md](CONNECTION.md) and the source contracts for clocks, cancellation requirements and
   revocation checks.
-- Decode peer input with `syntra_core::decode_frame(bytes, ctx)`. The codec
-  checks lengths and union boundaries before dispatch. An unknown Bebop
-  message field ends interpretation of that message's bounded tail; it does
-  not permit trailing bytes after the frame or dispatch of an unknown union
-  arm. Application payloads remain opaque to the envelope codec.
+- Decode peer input with `syntra_core::decode_frame(bytes, ctx)`, not raw
+  `prost::Message::decode`. Core checks the encoded size, nesting, and raw
+  `oneof` occurrences before prost can collapse duplicate alternatives. It
+  validates the frame against connection state before dispatch. Application
+  payloads remain opaque to the envelope codec.
 - Request IDs are permanently non-reused and ordered at FIFO enqueue/emission;
   host high-water violations close without an offending-ID result. Pending
   terminal gates check the deadline first; previously selected outcomes stay
@@ -407,7 +412,8 @@ The typed policy replaces the ordinary connection guard; combining it with an
 independent generic guard is refused. The runtime fences ordinary traffic and
 retires actual recovery attachments before transition. Raw/custom record, WASM,
 FFI, WS/WSS, and HTTP/HTTPS paths do not support terminal effects. Existing clients
-parse the same `CallResult`, with no new wire message or peer option. See
+using the Protobuf wire format parse the ordinary `RpcResult`, with no new
+wire message or peer option. See
 [API, support, tests, and evidence limits](TERMINAL_RECEIPT_DESIGN.md).
 
 ## Native FFI
@@ -460,9 +466,9 @@ commands. Container tooling is documented in
 [crates/syntra-integration/README.md](crates/syntra-integration/README.md)
 and is not run by root `cargo test --workspace`.
 
-For wire changes, use `bebopc` **3.2.3** with `bebop.json` at the repository
-root. See [schema and generated code](CONTRIBUTING.md#schema-and-generated-code)
-for the inputs and review procedure. Normal builds use committed bindings.
+Normal builds use committed Rust bindings; they do not run Buf. For schema
+changes, see [schema and generated code](CONTRIBUTING.md#schema-and-generated-code)
+for the pinned Buf CLI and plugin, regeneration command, and drift check.
 
 Run from the repository root:
 

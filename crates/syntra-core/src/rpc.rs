@@ -5,7 +5,7 @@
 //!   rule); malformed methods yield terminal `INVALID_ARGUMENT` for the
 //!   affected RPC — the connection stays usable, no socket is closed;
 //! - `request_id` is the `uint64` correlation field of the enclosing
-//!   `Frame` (not a field of `Call`), initiator-chosen, nonzero,
+//!   `Frame` (not a field of `RpcRequest`), initiator-chosen, nonzero,
 //!   strictly increasing in request-Frame emission order, never reused on
 //!   that connection (accepted RFC 0004 D1; gaps are permitted);
 //! - the initiator serializes allocation and FIFO enqueue under its admission
@@ -26,9 +26,9 @@ use std::sync::{
 use tokio::sync::oneshot;
 
 use crate::error::{ErrorCode, SyntraError};
-use crate::wire::CallResult;
+use crate::proto::RpcResult;
 
-/// Validate a `Call.method` before sending or dispatching.
+/// Validate an `RpcRequest.method` before sending or dispatching.
 ///
 /// Wire syntax is canonical `/package.Service/Method`: leading slash,
 /// exactly two slashes, non-empty segments, ASCII printable excluding
@@ -134,7 +134,7 @@ impl Default for RequestIdAllocator {
 /// Outcome delivered to one waiter.
 #[derive(Debug)]
 pub enum PendingOutcome {
-    Result(CallResult),
+    Result(RpcResult),
     TransportLost,
 }
 
@@ -147,7 +147,7 @@ struct Slot {
 
 /// Bounded correlation table: each RPC uses a nonzero initiator-chosen
 /// `request_id` unique among concurrent RPCs. Exactly one terminal
-/// `CallResult` with the same id completes the RPC. `cancel` for
+/// `RpcResult` with the same id completes the RPC. `cancel` for
 /// unknown/completed ids is ignored; duplicate outstanding ids are
 /// rejected with `FAILED_PRECONDITION` while the original waiter keeps
 /// running; `result` for an unknown id is ignored with a diagnostic
@@ -207,7 +207,7 @@ impl PendingTable {
     /// Complete one RPC with its terminal `result`. Unknown ids are
     /// ignored with a diagnostic (no error storm). Returns true if a
     /// waiter existed.
-    pub fn complete(&self, id: u64, result: CallResult) -> bool {
+    pub fn complete(&self, id: u64, result: RpcResult) -> bool {
         let slot = self.inner.lock().unwrap().remove(&id);
         match slot {
             Some(s) => {

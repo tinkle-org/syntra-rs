@@ -6,9 +6,7 @@
 //! Fault injection is deterministic: a seeded counter decides drop/duplicate/
 //! truncate faults, so the same seed replays the same pattern.
 
-#[path = "support/frame.rs"]
-mod frame_fixture;
-use frame_fixture::FrameFixture;
+use prost::Message;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -93,8 +91,7 @@ impl FaultInjector {
 }
 
 fn hello_bytes() -> Vec<u8> {
-    use syntra_core::wire::frame::Body;
-    use syntra_core::wire::{ClientHello, Frame};
+    use syntra_core::proto::{frame::Body, ClientHello, Frame};
     Frame {
         version: 1,
         request_id: 0,
@@ -104,14 +101,13 @@ fn hello_bytes() -> Vec<u8> {
             credential: vec![].into(),
         })),
     }
-    .fixture_bytes()
+    .encode_to_vec()
 }
 
 /// Assert a decoded Result carries the expected request id and payload.
 /// This assertion alone says nothing about caller settlement or replay.
 fn assert_terminal_payload(frame_bytes: &[u8], expected: &[u8], request_id: u64) {
-    use syntra_core::wire::call_result::Outcome;
-    use syntra_core::wire::frame::Body;
+    use syntra_core::proto::{frame::Body, rpc_result::Outcome};
     let ctx = ValidationContext::active(1);
     let f = decode_frame(frame_bytes, ctx).expect("terminal must decode");
     assert_eq!(f.request_id, request_id, "terminal carries the delivery id");
@@ -418,8 +414,7 @@ async fn sc_oversize_handler_result_bounded() {
 
 #[tokio::test]
 async fn local_duplicate_id_violation_closes_without_same_id_result() {
-    use syntra_core::wire::frame::Body;
-    use syntra_core::wire::{Call, Frame};
+    use syntra_core::proto::{frame::Body, Frame, RpcRequest};
     let release = Arc::new(tokio::sync::Notify::new());
     let started = Arc::new(tokio::sync::Barrier::new(2));
     let dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -445,7 +440,7 @@ async fn local_duplicate_id_violation_closes_without_same_id_result() {
         blocking,
     );
     {
-        use syntra_core::wire::ClientHello;
+        use syntra_core::proto::ClientHello;
         let raw = Frame {
             version: 1,
             request_id: 0,
@@ -455,7 +450,7 @@ async fn local_duplicate_id_violation_closes_without_same_id_result() {
                 credential: vec![].into(),
             })),
         }
-        .fixture_bytes();
+        .encode_to_vec();
         host.ingest(&raw).await;
     }
     expect_ready(&mut wrx, "ready").await;
@@ -463,13 +458,13 @@ async fn local_duplicate_id_violation_closes_without_same_id_result() {
         Frame {
             version: 1,
             request_id: id,
-            body: Some(Body::Call(Call {
+            body: Some(Body::Request(RpcRequest {
                 method: "/example.Echo/Echo".into(),
                 payload: vec![].into(),
                 timeout_ms: 5000,
             })),
         }
-        .fixture_bytes()
+        .encode_to_vec()
     };
     host.ingest(&req(7)).await;
     // Local RFC 0004 D2 regression only, not a formal CONF-RPC-004 verdict.
@@ -518,8 +513,7 @@ async fn sc_close_after_completed_echo() {
 async fn sc_fault_injection_deterministic() {
     // Separate request, response and hello streams. Request retries here
     // are ordinary RPC retries, not durable delivery reconciliation.
-    use syntra_core::wire::frame::Body;
-    use syntra_core::wire::{Call, Frame};
+    use syntra_core::proto::{frame::Body, Frame, RpcRequest};
     let mut fi = FaultInjector::new(0x5EED1234);
     let mut resp_fi = FaultInjector::new(0xBE5E11);
     let mut hello_fi = FaultInjector::new(0xCAFE01);
@@ -536,13 +530,13 @@ async fn sc_fault_injection_deterministic() {
         let raw = Frame {
             version: 1,
             request_id: req_id,
-            body: Some(Body::Call(Call {
+            body: Some(Body::Request(RpcRequest {
                 method: "/example.Echo/Echo".into(),
                 payload: payload.clone().into(),
                 timeout_ms: 5000,
             })),
         }
-        .fixture_bytes();
+        .encode_to_vec();
         let sends = fi.transport_wrap(raw.clone());
         if sends.is_empty() {
             drops += 1;
@@ -573,7 +567,7 @@ async fn sc_fault_injection_deterministic() {
             let f = decode_frame(&resp, ctx).expect("valid");
             match f.body {
                 Some(Body::Result(r)) => {
-                    use syntra_core::wire::call_result::Outcome;
+                    use syntra_core::proto::rpc_result::Outcome;
                     match r.outcome {
                         Some(Outcome::Payload(p)) => {
                             assert_eq!(p, payload, "opaque payload preserved")
@@ -728,30 +722,41 @@ async fn sc_hello_faults_recover() {
 
 #[test]
 fn sc_wire_vectors_decode() {
-    use syntra_core::wire::frame::Body;
+    use syntra_core::proto::frame::Body;
     use syntra_core::ConnectionState;
-    for (hex, ctx) in [
+    // Read the two named records from the shared fixture, not a second copy of its bytes.
+    let corpus = include_str!("../../../tests/interoperability/fixtures/protobuf-vectors.yaml");
+    for (id, ctx) in [
         (
-            vectors::bebop::HELLO,
+            "GOLD-PROT-HELLO-01",
             ValidationContext::pre_handshake(ConnectionState::Connected),
         ),
-        (vectors::bebop::CALL, ValidationContext::active(1)),
+        ("GOLD-PROT-REQ-01", ValidationContext::active(1)),
     ] {
-        let bytes = vectors::hex_to_bytes(hex);
+        let mut records = corpus
+            .split("\n  - id: ")
+            .filter(|r| r.lines().next() == Some(id));
+        let record = records.next().expect("missing golden fixture");
+        assert!(records.next().is_none(), "duplicate golden fixture {id}");
+        let hex = record
+            .lines()
+            .find_map(|line| line.strip_prefix("    frame_hex: "))
+            .unwrap();
+        let bytes = vectors::hex_to_bytes(hex.trim_matches('"'));
         let frame = decode_frame(&bytes, ctx).unwrap();
         assert_eq!(frame.version, 1);
         match frame.body.unwrap() {
             Body::Hello(h) => {
                 assert_eq!((frame.request_id, h.min_version, h.max_version), (0, 1, 1));
-                assert_eq!(h.credential, [255, 0]);
+                assert_eq!(h.credential, b"opaque-test-credential-A");
             }
-            Body::Call(c) => {
-                assert_eq!(frame.request_id, 0x0102030405060708);
-                assert_eq!(c.method, "/a/B");
-                assert_eq!(c.timeout_ms, 0x11223344);
-                assert_eq!(c.payload, [255, 0]);
+            Body::Request(r) => {
+                assert_eq!(frame.request_id, 7);
+                assert_eq!(r.method, "/example.Echo/Echo");
+                assert_eq!(r.timeout_ms, 500);
+                assert_eq!(r.payload, b"hello");
             }
-            other => panic!("unexpected Bebop fixture {other:?}"),
+            other => panic!("unexpected Protobuf fixture {other:?}"),
         }
         assert!(decode_frame(&bytes[..bytes.len() - 1], ctx).is_err());
     }

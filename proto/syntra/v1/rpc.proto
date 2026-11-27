@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package syntra.v1;
+
+import "syntra/v1/errors.proto";
+
+option go_package = "github.com/tinklehq/syntra/bindings/go/gen/syntra/v1;syntrav1";
+
+// RpcRequest carries opaque application-defined data (SNTR-RPC-001/003/004/007).
+// Correlation belongs to Frame.request_id; operation keys remain inside payload.
+// No universal HTTP status fields or application service methods are declared.
+message RpcRequest {
+  // method is a canonical /package.Service/Method identifier (SNTR-RPC-001).
+  string method = 1;
+  // payload accepts arbitrary bytes, including empty/non-UTF-8 (SNTR-RPC-003).
+  bytes payload = 2;
+  // timeout_ms is a relative millisecond budget; zero selects the bounded host
+  // default. This existing scalar has implicit presence, not an absolute clock.
+  uint32 timeout_ms = 3;
+}
+
+// RpcResult is the published RPC response name (SNTR-RPC-002/006). Renaming it
+// RpcResponse would change schema identity and generated APIs; see RFC 0001.
+message RpcResult {
+  // outcome is selected even for a successful zero-byte result (SNTR-WIRE-007).
+  // Missing outcome is representable by codecs but is not protocol success.
+  oneof outcome {
+    // payload is opaque response data; selected empty bytes mean success.
+    bytes payload = 1;
+    // error is a failure with a nonzero code (SNTR-ERR-001/005).
+    RpcError error = 2;
+  }
+}
+
+// Cancel targets Frame.request_id; it is advisory, not rollback (SNTR-RPC-005).
+message Cancel {}

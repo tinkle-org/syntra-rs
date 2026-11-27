@@ -57,21 +57,33 @@ def canonical(value):
 
 
 def verify_transcriptions(root=ROOT):
-    """Check WS fixture inputs and handwritten constants, not runtime behavior."""
+    """Check local Protobuf and WS fixture inputs, not runtime behavior."""
+    corpus_origin = FIXTURES / "protobuf-vectors.yaml"
+    corpus = regular_file(root, corpus_origin)
+    # Pin the historical b99f56b blob, allowing checkout line endings only.
+    if digest(corpus.replace(b"\r\n", b"\n")) != "614e7ae45cd1739f3e0bc66b89b5d657ba607856104b59d73d93fbe8ade15360":
+        raise ValueError("historical Protobuf corpus drift")
+    gold = {row['id']: row for row in load_yaml(corpus)['vectors']}
+    unknown_suffix = gold['GOLD-PROT-UNKNOWN-FIELD-01']['frame_hex'].removeprefix(gold['GOLD-PROT-REQ-01']['frame_hex'])
     origin = FIXTURES / "transport.yaml"
     source = regular_file(root, origin)
     transport = load_yaml(source)
     fixtures = {row["id"]: row for row in transport["fixtures"]}
     if len(fixtures) != len(transport["fixtures"]):
         raise ValueError("duplicate transport fixture ID")
-    rejection_origin = FIXTURES / "ws-no-length-prefix.hex"
-    rejection = regular_file(root, rejection_origin)
-    if (not re.fullmatch(rb"(?:[0-9a-f]{2})+(?:\r?\n)?", rejection)
-            or digest(bytes.fromhex(rejection.decode("ascii"))) != fixtures["websocket/VEC-WS-009"]["frame_sha256"]):
-        raise ValueError("VEC-WS-009 rejection fixture drift")
+    hello_origin = FIXTURES / "ws-no-length-prefix.hex"
+    hello = regular_file(root, hello_origin)
+    if not re.fullmatch(rb"(?:[0-9a-f]{2})+(?:\r?\n)?", hello):
+        raise ValueError("VEC-WS-009 hello fixture drift")
+    good = bytes.fromhex(hello.decode("ascii"))
+    if len(good) >= 128 or digest(good) != fixtures["websocket/VEC-WS-009"]["frame_sha256"]:
+        raise ValueError("VEC-WS-009 hello fixture drift")
     ping = fixtures["websocket/VEC-WS-005"]
     close = fixtures["websocket/VEC-WS-006"]
     expected = {
+        "NO_LENGTH_PREFIX_GOOD_HEX": good.hex(), "UNKNOWN_FIELD_SUFFIX_HEX": unknown_suffix,
+        "VARINT_PREFIXED_HEX": (bytes([len(good)]) + good).hex(),
+        "U32_PREFIXED_HEX": (len(good).to_bytes(4, "big") + good).hex(), "SUFFIXED_HEX": good.hex() + "00",
         "PING_WIRE_HEX": ping["server_wire_hex"], "PONG_WIRE_HEX": ping["client_wire_hex"],
         "CLOSE_CLIENT_WIRE_HEX": close["client_wire_hex"],
         "CLOSE_HOST_WIRE_HEX": close["server_wire_hex"],
@@ -105,7 +117,8 @@ def verify_transcriptions(root=ROOT):
         raise ValueError("handwritten envelope bound transcription drift")
     return {"kind": "fixture_transcription_only", "verdict": "PASS", "formal_conformance": False,
             "source": name, "source_sha256": digest(text.encode()),
-            "origins": {origin.as_posix(): digest(source), rejection_origin.as_posix(): digest(rejection)}}
+            "origins": {origin.as_posix(): digest(source), hello_origin.as_posix(): digest(hello),
+                        corpus_origin.as_posix(): digest(corpus)}}
 
 
 def implementation_identity(root):

@@ -4,7 +4,7 @@ use syntra_core::secure_channel::{
     generate_server_key, Carrier, ClientConfig, Context, KeyStore, Mode, Secret32, ServerConfig,
 };
 use syntra_net::{
-    tcp::{accept_stream, connect_stream},
+    tcp::{accept_stream, connect_stream, ClientHandle, HostHandle},
     AuthenticatorFactory, Limits,
 };
 use syntra_runtime::{AuthError, Authenticator, StaticToken};
@@ -64,6 +64,34 @@ fn echo() -> Arc<dyn syntra_runtime::Handler> {
     }))
 }
 
+async fn open_duplex(capacity: usize) -> (ClientHandle, tokio::task::JoinHandle<HostHandle>) {
+    let (client_cfg, server_cfg) = configs();
+    let (a, b_stream) = tokio::io::duplex(capacity);
+    let auth = factory();
+    let server = tokio::spawn(async move {
+        accept_stream(
+            b_stream,
+            &server_cfg,
+            auth,
+            echo(),
+            ConnectionConfig::default(),
+            Limits::default(),
+        )
+        .await
+        .unwrap()
+    });
+    let client = connect_stream(
+        a,
+        client_cfg,
+        b"bench".to_vec(),
+        ConnectionConfig::default(),
+        Limits::default(),
+    )
+    .await
+    .unwrap();
+    (client, server)
+}
+
 pub fn pipe(c: &mut Criterion) {
     let mut group = c.benchmark_group("tcp");
     // Header-only microbenchmarks exclude sockets and crypto.
@@ -92,30 +120,7 @@ pub fn pipe(c: &mut Criterion) {
                 .unwrap();
             let payload = vec![0xA5; size];
             b.to_async(&rt).iter(|| async {
-                let (client_cfg, server_cfg) = configs();
-                let (a, b_stream) = tokio::io::duplex(1_048_576);
-                let auth = factory();
-                let server = tokio::spawn(async move {
-                    accept_stream(
-                        b_stream,
-                        &server_cfg,
-                        auth,
-                        echo(),
-                        ConnectionConfig::default(),
-                        Limits::default(),
-                    )
-                    .await
-                    .unwrap()
-                });
-                let client = connect_stream(
-                    a,
-                    client_cfg,
-                    b"bench".to_vec(),
-                    ConnectionConfig::default(),
-                    Limits::default(),
-                )
-                .await
-                .unwrap();
+                let (client, server) = open_duplex(1_048_576).await;
                 let out = client
                     .conn
                     .call("/bench.Echo/Echo", payload.clone(), 5000)
@@ -127,6 +132,33 @@ pub fn pipe(c: &mut Criterion) {
                 host.close().await;
             });
         });
+        group.bench_with_input(
+            BenchmarkId::new("duplex_echo_warm", size),
+            &size,
+            |b, &size| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let payload = vec![0xA5; size];
+                let (client, server) = rt.block_on(open_duplex(1_048_576));
+                let host = rt.block_on(server).unwrap();
+                let call = || async {
+                    let out = client
+                        .conn
+                        .call("/bench.Echo/Echo", payload.clone(), 5000)
+                        .await
+                        .unwrap();
+                    assert_eq!(out, payload);
+                };
+                rt.block_on(call()); // Warm the request/response path before timing.
+                b.to_async(&rt).iter(call);
+                rt.block_on(async {
+                    client.close().await;
+                    host.close().await;
+                });
+            },
+        );
     }
     group.finish();
     let mut lifecycle = c.benchmark_group("connection");
@@ -136,30 +168,7 @@ pub fn pipe(c: &mut Criterion) {
             .build()
             .unwrap();
         b.to_async(&rt).iter(|| async {
-            let (client_cfg, server_cfg) = configs();
-            let (a, b_stream) = tokio::io::duplex(65_536);
-            let auth = factory();
-            let server = tokio::spawn(async move {
-                accept_stream(
-                    b_stream,
-                    &server_cfg,
-                    auth,
-                    echo(),
-                    ConnectionConfig::default(),
-                    Limits::default(),
-                )
-                .await
-                .unwrap()
-            });
-            let client = connect_stream(
-                a,
-                client_cfg,
-                b"bench".to_vec(),
-                ConnectionConfig::default(),
-                Limits::default(),
-            )
-            .await
-            .unwrap();
+            let (client, server) = open_duplex(65_536).await;
             client.close().await;
             let host = server.await.unwrap();
             host.close().await;

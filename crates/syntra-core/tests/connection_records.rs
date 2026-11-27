@@ -78,7 +78,7 @@ fn both_modes_fragmented_hello_records_and_terminal_tag_failure() {
             &syntra_core::Frame {
                 version: 1,
                 request_id: 0,
-                body: Some(syntra_core::wire::frame::Body::Hello(
+                body: Some(syntra_core::proto::frame::Body::Hello(
                     syntra_core::build_hello(1, 1, vec![5; 8_000]).unwrap(),
                 )),
             },

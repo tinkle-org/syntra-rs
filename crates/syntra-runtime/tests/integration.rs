@@ -15,12 +15,9 @@ mod get_put;
 #[path = "../../../tests/integration/handshake.rs"]
 mod handshake_fixtures;
 #[path = "../../../tests/interoperability/vectors.rs"]
-#[allow(dead_code)] // shared vectors include other carrier and historical cases
+#[allow(dead_code)] // shared vectors include other carrier cases
 mod vectors;
 
-#[path = "support/frame.rs"]
-mod frame_fixture;
-use frame_fixture::FrameFixture;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -152,7 +149,7 @@ async fn handshake_malformed_range_rejected() {
         let bytes = handshake_fixtures::hello_bytes(min, max, vec![]);
         let frame = syntra_core::decode_frame_structure(&bytes).unwrap();
         assert_eq!((frame.version, frame.request_id), (1, 0));
-        let Some(syntra_core::wire::frame::Body::Hello(hello)) = frame.body else {
+        let Some(syntra_core::proto::frame::Body::Hello(hello)) = frame.body else {
             panic!("malformed range fixture must be a hello");
         };
         assert_eq!((hello.min_version, hello.max_version), (min, max));
@@ -195,11 +192,11 @@ async fn second_hello_fails() {
 
 #[tokio::test]
 async fn pre_active_frames_fail() {
-    use syntra_core::wire::frame::Body;
-    use syntra_core::wire::{Call, Cancel, Frame};
+    use syntra_core::proto::frame::Body;
+    use syntra_core::proto::{Cancel, Frame, RpcRequest};
 
     for body in [
-        Body::Call(Call {
+        Body::Request(RpcRequest {
             method: "/example.Echo/Echo".into(),
             payload: vec![].into(),
             timeout_ms: 100,
@@ -213,12 +210,13 @@ async fn pre_active_frames_fail() {
         );
         let _ = initiator;
         let raw = {
+            use prost::Message;
             Frame {
                 version: 1,
                 request_id: 7,
                 body: Some(body),
             }
-            .fixture_bytes()
+            .encode_to_vec()
         };
         host.ingest(&raw).await;
         assert_eq!(host.state().await, ConnectionState::Closed);
@@ -227,8 +225,9 @@ async fn pre_active_frames_fail() {
 
 #[tokio::test]
 async fn local_duplicate_id_violation_closes_without_same_id_result() {
-    use syntra_core::wire::frame::Body;
-    use syntra_core::wire::{Call, Frame};
+    use prost::Message;
+    use syntra_core::proto::frame::Body;
+    use syntra_core::proto::{Frame, RpcRequest};
 
     // Blocking handler: the first request stays outstanding until released.
     let release = Arc::new(tokio::sync::Notify::new());
@@ -264,13 +263,13 @@ async fn local_duplicate_id_violation_closes_without_same_id_result() {
         Frame {
             version: 1,
             request_id: id,
-            body: Some(Body::Call(Call {
+            body: Some(Body::Request(RpcRequest {
                 method: "/example.Echo/Echo".into(),
                 payload: vec![].into(),
                 timeout_ms: 5000,
             })),
         }
-        .fixture_bytes()
+        .encode_to_vec()
     };
     // Supplemental local RFC 0004 D2 regression, not a formal suite verdict.
     // Hold the original terminal computation until violation/closure is done.
@@ -486,21 +485,28 @@ async fn malformed_method_terminal_without_close() {
 }
 
 #[tokio::test]
-async fn bebop_frame_consumes_exactly_one_unit() {
-    use syntra_core::wire::frame::Body;
+async fn interop_no_length_prefix_vectors() {
+    use syntra_core::proto::frame::Body;
     // Good: decodes directly as one Frame (no prefix stripping).
-    let good = vectors::hex_to_bytes(vectors::bebop::HELLO);
+    let good = vectors::hex_to_bytes(vectors::NO_LENGTH_PREFIX_GOOD_HEX);
     let ctx = syntra_core::ValidationContext::pre_handshake(ConnectionState::Connected);
     let frame = syntra_core::decode_frame(&good, ctx).expect("good vector");
     assert!(matches!(frame.body, Some(Body::Hello(_))));
-    for (case, bad) in [
-        ("leading byte", [&[0][..], &good].concat()),
-        ("trailing byte", [&good[..], &[0]].concat()),
-        ("truncated hello", good[..good.len() - 1].to_vec()),
+    // Unknown-field suffix: same logical frame.
+    let mut with_unknown = good.clone();
+    with_unknown.extend_from_slice(&vectors::hex_to_bytes(vectors::UNKNOWN_FIELD_SUFFIX_HEX));
+    let frame2 = syntra_core::decode_frame(&with_unknown, ctx).expect("unknown tolerated");
+    assert!(matches!(frame2.body, Some(Body::Hello(_))));
+    // Bad: varint-prefixed, u32-prefixed, suffixed — all rejected.
+    for hex in [
+        vectors::VARINT_PREFIXED_HEX,
+        vectors::U32_PREFIXED_HEX,
+        vectors::SUFFIXED_HEX,
     ] {
+        let bad = vectors::hex_to_bytes(hex);
         assert!(
             syntra_core::decode_frame(&bad, ctx).is_err(),
-            "decoder accepted {case}: {bad:02x?}"
+            "must reject {hex}"
         );
     }
 }

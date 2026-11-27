@@ -57,18 +57,22 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertNotIn("if", contract)
         self.assertNotIn("continue-on-error", contract)
 
-    def test_generation_check_uses_verified_bebopc(self):
+    def test_generation_check_uses_pinned_buf_and_remote_plugin(self):
         job = self.workflow['jobs']['generated-rust']
         steps = job['steps']
-        setup, = [s for s in steps if s.get('uses') == './.github/actions/setup-bebopc']
+        setup, = [s for s in steps if s.get('uses', '').startswith('bufbuild/buf-setup-action@')]
+        self.assertRegex(setup['uses'], r'@[0-9a-f]{40}$')
+        self.assertEqual(setup['with']['version'], '1.59.0')
         check, = [s for s in steps if s.get('run') == 'python3 scripts/check-generated.py']
         self.assertLess(steps.index(setup), steps.index(check))
         for gate in (job, setup, check):
             self.assertNotIn('if', gate)
             self.assertNotIn('continue-on-error', gate)
-        install = (ROOT / '.github/actions/setup-bebopc/action.yml').read_text()
-        self.assertIn('/releases/download/v3.2.3/', install)
-        self.assertRegex(install, r"'[0-9a-f]{64}  bebopc.zip' \| sha256sum --check")
+        template = yaml.safe_load((ROOT / 'buf.gen.yaml').read_text())
+        self.assertEqual(template['plugins'], [{
+            'remote': 'buf.build/community/neoeinstein-prost:v0.4.0', 'revision': 1,
+            'out': 'crates/syntra-core/src/generated',
+        }])
 
     def test_parser_budgets_and_main_only_benchmark_trigger(self):
         for workflow, seconds in ((self.workflow, "60"), (self.scheduled, "900")):
@@ -81,8 +85,8 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(set(bench["on"]["push"]["paths"]), {
             "crates/**/src/**/*.rs",
             "crates/**/benches/**/*.rs",
-            "schemas/**/*.bop",
-            "bebop.json",
+            "proto/**/*.proto",
+            "buf*.yaml",
             "crates/syntra-core/tests/bench_allocations.rs",
             "scripts/benchmark_baseline.py",
             "crates/**/build.rs",

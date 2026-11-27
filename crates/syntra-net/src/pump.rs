@@ -18,7 +18,7 @@ use syntra_core::secure_channel::{
     MAX_PLAINTEXT, MAX_WRAPPER,
 };
 use syntra_core::{
-    decode_frame, wire::frame::Body, ConnectionState, ErrorCode, SyntraError, ValidationContext,
+    decode_frame, proto::frame::Body, ConnectionState, ErrorCode, SyntraError, ValidationContext,
 };
 use syntra_runtime::connection::validate_close_grace;
 use syntra_runtime::elapsed::ElapsedClock;

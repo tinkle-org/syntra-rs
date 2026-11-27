@@ -1,5 +1,5 @@
 use super::*;
-use syntra_core::{wire::call_result::Outcome, CallResult};
+use syntra_core::{proto::rpc_result::Outcome, RpcResult};
 
 const METHOD: &str = "/example.Echo/Echo";
 
@@ -15,13 +15,9 @@ fn assert_clean(client: &Initiator) {
     assert!(client.conn.shared.emissions.lock().unwrap().is_empty());
 }
 
-fn request(bytes: &[u8]) -> Call {
-    match syntra_core::decode_frame_structure(bytes)
-        .unwrap()
-        .body
-        .unwrap()
-    {
-        Body::Call(request) => request,
+fn request(bytes: &[u8]) -> RpcRequest {
+    match Frame::decode(bytes).unwrap().body.unwrap() {
+        Body::Request(request) => request,
         _ => panic!("expected request"),
     }
 }
@@ -31,7 +27,7 @@ async fn complete(client: &Initiator, id: u64) {
         .inject_frame(Frame {
             version: 1,
             request_id: id,
-            body: Some(Body::Result(CallResult {
+            body: Some(Body::Result(RpcResult {
                 outcome: Some(Outcome::Payload(b"ok".to_vec())),
             })),
         })
@@ -125,9 +121,7 @@ async fn dropped_future_and_explicit_cancel_prevent_queued_emission() {
         assert!(futures_util::poll!(&mut call).is_pending());
         let bytes = writer.try_recv().unwrap();
         if explicit {
-            let id = syntra_core::decode_frame_structure(bytes.as_slice())
-                .unwrap()
-                .request_id;
+            let id = Frame::decode(bytes.as_slice()).unwrap().request_id;
             client.cancel(id).await.unwrap();
             assert!(matches!(call.await, Err(SyntraError::Cancelled(_))));
             let control = writer.try_recv().unwrap();
@@ -147,9 +141,7 @@ async fn selected_success_suppresses_queued_duplicates_and_survives_cancel_close
     let mut call = Box::pin(client.call_cancellable(METHOD, vec![], 100, &token));
     assert!(futures_util::poll!(&mut call).is_pending());
     let bytes = writer.try_recv().unwrap();
-    let id = syntra_core::decode_frame_structure(bytes.as_slice())
-        .unwrap()
-        .request_id;
+    let id = Frame::decode(bytes.as_slice()).unwrap().request_id;
     complete(&client, id).await;
     assert_clean(&client);
     token.cancel();
@@ -169,9 +161,7 @@ async fn handoff_is_one_shot_and_cancel_is_terminal_locally_not_byte_rewrite() {
         client.prepare_outbound(bytes.clone()).is_none(),
         "must use original Vec"
     );
-    let id = syntra_core::decode_frame_structure(bytes.as_slice())
-        .unwrap()
-        .request_id;
+    let id = Frame::decode(bytes.as_slice()).unwrap().request_id;
     let prepared = client.prepare_outbound(bytes).unwrap();
     assert!(client.prepare_outbound(prepared.clone()).is_none());
     client.cancel(id).await.unwrap();
@@ -291,7 +281,7 @@ async fn default_budget_reserialization_cannot_exceed_envelope_bound() {
     let oversized = Frame {
         version: 1,
         request_id: 1,
-        body: Some(Body::Call(Call {
+        body: Some(Body::Request(RpcRequest {
             method: METHOD.into(),
             payload: vec![0; syntra_core::MAX_FRAME_BYTES],
             timeout_ms: 0,

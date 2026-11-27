@@ -9,9 +9,10 @@
 //! This crate never touches the network or interprets application payloads;
 //! scheduling, host policy and carrier I/O belong to its callers.
 //!
-//! [`wire`] owns caller-facing data independently of generated Bebop records.
-//! See the [contributor guide] for schema generation and the [connection guide]
-//! for encryption and embedding boundaries.
+//! [`proto`] contains the generated messages from `proto/syntra/v1/*.proto`.
+//! Use [`encode_frame`] and [`decode_frame`] at the envelope boundary: generated
+//! messages alone do not enforce wire or connection rules. See the [contributor
+//! guide] for generation and the [connection guide] for encryption and embedding.
 //!
 //! Pre-`ACTIVE` failures expose local typed errors and close the connection
 //! without an error envelope; application frames, including notifications,
@@ -22,16 +23,11 @@
 //! [contributor guide]: https://github.com/tinkle-org/syntra-rs/blob/main/CONTRIBUTING.md#schema-and-generated-code
 //! [connection guide]: https://github.com/tinkle-org/syntra-rs/blob/main/CONNECTION.md
 
-pub mod wire;
-
-/// Low-level Bebop records for profile adapters and schema fixtures. Do not
-/// deserialize peer input directly: generated readers assume lengths and
-/// union bounds have already been checked. Use [`decode_frame`] for frames.
-// bebopc emits a one-iteration field loop for the empty Cancel message.
-#[allow(clippy::never_loop)]
-#[rustfmt::skip]
-#[path = "generated/syntra.rs"]
-pub mod generated;
+/// Committed prost bindings; regenerate via `scripts/check-generated.py --write`
+/// so that `ClientHello` uses its credential-safe `Debug` implementation.
+pub mod proto {
+    include!("generated/syntra.v1.rs");
+}
 
 pub mod codec;
 pub mod error;
@@ -46,13 +42,13 @@ pub use codec::{decode_frame, decode_frame_structure, encode_frame, MAX_FRAME_BY
 pub use error::{bounded_diagnostic, ErrorCode, RpcError, SyntraError, MAX_DIAGNOSTIC_BYTES};
 pub use frame::{
     missing_result_outcome_id, validate_frame, validate_wire_structure, FrameKind,
-    ValidationContext,
+    ValidationContext, MAX_DECODE_DEPTH,
 };
 pub use handshake::{
     build_hello, negotiate_version, validate_connection_id, validate_hello_range,
     HANDSHAKE_TIMEOUT_DEFAULT, MAX_CONNECTION_ID_BYTES, MAX_CREDENTIAL_BYTES, MAX_VERSION,
     MIN_VERSION,
 };
+pub use proto::{Cancel, ClientHello, Frame, Notification, RpcRequest, RpcResult, ServerReady};
 pub use rpc::{validate_method, PendingOutcome, PendingTable, RequestIdAllocator};
 pub use state::{ConnectionState, StateEvent};
-pub use wire::{Call, CallResult, Cancel, ClientHello, Frame, Notification, ServerReady};

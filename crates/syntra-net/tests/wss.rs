@@ -18,8 +18,8 @@ use syntra_core::secure_channel::{
 };
 use syntra_core::{
     decode_frame, encode_frame,
-    wire::{call_result::Outcome, frame::Body},
-    CallResult, ConnectionState, ValidationContext,
+    proto::{frame::Body, rpc_result::Outcome},
+    ConnectionState, RpcResult, ValidationContext,
 };
 use syntra_net::{websocket as ws, AuthenticatorFactory, Error, HostHandle, Limits};
 #[cfg(feature = "reconnect")]
@@ -1476,12 +1476,12 @@ async fn fragmented_m2_reassembles_before_noise_client_role_both_modes() {
                     let request =
                         decode_frame(&frame, ValidationContext::active(1)).expect("request decode");
                     match request.body {
-                        Some(Body::Call(call)) => {
+                        Some(Body::Request(call)) => {
                             let result = encode_frame(
                                 &syntra_core::Frame {
                                     version: request.version,
                                     request_id: request.request_id,
-                                    body: Some(Body::Result(CallResult {
+                                    body: Some(Body::Result(RpcResult {
                                         outcome: Some(Outcome::Payload(call.payload)),
                                     })),
                                 },

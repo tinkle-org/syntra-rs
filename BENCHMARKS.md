@@ -42,9 +42,9 @@ Retain the implementation revision and dirty-worktree state with measurements.
   happens inside timing. See the setup/allocation boundaries below.
 - `syntra-net/pipe` measures preallocated u16 carrier-prefix and u32
   frame-prefix writes without socket or crypto work, plus serial encrypted
-  echo RPCs over in-memory duplex streams. Handshake and fixture allocation
-  are outside timing for header cases; establishment and echo payload
-  verification are timed for pipe cases. `Throughput::Bytes` counts twice
+  echo RPCs over in-memory duplex streams. Prefix cases have no handshake.
+  Both echo cases time payload verification; only the cold echo times
+  establishment and teardown. `Throughput::Bytes` counts twice
   the application payload length for echo (both directions), excluding envelopes,
   encrypted prefixes, tags and carrier overhead.
 
@@ -80,6 +80,12 @@ and pipe establishment under `connection`.
   The initial payload and Tokio runtime are created outside timing; the per-call
   payload clone is inside timing. This is in-process carrier work, not a network
   deployment benchmark.
+- `tcp/duplex_echo_warm/{64,1024,65536}` uses the same stream capacity, key setup,
+  handler, runtime configuration and payloads as `duplex_echo`. Each measurement
+  loop starts with a fresh, ready pair and one verified echo outside timing.
+  A timed iteration clones the request payload, makes one serial RPC over that
+  pair and compares the response. Both directions use the live encrypted pumps;
+  nonces advance normally. Setup, key generation and both closes are untimed.
 - `pipe::establishment_duplex` times the complete duplex lifecycle, from
   server-key/config and duplex setup through returning-mode channel handshake,
   Syntra readiness and teardown. It sends no application RPC.
@@ -131,7 +137,9 @@ fail for regression. Review the raw samples before attributing a slowdown.
 zeroed-allocation and reallocation calls combined per operation on the executing
 thread. Fixture construction, handshake RNG, session teardown and reporting
 are excluded; the timed benchmarks never install the counting allocator.
-Counts are diagnostic, not a timing threshold. Artifacts retain both revisions,
+The normal test suite also checks the two request fixtures against their
+Protobuf wire lengths and allocation ceilings; these are not latency thresholds.
+Artifacts retain both revisions,
 worktree status, runner/toolchain, counts, samples and intervals for 14 days.
 
 To reproduce an unchanged comparison locally, start with a fresh output directory:
@@ -166,3 +174,37 @@ Socket macrobenchmarks belong on dedicated hardware, outside shared-runner
 timing gates. Record OS, CPU, toolchain, payload distribution, parallelism
 and repeated-run distributions. These in-memory benchmarks are not end-to-end
 network measurements.
+
+### Local protobuf candidate comparison (2026-11-27)
+
+Each version was built with Rust 1.89.0 and its own lockfile on an Apple M4
+(arm64, macOS 27.2.1, AC power). A is `b99f56b`, before #54; B is the
+`feat/protobuf-wire` worktree on `34ece84`; C is unmodified Bebop from
+`34ece84`. A and C used B's `pipe.rs` to measure the same established RPC.
+
+| Measured quantity | A: old Protobuf | B: optimized Protobuf | C: Bebop |
+| --- | ---: | ---: | ---: |
+| Empty request: serialized bytes | 29 | 29 | 50 |
+| Near-limit request: serialized bytes | 1,048,355 | 1,048,355 | 1,048,375 |
+| Empty / near-limit round trip: allocation calls | 6 / 8 | 2 / 4 | 2 / 3 |
+| Empty request round trip (ns) | 229 / 229 | 196 / 194 | 194 / 167 |
+| Near-limit request round trip (µs) | 191 / 191 | 43 / 195 | 188 / 185 |
+| Established 64 B echo (µs) | 33.8 / 30.2 | 30.4 / 29.5 | 30.1 / 30.4 |
+| Established 64 KiB echo (ms) | 1.223 / 1.163 | 1.185 / 1.212 | 1.153 / 1.173 |
+
+Timings are Criterion means in forward / reverse build order per case. The
+candidate reduced empty-frame time by 14–16% versus old Protobuf. Its much
+lower first near-limit timing did not repeat. Neither the large-frame data
+nor the established echoes show a repeatable latency win over Bebop. Sizes
+exclude outer framing and encryption; the allocation counts cover only the
+in-memory decoder/encoder. No mobile device or network was involved.
+
+To repeat, prebuild both harnesses in each worktree with `--no-run`, run the
+allocation test separately, then run each exact case serially in both orders:
+
+```sh
+cargo test --locked --release -p syntra-core --test bench_allocations -- --ignored --nocapture
+# BIN is the frame_codec or pipe executable; use a fresh CRITERION_HOME per build/pass.
+# CASE: frame/roundtrip_request/{0,1048320} or tcp/duplex_echo_warm/{64,65536}.
+"$BIN" --bench "^${CASE}$" --warm-up-time 0.5 --measurement-time 1 --sample-size 30 --noplot
+```

@@ -35,17 +35,33 @@ unsafe impl GlobalAlloc for Counter {
     }
 }
 
+fn measure_request(payload_len: usize) -> (usize, usize) {
+    let ctx = ValidationContext::active(1);
+    let bytes = syntra_core::encode_frame(&frame::request_frame(payload_len), ctx).unwrap();
+    let before = CALLS.get();
+    let result = frame::roundtrip(&bytes, ctx);
+    let calls = CALLS.get() - before;
+    assert_eq!(result, bytes);
+    (bytes.len(), calls)
+}
+
+#[test]
+fn request_roundtrip_keeps_the_protobuf_size_and_allocation_budget() {
+    for (payload_len, wire_len, max_calls) in [(0, 29, 2), (1_048_320, 1_048_355, 4)] {
+        let (len, calls) = measure_request(payload_len);
+        assert_eq!(len, wire_len);
+        assert!(
+            calls <= max_calls,
+            "{payload_len}-byte payload: {calls} allocation calls"
+        );
+    }
+}
+
 #[test]
 #[ignore = "allocation measurement runs with post-merge benchmarks"]
 fn allocations_per_operation() {
     for size in frame::ROUNDTRIP_SIZES {
-        let bytes =
-            syntra_core::encode_frame(&frame::request_frame(size), ValidationContext::active(1))
-                .unwrap();
-        let before = CALLS.get();
-        let result = frame::roundtrip(&bytes, ValidationContext::active(1));
-        let calls = CALLS.get() - before;
-        assert_eq!(result, bytes);
+        let (_, calls) = measure_request(size);
         println!("frame/roundtrip_request/{size} {calls}");
     }
     for size in record::RECORD_SIZES {
