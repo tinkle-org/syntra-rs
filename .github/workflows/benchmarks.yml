@@ -59,15 +59,17 @@ jobs:
             git -C "$tree" status --short --branch >> "results/$tree-revision.txt"
           done
           { uname -a; lscpu; rustc -Vv; cargo -V; } > results/runner.txt
-      - name: Count allocations separately and prebuild both timing binaries
+      - name: Count allocations separately
         run: |
           for tree in old new; do
             (cd "$tree" && cargo test --locked --release -p syntra-core --test bench_allocations -- --ignored --nocapture) | tee "results/$tree-allocations.txt"
-            (cd "$tree" && cargo bench --locked -p syntra-core --bench frame_codec --bench channel --no-run)
           done
         shell: bash
       - name: Compare, repeating any suspected regression
         shell: bash
+        env:
+          # Don't let checkout-specific symbol tables distinguish otherwise identical executables.
+          CARGO_PROFILE_BENCH_STRIP: symbols
         run: |
           if [[ ! -e old/scripts/benchmark_baseline.py ]]; then
             mkdir results/calibration
