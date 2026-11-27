@@ -47,7 +47,7 @@ fn measure_request(payload_len: usize) -> (usize, usize) {
 
 #[test]
 fn request_roundtrip_keeps_the_protobuf_size_and_allocation_budget() {
-    for (payload_len, wire_len, max_calls) in [(0, 29, 2), (1_048_320, 1_048_355, 4)] {
+    for (payload_len, wire_len, max_calls) in [(0, 29, 2), (1_048_320, 1_048_355, 3)] {
         let (len, calls) = measure_request(payload_len);
         assert_eq!(len, wire_len);
         assert!(

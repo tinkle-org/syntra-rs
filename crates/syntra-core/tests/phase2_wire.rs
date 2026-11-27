@@ -482,6 +482,39 @@ fn nonminimal_encodings_and_ordinary_scalar_merge_are_preserved() {
 }
 
 #[test]
+fn admitted_requests_match_prost_field_order_defaults_and_merge() {
+    let unknown = group(90, &[len(1, b"ignored"), len(2, &[0xff])].concat());
+    let request = [
+        len(2, b"old"),
+        len(1, b""),
+        field(3, 0, &[0x81, 0]), // legal non-minimal varint
+        unknown.clone(),
+        len(1, b"/echo/Again"),
+        len(2, &[0, 0xff]),
+        field(3, 0, &varint(u64::from(u32::MAX) + 2)),
+    ]
+    .concat();
+    for body in [
+        len(12, &len(1, b"/echo/Default")),
+        len(12, &request),
+        len(12, &[request.as_slice(), &len(2, &[]), &[0x18, 0]].concat()),
+    ] {
+        let raw = [
+            field(1, 0, &[2]),
+            field(2, 0, &[7]),
+            body,
+            unknown.clone(),
+            field(2, 0, &varint(u64::MAX)),
+            field(1, 0, &varint((1 << 32) + 1)),
+        ]
+        .concat();
+        let expected = Frame::decode(raw.as_slice()).unwrap();
+        assert_eq!(decode_frame_structure(&raw).unwrap(), expected);
+        assert_eq!(decode_frame(&raw, active()).unwrap(), expected);
+    }
+}
+
+#[test]
 fn credentials_and_connection_ids_have_exact_byte_boundaries() {
     assert_eq!(MAX_CREDENTIAL_BYTES, 8192);
     assert_eq!(MAX_CONNECTION_ID_BYTES, 128);
