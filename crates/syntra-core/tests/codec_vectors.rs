@@ -130,7 +130,7 @@ fn exactly_one_complete_envelope_is_required() {
             );
         }
     }
-    let legacy = vectors::hex_to_bytes(vectors::NO_LENGTH_PREFIX_REJECTED_HEX);
+    let legacy = vectors::no_length_prefix_rejected();
     let ctx = ValidationContext::pre_handshake(ConnectionState::Connected);
     assert_eq!(
         decode_frame(&legacy, ctx).unwrap_err().code(),

@@ -18,3 +18,6 @@ fixtures:
       host_internal_failure: 1011
       going_away_or_idle_or_shutdown: 1001
     reserved: [1005, 1006, 1015]
+  - id: websocket/VEC-WS-009
+    # SHA-256 of the original frame bytes, before hex encoding.
+    frame_sha256: "3481d43e5307c23ec97ae054bd794200893da5973256cc9ff8c8679751042dd3"

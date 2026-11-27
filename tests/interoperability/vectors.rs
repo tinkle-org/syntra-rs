@@ -2,7 +2,9 @@
 //! `bebop` contains independent SDK-local envelope examples, not carrier records.
 
 /// Historical hello bytes, retained as a rejection case for the Bebop decoder.
-pub const NO_LENGTH_PREFIX_REJECTED_HEX: &str = "0801520408011001";
+pub fn no_length_prefix_rejected() -> Vec<u8> {
+    hex_to_bytes(include_str!("fixtures/ws-no-length-prefix.hex").trim_end())
+}
 
 #[path = "fixtures/bebop-envelope.rs"]
 pub mod bebop;

@@ -57,18 +57,21 @@ def canonical(value):
 
 
 def verify_transcriptions(root=ROOT):
-    """Check handwritten WS constants, NOT runtime behavior or cryptographic vectors."""
+    """Check WS fixture inputs and handwritten constants, not runtime behavior."""
     origin = FIXTURES / "transport.yaml"
     source = regular_file(root, origin)
     transport = load_yaml(source)
     fixtures = {row["id"]: row for row in transport["fixtures"]}
     if len(fixtures) != len(transport["fixtures"]):
         raise ValueError("duplicate transport fixture ID")
+    rejection_origin = FIXTURES / "ws-no-length-prefix.hex"
+    rejection = regular_file(root, rejection_origin)
+    if (not re.fullmatch(rb"(?:[0-9a-f]{2})+(?:\r?\n)?", rejection)
+            or digest(bytes.fromhex(rejection.decode("ascii"))) != fixtures["websocket/VEC-WS-009"]["frame_sha256"]):
+        raise ValueError("VEC-WS-009 rejection fixture drift")
     ping = fixtures["websocket/VEC-WS-005"]
     close = fixtures["websocket/VEC-WS-006"]
     expected = {
-        # Historical rejection input, not a control frame from transport.yaml.
-        "NO_LENGTH_PREFIX_REJECTED_HEX": "0801520408011001",
         "PING_WIRE_HEX": ping["server_wire_hex"], "PONG_WIRE_HEX": ping["client_wire_hex"],
         "CLOSE_CLIENT_WIRE_HEX": close["client_wire_hex"],
         "CLOSE_HOST_WIRE_HEX": close["server_wire_hex"],
@@ -102,7 +105,7 @@ def verify_transcriptions(root=ROOT):
         raise ValueError("handwritten envelope bound transcription drift")
     return {"kind": "fixture_transcription_only", "verdict": "PASS", "formal_conformance": False,
             "source": name, "source_sha256": digest(text.encode()),
-            "origins": {origin.as_posix(): digest(source)}}
+            "origins": {origin.as_posix(): digest(source), rejection_origin.as_posix(): digest(rejection)}}
 
 
 def implementation_identity(root):

@@ -3,7 +3,9 @@
 These fixtures are maintained here. `transport.yaml` retains the TCP inner frame bound
 and the RFC 6455 control bytes and close codes from `tcp/byte-vectors.yaml` and
 `websocket/fixtures.yaml` at `tinkle-org/syntra` commit `8ede3810b29fbba4d0e6ae6751a0025ceedda140`.
-It does not import that revision’s application encoding or endpoint policy.
+`ws-no-length-prefix.hex` is the `frame_hex` input from `websocket/VEC-WS-009` in
+that same revision. It is a rejection case for the Bebop decoder. Its entry in
+`transport.yaml` pins the digest of the decoded bytes, independent of line endings.
 
 `context-cases.json` keeps the carrier-specific recipe lists from `conformance/manifest/connection.yaml`
 at `3f7e8ea037fefcc5c86101d23e7722c83e28a0d3`; `syntra-1.0-context.json` contains their public

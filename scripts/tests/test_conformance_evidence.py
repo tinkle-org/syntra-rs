@@ -54,8 +54,9 @@ class TranscriptionTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.transport = evidence.FIXTURES / 'transport.yaml'
+        self.rejection = evidence.FIXTURES / 'ws-no-length-prefix.hex'
         self.vectors = Path('tests/interoperability/vectors.rs')
-        for rel in (self.transport, self.vectors):
+        for rel in (self.transport, self.rejection, self.vectors):
             (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(evidence.ROOT / rel, self.root / rel)
 
@@ -65,7 +66,8 @@ class TranscriptionTests(unittest.TestCase):
         self.assertEqual(report['verdict'], 'PASS')
         self.assertFalse(report['formal_conformance'])
         f = self.root / self.transport
-        self.assertEqual(report['origins'], {self.transport.as_posix(): evidence.digest(f.read_bytes())})
+        self.assertEqual(report['origins'], {p.as_posix(): evidence.digest((self.root / p).read_bytes())
+                                             for p in (self.transport, self.rejection)})
         self.assertEqual(report['source_sha256'], evidence.digest((self.root / self.vectors).read_bytes()))
         original = f.read_text()
         for value in ('890670696e672d31', '1005', '1001', '1048576'):
@@ -79,12 +81,15 @@ class TranscriptionTests(unittest.TestCase):
         ping = next(line for line in original.splitlines() if line.startswith('pub const PING_WIRE_HEX'))
         for change, edited in [('extra', original + '\npub const EXTRA_HEX: &str = "ff";'),
                                ('nonliteral extra', original + '\npub const EXTRA_HEX: &str = PING_WIRE_HEX;'),
-                               ('duplicate', original + '\n' + ping), ('commented out', original.replace(ping, '//' + ping)),
-                               ('legacy name', original.replace('NO_LENGTH_PREFIX_REJECTED_HEX', 'NO_LENGTH_PREFIX_GOOD_HEX')),
-                               ('legacy bytes', original.replace('0801520408011001', '0801520408011000'))]:
+                               ('duplicate', original + '\n' + ping), ('commented out', original.replace(ping, '//' + ping))]:
             vectors.write_text(edited)
             with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'WS vector transcription drift'):
                 evidence.verify_transcriptions(self.root)
+
+    def test_changed_rejection_bytes_fail_without_a_change_to_the_origin_pin(self):
+        (self.root / self.rejection).write_text('00\n')
+        with self.assertRaisesRegex(ValueError, 'VEC-WS-009 rejection fixture drift'):
+            evidence.verify_transcriptions(self.root)
 
 
 class EvidenceTests(unittest.TestCase):
