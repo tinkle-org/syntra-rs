@@ -1038,7 +1038,7 @@ async fn complete_worker_baseline(
             assert_eq!(t.boundary_checkpoint, b"c0");
             assert_eq!(
                 t.outcome,
-                Some(recovery_batch_trailer::Outcome::CatchupComplete(true))
+                Some(recovery_batch_trailer::Outcome::CatchupComplete)
             );
             completed = true;
         }
@@ -1196,7 +1196,7 @@ async fn worker_barrier_permission_revoked_after_pop_discards_batch_only_for_tar
         fixture.release_writer();
         assert_eq!(
             fixture.targeted_terminal().await.outcome,
-            Some(recovery_batch_trailer::Outcome::Terminated(true))
+            Some(recovery_batch_trailer::Outcome::Terminated)
         );
         fixture.healthy_continues().await;
     })

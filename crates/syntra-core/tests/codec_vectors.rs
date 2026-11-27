@@ -130,12 +130,35 @@ fn exactly_one_complete_envelope_is_required() {
             );
         }
     }
-    let legacy = vectors::hex_to_bytes(vectors::NO_LENGTH_PREFIX_GOOD_HEX);
-    assert!(decode_frame(
-        &legacy,
-        ValidationContext::pre_handshake(ConnectionState::Connected)
-    )
-    .is_err());
+    let legacy = vectors::hex_to_bytes(vectors::NO_LENGTH_PREFIX_REJECTED_HEX);
+    let ctx = ValidationContext::pre_handshake(ConnectionState::Connected);
+    assert_eq!(
+        decode_frame(&legacy, ctx).unwrap_err().code(),
+        ErrorCode::InvalidArgument
+    );
+}
+
+#[test]
+fn unregistered_rpc_error_codes_keep_the_wire_integer() {
+    let ctx = ValidationContext::active(1);
+    for raw in [i32::MIN, -1, i32::MAX] {
+        let frame = Frame {
+            version: 1,
+            request_id: 7,
+            body: Some(Body::Result(CallResult {
+                outcome: Some(Outcome::Error(RpcError {
+                    code: raw,
+                    message: String::new(),
+                })),
+            })),
+        };
+        let bytes = encode_frame(&frame, ctx).unwrap();
+        assert_eq!(decode_frame(&bytes, ctx).unwrap(), frame);
+        assert_eq!(
+            ErrorCode::from_i32_lossy(raw),
+            (ErrorCode::Unknown, Some(raw))
+        );
+    }
 }
 
 #[test]

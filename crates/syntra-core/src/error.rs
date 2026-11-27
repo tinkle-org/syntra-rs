@@ -215,6 +215,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn registered_error_codes_match_the_schema() {
+        use crate::generated::ErrorCode as SchemaCode;
+
+        // Match exhaustively in both directions so adding to either enum requires a decision.
+        macro_rules! check_codes {
+            ($($name:ident),+ $(,)?) => {
+                for code in [$(ErrorCode::$name),+] {
+                    let schema = match code { $(ErrorCode::$name => SchemaCode::$name),+ };
+                    let raw = i32::from(schema);
+                    assert_eq!(code.as_i32(), raw, "{code:?}");
+                    let expected = match schema { $(SchemaCode::$name => ErrorCode::$name),+ };
+                    assert_eq!(ErrorCode::from_i32_lossy(raw), (expected, None));
+                }
+            };
+        }
+        check_codes!(
+            Unspecified,
+            Cancelled,
+            Unknown,
+            InvalidArgument,
+            DeadlineExceeded,
+            NotFound,
+            AlreadyExists,
+            PermissionDenied,
+            ResourceExhausted,
+            FailedPrecondition,
+            Aborted,
+            OutOfRange,
+            Unimplemented,
+            Internal,
+            Unavailable,
+            DataLoss,
+            Unauthenticated,
+        );
+    }
+
+    #[test]
     fn rpc_unknown_outcome_is_conservative_for_loss_deadline_and_internal_errors() {
         for raw in 1..=16 {
             let (code, _) = ErrorCode::from_i32_lossy(raw);

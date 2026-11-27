@@ -742,7 +742,7 @@ async fn local_acceptance_local_overflow_has_no_next_g_and_other_subscription_co
             assert_eq!(generation, 7);
             assert_eq!(next_generation, None);
             assert_eq!(t.terminate_reason, b"local-queue-exhausted");
-            assert_eq!(t.outcome, Some(Outcome::Terminated(true)));
+            assert_eq!(t.outcome, Some(Outcome::Terminated));
         }
         _ => panic!("expected local reserved overflow control"),
     }
@@ -1011,7 +1011,7 @@ async fn local_acceptance_nonempty_catchup_pages_completion_does_not_replace_dur
     source.append(&service, A);
     let accepted = bounded(c.catch_up(&s.subscription_handle)).await.unwrap();
     assert_eq!(accepted.catchup_boundary, CP[3]);
-    b.trace.wait_matching(1, true, |n| matches!(n, Notification::Trailer(t) if t.outcome == Some(Outcome::CatchupComplete(true)))).await;
+    b.trace.wait_matching(1, true, |n| matches!(n, Notification::Trailer(t) if t.outcome == Some(Outcome::CatchupComplete))).await;
     for index in 1..=3 {
         let offered = batch(&mut c).await;
         assert_eq!(offered.predecessor_checkpoint, CP[index - 1]);

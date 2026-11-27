@@ -129,10 +129,50 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(adapters.frame_bytes(frame).endswith(bytes.fromhex('5a010000007800')))
         frame = {**frame, 'payload_b64': '', 'unknown_fields': []}
         self.assertIn(bytes.fromhex('020000000003'), adapters.frame_bytes(frame))
-        no_timeout = {key: value for key, value in frame.items() if key != 'timeout_ms'}
-        self.assertEqual(adapters.frame_bytes(no_timeout), adapters.frame_bytes({**frame, 'timeout_ms': 0}))
         with self.assertRaises(ValueError):
             adapters.frame_bytes({**frame, 'unreviewed': True})
+
+    def test_zero_or_missing_timeout_omits_the_wire_field(self):
+        frame = {'request_id': 1, 'body': 'request', 'method': '/a/B', 'payload_b64': '/wA='}
+        envelope = '01000000 0100000000000000 '
+        method_payload = '01 04000000 2f612f42 02 02000000 ff00 '
+        for timeout, lengths, tail in [({}, '15000000 0c 11000000 ', '00'),
+                                      ({'timeout_ms': 0}, '15000000 0c 11000000 ', '00'),
+                                      ({'timeout_ms': 500}, '1a000000 0c 16000000 ', '03 f4010000 00')]:
+            with self.subTest(timeout=timeout):
+                self.assertEqual(adapters.frame_bytes({**frame, **timeout}),
+                                 bytes.fromhex(envelope + lengths + method_payload + tail))
+
+    def test_payload_variants_are_correlated_results_of_only_the_declared_sends(self):
+        request = adapters.request_for('wss-payloads')
+        result = self.result(request)
+        got = result['observation']
+        got['frames'] += [{'request_id': 8, 'body': 'result', 'payload_hex': ''},
+                          {'request_id': 9, 'body': 'result', 'payload_hex': '000102ffff'}]
+        adapters.validate_result(request, result)
+        got['sent_frames_hex'].insert(-1, request['frames_hex'][-1])
+        with self.assertRaisesRegex(ValueError, 'only setup, declared calls and followup'):
+            adapters.validate_result(request, result)
+        del got['sent_frames_hex'][-2]
+        got['frames'][2]['payload_hex'] = '000102'
+        with self.assertRaisesRegex(ValueError, 'payload mismatch'):
+            adapters.validate_result(request, result)
+
+    def test_policy_denial_checks_the_wire_message_for_the_injected_detail(self):
+        request = adapters.request_for('wss-authorization-denied')
+        result = self.result(request)
+        got = result['observation']
+        error = {'code': 'PERMISSION_DENIED', 'message': 'access denied'}
+        got['frames'] = [{'request_id': 7, 'body': 'result', 'error': error}]
+        adapters.validate_result(request, result)
+        got['error'] = error.copy()  # a clean local diagnostic must not mask a wire leak
+        detail = request['scenario']['input']['faults']['policy_denial_message']
+        error['message'] += ': ' + detail.upper()
+        with self.assertRaisesRegex(ValueError, 'forbidden diagnostic'):
+            adapters.validate_result(request, result)
+        del error['message']
+        with self.assertRaisesRegex(ValueError, 'missing wire diagnostic'):
+            adapters.validate_result(request, result)
 
     def run_fake(self, text, returncode=0, artifact=True, tamper=None):
         """Return a mocked supplemental lane result with configurable logs and observations."""

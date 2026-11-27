@@ -237,7 +237,7 @@ jobs:
           if-no-files-found: error
 
   manifest-cases:
-    name: unified Syntra validation + ten supplemental WSS scenarios
+    name: unified Syntra validation + supplemental WSS scenarios
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -261,7 +261,7 @@ jobs:
           --run-local native-tls13 --run-local loopback-ws
           --run-local wss-envelope --run-local wss-unknown-field --run-local wss-ready
           --run-local wss-reserved-method --run-local wss-payloads --run-local wss-duplicate-id
-          --run-local wss-deadline --run-local wss-internal-error
+          --run-local wss-deadline --run-local wss-internal-error --run-local wss-authorization-denied
           --run-local wss-reverse-completion --run-local wss-recovery-isolation
           --output "$RUNNER_TEMP/manifest-cases"
       - name: Preserve implementation evidence and supplemental observations

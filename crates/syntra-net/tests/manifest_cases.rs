@@ -31,8 +31,8 @@ use syntra_net::{
     websocket as ws, AuthenticatorFactory, HostHandle, Limits, RecoveryAuthenticatorFactory,
 };
 use syntra_runtime::{
-    recovery::wire::*, AllowAnonymous, AuthError, Authenticator, ConnectionConfig, FnHandler,
-    Handler, HandlerOutcome, Principal,
+    recovery::wire::*, AllowAnonymous, AuthError, Authenticator, CancelToken, ConnectionConfig,
+    FnHandler, Handler, HandlerFut, HandlerOutcome, Principal,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -414,6 +414,29 @@ impl RecoverySource for Source {
     }
 }
 
+struct RestrictedEcho {
+    denial_message: String,
+    denials: AtomicUsize,
+}
+
+impl Handler for RestrictedEcho {
+    fn authorize(&self, _: &Principal, method: &str) -> Result<(), AuthError> {
+        if method == "/example.Echo/Echo" {
+            return Ok(());
+        }
+        self.denials.fetch_add(1, Ordering::SeqCst);
+        Err(AuthError {
+            code: ErrorCode::PermissionDenied,
+            message: self.denial_message.clone(),
+        })
+    }
+
+    fn handle(&self, method: String, payload: Vec<u8>, _: CancelToken) -> HandlerFut {
+        assert_eq!(method, "/example.Echo/Echo", "denied call reached handler");
+        Box::pin(std::future::ready(HandlerOutcome::Payload(payload)))
+    }
+}
+
 async fn execute(input: &Value) -> Value {
     let id = input["scenario_id"].as_str().unwrap();
     let frames: Vec<Vec<u8>> = input["frames_hex"]
@@ -486,6 +509,19 @@ async fn execute(input: &Value) -> Value {
         "wss-recovery-isolation" | "wss-ready" | "wss-reserved-method"
     )
     .then(|| RecoveryService::new(source.clone(), RecoveryLimits::default()).unwrap());
+    let policy = (id == "wss-authorization-denied").then(|| {
+        Arc::new(RestrictedEcho {
+            denial_message: input["scenario"]["input"]["faults"]["policy_denial_message"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            denials: AtomicUsize::new(0),
+        })
+    });
+    let handler: Arc<dyn Handler> = match &policy {
+        Some(policy) => policy.clone(),
+        None => handler,
+    };
     let fixture = Fixture::new(handler, recovery).await;
     let supplied_hello = id == "wss-ready";
     let hello_bytes = if supplied_hello {
@@ -604,21 +640,15 @@ async fn execute(input: &Value) -> Value {
         | "wss-reserved-method"
         | "wss-payloads"
         | "wss-deadline"
-        | "wss-internal-error" => {
+        | "wss-internal-error"
+        | "wss-authorization-denied" => {
             let started_at = std::time::Instant::now();
             for bytes in &frames {
                 peer.send(bytes).await;
                 output.push(observed(&peer.one().await));
             }
-            if id == "wss-payloads" {
-                let mut variants = Vec::new();
-                for (id, payload) in [(8, vec![]), (9, vec![0, 1, 2, 255, 255])] {
-                    peer.send(&request(id, payload.clone())).await;
-                    let row = observed(&peer.one().await);
-                    assert_eq!(row["payload_hex"], hex(&payload));
-                    variants.push(row);
-                }
-                checks["payload_variants"] = json!(variants);
+            if let Some(policy) = &policy {
+                assert_eq!(policy.denials.load(Ordering::SeqCst), 1);
             }
             if id == "wss-deadline" {
                 checks["handler_delay_ms"] = json!(handler_delay_ms);

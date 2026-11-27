@@ -149,9 +149,15 @@ async fn handshake_malformed_range_rejected() {
             ConnectionConfig::default(),
         );
         let _ = initiator;
-        host.ingest(&handshake_fixtures::hello_bytes(min, max, vec![]))
-            .await;
-        assert_eq!(host.state().await, ConnectionState::Closed);
+        let bytes = handshake_fixtures::hello_bytes(min, max, vec![]);
+        let frame = syntra_core::decode_frame_structure(&bytes).unwrap();
+        assert_eq!((frame.version, frame.request_id), (1, 0));
+        let Some(syntra_core::wire::frame::Body::Hello(hello)) = frame.body else {
+            panic!("malformed range fixture must be a hello");
+        };
+        assert_eq!((hello.min_version, hello.max_version), (min, max));
+        host.ingest(&bytes).await;
+        assert_eq!(host.state().await, ConnectionState::Closed, "{min}..={max}");
     }
 }
 
@@ -487,12 +493,15 @@ async fn bebop_frame_consumes_exactly_one_unit() {
     let ctx = syntra_core::ValidationContext::pre_handshake(ConnectionState::Connected);
     let frame = syntra_core::decode_frame(&good, ctx).expect("good vector");
     assert!(matches!(frame.body, Some(Body::Hello(_))));
-    for bad in [
-        [&[0][..], &good].concat(),
-        [&good[..], &[0]].concat(),
-        good[..good.len() - 1].to_vec(),
+    for (case, bad) in [
+        ("leading byte", [&[0][..], &good].concat()),
+        ("trailing byte", [&good[..], &[0]].concat()),
+        ("truncated hello", good[..good.len() - 1].to_vec()),
     ] {
-        assert!(syntra_core::decode_frame(&bad, ctx).is_err());
+        assert!(
+            syntra_core::decode_frame(&bad, ctx).is_err(),
+            "decoder accepted {case}: {bad:02x?}"
+        );
     }
 }
 
@@ -531,4 +540,30 @@ fn ready_fixture_decodes() {
     let frame = decode_frame(&bytes, ctx).expect("ready fixture");
     assert_eq!(frame.version, 1);
     assert_eq!(frame.request_id, 0);
+}
+
+#[test]
+fn handshake_fixture_fields_are_validated_on_receive() {
+    let hello =
+        handshake_fixtures::hello_bytes(1, 1, vec![0; syntra_core::MAX_CREDENTIAL_BYTES + 1]);
+    let ready = handshake_fixtures::ready_bytes(1, "");
+    for (frame, state, code) in [
+        (
+            hello,
+            ConnectionState::Connected,
+            ErrorCode::ResourceExhausted,
+        ),
+        (
+            ready,
+            ConnectionState::Negotiating,
+            ErrorCode::InvalidArgument,
+        ),
+    ] {
+        assert_eq!(
+            decode_frame(&frame, ValidationContext::pre_handshake(state))
+                .unwrap_err()
+                .code(),
+            code
+        );
+    }
 }

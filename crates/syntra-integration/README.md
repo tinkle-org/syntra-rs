@@ -21,9 +21,11 @@ rustls WSS convenience feature. Managed networking (`managed`), proxy helpers
 `network_websocket` covers managed loopback WS/application-provider WSS listeners;
 `routes` covers explicit allowlisted endpoint composition. CI selects both
 `managed,websocket,proxy` and `managed,tls-rustls,proxy` for those targets.
-Candidate HTTP/HTTPS uses `http_connections`, `network_http` and `routes` with
+The draft RFC0013 HTTP/HTTPS bindings are unregistered candidates. Their tests use
+`http_connections`, `network_http` and `routes` with
 `managed,http,proxy`, plus a separate `managed,http,websocket,proxy` combination.
-These are native test lanes, outside this TCP/WS Docker fixture.
+These native tests run outside the TCP/WS Docker fixture and do not establish
+carrier approval or conformance.
 
 The WS endpoint is `/syntra/1.0/ws` (`websocket::ENDPOINT_PATH`) with exact
 subprotocol `syntra.1.0`. The harness dials mapped ports on `127.0.0.1` to meet

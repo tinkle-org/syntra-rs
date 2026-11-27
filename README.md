@@ -70,6 +70,8 @@ and `features = ["tcp"]` when the application owns a Tokio runtime, or select
 See the [package README](crates/syntra-net/README.md) for the dependency declaration,
 security inputs, and native/WASM boundaries. Pin compatible
 RC versions together when also using core/runtime types directly.
+For `syntra-ws` callers, [Dial and call](#dial-and-call) shows the `syntra-net`
+connection inputs and explicit shutdown; changing the dependency name alone is not enough.
 
 Runtime byte channels exchange serialized `Frame` values inside the embedder.
 Supplied connection drivers compose them with encrypted record framing and

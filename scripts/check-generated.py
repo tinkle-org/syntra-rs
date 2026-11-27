@@ -17,8 +17,9 @@ VERSION = "3.2.3"
 
 
 def files(directory):
+    # Both the compiler and the checkout may use host newlines. Compare in LF.
     return {
-        path.relative_to(directory): path.read_bytes()
+        path.relative_to(directory).as_posix(): path.read_bytes().replace(b"\r\n", b"\n")
         for path in directory.rglob("*") if path.is_file()
     }
 
@@ -39,19 +40,18 @@ def main():
         shutil.copytree(ROOT / "schemas", stage / "schemas")
         subprocess.run(["bebopc", "build"], cwd=stage, check=True, timeout=180)
         actual = files(stage / GENERATED)
-    if not actual:
-        raise RuntimeError("no Rust bindings generated")
-    # Native bebopc uses the host newline. The committed artifact uses LF.
-    actual = {name: data.replace(b"\r\n", b"\n") for name, data in actual.items()}
     output = ROOT / GENERATED
     expected = files(output)
-    for name in sorted(actual.keys() | expected.keys()):
-        if expected.get(name) == actual.get(name):
-            continue
-        if not args.write:
-            raise RuntimeError(f"generated Rust drift: {name} (rerun with --write)")
-        if name not in actual:
-            raise RuntimeError(f"obsolete generated file: remove {name} explicitly")
+    if not actual:
+        raise RuntimeError("\n".join(["no Rust bindings generated", *sorted(expected)]))
+    differing = sorted(name for name in actual.keys() | expected.keys()
+                       if actual.get(name) != expected.get(name))
+    if differing and not args.write:
+        raise RuntimeError("generated Rust drift (rerun with --write):\n" + "\n".join(differing))
+    obsolete = sorted(expected.keys() - actual.keys())
+    if obsolete:
+        raise RuntimeError("obsolete generated files (remove explicitly):\n" + "\n".join(obsolete))
+    for name in differing:
         path = output / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(actual[name])

@@ -11,16 +11,15 @@ HTTP/HTTPS and cross-carrier failover remain opt-in implementation candidates.
 
 ## Using TCP
 
-For an application that already owns a native Tokio runtime, select `tcp`:
+For an application that already owns a native Tokio runtime, select `tcp` and
+point Cargo at the local checkout (adjust the relative path as needed):
 
 ```toml
 [dependencies]
-syntra-net = { version = "=1.0.0-rc.2", default-features = false, features = ["tcp"] }
+syntra-net = { path = "../syntra-rs/crates/syntra-net", default-features = false, features = ["tcp"] }
 ```
 
-Select a published version for a registry dependency, or use a path dependency
-to build against this checkout. Align direct `syntra-core` and `syntra-runtime`
-pins with `syntra-net`; prereleases can contain breaking changes.
+Use matching `syntra-core` and `syntra-runtime` dependencies from the same source.
 
 `syntra_net::tcp::connect` establishes an encrypted connection and returns a
 `ClientHandle` exposing the runtime `Initiator`. Provision the server public key,

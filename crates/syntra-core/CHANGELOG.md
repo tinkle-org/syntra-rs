@@ -28,9 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - [**breaking**] consolidate native networking in syntra-net ([#23](https://github.com/tinkle-org/syntra-rs/pull/23))
-- [**breaking**] update v1 Core/RPC and recovery behavior ([#16](https://github.com/tinkle-org/syntra-rs/pull/16))
-- add secure-channel connectivity and benchmarks ([#10](https://github.com/tinkle-org/syntra-rs/pull/10))
+- [**breaking**] implement Phase 2 Core/RPC and Phase 3 recovery alignment to accepted SDD v1 ([#16](https://github.com/tinkle-org/syntra-rs/pull/16))
+- add SC1 connectivity and benchmarks ([#10](https://github.com/tinkle-org/syntra-rs/pull/10))
 
 ### Other
 
-- initial Rust implementation ([#1](https://github.com/tinkle-org/syntra-rs/pull/1))
+- extract existing Rust implementation from syntra ([#1](https://github.com/tinkle-org/syntra-rs/pull/1))

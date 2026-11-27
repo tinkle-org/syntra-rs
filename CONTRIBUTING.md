@@ -250,8 +250,9 @@ to LF. Remove obsolete generated files explicitly; `--write` will not delete the
   changing their order changes the bytes. Preserve numbered `message` fields
   and `union` discriminators; do not recycle their IDs.
 - Use the owned [`syntra_core::wire`](crates/syntra-core/src/wire.rs) types in
-  caller-facing APIs. `FrameBody` selects one body; `CallResult` carries a
-  `CallOutcome` that distinguishes success (including empty bytes) from error.
+  caller-facing APIs. `Frame.body` uses `wire::frame::Body`;
+  `CallResult.outcome` is an `Option<wire::call_result::Outcome>`. A successful
+  empty payload is valid; a missing outcome (`None`) is not.
   Core validates the envelope; the negotiated service validates its payload.
 - Review schema, bindings, codec validation, and wire fixtures together in this
   repository. Compare expected bytes as well as decoded values: a same-codec

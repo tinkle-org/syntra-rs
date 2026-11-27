@@ -60,6 +60,25 @@ def coverage(contract, fixture, cases):
     require(seen == recipes.keys(), "unreferenced negative recipes")
 
 
+def validate_number_types(limits, layout):
+    require(isinstance(limits, dict) and all(type(n) is int for n in limits.values()),
+            "channel limits must be integers")
+    for field, extent in layout.items():
+        if field == "m2_bytes":
+            require(type(extent) is int, "m2_bytes must be an integer")
+        else:
+            require(isinstance(extent, list) and len(extent) == 2 and type(extent[0]) is int
+                    and (type(extent[1]) is int or (field == "scope" and extent[1] is None)),
+                    f"invalid integer extent: {field}")
+
+
+def verify_independent(rows, reference):
+    independent = indexed(rows)
+    require(len({row['context_hex'] for row in rows}) == len(rows), "duplicate independent Rust context bytes")
+    require(len(independent) >= 4 and all(reference[k].get(f) == v for k, r in independent.items()
+                                          for f, v in r.items() if f != "kind"), "independent context fixture drift")
+
+
 def verify(root=ROOT):
     contract = read_json(root, 'protocol-contract.json')
     fixture = read_json(root, FIXTURES / 'syntra-1.0-context.json')
@@ -67,6 +86,7 @@ def verify(root=ROOT):
     coverage(contract, fixture, cases)
     rows, negatives = fixture["contexts"], fixture["negative_recipes"]
     layout, limits = contract["context_layout"], contract["channel_limits"]
+    validate_number_types(limits, layout)
     observed = probe(root, rows, negatives, layout)
 
     def observations(kind):
@@ -98,15 +118,13 @@ def verify(root=ROOT):
     require(rejected.keys() == indexed(negatives).keys() and all(r["rejected"] for r in rejected.values()), "negative context accepted")
     require({r["carrier"]: r["rejected"] for r in observations("default_candidate_rejection")} == {4: True, 5: True},
             "opt-in carrier accepted by default")
-    independent = indexed(observations("independent"))
-    reference = indexed(rows)
-    require(len(independent) >= 4 and all(reference[k].get(f) == v for k, r in independent.items()
-                                          for f, v in r.items() if f != "kind"), "independent context fixture drift")
+    verify_independent(observations("independent"), indexed(rows))
     record, = observations("record_fixture")
     require(any(row["carrier"] == 3 and row["context_hex"] == record["hex"] for row in rows), "record WSS fixture drift")
-    binding_sources(root, contract)
-    record_fixture_bounds(root, contract)
-    return {"protocol": contract["protocol"], "carriers": sorted(cases), "contexts": len(rows), "negative_recipes": len(negatives)}
+    return {"kind": "compiled_source_encoding_agreement_not_full_crate_or_carrier_execution",
+            "protocol": contract["protocol"], "carriers": sorted(cases), "contexts": len(rows),
+            "negative_recipes": len(negatives), "bindings": binding_sources(root, contract),
+            "record_fixture_bounds": record_fixture_bounds(root, contract)}
 
 
 if __name__ == "__main__":

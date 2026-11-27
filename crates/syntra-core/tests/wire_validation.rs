@@ -321,7 +321,7 @@ fn direct_admission_and_encoder_reject_invalid_call_and_result_values() {
 }
 
 #[test]
-fn allocator_is_unique_across_threads_and_never_recycles_abandoned_ids() {
+fn allocator_issues_consecutive_unique_ids_across_threads() {
     let allocator = std::sync::Arc::new(RequestIdAllocator::default());
     let workers: Vec<_> = (0..4)
         .map(|_| {

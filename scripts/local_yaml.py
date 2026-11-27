@@ -4,6 +4,13 @@ import yaml
 
 
 class UniqueSafeLoader(yaml.SafeLoader):
+    def compose_node(self, parent, index):
+        node = super().compose_node(parent, index)
+        # These pair-list tags bypass construct_mapping, even as merge operands.
+        if node is not None and node.tag in ("tag:yaml.org,2002:omap", "tag:yaml.org,2002:pairs"):
+            self.construct_undefined(node)
+        return node
+
     def construct_mapping(self, node, deep=False):
         self.flatten_mapping(node)
         result = {}

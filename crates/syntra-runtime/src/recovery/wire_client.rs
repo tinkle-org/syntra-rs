@@ -1309,7 +1309,7 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
                                     self.retire(&h, Some(next));
                                 }
                             }
-                            Some(Outcome::SnapshotRequired(true)) => {
+                            Some(Outcome::SnapshotRequired) => {
                                 if r.stage.is_some()
                                     || r.pending.as_ref().is_some_and(|offer| offer.snapshot)
                                 {
@@ -1339,7 +1339,7 @@ impl<S: RecoveryPersistence + Send + Sync + 'static> RecoveryClient<S> {
                                     handle: handle.clone(),
                                 });
                             }
-                            Some(Outcome::CatchupComplete(true)) => {
+                            Some(Outcome::CatchupComplete) => {
                                 if r.mode == Mode::Snapshot || r.snapshot_installed {
                                     continue;
                                 }

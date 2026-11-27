@@ -422,12 +422,12 @@ impl Slot {
     }
     fn overflow(&mut self) {
         self.end(
-            recovery_batch_trailer::Outcome::Terminated(true),
+            recovery_batch_trailer::Outcome::Terminated,
             b"local-queue-exhausted",
         );
     }
     fn snapshot_required(&mut self) {
-        let trailer = self.trailer(recovery_batch_trailer::Outcome::SnapshotRequired(true), &[]);
+        let trailer = self.trailer(recovery_batch_trailer::Outcome::SnapshotRequired, &[]);
         if let Some(s) = &mut self.sub {
             s.mode = Mode::Snapshot;
             s.complete = false;
@@ -441,7 +441,7 @@ impl Slot {
     }
     fn finish(&mut self, catchup: bool) {
         let done = if catchup {
-            self.trailer(recovery_batch_trailer::Outcome::CatchupComplete(true), &[])
+            self.trailer(recovery_batch_trailer::Outcome::CatchupComplete, &[])
         } else {
             notification(recovery_notification::Notification::ReplayComplete(
                 RecoveryReplayComplete {
@@ -615,7 +615,7 @@ impl RecoveryHostSession {
         let auth = self.authorize(&s.selector, hook);
         if let Err(e) = auth {
             slot.end(
-                recovery_batch_trailer::Outcome::Terminated(true),
+                recovery_batch_trailer::Outcome::Terminated,
                 b"authorization-ended",
             );
             return Err(e);
@@ -633,7 +633,7 @@ impl RecoveryHostSession {
                     ProviderError::PermissionDenied | ProviderError::Unauthenticated
                 ) {
                     slot.end(
-                        recovery_batch_trailer::Outcome::Terminated(true),
+                        recovery_batch_trailer::Outcome::Terminated,
                         b"authorization-ended",
                     );
                 }
@@ -648,7 +648,7 @@ impl RecoveryHostSession {
                 );
             } else {
                 slot.end(
-                    recovery_batch_trailer::Outcome::Terminated(true),
+                    recovery_batch_trailer::Outcome::Terminated,
                     b"provider-binding-lost",
                 );
             }
@@ -797,10 +797,8 @@ impl RecoveryHostSession {
                     subscription_handle: handle,
                     generation: state.slots[index].generation,
                 })?;
-                state.slots[index].end(
-                    recovery_batch_trailer::Outcome::Terminated(true),
-                    b"unsubscribed",
-                );
+                state.slots[index]
+                    .end(recovery_batch_trailer::Outcome::Terminated, b"unsubscribed");
                 Ok(reply)
             }
             _ => unreachable!(),
@@ -1241,7 +1239,7 @@ impl RecoveryHostSession {
             Ok(cut) => cut,
             Err(_) => {
                 slot.end(
-                    recovery_batch_trailer::Outcome::Terminated(true),
+                    recovery_batch_trailer::Outcome::Terminated,
                     b"snapshot-chain-gap",
                 );
                 return Err(ProviderError::FailedPrecondition);
@@ -1348,7 +1346,7 @@ impl RecoveryHostSession {
             } // exact-tail retry, scoped and authorized
             if batch.predecessor != s.live_tail {
                 slot.end(
-                    recovery_batch_trailer::Outcome::Terminated(true),
+                    recovery_batch_trailer::Outcome::Terminated,
                     b"provider-chain-gap",
                 );
                 remember_error(&mut error, ProviderError::FailedPrecondition);
@@ -1364,7 +1362,7 @@ impl RecoveryHostSession {
                     ProviderError::PermissionDenied | ProviderError::Unauthenticated
                 ) {
                     slot.end(
-                        recovery_batch_trailer::Outcome::Terminated(true),
+                        recovery_batch_trailer::Outcome::Terminated,
                         b"authorization-ended",
                     );
                 }
@@ -1396,10 +1394,7 @@ impl RecoveryHostSession {
         if slot.sub.is_none() {
             return Err(ProviderError::FailedPrecondition);
         }
-        slot.end(
-            recovery_batch_trailer::Outcome::Terminated(true),
-            b"superseded",
-        );
+        slot.end(recovery_batch_trailer::Outcome::Terminated, b"superseded");
         Ok(())
     }
 
@@ -1456,7 +1451,7 @@ impl RecoveryHostSession {
                 matches!(
                     t.outcome,
                     Some(
-                        recovery_batch_trailer::Outcome::Terminated(true)
+                        recovery_batch_trailer::Outcome::Terminated
                             | recovery_batch_trailer::Outcome::NextGeneration(_)
                     )
                 ),
@@ -1510,10 +1505,10 @@ impl RecoveryHostSession {
             recovery_notification::Notification::Trailer(t) => {
                 t.boundary_checkpoint == slot.boundary
                     && match t.outcome {
-                        Some(recovery_batch_trailer::Outcome::CatchupComplete(true)) => {
+                        Some(recovery_batch_trailer::Outcome::CatchupComplete) => {
                             s.mode == Mode::CatchUp && s.complete
                         }
-                        Some(recovery_batch_trailer::Outcome::SnapshotRequired(true)) => {
+                        Some(recovery_batch_trailer::Outcome::SnapshotRequired) => {
                             s.mode == Mode::Snapshot && s.snapshot.is_none()
                         }
                         _ => false,

@@ -50,7 +50,8 @@ def frame_bytes(frame):
         arm = 12
         payload = base64.b64decode(frame["payload_b64"], validate=True)
         fields = b"\x01" + sized(frame["method"].encode()) + b"\x02" + sized(payload)
-        fields += b"\x03" + struct.pack("<I", frame.get("timeout_ms", 0))
+        if frame.get("timeout_ms", 0) != 0:
+            fields += b"\x03" + struct.pack("<I", frame["timeout_ms"])
     elif frame["body"] == "hello":
         arm = 10
         fields = struct.pack("<BIBI", 1, frame["min_version"], 2, frame["max_version"]) + b"\x03" + sized(b"")
@@ -92,7 +93,7 @@ def request_for(identifier):
         for frame in expected.get("frames", []):
             require(not (set(frame) - {"request_id", "body", "payload_b64", "shape", "note"}),
                     "adapter lacks an oracle for declared expected frame fields")
-        require(not (set(expected.get("error", {})) - {"code", "message_pattern", "observer", "carriage"}),
+        require(not (set(expected.get("error", {})) - {"code", "message", "message_pattern", "observer", "carriage"}),
                 "adapter lacks an oracle for declared error fields")
     return {"protocol": 2, "kind": "supplemental_local_scenario", "formal_conformance": False,
             "nonce": secrets.token_hex(24), "scenario_id": identifier,
@@ -123,18 +124,20 @@ def expected_observation(want, got):
     if "frames" in want:
         expected_frames(want["frames"], got["frames"])
     if "error" in want:
-        error = got.get("error")
-        if error is None:
+        if want["error"].get("carriage") == "local_only":
+            error = got["error"]
+        else:
             errors = [frame["error"] for frame in got["frames"] if "error" in frame]
             require(len(errors) == 1, "expected exactly one error observation")
             error = errors[0]
-        for key in ("code", "observer", "carriage"):
+        for key in ("code", "message", "observer", "carriage"):
             if key in want["error"]:
                 require(error.get(key) == want["error"][key], f"error {key} mismatch")
         pattern = want["error"].get("message_pattern", "")
         if pattern:
             require(pattern.startswith("NEGATIVE:"), "unimplemented message assertion")
-            require(pattern.removeprefix("NEGATIVE:").lower() not in error.get("message", "").lower(), "forbidden diagnostic")
+            require(isinstance(error.get("message"), str), "missing wire diagnostic observation")
+            require(pattern.removeprefix("NEGATIVE:").lower() not in error["message"].lower(), "forbidden diagnostic")
 
 
 def validate_result(request, result, root=ROOT):
@@ -179,7 +182,7 @@ def validate_result(request, result, root=ROOT):
         require(checks["completed_handlers_at_terminal"] == 0 and checks["dispatched_handlers"] == 1,
                 "deadline did not race a genuinely delayed outstanding handler")
     elif identifier == "wss-payloads":
-        require([row["payload_hex"] for row in checks["payload_variants"]] == ["", "000102ffff"], "missing empty/non-UTF8 subcases")
+        require(len(sent) == 1 + len(request["frames_hex"]) + 1, "expected only setup, declared calls and followup")
     elif identifier == "wss-ready":
         require(checks["ready_without_optional_negotiation"] is True, "missing no-negotiation Ready observation")
     elif identifier == "wss-recovery-isolation":

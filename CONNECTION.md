@@ -236,7 +236,8 @@ readiness. It adds no DNS discovery, redirects or retry loop; the owning
 
 ### Candidate cross-carrier failover
 
-The new opt-in API is
+Ordinary routes require one carrier. Mixed-carrier retry is a draft exception
+to `SNTR-TSEC-007`; it has neither protocol adoption nor security approval. To opt in, use
 `routes::client_routes_cross_carrier(RouteConfig, CrossCarrierPolicy, inputs)`,
 where `CrossCarrierPolicy { permitted_carriers: Vec<Carrier> }` has no default
 permissions and `inputs` has shape

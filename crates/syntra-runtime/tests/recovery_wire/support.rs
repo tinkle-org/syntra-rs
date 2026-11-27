@@ -500,7 +500,7 @@ impl Bridge {
                             let frame = syntra_core::decode_frame_structure(bytes.as_slice()).unwrap();
                             let completion = match &frame.body { Some(Body::Notification(n)) => match codec::decode::<RecoveryNotification>(n.payload.as_slice()).unwrap().notification {
                                 Some(Notification::ReplayComplete(_)) => true,
-                                Some(Notification::Trailer(t)) => t.outcome == Some(recovery_batch_trailer::Outcome::CatchupComplete(true)),
+                                Some(Notification::Trailer(t)) => t.outcome == Some(recovery_batch_trailer::Outcome::CatchupComplete),
                                 _ => false,
                             }, _ => false };
                             let drop_result = matches!(frame.body, Some(Body::Result(_))) && f.drop_results.lock().unwrap().is_some_and(|method| methods.lock().unwrap().get(&frame.request_id).is_some_and(|m| m == method));

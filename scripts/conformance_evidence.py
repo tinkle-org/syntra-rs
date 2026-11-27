@@ -25,6 +25,7 @@ sys.dont_write_bytecode = True
 
 import yaml
 
+from context_probe import rust_tokens
 from local_inputs import FIXTURES, ROOT, digest, regular_file
 from local_yaml import load_yaml
 from protocol_contract import verify as verify_protocol
@@ -66,14 +67,25 @@ def verify_transcriptions(root=ROOT):
     ping = fixtures["websocket/VEC-WS-005"]
     close = fixtures["websocket/VEC-WS-006"]
     expected = {
+        # Historical rejection input, not a control frame from transport.yaml.
+        "NO_LENGTH_PREFIX_REJECTED_HEX": "0801520408011001",
         "PING_WIRE_HEX": ping["server_wire_hex"], "PONG_WIRE_HEX": ping["client_wire_hex"],
         "CLOSE_CLIENT_WIRE_HEX": close["client_wire_hex"],
         "CLOSE_HOST_WIRE_HEX": close["server_wire_hex"],
     }
     name = "tests/interoperability/vectors.rs"
     text = regular_file(root, name).decode("utf-8")
-    pairs = re.findall(r'pub const (\w+_HEX): &str = "([0-9a-f]+)";', text)
-    if len(pairs) != len(dict(pairs)) or any(dict(pairs).get(key) != value for key, value in expected.items()):
+    tokens = [token[0] for token in rust_tokens(text)]
+    actual = {}
+    for i, key in enumerate(tokens):
+        if not key.endswith("_HEX") or tokens[i - 1] != "const":
+            continue
+        declaration = " ".join(tokens[i - 2:i + 7])
+        literal = re.fullmatch(r'pub const \w+_HEX : & str = "([0-9a-f]+)" ;', declaration)
+        if not literal or key in actual:
+            raise ValueError(f"handwritten WS vector transcription drift: {key}")
+        actual[key] = literal[1]
+    if actual != expected:
         raise ValueError("handwritten WS vector transcription drift")
     close_codes = fixtures["websocket/VEC-WS-007"]
     expected_codes = set(close_codes["mapping"].values())

@@ -1,4 +1,6 @@
 //! Initiator RPC admission, emission, and terminal selection across lifecycle changes.
+//! These local regressions cover RFC 0004 D1/D4 and RFC 0008 cases; they do not
+//! exercise real OS suspend or establish formal conformance.
 
 use super::*;
 use crate::frame_fixture::FrameFixture;

@@ -249,14 +249,14 @@ profile!(RecoveryBatchTrailer, self, {
         Some(Outcome::NextGeneration(g)) => {
             *g > self.generation && self.terminate_reason.is_empty()
         }
-        Some(Outcome::Terminated(true)) => {
+        Some(Outcome::Terminated) => {
             opaque(&self.terminate_reason, 256, true) && self.terminate_reason.is_ascii()
         }
-        Some(Outcome::CatchupComplete(true)) => {
+        Some(Outcome::CatchupComplete) => {
             cp(&self.boundary_checkpoint) && self.terminate_reason.is_empty()
         }
-        Some(Outcome::SnapshotRequired(true)) => self.terminate_reason.is_empty(),
-        _ => false,
+        Some(Outcome::SnapshotRequired) => self.terminate_reason.is_empty(),
+        None => false,
     })
 });
 profile!(RecoveryNotification, self, {

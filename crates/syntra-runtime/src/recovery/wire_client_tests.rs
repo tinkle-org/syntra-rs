@@ -497,7 +497,7 @@ fn inbox_overflow_is_targeted_reserved_and_unchanged_generation_even_with_leased
         panic!("reserved terminal");
     };
     assert_eq!(t.generation, 7);
-    assert_eq!(t.outcome, Some(Outcome::Terminated(true)));
+    assert_eq!(t.outcome, Some(Outcome::Terminated));
     assert_eq!(t.terminate_reason, b"local-queue-exhausted");
     assert!(inbox.active(b"J", 7));
     assert_eq!(inbox.counts().data_messages, 1);
@@ -984,7 +984,7 @@ async fn snapshot_required_after_staging_retires_offer_even_at_equal_boundary() 
         assert_eq!(client.snapshot_bytes(b"H").unwrap(), b"snapshot bytes");
         notify(&client.inbox, Notification::Batch(batch(b"H", s0, b"L")));
         assert_eq!(client.inbox.counts().data_messages, 1);
-        let mut expiry = trailer(b"H", Outcome::SnapshotRequired(true));
+        let mut expiry = trailer(b"H", Outcome::SnapshotRequired);
         if let Notification::Trailer(ref mut t) = expiry {
             t.boundary_checkpoint = s0.to_vec();
         }
@@ -1083,7 +1083,7 @@ async fn snapshot_required_during_install_write_preserves_durable_state_without_
         let boundary = s0.to_vec();
         let commits_before_install = store.commits.load(Ordering::Acquire);
         *store.hook.lock().unwrap() = Some(Box::new(move || {
-            let mut expiry = trailer(b"H", Outcome::SnapshotRequired(true));
+            let mut expiry = trailer(b"H", Outcome::SnapshotRequired);
             if let Notification::Trailer(ref mut t) = expiry {
                 t.boundary_checkpoint = boundary.clone();
             }
@@ -1393,7 +1393,7 @@ fn aggregate_bytes_bound_and_separate_equivalent_completion_slots() {
     notify(&inbox, Notification::Batch(batch(b"H", b"A", b"B")));
     assert_eq!(inbox.counts().data_bytes, charge, "exact MAX admitted");
     notify(&inbox, complete(b"H", b"B"));
-    let mut equivalent = trailer(b"H", Outcome::CatchupComplete(true));
+    let mut equivalent = trailer(b"H", Outcome::CatchupComplete);
     if let Notification::Trailer(ref mut t) = equivalent {
         t.boundary_checkpoint = b"B".to_vec();
     }
@@ -1431,7 +1431,7 @@ async fn retention_trailer_after_rpc_failure_allows_explicit_snapshot_not_genera
         let (id, _) = peer.request(wire::REPLAY).await;
         peer.result(id, Err(ErrorCode::FailedPrecondition)).await;
         tokio::time::sleep(Duration::from_millis(1)).await;
-        notify(&inbox, trailer(b"H", Outcome::SnapshotRequired(true)));
+        notify(&inbox, trailer(b"H", Outcome::SnapshotRequired));
     };
     let (result, ()) = tokio::join!(client.replay_page(b"H"), response);
     assert_eq!(
@@ -1943,7 +1943,7 @@ async fn local_overflow_event_carries_ascii_terminal_without_inventing_next_gene
     assert_eq!(generation, 7);
     assert_eq!(next_generation, None);
     assert_eq!(t.generation, 7);
-    assert_eq!(t.outcome, Some(Outcome::Terminated(true)));
+    assert_eq!(t.outcome, Some(Outcome::Terminated));
     assert_eq!(t.terminate_reason, b"local-queue-exhausted");
     assert!(
         peer.writer.try_recv().is_err(),

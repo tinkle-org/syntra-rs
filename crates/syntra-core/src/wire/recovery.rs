@@ -81,9 +81,9 @@ pub mod recovery_batch_trailer {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Outcome {
         NextGeneration(u64),
-        CatchupComplete(bool),
-        SnapshotRequired(bool),
-        Terminated(bool),
+        CatchupComplete,
+        SnapshotRequired,
+        Terminated,
     }
 }
 

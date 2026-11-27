@@ -582,7 +582,7 @@ fn catchup_is_pull_driven_bounded_and_exact_acceptance_retries_are_effect_free()
     let done = trailer(&s);
     assert_eq!(
         done.outcome,
-        Some(recovery_batch_trailer::Outcome::CatchupComplete(true))
+        Some(recovery_batch_trailer::Outcome::CatchupComplete)
     );
     assert_eq!(done.boundary_checkpoint, h.catchup_boundary);
     assert_eq!(s.handle(CATCH_UP, &r.fixture_bytes()).unwrap(), accepted);
@@ -612,7 +612,7 @@ fn initial_skips_replay_and_requires_explicit_baseline_completion() {
     let _: RecoveryCatchUpAccepted = call(&s, CATCH_UP, &catchup(&h.subscription_handle)).unwrap();
     assert_eq!(
         trailer(&s).outcome,
-        Some(recovery_batch_trailer::Outcome::CatchupComplete(true))
+        Some(recovery_batch_trailer::Outcome::CatchupComplete)
     );
     assert_eq!(source.replay_calls.load(Ordering::SeqCst), 0);
 }
@@ -636,7 +636,7 @@ fn retention_miss_has_failed_result_and_snapshot_required_at_unchanged_g() {
         assert_eq!(t.generation, 7);
         assert_eq!(
             t.outcome,
-            Some(recovery_batch_trailer::Outcome::SnapshotRequired(true))
+            Some(recovery_batch_trailer::Outcome::SnapshotRequired)
         );
         assert!(t.terminate_reason.is_empty());
         let _: RecoverySnapshotDescriptor =
@@ -1019,10 +1019,7 @@ async fn irreconcilable_snapshot_held_chain_terminates_only_h_and_requires_a_fre
     };
     assert_eq!(t.subscription_handle, h.subscription_handle);
     assert_eq!(t.generation, 7);
-    assert_eq!(
-        t.outcome,
-        Some(recovery_batch_trailer::Outcome::Terminated(true))
-    );
+    assert_eq!(t.outcome, Some(recovery_batch_trailer::Outcome::Terminated));
     assert_eq!(t.terminate_reason, b"snapshot-chain-gap");
     assert_eq!(
         s.handle(SNAPSHOT_CONFIRM, &install.fixture_bytes()),
@@ -1099,10 +1096,7 @@ fn local_overflow_terminates_only_the_slow_handle_and_reserves_control_capacity(
     let t = trailer(&slow);
     assert_eq!(t.subscription_handle, hs.subscription_handle);
     assert_eq!(t.generation, 7);
-    assert_eq!(
-        t.outcome,
-        Some(recovery_batch_trailer::Outcome::Terminated(true))
-    );
+    assert_eq!(t.outcome, Some(recovery_batch_trailer::Outcome::Terminated));
     assert_eq!(t.terminate_reason, b"local-queue-exhausted");
     assert_eq!(source.current_generation(&p, b"s").unwrap(), 7);
     assert_eq!(fast.queue_counts().unwrap().subscriptions, 1);
@@ -1161,10 +1155,7 @@ fn revocation_is_rechecked_before_emission_and_never_manufactures_an_epoch() {
     source.data.lock().unwrap().denied.insert(p.subject.clone());
     let t = trailer(&s);
     assert_eq!(t.generation, 7);
-    assert_eq!(
-        t.outcome,
-        Some(recovery_batch_trailer::Outcome::Terminated(true))
-    );
+    assert_eq!(t.outcome, Some(recovery_batch_trailer::Outcome::Terminated));
     assert_eq!(t.terminate_reason, b"authorization-ended");
     assert_eq!(s.queue_counts().unwrap().data_bytes, 0);
 }
@@ -1461,6 +1452,23 @@ fn positional_subscribe_checks_declared_lengths_and_exact_consumption() {
 }
 
 #[test]
+fn positional_subscribe_checks_field_size_limits() {
+    let subscribe = |selector_len, checkpoint_len| Subscribe {
+        profile_version: 1,
+        stream_selector: vec![b's'; selector_len],
+        start_checkpoint: vec![b'c'; checkpoint_len],
+    };
+    let max = subscribe(1024, 4096);
+    assert_eq!(codec::decode::<Subscribe>(&max.fixture_bytes()), Ok(max));
+    for oversized in [subscribe(1025, 4096), subscribe(1024, 4097)] {
+        assert_eq!(
+            codec::decode::<Subscribe>(&oversized.fixture_bytes()),
+            Err(ProviderError::FailedPrecondition)
+        );
+    }
+}
+
+#[test]
 fn notification_preflight_checks_arm_discriminator_and_exact_extent() {
     let message = RecoveryNotification {
         profile_version: 1,
@@ -1713,7 +1721,7 @@ async fn egress_reauthorization_after_writer_barrier_denies_popped_batch_and_tar
     assert!(
         matches!(t.notification, Some(recovery_notification::Notification::Trailer(t))
         if t.subscription_handle == h.subscription_handle && t.generation == 7
-            && t.outcome == Some(recovery_batch_trailer::Outcome::Terminated(true))
+            && t.outcome == Some(recovery_batch_trailer::Outcome::Terminated)
             && t.terminate_reason == b"authorization-ended")
     );
     let _: RecoveryCatchUpAccepted =
@@ -1895,7 +1903,7 @@ fn egress_rejects_cross_session_protected_and_terminal_payloads_and_invalid_name
         other.revalidate_notification(&terminal),
         Err(ProviderError::FailedPrecondition)
     );
-    let template: RecoveryNotification = codec::decode(&terminal).unwrap();
+    let mut template: RecoveryNotification = codec::decode(&terminal).unwrap();
     for handle in [
         vec![0; 31],
         {
@@ -1923,10 +1931,25 @@ fn egress_rejects_cross_session_protected_and_terminal_payloads_and_invalid_name
             Err(ProviderError::FailedPrecondition)
         );
     }
-    let mut unset = terminal.clone();
-    unset.truncate(unset.len() - 1);
+    let Some(recovery_notification::Notification::Trailer(t)) = &mut template.notification else {
+        panic!("expected terminal trailer");
+    };
+    // Terminated has no payload: its tag immediately precedes the length-prefixed reason.
+    let tag = terminal.len() - t.terminate_reason.len() - 4 - 1;
+    assert_eq!(terminal[tag], 8);
+    t.outcome = None;
     assert_eq!(
-        s.revalidate_notification(&unset),
+        codec::encode(&template),
+        Err(ProviderError::FailedPrecondition)
+    );
+    let mut unknown = terminal.clone();
+    unknown[tag] = 0; // No wire arm for an unset outcome; keep both union lengths intact.
+    assert_eq!(
+        s.revalidate_notification(&unknown),
+        Err(ProviderError::FailedPrecondition)
+    );
+    assert_eq!(
+        s.revalidate_notification(&terminal[..terminal.len() - 1]),
         Err(ProviderError::FailedPrecondition)
     );
     assert_eq!(
@@ -2004,7 +2027,7 @@ fn egress_unauthenticated_is_sticky_on_authorize_and_generation_callbacks() {
         assert!(
             matches!(t.notification, Some(recovery_notification::Notification::Trailer(t))
             if t.subscription_handle == h.subscription_handle && t.generation == 7
-                && t.outcome == Some(recovery_batch_trailer::Outcome::Terminated(true)))
+                && t.outcome == Some(recovery_batch_trailer::Outcome::Terminated))
         );
         source.data.lock().unwrap().unauthenticated.clear();
         source.data.lock().unwrap().generation_error = None;
@@ -2290,10 +2313,7 @@ fn publication_permission_denial_is_targeted_and_other_source_errors_are_not_wit
             let t = trailer(&s);
             assert_eq!(t.subscription_handle, h.subscription_handle);
             assert_eq!(t.generation, 7);
-            assert_eq!(
-                t.outcome,
-                Some(recovery_batch_trailer::Outcome::Terminated(true))
-            );
+            assert_eq!(t.outcome, Some(recovery_batch_trailer::Outcome::Terminated));
             assert_eq!(t.terminate_reason, b"authorization-ended");
         } else {
             assert_eq!(s.queue_counts().unwrap().subscriptions, 1);

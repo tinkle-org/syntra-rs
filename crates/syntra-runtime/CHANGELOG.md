@@ -48,16 +48,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- [**breaking**] update v1 Core/RPC and recovery behavior ([#16](https://github.com/tinkle-org/syntra-rs/pull/16))
-- update the v1 secure channel ([#15](https://github.com/tinkle-org/syntra-rs/pull/15))
-- gate outbound frames during the WSS lifecycle ([#11](https://github.com/tinkle-org/syntra-rs/pull/11))
-- add secure-channel connectivity and benchmarks ([#10](https://github.com/tinkle-org/syntra-rs/pull/10))
+- [**breaking**] implement Phase 2 Core/RPC and Phase 3 recovery alignment to accepted SDD v1 ([#16](https://github.com/tinkle-org/syntra-rs/pull/16))
+- align SC1 v1 with accepted RFC 0007 profile ([#15](https://github.com/tinkle-org/syntra-rs/pull/15))
+- canonical SC1 WSS lifecycle with emission gate ([#11](https://github.com/tinkle-org/syntra-rs/pull/11))
+- add SC1 connectivity and benchmarks ([#10](https://github.com/tinkle-org/syntra-rs/pull/10))
 
 ### Fixed
 
-- repair file-store lock release ([#21](https://github.com/tinkle-org/syntra-rs/pull/21))
+- pin committed candidate provenance and repair file-store lock release ([#21](https://github.com/tinkle-org/syntra-rs/pull/21))
 
 ### Other
 
 - *(deps)* bump sha2 from 0.10.9 to 0.11.1 ([#19](https://github.com/tinkle-org/syntra-rs/pull/19))
-- initial Rust implementation ([#1](https://github.com/tinkle-org/syntra-rs/pull/1))
+- extract existing Rust implementation from syntra ([#1](https://github.com/tinkle-org/syntra-rs/pull/1))

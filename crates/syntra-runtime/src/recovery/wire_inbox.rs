@@ -75,7 +75,7 @@ impl Slot {
             subscription_handle: handle.to_vec(),
             generation: self.generation,
             boundary_checkpoint: Vec::new(),
-            outcome: Some(Outcome::Terminated(true)),
+            outcome: Some(Outcome::Terminated),
             terminate_reason: b"local-queue-exhausted".to_vec(),
         }));
     }
@@ -208,7 +208,7 @@ impl RecoveryInbox {
                 }
             }
             Notification::Trailer(ref trailer) => match trailer.outcome {
-                Some(Outcome::CatchupComplete(true)) => {
+                Some(Outcome::CatchupComplete) => {
                     if slot
                         .completion
                         .as_ref()
@@ -222,7 +222,7 @@ impl RecoveryInbox {
                 _ => {
                     slot.clear_data();
                     slot.revision = slot.revision.saturating_add(1);
-                    slot.fenced = !matches!(trailer.outcome, Some(Outcome::SnapshotRequired(true)));
+                    slot.fenced = !matches!(trailer.outcome, Some(Outcome::SnapshotRequired));
                     slot.terminal = Some(n);
                 }
             },

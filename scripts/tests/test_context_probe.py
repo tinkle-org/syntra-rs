@@ -6,10 +6,24 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import context_probe as probe
 from local_inputs import ROOT, read_json
-from protocol_contract import indexed
+from protocol_contract import indexed, validate_number_types, verify_independent
 
 
 class FixtureTests(unittest.TestCase):
+    def test_contract_numbers_do_not_coerce_booleans_or_floats(self):
+        validate_number_types({"authorization_key_bytes": 32}, {"scope": [34, None], "m2_bytes": 48})
+        for limits, layout in (({"authorization_key_bytes": 32.0}, {}), ({}, {"scope_bytes": [True, 255]}),
+                               ({}, {"domain": [False, 10]}), ({}, {"m2_bytes": 48.0})):
+            with self.subTest(limits=limits, layout=layout), self.assertRaises(ValueError):
+                validate_number_types(limits, layout)
+
+    def test_independent_ids_cannot_share_context_bytes(self):
+        rows = [{"id": str(i), "context_hex": f"{i:02x}"} for i in range(4)]
+        verify_independent(rows, indexed(rows))
+        rows[-1]['context_hex'] = rows[0]['context_hex']
+        with self.assertRaisesRegex(ValueError, "duplicate independent Rust context bytes"):
+            verify_independent(rows, indexed(rows))
+
     def test_index_requires_unique_nonempty_string_ids(self):
         rows = [{"id": "a"}, {"id": "b"}]
         self.assertEqual(indexed(rows), {"a": rows[0], "b": rows[1]})

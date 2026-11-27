@@ -119,14 +119,13 @@ macro_rules! borrow_field {
             recovery_batch_trailer::Outcome::NextGeneration(value) => {
                 raw::TrailerOutcome::NextGeneration { value }
             }
-            recovery_batch_trailer::Outcome::Terminated(true) => raw::TrailerOutcome::Terminated {},
-            recovery_batch_trailer::Outcome::CatchupComplete(true) => {
+            recovery_batch_trailer::Outcome::Terminated => raw::TrailerOutcome::Terminated {},
+            recovery_batch_trailer::Outcome::CatchupComplete => {
                 raw::TrailerOutcome::CatchupComplete {}
             }
-            recovery_batch_trailer::Outcome::SnapshotRequired(true) => {
+            recovery_batch_trailer::Outcome::SnapshotRequired => {
                 raw::TrailerOutcome::SnapshotRequired {}
             }
-            _ => return Err(INVALID),
         }
     };
     ($v:expr, event) => {
@@ -163,12 +162,12 @@ macro_rules! own_field {
             raw::TrailerOutcome::NextGeneration { value } => {
                 recovery_batch_trailer::Outcome::NextGeneration(value)
             }
-            raw::TrailerOutcome::Terminated {} => recovery_batch_trailer::Outcome::Terminated(true),
+            raw::TrailerOutcome::Terminated {} => recovery_batch_trailer::Outcome::Terminated,
             raw::TrailerOutcome::CatchupComplete {} => {
-                recovery_batch_trailer::Outcome::CatchupComplete(true)
+                recovery_batch_trailer::Outcome::CatchupComplete
             }
             raw::TrailerOutcome::SnapshotRequired {} => {
-                recovery_batch_trailer::Outcome::SnapshotRequired(true)
+                recovery_batch_trailer::Outcome::SnapshotRequired
             }
             raw::TrailerOutcome::Unknown => return Err(INVALID),
         })

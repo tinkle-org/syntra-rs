@@ -16,8 +16,9 @@ implementation; `tls-rustls` adds optional WSS convenience APIs. `managed`,
 `proxy`, `reconnect` and candidate `http` HTTP/HTTPS connections are
 explicit opt-ins. Pipe timings cover no managed WS/WSS listeners, route selection,
 HTTP/HTTPS connections or raw adapters, TLS/provider composition, managed runtime,
-proxies or reconnect behavior. Candidate full-RPC tests are separate from these
-timings. See
+proxies or reconnect behavior. The separate full-RPC tests exercise the draft
+RFC0013 HTTP/HTTPS bindings. Neither the timings nor those tests establish
+adoption, conformance, or completion of security review. See
 [CONNECTION.md](CONNECTION.md) for encryption and connection guidance. These local
 harnesses do not establish operational budgets or real-device/network results.
 Retain the implementation revision and dirty-worktree state with measurements.

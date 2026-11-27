@@ -1,7 +1,10 @@
 # Sequential cross-carrier failover candidate
 
-Status: opt-in implementation candidate. This document describes route selection,
-failure handling, and validation commands.
+Status: opt-in implementation candidate. Mixed-carrier retry is a proposed
+exception to the prohibition on automatic carrier fallback in `SNTR-TSEC-007`
+and the same-carrier rule in draft RFC0013. The requirements below apply only
+to the candidate; local tests do not establish adoption, conformance, or
+independent security review.
 
 See [README.md](README.md#candidate-cross-carrier-failover) for the feature overview
 and [CONNECTION.md](CONNECTION.md#candidate-cross-carrier-failover) for composition.
