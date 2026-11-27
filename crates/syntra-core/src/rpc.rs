@@ -48,40 +48,30 @@ pub fn validate_method(method: &str) -> Result<(), SyntraError> {
             message: "method must start with '/'".to_string(),
         });
     }
-    if method.matches('/').count() != 2 {
+    // Check separators and characters in one pass, preserving error precedence.
+    let mut separators = 0;
+    let mut printable = true;
+    for b in method.bytes().skip(1) {
+        separators += usize::from(b == b'/');
+        printable &= (0x21..=0x7E).contains(&b);
+    }
+    if separators != 1 {
         return Err(SyntraError::Protocol {
             code: ErrorCode::InvalidArgument,
             message: "method must be /package.Service/Method".to_string(),
         });
     }
-    let mut parts = method.split('/');
-    let _leading = parts.next(); // "" before the leading slash
-    let pkg_svc = parts.next().unwrap_or("");
-    let meth = parts.next().unwrap_or("");
-    // Exactly two slashes means no fourth segment; check explicitly.
-    if parts.next().is_some() {
-        return Err(SyntraError::Protocol {
-            code: ErrorCode::InvalidArgument,
-            message: "method must contain exactly two '/'".to_string(),
-        });
-    }
-    if pkg_svc.is_empty() || meth.is_empty() {
+    if method.starts_with("//") || method.ends_with('/') {
         return Err(SyntraError::Protocol {
             code: ErrorCode::InvalidArgument,
             message: "method segments must be non-empty".to_string(),
         });
     }
-    for seg in [pkg_svc, meth] {
-        for b in seg.bytes() {
-            // Printable ASCII excluding space (0x20), controls, and DEL.
-            // '/' (0x2F) cannot appear: the two-slash count forbids it.
-            if !(0x21..=0x7E).contains(&b) {
-                return Err(SyntraError::Protocol {
-                    code: ErrorCode::InvalidArgument,
-                    message: "method must be ASCII printable excluding spaces/control".to_string(),
-                });
-            }
-        }
+    if !printable {
+        return Err(SyntraError::Protocol {
+            code: ErrorCode::InvalidArgument,
+            message: "method must be ASCII printable excluding spaces/control".to_string(),
+        });
     }
     Ok(())
 }

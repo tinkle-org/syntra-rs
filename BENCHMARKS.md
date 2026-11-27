@@ -208,3 +208,24 @@ cargo test --locked --release -p syntra-core --test bench_allocations -- --ignor
 # CASE: frame/roundtrip_request/{0,1048320} or tcp/duplex_echo_warm/{64,65536}.
 "$BIN" --bench "^${CASE}$" --warm-up-time 0.5 --measurement-time 1 --sample-size 30 --noplot
 ```
+
+### Follow-up: Protobuf request decoding on Linux ARM64
+
+The [main-push run after #55](https://github.com/tinkle-org/syntra-rs/actions/runs/46076555674)
+compared `34ece84` (Bebop) to `a85467a` (Protobuf). Empty request time rose
+21% and 19% on the two passes; near-limit request time rose 64% and 57%.
+None of the three encrypted-record cases crossed the gate. Both codecs made
+two allocations for empty requests, but Protobuf made four instead of three
+for near-limit requests. After the structural scan it parsed the request again,
+and prost's borrowed-slice to `Vec<u8>` decode copied the payload twice.
+
+With Rust 1.89.0 in a four-CPU Linux ARM64 Docker container on an M4, the
+unchanged `benchmark_baseline.py` reproduced both failures. Reusing the scanned
+request fields and checking method syntax in one pass cut empty and near-limit
+request times by 55% and 40% versus `a85467a`. Against `34ece84`, the empty
+case was 40–42% faster and the near-limit case ranged from 2% slower to 3%
+faster across two passes. The repeat was triggered by a warm-record control,
+not a frame case. The full gate passed against both baselines. Allocation calls
+are now 2 / 3 at the same 29 / 1,048,355 encoded bytes. These are in-memory
+results from a local Linux VM, not a rerun on the hosted runner or an RPC
+latency measurement.

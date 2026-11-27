@@ -78,7 +78,7 @@ impl ValidationContext {
 
 /// Shared bounded structural walk, before any raw-choice classification or
 /// generated decoding. Also used by the narrow missing-outcome correlator.
-fn structural_scan(bytes: &[u8]) -> Result<ScanStats, SyntraError> {
+fn structural_scan(bytes: &[u8]) -> Result<ScanStats<'_>, SyntraError> {
     if bytes.is_empty() {
         return Err(SyntraError::Protocol {
             code: ErrorCode::InvalidArgument,
@@ -99,19 +99,27 @@ fn structural_scan(bytes: &[u8]) -> Result<ScanStats, SyntraError> {
 /// Validate the entire raw structure, choice multiplicity and field allocation
 /// bounds without allocating decoded values or applying connection semantics.
 pub fn validate_wire_structure(bytes: &[u8]) -> Result<(), SyntraError> {
-    let scan = structural_scan(bytes)?;
-    // No semantic classification may short-circuit the complete structural walk.
-    scan.validate_body()?;
-    if let Some(outcome) = &scan.outcome {
-        outcome.validate("result outcome")?;
-    }
-    scan.validate_field_bounds()
+    structural_scan(bytes)?.validate()
 }
 
 /// Decode a bounded envelope for error classification, not dispatch. This does
 /// not validate its version, request ID, connection state or per-body semantics.
 pub fn decode_frame_structure(bytes: &[u8]) -> Result<Frame, SyntraError> {
-    validate_wire_structure(bytes)?;
+    let scan = structural_scan(bytes)?;
+    scan.validate()?;
+    // The walk has already decoded these fields. Copy only the admitted values,
+    // rather than parsing again and copying the payload via a temporary Bytes.
+    if scan.is_request {
+        return Ok(Frame {
+            version: scan.version,
+            request_id: scan.request_id,
+            body: Some(Body::Request(crate::proto::RpcRequest {
+                method: scan.method.into(),
+                payload: scan.payload.into(),
+                timeout_ms: scan.timeout_ms,
+            })),
+        });
+    }
     Frame::decode(bytes).map_err(|_| invalid("malformed protobuf frame"))
 }
 
@@ -354,7 +362,7 @@ impl RawChoice {
 }
 
 #[derive(Default)]
-struct ScanStats {
+struct ScanStats<'a> {
     reserved: bool,
     body: RawChoice,
     // Only relevant after exactly one known Frame body has been established.
@@ -362,6 +370,12 @@ struct ScanStats {
     outcome: Option<RawChoice>,
     // Deferred so malformed structure and raw-choice failures always win.
     field_bound_violation: Option<FieldBoundViolation>,
+    is_request: bool,
+    version: u32,
+    request_id: u64,
+    method: &'a str,
+    payload: &'a [u8],
+    timeout_ms: u32,
 }
 
 enum FieldBoundViolation {
@@ -370,7 +384,15 @@ enum FieldBoundViolation {
     Diagnostic,
 }
 
-impl ScanStats {
+impl ScanStats<'_> {
+    fn validate(&self) -> Result<(), SyntraError> {
+        self.validate_body()?;
+        if let Some(outcome) = &self.outcome {
+            outcome.validate("result outcome")?;
+        }
+        self.validate_field_bounds()
+    }
+
     fn validate_body(&self) -> Result<(), SyntraError> {
         if self.reserved {
             return Err(invalid("frame uses reserved field number"));
@@ -440,13 +462,13 @@ impl Schema {
 /// Allocation-free structural walk. Unknown LEN values and opaque bytes are
 /// skipped, not interpreted; lawful unknown groups have matching end tags and
 /// consume the same depth budget as embedded known messages. Root depth is zero.
-fn walk(
-    bytes: &[u8],
+fn walk<'a>(
+    bytes: &'a [u8],
     i: &mut usize,
     schema: Schema,
     depth: u32,
     end_group: Option<u32>,
-    scan: &mut ScanStats,
+    scan: &mut ScanStats<'a>,
 ) -> Result<(), SyntraError> {
     if depth > MAX_DECODE_DEPTH {
         return Err(resource("frame nesting exceeds depth bound"));
@@ -492,7 +514,13 @@ fn walk(
         }
         match wire {
             0 => {
-                read_varint(bytes, i)?;
+                let value = read_varint(bytes, i)?;
+                match (schema, field) {
+                    (Schema::Frame, 1) => scan.version = value as u32,
+                    (Schema::Frame, 2) => scan.request_id = value,
+                    (Schema::Request, 3) => scan.timeout_ms = value as u32,
+                    _ => {}
+                }
             }
             1 => advance(bytes, i, 8)?,
             2 => {
@@ -505,11 +533,18 @@ fn walk(
                 let value = &bytes[start..*i];
                 match field_type {
                     Some(FieldType::Message(nested)) => {
+                        scan.is_request |= matches!(nested, Schema::Request);
                         walk(value, &mut 0, nested, depth + 1, None, scan)?;
                     }
                     Some(FieldType::String) => {
-                        std::str::from_utf8(value)
+                        let text = std::str::from_utf8(value)
                             .map_err(|_| invalid("invalid UTF-8 in core string"))?;
+                        if matches!((schema, field), (Schema::Request, 1)) {
+                            scan.method = text;
+                        }
+                    }
+                    Some(FieldType::Bytes) if matches!((schema, field), (Schema::Request, 2)) => {
+                        scan.payload = value;
                     }
                     _ => {}
                 }
