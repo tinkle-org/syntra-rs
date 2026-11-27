@@ -6,7 +6,7 @@
 //!
 //! - Per-stream coordinator map keyed by stream selector bytes.
 //! - Fixed catch-up boundary per stream. The subscribed boundary from
-//!   `SubscriptionAccepted.catchup_boundary` is recorded via
+//!   `RecoverySubscribeResponse.catchup_boundary` is recorded via
 //!   [`ProfileEngine::set_subscribed_boundary`]; when set, every replay
 //!   page and every catch-up completion boundary must equal it before held
 //!   live batches are released (SYN-URP-023). Neither replay nor completion

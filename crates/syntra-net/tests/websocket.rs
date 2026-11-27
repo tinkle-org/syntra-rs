@@ -9,7 +9,7 @@ use std::{
 };
 use syntra_core::secure_channel::*;
 use syntra_core::{
-    decode_frame, encode_frame, wire::frame::Body, ConnectionState, ValidationContext,
+    decode_frame, encode_frame, proto::frame::Body, ConnectionState, ValidationContext,
 };
 use syntra_net::{websocket as ws, AuthenticatorFactory, Limits};
 use syntra_runtime::{
@@ -364,17 +364,16 @@ async fn protected_record_bounds_and_active_message_faults_both_modes() {
                             payload: vec![0x5a; MAX_PLAINTEXT],
                         })),
                     };
-                    let overhead = 4 + notification.encoded_len() - MAX_PLAINTEXT;
+                    let ctx = ValidationContext::active(1);
+                    let overhead =
+                        4 + encode_frame(&notification, ctx).unwrap().len() - MAX_PLAINTEXT;
                     let Some(Body::Notification(body)) = notification.body.as_mut() else {
                         unreachable!()
                     };
                     body.payload.truncate(MAX_PLAINTEXT - overhead);
                     let record = channel
                         .encrypt(
-                            &frame_plaintext(
-                                &encode_frame(&notification, ValidationContext::active(1)).unwrap(),
-                            )
-                            .unwrap(),
+                            &frame_plaintext(&encode_frame(&notification, ctx).unwrap()).unwrap(),
                         )
                         .unwrap();
                     assert_eq!(record.len(), MAX_CIPHERTEXT);
@@ -564,7 +563,7 @@ async fn protected_socket_loss_fails_pending_calls_and_handle_drop_closes_clones
                     let frames = FrameDecoder::default().push(&plaintext).unwrap();
                     assert_eq!(frames.len(), 1);
                     let call = decode_frame(&frames[0], ValidationContext::active(1)).unwrap();
-                    assert!(matches!(call.body, Some(Body::Call(_))));
+                    assert!(matches!(call.body, Some(Body::Request(_))));
                     request_seen.send(()).unwrap();
                     if !remote_loss {
                         // Owner drop is abortive: no WS closing handshake is promised.

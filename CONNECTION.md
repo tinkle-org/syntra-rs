@@ -5,9 +5,9 @@ part of the protocol. The `syntra_core::secure_channel` module owns cryptographi
 state within core, separate from runtime scheduling and socket policy.
 Encryption is integral to every connection.
 
-The [Bebop schemas](CONTRIBUTING.md#schema-and-generated-code) define message
-bytes. The authenticated context, Noise messages, protected record stream, and
-carrier framing have separate encodings, described below.
+The [Protobuf schema](proto/syntra/v1) defines the `syntra.v1.Frame` envelope
+and negotiated recovery messages. The authenticated context, Noise messages,
+protected record stream, and carrier framing have separate encodings.
 
 ## Layer and crate ownership
 
@@ -105,12 +105,16 @@ failure blocks automatic continuation. See the
 
 ## Records and carriers
 
-The runtime and the production frame-pump ABI exchange **one serialized frame**
-at a time, without a carrier or stream prefix. The record driver prefixes those
-bytes before encryption. Bebop's little-endian lengths inside a message do not
-replace the big-endian stream and TCP lengths below. RPC application payloads
-stay opaque; only the selected service interprets them (including negotiated
-update/recovery messages).
+The runtime and the production frame-pump ABI exchange **one serialized Protobuf
+`Frame`** at a time. Do not add a Protobuf length delimiter: the record driver
+adds the big-endian frame-stream length before encryption. The TCP record
+length is a separate outer prefix. RPC payloads stay opaque to core; the
+selected service interprets them (including negotiated update/recovery messages).
+
+All carriers use the same envelope. A successful Noise handshake or a match
+on the `syntra.1.0` subprotocol does not distinguish this encoding from #54's
+incompatible version-1 encoding. Provision matching peers rather than trying
+a second decoder on invalid input.
 
 The encryption kernel accepts at most 65,519 plaintext bytes per record, producing
 at most 65,535 ciphertext bytes including the 16-byte authentication tag. Empty

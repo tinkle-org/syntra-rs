@@ -225,45 +225,74 @@ issues. Scope each verification claim to the code and boundary exercised.
 Repository implementation licensing is Apache-2.0 ([LICENSE](LICENSE) and the root
 manifest). Preserve source provenance when updating schemas and fixtures.
 
+## Input provenance and authority
+
+The `.proto` files in [`proto/syntra/v1`](proto/syntra/v1) restore this
+repository's `syntra.v1` schema from `b99f56b`, before the Bebop change in
+[#54](https://github.com/tinkle-org/syntra-rs/pull/54), with local corrections
+to the schema comments. The checked-in schema is the input for this
+implementation. That revision identifies the schema's
+history; it does not import an external protocol pin, test suite, or verdict.
+Both encodings use Core wire version 1. Upgrade peers together; changing
+carrier or negotiating recovery does not select a codec.
+
 ## Schema and generated code
 
-`syntra-rs` owns the wire contract. Edit [`frame.bop`](schemas/v1/frame.bop)
-for the envelope and [`recovery.bop`](schemas/v1/recovery.bop) for the
-negotiated service payloads. The root [`bebop.json`](bebop.json) selects the
-schemas and the Rust output, `crates/syntra-core/src/generated/syntra.rs`.
-Use exactly `bebopc` 3.2.3; do not hand-edit the generated file.
+[`envelope.proto`](proto/syntra/v1/envelope.proto) defines `Frame`;
+[`rpc.proto`](proto/syntra/v1/rpc.proto) defines the RPC messages;
+[`recovery_profile.proto`](proto/syntra/v1/recovery_profile.proto) defines the
+negotiated service payloads. Preserve field numbers, reserved names and
+numbers, and `oneof` membership. These determine which values a peer can
+interpret, independently of Rust naming.
 
-From the repository root, with `bebopc` on `PATH`:
+[`buf.yaml`](buf.yaml) defines a module rooted at `proto`; its schema imports
+resolve locally. Use **Buf CLI 1.59.0** with [`buf.gen.yaml`](buf.gen.yaml),
+which pins `buf.build/community/neoeinstein-prost:v0.4.0`, **revision 1**.
+The Cargo runtime dependency is `prost = "=0.14.6"`. Normal builds
+read [`syntra.v1.rs`](crates/syntra-core/src/generated/syntra.v1.rs) directly.
+Do not hand-edit it. From the repository root, with `buf` on `PATH` and access
+to `buf.build` for remote generation:
 
 ```sh
 python3 scripts/check-generated.py --write  # Regenerate after editing a schema.
-python3 scripts/check-generated.py          # Check for drift without writing.
+python3 scripts/check-generated.py          # Check for drift without changing the checkout.
 ```
 
-The [generation script](scripts/check-generated.py) checks the compiler version,
-copies the root config and schemas into a temporary directory, and runs
-`bebopc build` there. It compares filenames and bytes after normalizing output
-to LF. Remove obsolete generated files explicitly; `--write` will not delete them.
+Use the script rather than bare `buf generate`: it runs the pinned plugin in
+a temporary directory and adds `#[prost(skip_debug)]` to `ClientHello` so its
+credential is not included by a generated `Debug` implementation. The drift
+check compares filenames and bytes after that step.
 
-- Use `PascalCase` for schema types and `lowerCamelCase` for fields (`requestId`
-  in the schema, `request_id` in Rust). Required `struct` fields are positional:
-  changing their order changes the bytes. Preserve numbered `message` fields
-  and `union` discriminators; do not recycle their IDs.
-- Use the owned [`syntra_core::wire`](crates/syntra-core/src/wire.rs) types in
-  caller-facing APIs. `Frame.body` uses `wire::frame::Body`;
-  `CallResult.outcome` is an `Option<wire::call_result::Outcome>`. A successful
-  empty payload is valid; a missing outcome (`None`) is not.
-  Core validates the envelope; the negotiated service validates its payload.
-- Review schema, bindings, codec validation, and wire fixtures together in this
-  repository. Compare expected bytes as well as decoded values: a same-codec
-  round trip alone cannot detect a layout change on both sides. See
-  [records and carriers](CONNECTION.md#records-and-carriers) for framing outside Bebop.
+Use the public `syntra_core::proto` types. The crate root also re-exports
+`Frame`, `RpcRequest`, and `RpcResult`. For example, this is a successful
+empty RPC result; omitting `outcome` is invalid:
+
+```rust
+use syntra_core::proto::{frame::Body, rpc_result::Outcome, RpcResult};
+
+let body = Body::Result(RpcResult { outcome: Some(Outcome::Payload(vec![])) });
+```
+
+Use `Body::Request(RpcRequest { .. })` for a request. Recovery uses names such
+as `RecoverySubscribeRequest` and `RecoverySubscribeResponse`. In a wire error,
+`proto::RpcError.code` is a raw `i32`; zero (`ErrorCode::Unspecified`) is invalid.
+
+Use `syntra_core::encode_frame` and `syntra_core::decode_frame` at the frame
+boundary. A generated type does not enforce raw-wire or connection-state
+rules. Review the schema, generated bindings, validation, and local fixtures
+together: compare expected bytes as well as decoded values, since a round
+trip alone can pass when both sides change. See [records and carriers](CONNECTION.md#records-and-carriers)
+for framing outside Protobuf.
 
 ## Implementation evidence
 
+Use this checkout's [protocol contract](protocol-contract.json) and fixtures.
+With the Python dependencies from `scripts/requirements-evidence.txt` installed,
+run `python3 scripts/conformance_evidence.py` to check those inputs. This
+default invocation is not a peer run or a formal conformance assessment.
 Record the local revision, feature set, command, and named cases that actually
-ran. Distinguish a generated-file comparison from a codec fixture, an encrypted
-round trip, and a run with an independent peer. A zero-test filter or successful
+ran. Distinguish a generated-file comparison from a codec fixture and from an
+encrypted round trip with this SDK on both ends. A zero-test filter or successful
 compilation is not an executed test. Report performance only from measurements
 with the setup and timing boundary described in [BENCHMARKS.md](BENCHMARKS.md).
 
@@ -334,9 +363,9 @@ and rerun the failed merge run after reviewing its revision. A rerun uses the
 original source and workflow; it cannot pick up a later source fix. After a
 reviewed workflow-only fix, use the Release-plz workflow's manual Run workflow
 action on `main`, with `release_commit` set to the full lowercase SHA of the
-original release-PR squash merge. The target commit must contain the schema root
-`schemas/v1/syntra.bop`, `bebop.json`, `scripts/check-generated.py`, and the local
-`setup-bebopc` action. This retry verifies that the commit is on
+original release-PR squash merge. The target must contain the Protobuf schema,
+Buf configuration, and local generation and evidence scripts required by the
+[release workflow](.github/workflows/release-plz.yml). This retry verifies that the commit is on
 `main` and belongs to a merged release-plz PR, reruns all validation on that exact
 commit, then publishes from the same revision with the current workflow. It
 does not prepare another release PR or bypass `release_always = false`.

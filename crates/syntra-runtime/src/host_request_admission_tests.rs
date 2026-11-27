@@ -4,22 +4,21 @@
 mod request_budget_tests;
 
 use super::*;
-use crate::frame_fixture::FrameFixture;
 use crate::session::AllowAnonymous;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use syntra_core::wire::{call_result::Outcome, Cancel, ClientHello};
+use syntra_core::proto::{rpc_result::Outcome, Cancel, ClientHello};
 
 fn request(id: u64, method: &str, timeout_ms: u32) -> Vec<u8> {
     Frame {
         version: 1,
         request_id: id,
-        body: Some(Body::Call(Call {
+        body: Some(Body::Request(RpcRequest {
             method: method.into(),
             payload: vec![],
             timeout_ms,
         })),
     }
-    .fixture_bytes()
+    .encode_to_vec()
 }
 
 fn call(id: u64) -> Vec<u8> {
@@ -32,7 +31,7 @@ fn cancel(id: u64) -> Vec<u8> {
         request_id: id,
         body: Some(Body::Cancel(Cancel {})),
     }
-    .fixture_bytes()
+    .encode_to_vec()
 }
 
 async fn activate(host: &Host, writer: &mut mpsc::Receiver<Vec<u8>>) {
@@ -46,7 +45,7 @@ async fn activate(host: &Host, writer: &mut mpsc::Receiver<Vec<u8>>) {
                 credential: vec![],
             })),
         }
-        .fixture_bytes(),
+        .encode_to_vec(),
     )
     .await;
     assert!(matches!(
@@ -61,7 +60,7 @@ async fn result(writer: &mut mpsc::Receiver<Vec<u8>>, id: u64) -> Outcome {
     let frame =
         syntra_core::decode_frame_structure(writer.recv().await.unwrap().as_slice()).unwrap();
     assert_eq!(frame.request_id, id);
-    let Some(Body::Result(CallResult {
+    let Some(Body::Result(RpcResult {
         outcome: Some(outcome),
     })) = frame.body
     else {
@@ -222,7 +221,7 @@ async fn fifo_gate_and_receipt_timestamp_include_admission_delay() {
         let frame =
             syntra_core::decode_frame_structure(writer.recv().await.unwrap().as_slice()).unwrap();
         ids.push(frame.request_id);
-        let Some(Body::Result(CallResult {
+        let Some(Body::Result(RpcResult {
             outcome: Some(outcome),
         })) = frame.body
         else {
@@ -477,7 +476,7 @@ async fn direct_error_variants_are_sanitized_and_bounded() {
         Arc::new(AllowAnonymous),
         Arc::new(FnHandler(|_, _, _| async {
             HandlerOutcome::Error {
-                code: ErrorCode::Invalid,
+                code: ErrorCode::Unspecified,
                 message: "é".repeat(syntra_core::MAX_DIAGNOSTIC_BYTES),
             }
         })),
@@ -490,7 +489,7 @@ async fn direct_error_variants_are_sanitized_and_bounded() {
     assert_eq!(e.code, ErrorCode::Unknown.as_i32());
     assert!(e.message.len() <= syntra_core::MAX_DIAGNOSTIC_BYTES);
     assert!(std::str::from_utf8(e.message.as_bytes()).is_ok());
-    let Outcome::Error(e) = outcome_error(ErrorCode::Invalid, &"x".repeat(10_000)) else {
+    let Outcome::Error(e) = outcome_error(ErrorCode::Unspecified, &"x".repeat(10_000)) else {
         panic!("error")
     };
     assert_eq!(e.code, ErrorCode::Unknown.as_i32());
@@ -984,7 +983,7 @@ async fn authorization_codes_are_generic_and_never_replace_or_union_the_bound_pr
             "access denied",
         ),
         (
-            ErrorCode::Invalid,
+            ErrorCode::Unspecified,
             ErrorCode::PermissionDenied,
             "access denied",
         ),

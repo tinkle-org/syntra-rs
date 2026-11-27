@@ -22,7 +22,7 @@ use syntra_core::secure_channel::{
     generate_server_key, Carrier, ClientConfig, Context, KeyStore, Mode, Secret32, ServerConfig,
     VerifiedIdentity,
 };
-use syntra_core::{wire::*, ConnectionState, ErrorCode};
+use syntra_core::{proto::*, ConnectionState, ErrorCode};
 use syntra_net::{
     websocket as ws, AuthenticatorFactory, ClientHandle, Error, HostHandle, Limits,
     RecoveryAuthenticatorFactory,
@@ -401,7 +401,7 @@ async fn negotiate(client: &mut RecoveryClient<Store>) {
 async fn subscribe(
     client: &mut RecoveryClient<Store>,
     intent: SubscribeIntent,
-) -> SubscriptionAccepted {
+) -> RecoverySubscribeResponse {
     bounded(client.subscribe(SELECTOR.to_vec(), STREAM.to_vec(), intent))
         .await
         .unwrap()
@@ -470,7 +470,7 @@ async fn direct_wss_recovery_both_noise_modes_and_explicit_reconnect() {
             Err(RecoveryClientError::InvalidState)
         ));
         // Installing the service does not negotiate it, even on an ACTIVE host.
-        let request = Subscribe {
+        let request = RecoverySubscribeRequest {
             profile_version: 1,
             stream_selector: SELECTOR.to_vec(),
             start_checkpoint: vec![],
@@ -551,7 +551,7 @@ async fn direct_wss_recovery_both_noise_modes_and_explicit_reconnect() {
             ErrorCode::Unimplemented
         );
         negotiate(&mut fresh).await;
-        let stale_confirm = Confirm {
+        let stale_confirm = RecoveryConfirmRequest {
             profile_version: 1,
             subscription_handle: first.subscription_handle.clone(),
             generation: GENERATION,

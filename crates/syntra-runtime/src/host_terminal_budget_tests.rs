@@ -1,6 +1,5 @@
 //! Cooperative authority budgets and retained work after request-wide expiry.
 use super::*;
-use crate::frame_fixture::FrameFixture;
 use std::sync::atomic::AtomicUsize;
 
 const METHOD: &str = "/example.Authority/Retire";
@@ -279,13 +278,13 @@ async fn fixture(
         &Frame {
             version: 1,
             request_id: 0,
-            body: Some(Body::Hello(syntra_core::wire::ClientHello {
+            body: Some(Body::Hello(syntra_core::proto::ClientHello {
                 min_version: 1,
                 max_version: 1,
                 credential: b"fixture".to_vec(),
             })),
         }
-        .fixture_bytes(),
+        .encode_to_vec(),
     )
     .await;
     ordinary.recv().await.unwrap();
@@ -295,13 +294,13 @@ async fn fixture(
         &Frame {
             version: 1,
             request_id: 123,
-            body: Some(Body::Call(Call {
+            body: Some(Body::Request(RpcRequest {
                 method: METHOD.into(),
                 payload: vec![],
                 timeout_ms: 10_000,
             })),
         }
-        .fixture_bytes(),
+        .encode_to_vec(),
         origin,
     )
     .await;
@@ -519,13 +518,13 @@ async fn hard_denial_reservation_race() {
         &Frame {
             version: 1,
             request_id: 0,
-            body: Some(Body::Hello(syntra_core::wire::ClientHello {
+            body: Some(Body::Hello(syntra_core::proto::ClientHello {
                 min_version: 1,
                 max_version: 1,
                 credential: b"fixture".to_vec(),
             })),
         }
-        .fixture_bytes(),
+        .encode_to_vec(),
     )
     .await;
     ordinary.recv().await.unwrap();
@@ -533,13 +532,13 @@ async fn hard_denial_reservation_race() {
         Frame {
             version: 1,
             request_id: id,
-            body: Some(Body::Call(Call {
+            body: Some(Body::Request(RpcRequest {
                 method: method.into(),
                 payload: vec![],
                 timeout_ms: 10_000,
             })),
         }
-        .fixture_bytes()
+        .encode_to_vec()
     };
     host.ingest(&request(1, METHOD)).await;
     let context = captured.await.unwrap();

@@ -575,7 +575,7 @@ mod active_loss {
     use crate::client::{Failure, LifecycleStatus, ReconnectConfig, ReconnectingClient};
     use crate::tls::{BoxIo, EarlyData, ProviderTlsStream, TlsFuture, TlsMetadata, TlsProvider};
     use syntra_core::{
-        decode_frame, encode_frame, wire::frame::Body, ConnectionState, ValidationContext,
+        decode_frame, encode_frame, proto::frame::Body, ConnectionState, ValidationContext,
     };
     use syntra_runtime::{AllowAnonymous, AuthError, Authenticator, FnHandler, HandlerOutcome};
 
@@ -983,7 +983,7 @@ async fn joined_connection_close_does_not_wait_for_an_unrelated_process_dns_job(
             _ => panic!("hello"),
         };
         channel.decrypt(&hello).unwrap();
-        use syntra_core::{encode_frame, wire::frame::Body, ConnectionState, ValidationContext};
+        use syntra_core::{encode_frame, proto::frame::Body, ConnectionState, ValidationContext};
         let ready = encode_frame(
             &syntra_core::Frame {
                 version: 1,

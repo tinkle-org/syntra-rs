@@ -92,9 +92,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
                       '.merged_at != null', '.base.ref == "main"',
                       '.merge_commit_sha == env.RELEASE_COMMIT', 'startswith("release-plz-")'):
             self.assertIn(guard, proof["run"])
-        eligibility, = [step for step in steps if "schemas/v1/syntra.bop" in step.get("run", "")]
+        eligibility, = [step for step in steps if "buf.gen.yaml" in step.get("run", "")]
         self.assertEqual(eligibility["if"], "github.event_name == 'workflow_dispatch'")
-        setup, = [step for step in steps if step.get("uses") == "./.github/actions/setup-bebopc"]
+        setup, = [step for step in steps if step.get("uses", "").startswith("bufbuild/buf-setup-action@")]
         self.assertLess(steps.index(proof), steps.index(eligibility))
         self.assertLess(steps.index(eligibility), steps.index(setup))
         for name in ("validate-release", "release-plz-release"):
@@ -106,11 +106,16 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
     def test_retry_target_must_supply_its_own_generation_inputs(self):
         steps = self.workflow["jobs"]["validate-release"]["steps"]
-        guard, = [step["run"] for step in steps if "schemas/v1/syntra.bop" in step.get("run", "")]
+        guard, = [step["run"] for step in steps if "buf.gen.yaml" in step.get("run", "")]
+        # Discover from the current modules, not the incomplete retry checkout or the guard's list.
+        modules = yaml.safe_load((ROOT / "buf.yaml").read_text())["modules"]
+        schemas = sorted(path.relative_to(ROOT) for module in modules
+                         for path in (ROOT / module["path"]).rglob("*.proto"))
+        self.assertTrue(schemas, "expected .proto inputs in the Buf modules")
         with tempfile.TemporaryDirectory() as target:
             inputs = [Path(target) / name for name in (
-                "schemas/v1/syntra.bop", "bebop.json", "scripts/check-generated.py",
-                ".github/actions/setup-bebopc/action.yml",
+                *schemas, "buf.yaml", "buf.gen.yaml",
+                "scripts/check-generated.py", "scripts/local_inputs.py",
             )]
             for path in inputs:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,7 +134,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(self.workflow["env"]["RUSTUP_TOOLCHAIN"], "1.89.0")
         steps = validation["steps"]
         runs = [step["run"] for step in steps if "run" in step]
-        setup, = [step for step in steps if step.get("uses") == "./.github/actions/setup-bebopc"]
+        setup, = [step for step in steps if step.get("uses", "").startswith("bufbuild/buf-setup-action@")]
+        self.assertRegex(setup["uses"], r"@[0-9a-f]{40}$")
+        self.assertEqual(setup["with"]["version"], "1.59.0")
         drift, = [step for step in steps if "python3 scripts/check-generated.py" in step.get("run", "").splitlines()]
         self.assertEqual(drift["run"].splitlines(), [
             "python3 scripts/check-generated.py", "python3 -B scripts/conformance_evidence.py",

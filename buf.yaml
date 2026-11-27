@@ -1,0 +1,10 @@
+# The local proto module has no external imports and is not published to BSR.
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE

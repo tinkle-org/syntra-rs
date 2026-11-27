@@ -4,11 +4,10 @@
 
 use super::super::persistence::MemoryRecoveryStore;
 use super::*;
-use crate::frame_fixture::FrameFixture;
-use crate::recovery::wire::codec::FixtureRecord;
+use prost::Message;
 use std::future::Future;
 use std::sync::atomic::AtomicUsize;
-use syntra_core::{wire::call_result, wire::frame::Body, Call, Frame};
+use syntra_core::{proto::frame::Body, proto::rpc_result, Frame, RpcRequest};
 use tokio::sync::mpsc;
 
 // This store is intentionally process-local, not a durability claim. It exposes
@@ -64,8 +63,8 @@ fn seed(store: &mut Store, stream: &[u8], generation: u64, checkpoint: &[u8]) {
         )
         .unwrap();
 }
-fn negotiated() -> Negotiated {
-    Negotiated {
+fn negotiated() -> RecoveryNegotiateResponse {
+    RecoveryNegotiateResponse {
         profile_version: 1,
         selected_version: 1,
         max_subscriptions_per_connection: 64,
@@ -74,8 +73,8 @@ fn negotiated() -> Negotiated {
         max_snapshot_pages: 256,
     }
 }
-fn subscribed(h: &[u8], b: &[u8]) -> SubscriptionAccepted {
-    SubscriptionAccepted {
+fn subscribed(h: &[u8], b: &[u8]) -> RecoverySubscribeResponse {
+    RecoverySubscribeResponse {
         profile_version: 1,
         subscription_handle: h.to_vec(),
         generation: 7,
@@ -139,7 +138,7 @@ fn final_page(h: &[u8], from: &[u8], b: &[u8], entries: Vec<RecoveryBatch>) -> R
 struct Peer {
     initiator: Initiator,
     writer: mpsc::Receiver<Vec<u8>>,
-    seen: Vec<(u64, Call)>,
+    seen: Vec<(u64, RpcRequest)>,
 }
 
 impl Peer {
@@ -151,9 +150,7 @@ impl Peer {
                 .prepare_outbound(writer.recv().await.unwrap())
                 .unwrap();
             assert!(matches!(
-                syntra_core::decode_frame_structure(hello.as_slice())
-                    .unwrap()
-                    .body,
+                Frame::decode(hello.as_slice()).unwrap().body,
                 Some(Body::Hello(_))
             ));
             initiator
@@ -165,7 +162,7 @@ impl Peer {
                             connection_id: "controlled-peer".into(),
                         })),
                     }
-                    .fixture_bytes(),
+                    .encode_to_vec(),
                 )
                 .await;
         };
@@ -178,16 +175,16 @@ impl Peer {
         }
     }
 
-    async fn request(&mut self, method: &str) -> (u64, Call) {
+    async fn request(&mut self, method: &str) -> (u64, RpcRequest) {
         let original = self.writer.recv().await.unwrap();
-        let frame = syntra_core::decode_frame_structure(
+        let frame = Frame::decode(
             self.initiator
                 .prepare_outbound(original)
                 .unwrap()
                 .as_slice(),
         )
         .unwrap();
-        let Some(Body::Call(request)) = frame.body else {
+        let Some(Body::Request(request)) = frame.body else {
             panic!("expected RPC");
         };
         assert_eq!(request.method, method);
@@ -197,8 +194,8 @@ impl Peer {
 
     async fn result(&self, id: u64, payload: Result<Vec<u8>, ErrorCode>) {
         let outcome = match payload {
-            Ok(payload) => call_result::Outcome::Payload(payload),
-            Err(code) => call_result::Outcome::Error(syntra_core::wire::RpcError {
+            Ok(payload) => rpc_result::Outcome::Payload(payload),
+            Err(code) => rpc_result::Outcome::Error(syntra_core::proto::RpcError {
                 code: code.as_i32(),
                 message: "public failure".into(),
             }),
@@ -208,11 +205,11 @@ impl Peer {
                 &Frame {
                     version: 1,
                     request_id: id,
-                    body: Some(Body::Result(CallResult {
+                    body: Some(Body::Result(RpcResult {
                         outcome: Some(outcome),
                     })),
                 }
-                .fixture_bytes(),
+                .encode_to_vec(),
             )
             .await;
     }
@@ -221,7 +218,7 @@ impl Peer {
         &mut self,
         operation: impl Future<Output = T>,
         method: &str,
-        response: impl FnOnce(&Call) -> Result<Vec<u8>, ErrorCode>,
+        response: impl FnOnce(&RpcRequest) -> Result<Vec<u8>, ErrorCode>,
     ) -> T {
         let peer = async {
             let (id, request) = self.request(method).await;
@@ -236,7 +233,7 @@ impl Peer {
             RecoveryClient::new(self.initiator.clone(), b"P".to_vec(), store, limits).unwrap();
         let result = self
             .rpc(client.negotiate(), wire::NEGOTIATE, |r| {
-                let request: Negotiate = codec::decode(&r.payload).unwrap();
+                let request: RecoveryNegotiateRequest = codec::decode(&r.payload).unwrap();
                 assert_eq!((request.min_version, request.max_version), (1, 1));
                 assert_eq!(request.capability, wire::CAPABILITY);
                 bytes(&negotiated())
@@ -288,9 +285,9 @@ impl Peer {
             client.persist_and_confirm(h, state.to_vec()),
             wire::CONFIRM,
             |request| {
-                let r: Confirm = codec::decode(&request.payload).unwrap();
+                let r: RecoveryConfirmRequest = codec::decode(&request.payload).unwrap();
                 assert_eq!(r.checkpoint, cp);
-                bytes(&Confirmed {
+                bytes(&RecoveryConfirmResponse {
                     profile_version: 1,
                     subscription_handle: h.to_vec(),
                     generation: 7,
@@ -403,7 +400,7 @@ async fn selected_quota_above_sixteen_is_not_accepted() {
     response.max_pending_rpcs_per_connection = 17;
     assert_eq!(
         peer.rpc(client.negotiate(), wire::NEGOTIATE, |_| Ok(
-            response.fixture_bytes()
+            response.encode_to_vec()
         ))
         .await
         .err(),
@@ -413,12 +410,18 @@ async fn selected_quota_above_sixteen_is_not_accepted() {
 }
 
 #[test]
-fn inbox_version_wrapper_exact_length_and_registration_window() {
+fn inbox_version_wrapper_unknown_fields_and_registration_window() {
     let inbox = Arc::new(RecoveryInbox::new(RecoveryLimits::default()));
     assert_eq!(inbox.push(&[]), Err(ProviderError::FailedPrecondition));
     inbox.enable().unwrap();
     assert_eq!(
-        inbox.push(&1_u32.to_le_bytes()), // version without the required event
+        inbox.push(
+            &RecoveryNotification {
+                profile_version: 1,
+                notification: None
+            }
+            .encode_to_vec()
+        ),
         Err(ProviderError::FailedPrecondition)
     );
     let mut wrong = batch(b"H", b"A", b"B");
@@ -429,7 +432,7 @@ fn inbox_version_wrapper_exact_length_and_registration_window() {
                 profile_version: 1,
                 notification: Some(Notification::Batch(wrong))
             }
-            .fixture_bytes()
+            .encode_to_vec()
         ),
         Err(ProviderError::FailedPrecondition)
     );
@@ -441,11 +444,10 @@ fn inbox_version_wrapper_exact_length_and_registration_window() {
         notification: Some(Notification::Batch(batch(b"H", b"A", b"B"))),
     })
     .unwrap();
-    payload.push(0);
-    assert_eq!(inbox.push(&payload), Err(ProviderError::FailedPrecondition));
-    payload.pop();
+    payload.extend_from_slice(&[0xa0, 0x06, 1]); // ignorable field 100, varint
     inbox.push(&payload).unwrap();
     assert_eq!(inbox.counts().data_messages, 1);
+    assert_eq!(inbox.counts().data_bytes, payload.len() + 32);
     drop(pending);
     assert_eq!(inbox.counts().handles, 0);
     let pending = inbox.begin_subscribe().unwrap();
@@ -497,7 +499,7 @@ fn inbox_overflow_is_targeted_reserved_and_unchanged_generation_even_with_leased
         panic!("reserved terminal");
     };
     assert_eq!(t.generation, 7);
-    assert_eq!(t.outcome, Some(Outcome::Terminated));
+    assert_eq!(t.outcome, Some(Outcome::Terminated(true)));
     assert_eq!(t.terminate_reason, b"local-queue-exhausted");
     assert!(inbox.active(b"J", 7));
     assert_eq!(inbox.counts().data_messages, 1);
@@ -522,7 +524,7 @@ async fn initial_baseline_holds_early_live_and_acceptance_is_not_completion() {
         ),
         wire::SUBSCRIBE,
         |request| {
-            let request: Subscribe = codec::decode(&request.payload).unwrap();
+            let request: RecoverySubscribeRequest = codec::decode(&request.payload).unwrap();
             assert!(request.start_checkpoint.is_empty());
             notify(&inbox, Notification::Batch(batch(b"H", b"B", b"L")));
             bytes(&subscribed(b"H", b"B"))
@@ -590,7 +592,7 @@ async fn replay_and_live_use_same_pipeline_with_durable_boundary_and_duplicates(
     notify(&inbox, Notification::Batch(batch(b"H", b"B", b"L")));
     let page = final_page(b"H", b"A", b"B", vec![batch(b"H", b"A", b"B")]);
     peer.rpc(client.replay_page(b"H"), wire::REPLAY, |request| {
-        let r: Replay = codec::decode(&request.payload).unwrap();
+        let r: RecoveryReplayRequest = codec::decode(&request.payload).unwrap();
         assert_eq!(r.from_checkpoint, b"A");
         assert!(r.continuation_marker.is_empty());
         bytes(&page)
@@ -633,11 +635,46 @@ async fn replay_and_live_use_same_pipeline_with_durable_boundary_and_duplicates(
                 profile_version: 1,
                 notification: Some(Notification::Batch(stale))
             }
-            .fixture_bytes()
+            .encode_to_vec()
         ),
         Err(ProviderError::FailedPrecondition)
     );
     assert_eq!(store.load(&scope(b"S")).unwrap().unwrap().checkpoint, b"L");
+}
+
+#[tokio::test]
+async fn replay_charges_original_entry_until_offer_is_released() {
+    let expected = batch(b"H", b"A", b"B");
+    let mut page = final_page(b"H", b"A", b"B", vec![expected.clone()]);
+    page.batch_payloads[0].extend_from_slice(&[0xa0, 0x06, 1]); // ignorable field 100, varint
+    let charge = page.batch_payloads[0].len() + 40;
+    let limits = RecoveryLimits {
+        queued_bytes_per_stream: charge,
+        ..RecoveryLimits::default()
+    };
+    let mut peer = Peer::active().await;
+    let mut store = Store::default();
+    seed(&mut store, b"S", 7, b"A");
+    let mut client = peer.client(store, limits).await;
+    peer.subscribe(
+        &mut client,
+        b"H",
+        b"B",
+        b"S",
+        SubscribeIntent::ResumeDurable,
+    )
+    .await;
+    peer.rpc(client.replay_page(b"H"), wire::REPLAY, |_| bytes(&page))
+        .await
+        .unwrap();
+    assert_eq!(client.inbox.counts().data_bytes, charge);
+    let RecoveryEvent::Batch { batch } = event(&mut client).await else {
+        panic!("expected replay offer");
+    };
+    assert_eq!(batch, expected);
+    assert_eq!(client.inbox.counts().data_bytes, charge);
+    peer.persist(&mut client, b"H", b"B", b"state at B").await;
+    assert_eq!(client.inbox.counts().data_bytes, 0);
 }
 
 #[tokio::test]
@@ -715,7 +752,7 @@ async fn continuation_echo_and_wrong_fixed_boundary_retire_only_that_round() {
     );
     assert_eq!(
         peer.rpc(client.replay_page(b"H"), wire::REPLAY, |request| {
-            let r: Replay = codec::decode(&request.payload).unwrap();
+            let r: RecoveryReplayRequest = codec::decode(&request.payload).unwrap();
             assert_eq!(r.continuation_marker, b"opaque marker");
             assert_eq!(r.from_checkpoint, b"C");
             bytes(&bad)
@@ -806,7 +843,7 @@ async fn commit_unknown_never_confirms_and_next_connection_uses_durable_unacknow
         wire::SUBSCRIBE,
         |request| {
             assert_eq!(
-                codec::decode::<Subscribe>(&request.payload)
+                codec::decode::<RecoverySubscribeRequest>(&request.payload)
                     .unwrap()
                     .start_checkpoint,
                 b"L"
@@ -885,7 +922,7 @@ async fn snapshot(peer: &mut Peer, client: &mut RecoveryClient<Store>, h: &[u8],
         client.snapshot_fetch(h, 0),
         wire::SNAPSHOT_FETCH,
         |request| {
-            let r: FetchSnapshot = codec::decode(&request.payload).unwrap();
+            let r: RecoverySnapshotFetchRequest = codec::decode(&request.payload).unwrap();
             assert_eq!(r.snapshot_handle, b"X");
             assert_eq!(r.page_index, 0);
             bytes(&RecoverySnapshotChunk {
@@ -924,7 +961,7 @@ async fn snapshot_same_generation_at_s0_different_from_old_b_requires_installed_
         client.install_and_confirm(b"H", b"transformed full snapshot state".to_vec()),
         wire::SNAPSHOT_CONFIRM,
         |request| {
-            let r: ConfirmSnapshot = codec::decode(&request.payload).unwrap();
+            let r: RecoverySnapshotConfirmRequest = codec::decode(&request.payload).unwrap();
             assert_eq!(r.generation, 7);
             assert_eq!(r.boundary_checkpoint, b"S0");
             let durable = observed.load(&scope(b"S")).unwrap().unwrap();
@@ -955,7 +992,7 @@ async fn snapshot_same_generation_at_s0_different_from_old_b_requires_installed_
     peer.persist(&mut client, b"H", b"L", b"snapshot plus live state")
         .await;
     peer.rpc(client.unsubscribe(b"H"), wire::UNSUBSCRIBE, |_| {
-        bytes(&Unsubscribed {
+        bytes(&RecoveryUnsubscribeResponse {
             profile_version: 1,
             subscription_handle: b"H".to_vec(),
             generation: 7,
@@ -984,7 +1021,7 @@ async fn snapshot_required_after_staging_retires_offer_even_at_equal_boundary() 
         assert_eq!(client.snapshot_bytes(b"H").unwrap(), b"snapshot bytes");
         notify(&client.inbox, Notification::Batch(batch(b"H", s0, b"L")));
         assert_eq!(client.inbox.counts().data_messages, 1);
-        let mut expiry = trailer(b"H", Outcome::SnapshotRequired);
+        let mut expiry = trailer(b"H", Outcome::SnapshotRequired(true));
         if let Notification::Trailer(ref mut t) = expiry {
             t.boundary_checkpoint = s0.to_vec();
         }
@@ -1032,7 +1069,7 @@ async fn snapshot_required_after_staging_retires_offer_even_at_equal_boundary() 
         ));
 
         peer.rpc(client.unsubscribe(b"H"), wire::UNSUBSCRIBE, |_| {
-            bytes(&Unsubscribed {
+            bytes(&RecoveryUnsubscribeResponse {
                 profile_version: 1,
                 subscription_handle: b"H".to_vec(),
                 generation: 7,
@@ -1083,7 +1120,7 @@ async fn snapshot_required_during_install_write_preserves_durable_state_without_
         let boundary = s0.to_vec();
         let commits_before_install = store.commits.load(Ordering::Acquire);
         *store.hook.lock().unwrap() = Some(Box::new(move || {
-            let mut expiry = trailer(b"H", Outcome::SnapshotRequired);
+            let mut expiry = trailer(b"H", Outcome::SnapshotRequired(true));
             if let Notification::Trailer(ref mut t) = expiry {
                 t.boundary_checkpoint = boundary.clone();
             }
@@ -1147,7 +1184,7 @@ async fn snapshot_required_during_install_write_preserves_durable_state_without_
         );
 
         peer.rpc(client.unsubscribe(b"H"), wire::UNSUBSCRIBE, |_| {
-            bytes(&Unsubscribed {
+            bytes(&RecoveryUnsubscribeResponse {
                 profile_version: 1,
                 subscription_handle: b"H".to_vec(),
                 generation: 7,
@@ -1165,7 +1202,7 @@ async fn snapshot_required_during_install_write_preserves_durable_state_without_
                 wire::SUBSCRIBE,
                 |request| {
                     assert_eq!(
-                        codec::decode::<Subscribe>(&request.payload)
+                        codec::decode::<RecoverySubscribeRequest>(&request.payload)
                             .unwrap()
                             .start_checkpoint,
                         s0
@@ -1240,7 +1277,7 @@ async fn explicit_current_generation_snapshot_does_not_reinterpret_old_durable_c
         ),
         wire::SUBSCRIBE,
         |request| {
-            assert!(codec::decode::<Subscribe>(&request.payload)
+            assert!(codec::decode::<RecoverySubscribeRequest>(&request.payload)
                 .unwrap()
                 .start_checkpoint
                 .is_empty());
@@ -1393,7 +1430,7 @@ fn aggregate_bytes_bound_and_separate_equivalent_completion_slots() {
     notify(&inbox, Notification::Batch(batch(b"H", b"A", b"B")));
     assert_eq!(inbox.counts().data_bytes, charge, "exact MAX admitted");
     notify(&inbox, complete(b"H", b"B"));
-    let mut equivalent = trailer(b"H", Outcome::CatchupComplete);
+    let mut equivalent = trailer(b"H", Outcome::CatchupComplete(true));
     if let Notification::Trailer(ref mut t) = equivalent {
         t.boundary_checkpoint = b"B".to_vec();
     }
@@ -1431,7 +1468,7 @@ async fn retention_trailer_after_rpc_failure_allows_explicit_snapshot_not_genera
         let (id, _) = peer.request(wire::REPLAY).await;
         peer.result(id, Err(ErrorCode::FailedPrecondition)).await;
         tokio::time::sleep(Duration::from_millis(1)).await;
-        notify(&inbox, trailer(b"H", Outcome::SnapshotRequired));
+        notify(&inbox, trailer(b"H", Outcome::SnapshotRequired(true)));
     };
     let (result, ()) = tokio::join!(client.replay_page(b"H"), response);
     assert_eq!(
@@ -1632,14 +1669,14 @@ async fn fresh_handle_after_gap_uses_latest_durable_c_and_new_b_not_old_round() 
     let responses = async {
         let (id, request) = peer.request(wire::UNSUBSCRIBE).await;
         assert_eq!(
-            codec::decode::<Unsubscribe>(&request.payload)
+            codec::decode::<RecoveryUnsubscribeRequest>(&request.payload)
                 .unwrap()
                 .subscription_handle,
             b"H1"
         );
         peer.result(
             id,
-            bytes(&Unsubscribed {
+            bytes(&RecoveryUnsubscribeResponse {
                 profile_version: 1,
                 subscription_handle: b"H1".to_vec(),
                 generation: 7,
@@ -1648,7 +1685,7 @@ async fn fresh_handle_after_gap_uses_latest_durable_c_and_new_b_not_old_round() 
         .await;
         let (id, request) = peer.request(wire::SUBSCRIBE).await;
         assert_eq!(
-            codec::decode::<Subscribe>(&request.payload)
+            codec::decode::<RecoverySubscribeRequest>(&request.payload)
                 .unwrap()
                 .start_checkpoint,
             b"C2"
@@ -1943,7 +1980,7 @@ async fn local_overflow_event_carries_ascii_terminal_without_inventing_next_gene
     assert_eq!(generation, 7);
     assert_eq!(next_generation, None);
     assert_eq!(t.generation, 7);
-    assert_eq!(t.outcome, Some(Outcome::Terminated));
+    assert_eq!(t.outcome, Some(Outcome::Terminated(true)));
     assert_eq!(t.terminate_reason, b"local-queue-exhausted");
     assert!(
         peer.writer.try_recv().is_err(),

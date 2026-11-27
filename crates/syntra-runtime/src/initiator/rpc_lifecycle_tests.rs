@@ -3,9 +3,8 @@
 //! exercise real OS suspend or establish formal conformance.
 
 use super::*;
-use crate::frame_fixture::FrameFixture;
 use std::sync::Arc;
-use syntra_core::{wire::call_result::Outcome, CallResult};
+use syntra_core::{proto::rpc_result::Outcome, RpcResult};
 use tokio::sync::Barrier;
 
 const METHOD: &str = "/example.Echo/Echo";
@@ -28,7 +27,7 @@ async fn ready_rechecks_suspend_and_elapsed_after_last_version_lock_await() {
                 connection_id: "late-commit".into(),
             })),
         }
-        .fixture_bytes();
+        .encode_to_vec();
         let mut delivery = Box::pin(client.ingest(&bytes));
         assert!(futures_util::poll!(&mut delivery).is_pending());
         if suspend {
@@ -57,7 +56,7 @@ async fn suspended_buffered_notification_does_not_enter_application_or_recovery_
             payload: vec![1],
         })),
     }
-    .fixture_bytes();
+    .encode_to_vec();
     let mut delivery = Box::pin(client.ingest(&bytes));
     assert!(futures_util::poll!(&mut delivery).is_pending());
     client.suspend();
@@ -81,11 +80,11 @@ fn result_bytes(id: u64, outcome: Outcome) -> Vec<u8> {
     Frame {
         version: 1,
         request_id: id,
-        body: Some(Body::Result(CallResult {
+        body: Some(Body::Result(RpcResult {
             outcome: Some(outcome),
         })),
     }
-    .fixture_bytes()
+    .encode_to_vec()
 }
 
 fn payload_result(id: u64, payload: &[u8]) -> Vec<u8> {
@@ -97,7 +96,7 @@ fn emitted(client: &Initiator, original: Vec<u8>) -> Frame {
         .prepare_outbound(original)
         .expect("live original queue item must reach carrier handoff");
     let frame = syntra_core::decode_frame_structure(bytes.as_slice()).unwrap();
-    assert!(matches!(frame.body, Some(Body::Call(_))));
+    assert!(matches!(frame.body, Some(Body::Request(_))));
     frame
 }
 
@@ -190,7 +189,7 @@ async fn sixteen_concurrent_admissions_emit_increasing_ids_and_reverse_complete(
     );
     assert!(writer.try_recv().is_err(), "overload emits no request");
     for frame in requests.into_iter().rev() {
-        let Some(Body::Call(request)) = frame.body else {
+        let Some(Body::Request(request)) = frame.body else {
             unreachable!();
         };
         client
@@ -249,14 +248,14 @@ async fn admission_mutex_orders_allocation_and_fifo_enqueue_despite_reversed_pol
         assert_eq!(client.pending_len(), (next_id + 1).min(16) as usize);
         let frame = emitted(&client, writer.try_recv().expect("one FIFO item"));
         assert_eq!(frame.request_id, next_id);
-        let Some(Body::Call(ref request)) = frame.body else {
+        let Some(Body::Request(ref request)) = frame.body else {
             unreachable!();
         };
         assert_eq!(request.payload, vec![(16 - next_id) as u8]);
         requests.push(frame);
     }
     for frame in requests.into_iter().rev() {
-        let Some(Body::Call(request)) = frame.body else {
+        let Some(Body::Request(request)) = frame.body else {
             unreachable!();
         };
         client
@@ -359,7 +358,7 @@ async fn pump_accepts_only_original_vec_and_only_once() {
         .prepare_outbound(
             syntra_core::decode_frame_structure(original.as_slice())
                 .unwrap()
-                .fixture_bytes()
+                .encode_to_vec()
         )
         .is_none());
     assert_eq!(
@@ -370,7 +369,7 @@ async fn pump_accepts_only_original_vec_and_only_once() {
     tokio::time::advance(Duration::from_micros(20_500)).await;
     let prepared = client.prepare_outbound(original).unwrap();
     let frame = syntra_core::decode_frame_structure(prepared.as_slice()).unwrap();
-    let Some(Body::Call(request)) = frame.body else {
+    let Some(Body::Request(request)) = frame.body else {
         panic!("expected request");
     };
     assert_eq!(request.timeout_ms, 79);
@@ -423,7 +422,7 @@ async fn predeadline_selected_result_survives_expiry_cancel_and_teardown() {
             let id = emitted(&client, writer.try_recv().unwrap()).request_id;
             tokio::time::advance(Duration::from_millis(9)).await;
             let outcome = if remote_error {
-                Outcome::Error(syntra_core::wire::RpcError {
+                Outcome::Error(syntra_core::proto::RpcError {
                     code: ErrorCode::NotFound.as_i32(),
                     message: "missing".into(),
                 })
@@ -477,7 +476,7 @@ async fn explicit_cancel_after_emission_is_locally_terminal_before_late_results(
         syntra_core::decode_frame_structure(prepared.as_slice())
             .unwrap()
             .body,
-        Some(Body::Call(_))
+        Some(Body::Request(_))
     ));
     assert_clean(&client);
 }

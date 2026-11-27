@@ -11,7 +11,6 @@ import os
 import re
 import secrets
 import subprocess
-import struct
 
 from local_inputs import FIXTURES, ROOT, digest, read_json, regular_file
 from local_yaml import load_yaml
@@ -33,8 +32,23 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
 
-def sized(data):
-    return struct.pack("<I", len(data)) + data
+def varint(value):
+    encoded = bytearray()
+    while value >= 128:
+        encoded.append((value & 127) | 128)
+        value >>= 7
+    encoded.append(value)
+    return bytes(encoded)
+
+
+def uint(tag, value, bits=32):
+    if type(value) is not int or not 0 <= value < (1 << bits):
+        raise ValueError(f"invalid fixture uint{bits}")
+    return varint(tag << 3) + varint(value) if value else b""
+
+
+def blob(tag, data):
+    return varint((tag << 3) | 2) + varint(len(data)) + data
 
 
 def frame_bytes(frame):
@@ -43,27 +57,23 @@ def frame_bytes(frame):
         if set(frame) != {"raw_b64"}:
             raise ValueError("ambiguous raw fixture")
         return base64.b64decode(frame["raw_b64"], validate=True)
-    known = {"request_id", "body", "method", "payload_b64", "timeout_ms", "unknown_fields", "min_version", "max_version"}
-    if set(frame) - known:
-        raise ValueError("fixture encoder lacks declared input fields")
+    envelope = uint(1, 1) + uint(2, frame["request_id"], 64)
     if frame["body"] == "request":
-        arm = 12
+        known = {"method", "payload_b64", "timeout_ms"}
         payload = base64.b64decode(frame["payload_b64"], validate=True)
-        fields = b"\x01" + sized(frame["method"].encode()) + b"\x02" + sized(payload)
-        if frame.get("timeout_ms", 0) != 0:
-            fields += b"\x03" + struct.pack("<I", frame["timeout_ms"])
+        envelope += blob(12, blob(1, frame["method"].encode()) + blob(2, payload) + uint(3, frame.get("timeout_ms", 0)))
     elif frame["body"] == "hello":
-        arm = 10
-        fields = struct.pack("<BIBI", 1, frame["min_version"], 2, frame["max_version"]) + b"\x03" + sized(b"")
+        known = {"min_version", "max_version"}
+        envelope += blob(10, uint(1, frame["min_version"]) + uint(2, frame["max_version"]))
     else:
         raise ValueError("fixture body not implemented")
+    if set(frame) - known - {"request_id", "body", "unknown_fields"}:
+        raise ValueError("fixture encoder lacks declared input fields")
     for field in frame.get("unknown_fields", []):
-        if field["number"] != 90:
+        if set(field) != {"number", "wire_type", "value_b64"} or (field["number"], field["wire_type"]) != (90, 2):
             raise ValueError("unreviewed unknown-field fixture")
-        fields += bytes([90]) + sized(base64.b64decode(field["value_b64"], validate=True))
-    message = sized(fields + b"\0")
-    # Bebop union length excludes both the length word and the discriminator.
-    return struct.pack("<IQIB", 1, frame["request_id"], len(message), arm) + message
+        envelope += blob(90, base64.b64decode(field["value_b64"], validate=True))
+    return envelope
 
 
 def scenario_for(identifier):

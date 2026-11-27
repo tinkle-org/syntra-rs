@@ -11,7 +11,7 @@ wss-envelope:
       - &echo_reply {request_id: 7, body: result, payload_b64: aGk=}
 wss-unknown-field:
   input:
-    frames: [{request_id: 7, body: request, method: /example.Echo/Echo, payload_b64: aGk=, timeout_ms: 500, unknown_fields: [{number: 90, value_b64: eA==}]}]
+    frames: [{request_id: 7, body: request, method: /example.Echo/Echo, payload_b64: aGk=, timeout_ms: 500, unknown_fields: [{number: 90, wire_type: 2, value_b64: eA==}]}]
   expected: *echo_result
 wss-ready:
   input: {frames: [{request_id: 0, body: hello, min_version: 1, max_version: 1}]}
@@ -99,11 +99,11 @@ wss-reverse-completion:
 wss-recovery-isolation:
   input:
     frames:
-      - &subscribe {request_id: 3, body: request, method: /syntra.v1.UpdateRecovery/Subscribe, payload_b64: AQAAAA4AAABzdWJzY3JpcHRpb24tYQAAAAA=, timeout_ms: 500}
+      - &subscribe {request_id: 3, body: request, method: /syntra.v1.UpdateRecovery/Subscribe, payload_b64: CAESDnN1YnNjcmlwdGlvbi1h, timeout_ms: 500}
   expected: *unimplemented
   control_connection:
     frames:
-      - {request_id: 1, body: request, method: /syntra.v1.UpdateRecovery/Negotiate, payload_b64: AQAAAAEAAAABAAAAGAAAAHN5bnRyYS51cGRhdGUtcmVjb3ZlcnkvMQ==, timeout_ms: 500}
+      - {request_id: 1, body: request, method: /syntra.v1.UpdateRecovery/Negotiate, payload_b64: CAEQARgBIhhzeW50cmEudXBkYXRlLXJlY292ZXJ5LzE=, timeout_ms: 500}
       - *subscribe
     expected:
       connection_state: ACTIVE

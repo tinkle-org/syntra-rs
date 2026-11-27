@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       release_commit:
-        description: Full SHA of a release-PR squash merge on main with the current Bebop release inputs
+        description: Full SHA of a release-PR squash merge on main with the current Buf and local evidence inputs
         required: true
         type: string
 
@@ -82,10 +82,12 @@ jobs:
           gh api "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_COMMIT}/pulls" \
             --jq 'any(.[]; .merged_at != null and .base.ref == "main" and .merge_commit_sha == env.RELEASE_COMMIT and (.head.ref | startswith("release-plz-")))' \
             | python3 -c 'import sys; sys.exit(0 if sys.stdin.read().strip() == "true" else "commit must be the merge of a release-plz PR on main")'
-      - name: Require current Bebop inputs in the retry target
+      - name: Require Buf and local evidence inputs in the retry target
         if: github.event_name == 'workflow_dispatch'
         run: |
-          for path in schemas/v1/syntra.bop bebop.json scripts/check-generated.py .github/actions/setup-bebopc/action.yml; do
+          # Name the expected inputs: globbing the older checkout would miss deleted files.
+          for path in proto/syntra/v1/{capabilities,envelope,errors,events,handshake,recovery_profile,rpc,session}.proto \
+                      buf.yaml buf.gen.yaml scripts/check-generated.py scripts/local_inputs.py; do
             test -f "$path" || { echo "Release commit is ineligible for retry: missing $path" >&2; exit 1; }
           done
       - name: Install Rust toolchain
@@ -97,7 +99,10 @@ jobs:
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
-      - uses: ./.github/actions/setup-bebopc
+      - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+        with:
+          version: "1.59.0"
+          github_token: ${{ github.token }}
       - name: Install pinned fixture parser
         run: python3 -m pip install -r scripts/requirements-evidence.txt
       - name: Validate generated sources and repository protocol fixtures

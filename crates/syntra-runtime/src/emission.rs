@@ -1,10 +1,8 @@
 //! Synchronous queued-to-emitting handoff for initiator RPCs.
 
-#[cfg(test)]
-use crate::frame_fixture::FrameFixture;
 use std::{collections::HashMap, sync::Arc};
 
-use syntra_core::{wire::frame::Body, CallResult, PendingOutcome, SyntraError};
+use syntra_core::{proto::frame::Body, PendingOutcome, RpcResult, SyntraError, ValidationContext};
 use tokio::sync::oneshot;
 use web_time::Instant;
 
@@ -156,7 +154,7 @@ impl Shared {
         ))
     }
 
-    pub(crate) fn complete_rpc(&self, id: u64, result: CallResult) -> bool {
+    pub(crate) fn complete_rpc(&self, id: u64, result: RpcResult) -> bool {
         let mut entries = self.emissions.lock().unwrap();
         if self.suspended.load(std::sync::atomic::Ordering::Acquire) || !self.clock.is_continuous()
         {
@@ -230,7 +228,7 @@ impl Shared {
         {
             return None;
         }
-        let Some(Body::Call(request)) = &mut frame.body else {
+        let Some(Body::Request(request)) = &mut frame.body else {
             // Handshake and control units are not RPC queue entries.
             return Some(bytes);
         };
@@ -261,7 +259,7 @@ impl Shared {
             return None;
         }
         request.timeout_ms = remaining.min(u32::MAX as u128) as u32;
-        if frame.encoded_len() > syntra_core::MAX_FRAME_BYTES {
+        if prost::Message::encoded_len(&frame) > syntra_core::MAX_FRAME_BYTES {
             drop(_cancel);
             let entry = entries.remove(&frame.request_id).unwrap();
             self.fail_entry(
@@ -273,18 +271,16 @@ impl Shared {
             );
             return None;
         }
-        let prepared = match syntra_core::encode_frame(
-            &frame,
-            syntra_core::ValidationContext::active(frame.version),
-        ) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                drop(_cancel);
-                let entry = entries.remove(&frame.request_id).unwrap();
-                self.fail_entry(frame.request_id, entry, error);
-                return None;
-            }
-        };
+        let prepared =
+            match syntra_core::encode_frame(&frame, ValidationContext::active(frame.version)) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    drop(_cancel);
+                    let entry = entries.remove(&frame.request_id).unwrap();
+                    self.fail_entry(frame.request_id, entry, error);
+                    return None;
+                }
+            };
         // This is the linearization point, still under both gates. Bytes are
         // immutable to the runtime after handoff, including after cancellation.
         entry.phase = EmissionPhase::Emitting;
@@ -296,8 +292,8 @@ impl Shared {
 mod tests {
     use super::*;
     use crate::connection::{ConnectionConfig, Role};
-    use syntra_core::Frame;
-    use syntra_core::{wire::call_result::Outcome, Call};
+    use prost::Message;
+    use syntra_core::{proto::rpc_result::Outcome, Frame, RpcRequest};
     use tokio::sync::mpsc;
     use web_time::Duration;
 
@@ -310,13 +306,13 @@ mod tests {
             Frame {
                 version: 1,
                 request_id: 7,
-                body: Some(Body::Call(Call {
+                body: Some(Body::Request(RpcRequest {
                     method: "/example.Echo/Echo".into(),
                     payload: vec![],
                     timeout_ms: 1000,
                 })),
             }
-            .fixture_bytes()
+            .encode_to_vec()
         };
         let (old_result, _, old_guard) = shared
             .admit_rpc(7, "old", now() + Duration::from_secs(1), &token)
@@ -327,7 +323,7 @@ mod tests {
         let stale = queue.try_recv().unwrap();
         shared.complete_rpc(
             7,
-            CallResult {
+            RpcResult {
                 outcome: Some(Outcome::Payload(vec![])),
             },
         );

@@ -1,0 +1,10 @@
+// No separate session-control messages are defined in the current contract.
+// Establishment is implicit at ServerReady (SNTR-SESS-001); lifetime is bound to
+// the connection (SNTR-SESS-003/004). Authentication uses ClientHello.credential;
+// principal changes require a new handshake (SNTR-SESS-007). Resumption requires
+// an approved capability RFC (SNTR-SESS-006, SNTR-ASEC-007). See RFC 0001.
+syntax = "proto3";
+
+package syntra.v1;
+
+option go_package = "github.com/tinklehq/syntra/bindings/go/gen/syntra/v1;syntrav1";

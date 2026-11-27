@@ -24,7 +24,7 @@ use syntra_core::secure_channel::{
 };
 use syntra_core::{
     decode_frame, decode_frame_structure, encode_frame,
-    wire::{call_result::Outcome, frame::Body, *},
+    proto::{frame::Body, rpc_result::Outcome, *},
     ConnectionState, ErrorCode, ValidationContext,
 };
 use syntra_net::{
@@ -60,27 +60,11 @@ fn unhex(value: &str) -> Vec<u8> {
         .collect()
 }
 fn code(value: i32) -> &'static str {
-    let (code, unknown) = ErrorCode::from_i32_lossy(value);
-    assert_eq!(unknown, None, "unexpected error code in scenario");
-    match code {
-        ErrorCode::Invalid => "INVALID",
-        ErrorCode::Cancelled => "CANCELLED",
-        ErrorCode::Unknown => "UNKNOWN",
-        ErrorCode::InvalidArgument => "INVALID_ARGUMENT",
-        ErrorCode::DeadlineExceeded => "DEADLINE_EXCEEDED",
-        ErrorCode::NotFound => "NOT_FOUND",
-        ErrorCode::AlreadyExists => "ALREADY_EXISTS",
-        ErrorCode::PermissionDenied => "PERMISSION_DENIED",
-        ErrorCode::ResourceExhausted => "RESOURCE_EXHAUSTED",
-        ErrorCode::FailedPrecondition => "FAILED_PRECONDITION",
-        ErrorCode::Aborted => "ABORTED",
-        ErrorCode::OutOfRange => "OUT_OF_RANGE",
-        ErrorCode::Unimplemented => "UNIMPLEMENTED",
-        ErrorCode::Internal => "INTERNAL",
-        ErrorCode::Unavailable => "UNAVAILABLE",
-        ErrorCode::DataLoss => "DATA_LOSS",
-        ErrorCode::Unauthenticated => "UNAUTHENTICATED",
-    }
+    syntra_core::proto::ErrorCode::try_from(value)
+        .expect("unexpected error code in scenario")
+        .as_str_name()
+        .strip_prefix("ERROR_CODE_")
+        .expect("IDL enum prefix")
 }
 
 #[test]
@@ -303,7 +287,7 @@ fn request(id: u64, payload: Vec<u8>) -> Vec<u8> {
         &Frame {
             version: 1,
             request_id: id,
-            body: Some(Body::Call(Call {
+            body: Some(Body::Request(RpcRequest {
                 method: "/example.Echo/Echo".into(),
                 payload,
                 timeout_ms: 500,
@@ -452,7 +436,7 @@ async fn execute(input: &Value) -> Value {
     if id == "wss-duplicate-id" || id == "wss-reverse-completion" {
         for bytes in &frames {
             let frame = decode_frame(bytes, ValidationContext::active(1)).unwrap();
-            let Some(Body::Call(r)) = frame.body else {
+            let Some(Body::Request(r)) = frame.body else {
                 panic!("request");
             };
             gates
@@ -473,7 +457,7 @@ async fn execute(input: &Value) -> Value {
             .first()
             .and_then(|bytes| decode_frame_structure(bytes).ok())
             .and_then(|frame| {
-                if let Some(Body::Call(r)) = frame.body {
+                if let Some(Body::Request(r)) = frame.body {
                     Some(r.payload.to_vec())
                 } else {
                     None
@@ -569,7 +553,7 @@ async fn execute(input: &Value) -> Value {
             let mut release_order = Vec::new();
             for bytes in frames.iter().rev() {
                 let frame = decode_frame(bytes, ValidationContext::active(1)).unwrap();
-                let Some(Body::Call(r)) = frame.body else {
+                let Some(Body::Request(r)) = frame.body else {
                     panic!("request");
                 };
                 gates
@@ -595,20 +579,20 @@ async fn execute(input: &Value) -> Value {
                 control.send(&unhex(bytes.as_str().unwrap())).await;
                 let frame = control.one().await;
                 let mut row = observed(&frame);
-                let Some(Body::Result(CallResult {
+                let Some(Body::Result(RpcResult {
                     outcome: Some(Outcome::Payload(bytes)),
                 })) = frame.body
                 else {
                     panic!("control success");
                 };
                 if frame.request_id == 1 {
-                    let n: Negotiated = codec::decode(&bytes).unwrap();
+                    let n: RecoveryNegotiateResponse = codec::decode(&bytes).unwrap();
                     row["shape"] = json!("Negotiated");
                     row["decoded"] = json!({"profile_version":n.profile_version,"selected_version":n.selected_version,
                         "max_subscriptions_per_connection":n.max_subscriptions_per_connection,"max_pending_rpcs_per_connection":n.max_pending_rpcs_per_connection,
                         "max_page_bytes":n.max_page_bytes,"max_snapshot_pages":n.max_snapshot_pages});
                 } else {
-                    let s: SubscriptionAccepted = codec::decode(&bytes).unwrap();
+                    let s: RecoverySubscribeResponse = codec::decode(&bytes).unwrap();
                     row["shape"] = json!("SubscriptionAccepted");
                     row["decoded"] = json!({"profile_version":s.profile_version,"generation":s.generation,
                         "subscription_handle_hex":hex(&s.subscription_handle),"catchup_boundary_hex":hex(&s.catchup_boundary)});
@@ -700,7 +684,7 @@ async fn deadline_artifact_uses_the_executed_handler_delay_and_waits_for_it() {
             ValidationContext::active(1),
         )
         .unwrap();
-        let Some(Body::Call(r)) = frame.body.as_mut() else {
+        let Some(Body::Request(r)) = frame.body.as_mut() else {
             panic!("request");
         };
         r.timeout_ms = 50;

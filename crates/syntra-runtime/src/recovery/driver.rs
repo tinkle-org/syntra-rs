@@ -677,7 +677,7 @@ impl HostDriver {
     }
 
     /// Serve one bounded replay page continuing from `from_checkpoint`.
-    /// The caller transmits the page inside the terminal `CallResult`.
+    /// The caller transmits the page inside the terminal `RpcResult`.
     /// Validates the generation against the subscription, enforces
     /// per-handle fencing (only an identical request returns the verbatim
     /// last page; any other request must continue from the last page's

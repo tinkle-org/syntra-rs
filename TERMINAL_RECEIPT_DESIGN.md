@@ -53,7 +53,7 @@ Each outcome method has **1–8** non-sensitive payloads. ID 1 names the first
 entry (here, an empty application payload); ID 2 names the
 second. Zero and IDs beyond the method's table are invalid. The table is fixed
 for the binding; keep the meaning of stored IDs stable for the operation. The
-client sees only the correlated `CallResult`, never the ID or table.
+client sees only the correlated `RpcResult`, never the ID or table.
 Forward `terminal_methods` in custom factory wrappers to preserve this policy.
 
 The typed adapter supplies **complete operation-aware connection authority**.
@@ -214,7 +214,7 @@ pump in `crates/syntra-net/src/pump.rs` implement this sequence:
 
 1. Validate policy, native TCP support, call ownership, revision, time, and size.
 2. Encode **every** candidate success `Frame` with this call's version and request
-   ID before fencing or mutation. Each must fit **1,024 serialized Frame bytes**,
+   ID before fencing or mutation. Each must fit **1,024 serialized Protobuf frame bytes**,
    excluding the four-byte frame-stream prefix. Even an oversized unselected
    candidate refuses reservation. Reserve one private owner for the call.
 3. Fence ordinary dispatch and output, notifications, recovery, and sibling
@@ -326,10 +326,11 @@ establish bulk-transfer capacity.
 
 `Host::install_terminal_tcp` and the doc-hidden driver bridge are trusted SDK
 internals, not an application escape hatch or arbitrary custom-driver support.
-No new wire message, peer option, advertised capability, or client API is needed;
-clients parse the correlated `CallResult`. The payload is application data; the
-authority revision and outcome ID are not wire fields. Ordinary withdrawal and
-close keep their defaults.
+The receipt adds no wire message, peer option, advertised capability, or client
+API. Protobuf clients parse the ordinary `RpcResult` with a selected
+`syntra_core::proto::rpc_result::Outcome::Payload`, even for empty bytes.
+The payload is application data; the authority revision and outcome ID are not
+wire fields. Ordinary withdrawal and close keep their defaults.
 
 ## SDK tests and limits
 

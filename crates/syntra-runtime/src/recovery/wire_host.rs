@@ -5,11 +5,12 @@
 use super::codec::{self, ProfileMessage};
 use super::*;
 use crate::emission::now;
+use prost::Message;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
-use syntra_core::wire::*;
+use syntra_core::proto::*;
 use tokio::sync::Notify;
 use web_time::Instant;
 
@@ -422,12 +423,12 @@ impl Slot {
     }
     fn overflow(&mut self) {
         self.end(
-            recovery_batch_trailer::Outcome::Terminated,
+            recovery_batch_trailer::Outcome::Terminated(true),
             b"local-queue-exhausted",
         );
     }
     fn snapshot_required(&mut self) {
-        let trailer = self.trailer(recovery_batch_trailer::Outcome::SnapshotRequired, &[]);
+        let trailer = self.trailer(recovery_batch_trailer::Outcome::SnapshotRequired(true), &[]);
         if let Some(s) = &mut self.sub {
             s.mode = Mode::Snapshot;
             s.complete = false;
@@ -441,7 +442,7 @@ impl Slot {
     }
     fn finish(&mut self, catchup: bool) {
         let done = if catchup {
-            self.trailer(recovery_batch_trailer::Outcome::CatchupComplete, &[])
+            self.trailer(recovery_batch_trailer::Outcome::CatchupComplete(true), &[])
         } else {
             notification(recovery_notification::Notification::ReplayComplete(
                 RecoveryReplayComplete {
@@ -615,7 +616,7 @@ impl RecoveryHostSession {
         let auth = self.authorize(&s.selector, hook);
         if let Err(e) = auth {
             slot.end(
-                recovery_batch_trailer::Outcome::Terminated,
+                recovery_batch_trailer::Outcome::Terminated(true),
                 b"authorization-ended",
             );
             return Err(e);
@@ -633,7 +634,7 @@ impl RecoveryHostSession {
                     ProviderError::PermissionDenied | ProviderError::Unauthenticated
                 ) {
                     slot.end(
-                        recovery_batch_trailer::Outcome::Terminated,
+                        recovery_batch_trailer::Outcome::Terminated(true),
                         b"authorization-ended",
                     );
                 }
@@ -648,7 +649,7 @@ impl RecoveryHostSession {
                 );
             } else {
                 slot.end(
-                    recovery_batch_trailer::Outcome::Terminated,
+                    recovery_batch_trailer::Outcome::Terminated(true),
                     b"provider-binding-lost",
                 );
             }
@@ -713,12 +714,12 @@ impl RecoveryHostSession {
             if state.confirmed {
                 return Err(ProviderError::FailedPrecondition);
             }
-            let r: Negotiate = codec::decode(payload)?;
+            let r: RecoveryNegotiateRequest = codec::decode(payload)?;
             if r.min_version > 1 || r.max_version < 1 {
                 return Err(ProviderError::FailedPrecondition);
             }
             let l = &self.service.limits;
-            let reply = codec::encode(&Negotiated {
+            let reply = codec::encode(&RecoveryNegotiateResponse {
                 profile_version: 1,
                 selected_version: 1,
                 max_subscriptions_per_connection: l.subscriptions_per_connection as u32,
@@ -734,31 +735,31 @@ impl RecoveryHostSession {
         }
         let (handle, hook) = match method {
             REPLAY => (
-                codec::decode::<Replay>(payload)?.subscription_handle,
+                codec::decode::<RecoveryReplayRequest>(payload)?.subscription_handle,
                 AuthorizationHook::Replay,
             ),
             CATCH_UP => (
-                codec::decode::<CatchUp>(payload)?.subscription_handle,
+                codec::decode::<RecoveryCatchUpRequest>(payload)?.subscription_handle,
                 AuthorizationHook::CatchUp,
             ),
             CONFIRM => (
-                codec::decode::<Confirm>(payload)?.subscription_handle,
+                codec::decode::<RecoveryConfirmRequest>(payload)?.subscription_handle,
                 AuthorizationHook::Confirm,
             ),
             SNAPSHOT_OFFER => (
-                codec::decode::<OfferSnapshot>(payload)?.subscription_handle,
+                codec::decode::<RecoverySnapshotOfferRequest>(payload)?.subscription_handle,
                 AuthorizationHook::SnapshotOffer,
             ),
             SNAPSHOT_CONFIRM => (
-                codec::decode::<ConfirmSnapshot>(payload)?.subscription_handle,
+                codec::decode::<RecoverySnapshotConfirmRequest>(payload)?.subscription_handle,
                 AuthorizationHook::SnapshotConfirm,
             ),
             UNSUBSCRIBE => (
-                codec::decode::<Unsubscribe>(payload)?.subscription_handle,
+                codec::decode::<RecoveryUnsubscribeRequest>(payload)?.subscription_handle,
                 AuthorizationHook::Unsubscribe,
             ),
             SNAPSHOT_FETCH => {
-                let r: FetchSnapshot = codec::decode(payload)?;
+                let r: RecoverySnapshotFetchRequest = codec::decode(payload)?;
                 let h = state
                     .slots
                     .iter()
@@ -792,13 +793,15 @@ impl RecoveryHostSession {
                 self.snapshot_confirm(&mut state.slots[index], codec::decode(payload)?, deadline)
             }
             UNSUBSCRIBE => {
-                let reply = codec::encode(&Unsubscribed {
+                let reply = codec::encode(&RecoveryUnsubscribeResponse {
                     profile_version: 1,
                     subscription_handle: handle,
                     generation: state.slots[index].generation,
                 })?;
-                state.slots[index]
-                    .end(recovery_batch_trailer::Outcome::Terminated, b"unsubscribed");
+                state.slots[index].end(
+                    recovery_batch_trailer::Outcome::Terminated(true),
+                    b"unsubscribed",
+                );
                 Ok(reply)
             }
             _ => unreachable!(),
@@ -816,7 +819,7 @@ impl RecoveryHostSession {
     fn subscribe(
         &self,
         state: &mut State,
-        r: Subscribe,
+        r: RecoverySubscribeRequest,
         deadline: Instant,
     ) -> Result<Vec<u8>, ProviderError> {
         if state.slots.len() >= self.service.limits.subscriptions_per_connection {
@@ -844,7 +847,7 @@ impl RecoveryHostSession {
         self.authorize(&r.stream_selector, AuthorizationHook::Subscribe)?;
         self.deadline(deadline)?;
         let handle = self.handle_bytes(state)?;
-        let reply = codec::encode(&SubscriptionAccepted {
+        let reply = codec::encode(&RecoverySubscribeResponse {
             profile_version: 1,
             subscription_handle: handle.clone(),
             generation: stream.generation,
@@ -918,7 +921,7 @@ impl RecoveryHostSession {
                 .validate_issued(&self.principal, &s.stream, &b.result)?;
             cursor = b.result.clone();
             let b = self.batch(slot, b)?;
-            bytes += codec::batch_size(&b);
+            bytes += b.encoded_len();
             if bytes > max_bytes {
                 return Err(ProviderError::Internal);
             }
@@ -944,10 +947,10 @@ impl RecoveryHostSession {
     fn replay(
         &self,
         slot: &mut Slot,
-        r: Replay,
+        r: RecoveryReplayRequest,
         deadline: Instant,
     ) -> Result<Vec<u8>, ProviderError> {
-        let key = codec::encode(&r)?;
+        let key = codec::encode(&r)?; // decoded request equality; unknown fields are ignored
         let s = slot.sub.as_mut().expect("checked");
         if s.mode == Mode::CatchUp || s.mode == Mode::Snapshot || s.start.is_empty() {
             return Err(ProviderError::FailedPrecondition);
@@ -990,7 +993,7 @@ impl RecoveryHostSession {
     fn catch_up(
         &self,
         slot: &mut Slot,
-        r: CatchUp,
+        r: RecoveryCatchUpRequest,
         deadline: Instant,
     ) -> Result<Vec<u8>, ProviderError> {
         let key = codec::encode(&r)?;
@@ -1009,7 +1012,7 @@ impl RecoveryHostSession {
             return Err(ProviderError::FailedPrecondition);
         }
         // One bounded page is prepared before acceptance so retention misses
-        // can return the required failed CallResult, not only a later trailer.
+        // can return the required failed RpcResult, not only a later trailer.
         let page = if s.cursor != slot.boundary {
             Some(self.page(
                 slot,
@@ -1059,7 +1062,7 @@ impl RecoveryHostSession {
     fn confirm(
         &self,
         slot: &mut Slot,
-        r: Confirm,
+        r: RecoveryConfirmRequest,
         deadline: Instant,
     ) -> Result<Vec<u8>, ProviderError> {
         if r.generation != slot.generation {
@@ -1082,7 +1085,7 @@ impl RecoveryHostSession {
             s.offered.pop_front();
             s.last_confirm = Some(r.checkpoint.clone());
         }
-        codec::encode(&Confirmed {
+        codec::encode(&RecoveryConfirmResponse {
             profile_version: 1,
             subscription_handle: slot.handle.clone(),
             confirmed_checkpoint: r.checkpoint,
@@ -1094,7 +1097,7 @@ impl RecoveryHostSession {
         &self,
         state: &mut State,
         index: usize,
-        r: OfferSnapshot,
+        r: RecoverySnapshotOfferRequest,
         deadline: Instant,
     ) -> Result<Vec<u8>, ProviderError> {
         let slot = &mut state.slots[index];
@@ -1157,7 +1160,7 @@ impl RecoveryHostSession {
     fn snapshot_fetch(
         &self,
         slot: &mut Slot,
-        r: FetchSnapshot,
+        r: RecoverySnapshotFetchRequest,
         deadline: Instant,
     ) -> Result<Vec<u8>, ProviderError> {
         let s = slot.sub.as_mut().expect("checked");
@@ -1196,7 +1199,7 @@ impl RecoveryHostSession {
     fn snapshot_confirm(
         &self,
         slot: &mut Slot,
-        r: ConfirmSnapshot,
+        r: RecoverySnapshotConfirmRequest,
         deadline: Instant,
     ) -> Result<Vec<u8>, ProviderError> {
         if r.generation != slot.generation {
@@ -1239,7 +1242,7 @@ impl RecoveryHostSession {
             Ok(cut) => cut,
             Err(_) => {
                 slot.end(
-                    recovery_batch_trailer::Outcome::Terminated,
+                    recovery_batch_trailer::Outcome::Terminated(true),
                     b"snapshot-chain-gap",
                 );
                 return Err(ProviderError::FailedPrecondition);
@@ -1346,7 +1349,7 @@ impl RecoveryHostSession {
             } // exact-tail retry, scoped and authorized
             if batch.predecessor != s.live_tail {
                 slot.end(
-                    recovery_batch_trailer::Outcome::Terminated,
+                    recovery_batch_trailer::Outcome::Terminated(true),
                     b"provider-chain-gap",
                 );
                 remember_error(&mut error, ProviderError::FailedPrecondition);
@@ -1362,7 +1365,7 @@ impl RecoveryHostSession {
                     ProviderError::PermissionDenied | ProviderError::Unauthenticated
                 ) {
                     slot.end(
-                        recovery_batch_trailer::Outcome::Terminated,
+                        recovery_batch_trailer::Outcome::Terminated(true),
                         b"authorization-ended",
                     );
                 }
@@ -1394,7 +1397,10 @@ impl RecoveryHostSession {
         if slot.sub.is_none() {
             return Err(ProviderError::FailedPrecondition);
         }
-        slot.end(recovery_batch_trailer::Outcome::Terminated, b"superseded");
+        slot.end(
+            recovery_batch_trailer::Outcome::Terminated(true),
+            b"superseded",
+        );
         Ok(())
     }
 
@@ -1451,7 +1457,7 @@ impl RecoveryHostSession {
                 matches!(
                     t.outcome,
                     Some(
-                        recovery_batch_trailer::Outcome::Terminated
+                        recovery_batch_trailer::Outcome::Terminated(true)
                             | recovery_batch_trailer::Outcome::NextGeneration(_)
                     )
                 ),
@@ -1505,10 +1511,10 @@ impl RecoveryHostSession {
             recovery_notification::Notification::Trailer(t) => {
                 t.boundary_checkpoint == slot.boundary
                     && match t.outcome {
-                        Some(recovery_batch_trailer::Outcome::CatchupComplete) => {
+                        Some(recovery_batch_trailer::Outcome::CatchupComplete(true)) => {
                             s.mode == Mode::CatchUp && s.complete
                         }
-                        Some(recovery_batch_trailer::Outcome::SnapshotRequired) => {
+                        Some(recovery_batch_trailer::Outcome::SnapshotRequired(true)) => {
                             s.mode == Mode::Snapshot && s.snapshot.is_none()
                         }
                         _ => false,

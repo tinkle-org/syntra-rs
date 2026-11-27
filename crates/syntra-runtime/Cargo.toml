@@ -20,7 +20,7 @@ required-features = ["file-store"]
 
 [dependencies]
 syntra-core = { path = "../syntra-core", version = "1.0.0-rc.6" }
-bebop.workspace = true
+prost.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

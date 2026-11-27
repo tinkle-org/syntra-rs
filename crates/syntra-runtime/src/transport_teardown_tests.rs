@@ -1,7 +1,7 @@
 use super::*;
-use crate::frame_fixture::FrameFixture;
+use prost::Message;
 use std::{sync::Arc, time::Duration};
-use syntra_core::{wire::frame::Body, Call, ClientHello, Frame};
+use syntra_core::{proto::frame::Body, ClientHello, Frame, RpcRequest};
 use tokio::sync::mpsc;
 
 fn host(config: ConnectionConfig) -> (Arc<Host>, mpsc::Receiver<Vec<u8>>) {
@@ -25,7 +25,7 @@ async fn activate_host(host: &Host, rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<u8>
                 credential: vec![],
             })),
         }
-        .fixture_bytes(),
+        .encode_to_vec(),
     )
     .await;
     rx.recv().await.expect("ready frame")
@@ -51,13 +51,13 @@ async fn peer_close_fences_host_before_bridge_drain_rendezvous() {
             Frame {
                 version: 1,
                 request_id: id,
-                body: Some(Body::Call(Call {
+                body: Some(Body::Request(RpcRequest {
                     method: String::new(),
                     payload: vec![],
                     timeout_ms: 1000,
                 })),
             }
-            .fixture_bytes(),
+            .encode_to_vec(),
         )
         .unwrap();
     }
@@ -145,11 +145,11 @@ async fn bridge_drain_waits_for_outstanding_writer_permit() {
             Frame {
                 version: 1,
                 request_id: 0,
-                body: Some(Body::Notification(syntra_core::wire::Notification {
+                body: Some(Body::Notification(syntra_core::proto::Notification {
                     payload: b"reserved".to_vec(),
                 })),
             }
-            .fixture_bytes(),
+            .encode_to_vec(),
         );
         for pump in pumps {
             pump.join().await;

@@ -2,8 +2,6 @@
 //! handler pretending to implement the recovery profile. No external bridge.
 
 use super::*;
-use crate::frame_fixture::FrameFixture;
-use crate::recovery::wire::codec::FixtureRecord;
 use crate::recovery::wire::{
     AuthorizationHook, PageBudget, ProviderPage, ProviderSnapshot, ProviderStream, RecoveryLimits,
     RecoverySource,
@@ -11,9 +9,8 @@ use crate::recovery::wire::{
 use crate::session::StaticToken;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
-use syntra_core::wire::*;
-use syntra_core::Call;
-use syntra_core::ErrorCode;
+use syntra_core::proto::*;
+use syntra_core::{decode_frame_structure, ErrorCode};
 
 #[derive(Default)]
 struct Source {
@@ -138,7 +135,7 @@ async fn activate(host: &Host, writer: &mut mpsc::Receiver<Vec<u8>>) {
                 credential: b"credential".to_vec(),
             })),
         }
-        .fixture_bytes(),
+        .encode_to_vec(),
     )
     .await;
     let frame = receive(writer).await;
@@ -161,7 +158,7 @@ async fn receive(writer: &mut mpsc::Receiver<Vec<u8>>) -> Frame {
         .await
         .unwrap()
         .unwrap();
-    syntra_core::decode_frame_structure(bytes.as_slice()).unwrap()
+    decode_frame_structure(&bytes).unwrap()
 }
 
 async fn send(host: &Host, id: u64, method: &str, payload: Vec<u8>, timeout_ms: u32) {
@@ -169,13 +166,13 @@ async fn send(host: &Host, id: u64, method: &str, payload: Vec<u8>, timeout_ms: 
         &Frame {
             version: 1,
             request_id: id,
-            body: Some(Body::Call(Call {
+            body: Some(Body::Request(RpcRequest {
                 method: method.into(),
                 payload,
                 timeout_ms,
             })),
         }
-        .fixture_bytes(),
+        .encode_to_vec(),
     )
     .await;
 }
@@ -183,11 +180,11 @@ async fn send(host: &Host, id: u64, method: &str, payload: Vec<u8>, timeout_ms: 
 fn result(frame: Frame, id: u64) -> Result<Vec<u8>, ErrorCode> {
     assert_eq!(frame.request_id, id);
     match frame.body {
-        Some(Body::Result(CallResult {
-            outcome: Some(call_result::Outcome::Payload(p)),
+        Some(Body::Result(RpcResult {
+            outcome: Some(rpc_result::Outcome::Payload(p)),
         })) => Ok(p),
-        Some(Body::Result(CallResult {
-            outcome: Some(call_result::Outcome::Error(e)),
+        Some(Body::Result(RpcResult {
+            outcome: Some(rpc_result::Outcome::Error(e)),
         })) => Err(ErrorCode::from_i32_lossy(e.code).0),
         _ => panic!("expected terminal RPC result"),
     }
@@ -198,19 +195,19 @@ async fn negotiate(host: &Host, writer: &mut mpsc::Receiver<Vec<u8>>) {
         host,
         1,
         wire::NEGOTIATE,
-        Negotiate {
+        RecoveryNegotiateRequest {
             profile_version: 1,
             capability: wire::CAPABILITY.into(),
             min_version: 1,
             max_version: 1,
         }
-        .fixture_bytes(),
+        .encode_to_vec(),
         0,
     )
     .await;
     let payload = result(receive(writer).await, 1).unwrap();
     assert_eq!(
-        crate::recovery::wire::codec::decode::<Negotiated>(payload.as_slice())
+        RecoveryNegotiateResponse::decode(payload.as_slice())
             .unwrap()
             .selected_version,
         1
@@ -218,12 +215,12 @@ async fn negotiate(host: &Host, writer: &mut mpsc::Receiver<Vec<u8>>) {
 }
 
 fn subscribe_payload(selector: &[u8]) -> Vec<u8> {
-    Subscribe {
+    RecoverySubscribeRequest {
         profile_version: 1,
         stream_selector: selector.to_vec(),
         start_checkpoint: vec![],
     }
-    .fixture_bytes()
+    .encode_to_vec()
 }
 
 async fn subscribe(
@@ -234,7 +231,7 @@ async fn subscribe(
 ) -> Vec<u8> {
     send(host, id, wire::SUBSCRIBE, subscribe_payload(selector), 0).await;
     let payload = result(receive(writer).await, id).unwrap();
-    crate::recovery::wire::codec::decode::<SubscriptionAccepted>(payload.as_slice())
+    RecoverySubscribeResponse::decode(payload.as_slice())
         .unwrap()
         .subscription_handle
 }
@@ -357,11 +354,7 @@ async fn terminal_reservation_retires_actual_recovery_attachment_before_transiti
         panic!("expected exact typed result")
     };
     assert_eq!(
-        result(
-            syntra_core::decode_frame_structure(output.bytes()).unwrap(),
-            3
-        )
-        .unwrap(),
+        result(decode_frame_structure(output.bytes()).unwrap(), 3).unwrap(),
         b"retired"
     );
     coordinator.refresh().await.unwrap();
@@ -649,7 +642,7 @@ async fn profile_default_is_source_deadline_clamped_to_core_and_explicit_is_unch
         max_rpc_timeout: Duration::from_secs(3),
         ..ConnectionConfig::default()
     });
-    let mut req = Call {
+    let mut req = RpcRequest {
         method: wire::NEGOTIATE.into(),
         ..Default::default()
     };
@@ -680,13 +673,13 @@ async fn expired_receipt_consumes_id_before_profile_admission_without_binding() 
     let bytes = Frame {
         version: 1,
         request_id: 7,
-        body: Some(Body::Call(Call {
+        body: Some(Body::Request(RpcRequest {
             method: wire::NEGOTIATE.into(),
             payload: vec![],
             timeout_ms: 1,
         })),
     }
-    .fixture_bytes();
+    .encode_to_vec();
     host.ingest_received_at(&bytes, now() - Duration::from_millis(20))
         .await;
     assert_eq!(
@@ -733,13 +726,13 @@ async fn independent_profile_quota_does_not_lower_the_core_floor() {
         &host,
         2,
         wire::NEGOTIATE,
-        Negotiate {
+        RecoveryNegotiateRequest {
             profile_version: 1,
             capability: wire::CAPABILITY.into(),
             min_version: 1,
             max_version: 1,
         }
-        .fixture_bytes(),
+        .encode_to_vec(),
         0,
     )
     .await;
@@ -760,11 +753,11 @@ async fn notification_worker_emits_without_application_consumer_or_rpc_completio
         &host,
         3,
         wire::CATCH_UP,
-        CatchUp {
+        RecoveryCatchUpRequest {
             profile_version: 1,
             subscription_handle: handle.clone(),
         }
-        .fixture_bytes(),
+        .encode_to_vec(),
         0,
     )
     .await;
@@ -776,16 +769,7 @@ async fn notification_worker_emits_without_application_consumer_or_rpc_completio
             result(frame, 3).unwrap();
             results += 1;
         } else {
-            assert_eq!(frame.request_id, 0);
-            let Some(Body::Notification(n)) = frame.body else {
-                panic!("notification expected")
-            };
-            assert!(
-                crate::recovery::wire::codec::decode::<RecoveryNotification>(n.payload.as_slice())
-                    .unwrap()
-                    .notification
-                    .is_some()
-            );
+            recovery_event(frame);
             notifications += 1;
         }
     }
@@ -893,13 +877,7 @@ async fn notification_permission_denial_retires_only_the_target_stream() {
         Err(ProviderError::PermissionDenied)
     );
     let frame = receive(&mut writer).await;
-    assert_eq!(frame.request_id, 0);
-    let Some(Body::Notification(n)) = frame.body else {
-        panic!("expected targeted terminal")
-    };
-    let n =
-        crate::recovery::wire::codec::decode::<RecoveryNotification>(n.payload.as_slice()).unwrap();
-    let Some(recovery_notification::Notification::Trailer(t)) = n.notification else {
+    let recovery_notification::Notification::Trailer(t) = recovery_event(frame) else {
         panic!("expected terminal trailer")
     };
     assert_eq!(t.subscription_handle, denied_handle);
@@ -927,11 +905,11 @@ async fn close_wakes_a_backpressured_notification_worker() {
         &host,
         3,
         wire::CATCH_UP,
-        CatchUp {
+        RecoveryCatchUpRequest {
             profile_version: 1,
             subscription_handle: handle,
         }
-        .fixture_bytes(),
+        .encode_to_vec(),
         0,
     )
     .await;
@@ -1006,11 +984,11 @@ async fn complete_worker_baseline(
         host,
         id,
         wire::CATCH_UP,
-        CatchUp {
+        RecoveryCatchUpRequest {
             profile_version: 1,
             subscription_handle: handle.to_vec(),
         }
-        .fixture_bytes(),
+        .encode_to_vec(),
         0,
     )
     .await;
@@ -1038,7 +1016,7 @@ async fn complete_worker_baseline(
             assert_eq!(t.boundary_checkpoint, b"c0");
             assert_eq!(
                 t.outcome,
-                Some(recovery_batch_trailer::Outcome::CatchupComplete)
+                Some(recovery_batch_trailer::Outcome::CatchupComplete(true))
             );
             completed = true;
         }
@@ -1089,7 +1067,7 @@ impl WorkerBarrier {
                 payload: b"fixture writer-capacity barrier".to_vec(),
             })),
         }
-        .fixture_bytes()
+        .encode_to_vec()
     }
 
     async fn hold_popped_batch(&self) {
@@ -1196,7 +1174,7 @@ async fn worker_barrier_permission_revoked_after_pop_discards_batch_only_for_tar
         fixture.release_writer();
         assert_eq!(
             fixture.targeted_terminal().await.outcome,
-            Some(recovery_batch_trailer::Outcome::Terminated)
+            Some(recovery_batch_trailer::Outcome::Terminated(true))
         );
         fixture.healthy_continues().await;
     })

@@ -11,6 +11,15 @@
 
 use crate::error::{ErrorCode, SyntraError};
 
+impl std::fmt::Debug for crate::proto::ClientHello {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientHello")
+            .field("min_version", &self.min_version)
+            .field("max_version", &self.max_version)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Minimum supported Syntra version for this implementation.
 pub const MIN_VERSION: u32 = 1;
 /// Maximum supported Syntra version for this implementation.
@@ -54,7 +63,7 @@ pub fn negotiate_version(
         .copied()
         .filter(|v| *v >= min_version && *v <= max_version)
         .max();
-    best.ok_or(SyntraError::Handshake {
+    best.ok_or_else(|| SyntraError::Handshake {
         code: ErrorCode::Unimplemented,
         message: "no overlapping protocol version".to_string(),
     })
@@ -97,7 +106,7 @@ pub fn build_hello(
     min_version: u32,
     max_version: u32,
     credential: Vec<u8>,
-) -> Result<crate::wire::ClientHello, SyntraError> {
+) -> Result<crate::proto::ClientHello, SyntraError> {
     validate_hello_range(min_version, max_version)?;
     if credential.len() > MAX_CREDENTIAL_BYTES {
         return Err(SyntraError::Protocol {
@@ -105,7 +114,7 @@ pub fn build_hello(
             message: "credential exceeds bound".to_string(),
         });
     }
-    Ok(crate::wire::ClientHello {
+    Ok(crate::proto::ClientHello {
         min_version,
         max_version,
         credential,
@@ -115,6 +124,23 @@ pub fn build_hello(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hello_debug_omits_credentials_even_in_frames() {
+        let hello = build_hello(1, 2, vec![197, 251]).unwrap();
+        let direct = format!("{hello:?}");
+        let frame = crate::Frame {
+            version: 2,
+            request_id: 0,
+            body: Some(crate::proto::frame::Body::Hello(hello)),
+        };
+        for debug in [direct, format!("{frame:?}"), format!("{frame:#?}")] {
+            assert!(debug.contains("min_version"));
+            assert!(!debug.contains("credential"));
+            assert!(!debug.contains("197"));
+            assert!(!debug.contains("251"));
+        }
+    }
 
     #[test]
     fn negotiates_highest_overlap() {

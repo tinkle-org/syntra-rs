@@ -624,18 +624,21 @@ async fn surviving_authority_work_keeps_execution_charge_after_deadline() {
 #[tokio::test]
 async fn complete_frame_limit_is_1024_not_payload_limit() {
     use syntra_core::{
-        wire::{call_result::Outcome, frame::Body},
-        CallResult, Frame,
+        encode_frame,
+        proto::{frame::Body, rpc_result::Outcome},
+        Frame, RpcResult, ValidationContext,
     };
     let size = |n| {
-        Frame {
+        let frame = Frame {
             version: 1,
             request_id: 1,
-            body: Some(Body::Result(CallResult {
+            body: Some(Body::Result(RpcResult {
                 outcome: Some(Outcome::Payload(vec![0; n])),
             })),
-        }
-        .encoded_len()
+        };
+        encode_frame(&frame, ValidationContext::active(1))
+            .unwrap()
+            .len()
     };
     let n = (0..1024).find(|n| size(*n) == 1024).unwrap();
     for (payload, success) in [(vec![0; n], true), (vec![0; n + 1], false)] {
@@ -998,16 +1001,21 @@ async fn partial_ordinary_frame_finishes_before_commit_and_queued_notifications_
     assert!(client.conn.next_notification().await.is_none());
     // Prove the barrier waited for every record, not just the initially blocked
     // record. Count actual underlying TCP bytes handed off before commit entry.
-    let plaintext = 4 + syntra_core::Frame {
+    let frame = syntra_core::Frame {
         version: client.version,
         request_id: 1,
-        body: Some(syntra_core::wire::frame::Body::Result(
-            syntra_core::CallResult {
-                outcome: Some(syntra_core::wire::call_result::Outcome::Payload(result)),
+        body: Some(syntra_core::proto::frame::Body::Result(
+            syntra_core::RpcResult {
+                outcome: Some(syntra_core::proto::rpc_result::Outcome::Payload(result)),
             },
         )),
-    }
-    .encoded_len();
+    };
+    let plaintext = 4 + syntra_core::encode_frame(
+        &frame,
+        syntra_core::ValidationContext::active(client.version),
+    )
+    .unwrap()
+    .len();
     let expected_wire_bytes =
         plaintext + plaintext.div_ceil(MAX_PLAINTEXT) * (2 + MAX_CIPHERTEXT - MAX_PLAINTEXT);
     {

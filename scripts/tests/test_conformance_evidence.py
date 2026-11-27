@@ -19,6 +19,7 @@ import protocol_contract
 class FixtureTests(unittest.TestCase):
     def test_actual_contexts_and_negative_recipes(self):
         report = protocol_contract.verify()
+        self.assertEqual(report['encoding'], 'Protobuf')
         self.assertEqual((report['contexts'], report['negative_recipes']), (9, 36))
         self.assertEqual(len(report['carriers']), 3)
 
@@ -54,9 +55,10 @@ class TranscriptionTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.transport = evidence.FIXTURES / 'transport.yaml'
-        self.rejection = evidence.FIXTURES / 'ws-no-length-prefix.hex'
+        self.hello = evidence.FIXTURES / 'ws-no-length-prefix.hex'
+        self.corpus = evidence.FIXTURES / 'protobuf-vectors.yaml'
         self.vectors = Path('tests/interoperability/vectors.rs')
-        for rel in (self.transport, self.rejection, self.vectors):
+        for rel in (self.transport, self.hello, self.corpus, self.vectors):
             (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(evidence.ROOT / rel, self.root / rel)
 
@@ -67,7 +69,7 @@ class TranscriptionTests(unittest.TestCase):
         self.assertFalse(report['formal_conformance'])
         f = self.root / self.transport
         self.assertEqual(report['origins'], {p.as_posix(): evidence.digest((self.root / p).read_bytes())
-                                             for p in (self.transport, self.rejection)})
+                                             for p in (self.transport, self.hello, self.corpus)})
         self.assertEqual(report['source_sha256'], evidence.digest((self.root / self.vectors).read_bytes()))
         original = f.read_text()
         for value in ('890670696e672d31', '1005', '1001', '1048576'):
@@ -86,10 +88,22 @@ class TranscriptionTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'WS vector transcription drift'):
                 evidence.verify_transcriptions(self.root)
 
-    def test_changed_rejection_bytes_fail_without_a_change_to_the_origin_pin(self):
-        (self.root / self.rejection).write_text('00\n')
-        with self.assertRaisesRegex(ValueError, 'VEC-WS-009 rejection fixture drift'):
+    def test_changed_hello_bytes_fail_without_a_change_to_the_origin_pin(self):
+        (self.root / self.hello).write_text('00\n')
+        with self.assertRaisesRegex(ValueError, 'VEC-WS-009 hello fixture drift'):
             evidence.verify_transcriptions(self.root)
+
+    def test_local_protobuf_corpus_pins_ids_bytes_and_metadata(self):
+        corpus = self.root / self.corpus
+        crlf = corpus.read_bytes().replace(b'\r\n', b'\n').replace(b'\n', b'\r\n')
+        corpus.write_bytes(crlf)
+        report = evidence.verify_transcriptions(self.root)
+        self.assertEqual(report['origins'][self.corpus.as_posix()], evidence.digest(crlf))
+        for old, new in [(b'GOLD-PROT-HELLO-01', b'other'), (b'd2050178', b'd2050179'),
+                         (b'unknown_field_scope: Frame', b'unknown_field_scope: RpcRequest')]:
+            corpus.write_bytes(crlf.replace(old, new))
+            with self.subTest(old=old), self.assertRaisesRegex(ValueError, 'local Protobuf corpus drift'):
+                evidence.verify_transcriptions(self.root)
 
 
 class EvidenceTests(unittest.TestCase):

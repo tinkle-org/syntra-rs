@@ -1,8 +1,6 @@
 #![cfg(not(target_arch = "wasm32"))]
 //! Executable D5 lifecycle fixtures. These exercise runtime owners, not devices.
-#[path = "support/frame.rs"]
-mod frame_fixture;
-use frame_fixture::FrameFixture;
+use prost::Message;
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -10,7 +8,7 @@ use std::{
     },
     time::Duration,
 };
-use syntra_core::{wire::frame::Body, Call, ClientHello, Frame};
+use syntra_core::{proto::frame::Body, ClientHello, Frame, RpcRequest};
 use syntra_runtime::{
     elapsed::{ElapsedClock, ElapsedSource},
     *,
@@ -41,19 +39,19 @@ fn hello() -> Vec<u8> {
             credential: vec![],
         })),
     }
-    .fixture_bytes()
+    .encode_to_vec()
 }
 fn request(id: u64) -> Vec<u8> {
     Frame {
         version: 1,
         request_id: id,
-        body: Some(Body::Call(Call {
+        body: Some(Body::Request(RpcRequest {
             method: "/fixture.App/Mutate".into(),
             payload: vec![1],
             timeout_ms: 10_000,
         })),
     }
-    .fixture_bytes()
+    .encode_to_vec()
 }
 struct External(tokio::sync::mpsc::UnboundedSender<ExecutionLease>);
 impl Handler for External {

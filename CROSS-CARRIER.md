@@ -71,8 +71,10 @@ restore subscriptions and reconcile durable progress after negotiation.
 ### 1. Explicit permission to change carriers
 
 The default is same-carrier retry. With an explicit policy, retryable availability
-loss can select another permitted route on a fresh attempt. Never downgrade WSS
-below TLS 1.3, change the message format or authentication mode, or retry a
+loss can select another permitted route on a fresh attempt. Every route must
+use the same [Protobuf envelope](CONNECTION.md#records-and-carriers); failover
+cannot bridge #54's incompatible encoding even though both use wire version 1.
+Never downgrade WSS below TLS 1.3, change authentication mode, or retry a
 rejected trust decision. Each successor revalidates the endpoint and authenticates
 afresh. Both streams of a paired HTTP connection use one descriptor, carrier,
 authority, and security policy for the entire attempt.
