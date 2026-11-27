@@ -64,6 +64,17 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertIn('--output "$RUNNER_TEMP/candidate-rust-agreement"', producer["run"])
         self.assertEqual(upload["with"]["path"], "${{ runner.temp }}/candidate-rust-agreement")
 
+    def test_parser_budgets_and_main_only_benchmark_trigger(self):
+        for workflow, seconds in ((self.workflow, "60"), (self.scheduled, "900")):
+            self.assertEqual(workflow["jobs"]["parser-checks"], {
+                "uses": "./.github/workflows/parser-checks.yml", "with": {"seconds": seconds},
+            })
+        bench = yaml.load((ROOT / ".github/workflows/benchmarks.yml").read_text(), Loader=yaml.BaseLoader)
+        self.assertEqual(set(bench["on"]), {"push"})
+        self.assertEqual(bench["on"]["push"]["branches"], ["main"])
+        self.assertIn("crates/**/src/**/*.rs", bench["on"]["push"]["paths"])
+        self.assertEqual(bench["jobs"]["benches"]["runs-on"], "blacksmith-4vcpu-ubuntu-2404-arm")
+
     def test_candidate_upload_requires_execution_but_preserves_failure_evidence(self):
         upload, = [step for step in self.steps
                    if step.get("with", {}).get("name") == "candidate-rust-agreement"]
@@ -126,7 +137,7 @@ class CiWorkflowTests(unittest.TestCase):
                 self.assertNotIn("1.88", (ROOT / f".github/workflows/{name}.yml").read_text())
                 self.assertEqual(workflow["env"]["RUSTUP_TOOLCHAIN"], "1.89.0")
                 for job in workflow["jobs"].values():
-                    for step in job["steps"]:
+                    for step in job.get("steps", []):  # reusable workflow callers have no steps
                         action = step.get("uses", "")
                         if action.startswith("dtolnay/rust-toolchain@"):
                             self.assertEqual(step["with"]["toolchain"], "1.89.0")
@@ -159,11 +170,11 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", required)
         self.assertEqual(required["needs"], [
             "clippy", "rust", "native-macos", "generated-rust", "manifest-cases",
-            "package", "security", "actionlint", "dependency-review",
+            "package", "security", "parser-checks", "actionlint", "dependency-review",
         ])
         passing = {job: {"result": "success"} for job in required["needs"]}
         self.run_required_check(passing)
-        for job in ("rust", "native-macos", "generated-rust", "manifest-cases"):
+        for job in ("rust", "native-macos", "generated-rust", "manifest-cases", "parser-checks", "security"):
             for result in ("failure", "cancelled", "abandoned", "skipped", None):
                 with self.subTest(job=job, result=result):
                     results = {**passing, job: {"result": result}}

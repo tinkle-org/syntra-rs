@@ -17,6 +17,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  parser-checks:
+    uses: ./.github/workflows/parser-checks.yml
+    with:
+      seconds: 900
+
   full-linux:
     name: full validation (linux, 1.89.0)
     runs-on: ubuntu-24.04
@@ -189,9 +194,11 @@ jobs:
       - name: cargo-deny full check
         run: cargo deny --locked check
       - name: cargo-audit full
-        run: cargo audit --deny warnings
+        run: |
+          cargo audit --deny warnings
+          cargo audit --deny warnings --file fuzz/Cargo.lock
+          cargo deny --manifest-path fuzz/Cargo.toml --locked check advisories licenses sources
       - name: Optional native carrier, enrollment and file-store policy
         run: cargo deny --locked --features syntra-net/http,syntra-net/managed,syntra-net/proxy,syntra-net/tls-rustls,syntra-net/native-enrollment,syntra-runtime/file-store check advisories licenses sources
       - name: Portable WASM dependency policy
         run: cargo deny --locked --target wasm32-unknown-unknown check advisories licenses sources
-      # This workflow runs dependency checks, not fuzz or sanitizer campaigns.

@@ -1,0 +1,29 @@
+name: Parser property checks
+
+on:
+  workflow_call:
+    inputs:
+      seconds:
+        description: Seconds per target (1–900)
+        required: true
+        type: number
+
+permissions:
+  contents: read
+
+jobs:
+  parsers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned fuzz tools
+        run: |
+          rustup toolchain install 1.89.0 nightly-2026-03-15 --profile minimal
+          cargo +1.89.0 install --locked cargo-fuzz --version 0.13.1
+      - name: Run bounded parser properties
+        env:
+          PARSER_SECONDS: ${{ inputs.seconds }}
+        run: python3 fuzz/check.py "$PARSER_SECONDS"

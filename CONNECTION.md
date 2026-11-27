@@ -485,6 +485,8 @@ Run the isolated native, WASM, FFI and carrier checks in
 [CONTRIBUTING.md](CONTRIBUTING.md). Kernel browser execution and Docker integration
 are separate from compilation. Public context fixtures establish encoding
 agreement, not independent cryptographic vectors.
+For separate Noise-suite and primitive checks through Syntra's resolver, see the
+[known-answer fixtures](crates/syntra-core/tests/fixtures/resolver_kats/README.md).
 SDK-local round trips and candidate contract checks do not establish formal
 conformance or independent security review. Preserve the revision and scope of
 each recorded result. The

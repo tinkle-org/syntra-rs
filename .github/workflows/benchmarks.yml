@@ -1,66 +1,74 @@
 name: Benchmarks
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "17 4 * * 1"
-
-concurrency:
-  group: benchmarks-${{ github.ref }}
-  cancel-in-progress: false
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**/src/**/*.rs'
+      - 'crates/**/benches/**/*.rs'
+      - 'crates/**/*.bop'
+      - 'proto/**/*.proto'
+      - 'crates/syntra-core/tests/bench_allocations.rs'
+      - 'scripts/benchmark_baseline.py'
+      - 'crates/**/build.rs'
 
 permissions:
   contents: read
 
 env:
-  RUSTUP_TOOLCHAIN: "1.89.0"
-  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: '1.89.0'
 
 jobs:
   benches:
-    name: in-memory benchmarks (report-only)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    permissions:
-      contents: read
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          path: new
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.before }}
+          path: old
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: "1.89.0"
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-registry-${{ runner.os }}-1.89.0-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-registry-${{ runner.os }}-1.89.0-
-      - name: Compile benchmarks
-        run: cargo bench --locked --workspace --features syntra-net/tcp -- --test
-      - name: Run benchmarks (short, report-only)
-        # Target only the three Criterion harnesses: passing Criterion timing
-        # flags to the default libtest harness fails the run
-        # (`Unrecognized option`). The compile step above still covers every
-        # bench target with the harness-neutral `--test` selector.
+          toolchain: '1.89.0'
+      - name: Prepare identical harnesses and record environment
         run: |
-          cargo bench --locked -p syntra-core --bench frame_codec -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
-          cargo bench --locked -p syntra-core --bench channel -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
-          cargo bench --locked -p syntra-net --no-default-features --features tcp --bench pipe -- --measurement-time 0.1 --warm-up-time 0.05 --sample-size 10
-      - name: Record revision and toolchain
+          mkdir results
+          src=crates/syntra-core
+          # Bootstrap the pre-harness baseline on introduction only. Once present,
+          # use each revision's own codec API to measure the same named workloads.
+          if [[ ! -e old/scripts/benchmark_baseline.py ]]; then
+            cp -R new/$src/benches/{frame_codec.rs,channel.rs,fixtures} old/$src/benches/
+            cp new/$src/tests/bench_allocations.rs old/$src/tests/
+          fi
+          for tree in old new; do
+            git -C "$tree" rev-parse HEAD > "results/$tree-revision.txt"
+            git -C "$tree" status --short --branch >> "results/$tree-revision.txt"
+          done
+          { uname -a; lscpu; rustc -Vv; cargo -V; } > results/runner.txt
+      - name: Count allocations separately and prebuild both timing binaries
         run: |
-          mkdir -p bench-meta
-          git rev-parse HEAD > bench-meta/revision.txt
-          git status --short --branch >> bench-meta/revision.txt
-          rustc --version > bench-meta/toolchain.txt
-          cargo --version >> bench-meta/toolchain.txt
-      - name: Upload benchmark results
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+          for tree in old new; do
+            (cd "$tree" && cargo test --locked --release -p syntra-core --test bench_allocations -- --ignored --nocapture) | tee "results/$tree-allocations.txt"
+            (cd "$tree" && cargo bench --locked -p syntra-core --bench frame_codec --bench channel --no-run)
+          done
+        shell: bash
+      - name: Compare, repeating any suspected regression
+        shell: bash
+        run: |
+          if [[ ! -e old/scripts/benchmark_baseline.py ]]; then
+            mkdir results/calibration
+            python3 new/scripts/benchmark_baseline.py old old results/calibration 2>&1 | tee results/calibration.txt
+          fi
+          python3 new/scripts/benchmark_baseline.py old new results 2>&1 | tee results/comparison.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
         with:
-          name: criterion-${{ github.sha }}
-          path: |
-            target/criterion
-            bench-meta
+          name: benchmark-${{ github.sha }}-${{ github.run_attempt }}
+          path: results
+          if-no-files-found: error
           retention-days: 14

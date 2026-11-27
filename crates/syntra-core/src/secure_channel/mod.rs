@@ -718,6 +718,9 @@ mod context_tests;
 mod lifetime_tests;
 
 #[cfg(test)]
+mod resolver_kats;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

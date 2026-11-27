@@ -148,8 +148,11 @@ findings. See [the security policy](.github/SECURITY.md) for private vulnerabili
 
 Fuzz and negative tests:
 
-The checked-in workflows do not provide fuzz or sanitizer campaigns. Run the
-negative and regression suites explicitly when touching
+The isolated [parser checks](fuzz/README.md) use cargo-fuzz with AddressSanitizer
+for 60 seconds per target on PRs/main, and 900 seconds per target in scheduled
+validation. CI also checks the separate `fuzz/Cargo.lock` against RustSec and
+the workspace dependency policy. The 4 KiB fuzz input limit keeps these checks
+cheap. Run the full-size allocation, negative and regression suites when touching
 their parsers: `codec_vectors`, `encode_allocation`, `runtime_defects`,
 pump split-point and fault-injection tests. Pinned upstream conformance vectors
 and the selected local assets in `tests/interoperability/fixtures/` must retain
@@ -157,7 +160,10 @@ their provenance. Local fixture tests and carrier integration tests have distinc
 scopes; name the boundary actually exercised.
 
 The exact context/prologue fixture tests cover **public encoding only**, not
-independent Noise cryptographic vectors. Preserve the scope and contract revision
+independent Noise cryptographic vectors. The separate [resolver known-answer tests](crates/syntra-core/tests/fixtures/resolver_kats/README.md)
+check published primitive and Noise suite vectors through Syntra's Snow resolver;
+they do not exercise Syntra's wrapped flights or assert interoperability with another SDK.
+Preserve the scope and contract revision
 of each result. Same-library round trips, candidate agreement checks and pinned
 input checks do not establish formal conformance, device validation or independent
 security review.
@@ -176,8 +182,12 @@ cancel for PRs):
   vulnerability scans (does not gate PR/main validation).
 - `Integration` – separate Docker-based connectivity checks; see
   [crates/syntra-integration/README.md](crates/syntra-integration/README.md).
-- `Benchmarks` – report-only Criterion samples across workspace benches,
-  including codec, channel and pipe cases; see [BENCHMARKS.md](BENCHMARKS.md).
+- `Benchmarks` – same-runner Criterion comparisons for source changes on `main`,
+  covering frame round trips and protected records; see [BENCHMARKS.md](BENCHMARKS.md).
+- `CodeQL` – Rust and Actions analysis. After the initial scan, administrators
+  should require CodeQL results on `main` with security severity **High or higher**.
+  An uploaded scan alone does not block findings. Enable repository secret scanning
+  and push protection in GitHub settings; never allowlist a whole fixture directory.
 - `Release-plz` – validated release PRs, per-package `syntra-<crate>-vX.Y.Z`
   tags and gated Cargo publishing for eligible packages. Packages marked
   `publish = false` are excluded. Protocol releases remain separate; see
