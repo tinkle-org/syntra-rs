@@ -72,10 +72,22 @@ class CiWorkflowTests(unittest.TestCase):
         bench = yaml.load((ROOT / ".github/workflows/benchmarks.yml").read_text(), Loader=yaml.BaseLoader)
         self.assertEqual(set(bench["on"]), {"push"})
         self.assertEqual(bench["on"]["push"]["branches"], ["main"])
-        self.assertLessEqual({
-            "crates/**/src/**/*.rs", "Cargo.toml", "Cargo.lock", "crates/**/Cargo.toml",
-            "crates/**/Cargo.lock", ".cargo/config", ".cargo/config.toml", "rust-toolchain.toml",
-        }, set(bench["on"]["push"]["paths"]))
+        self.assertEqual(set(bench["on"]["push"]["paths"]), {
+            "crates/**/src/**/*.rs",
+            "crates/**/benches/**/*.rs",
+            "crates/**/*.bop",
+            "proto/**/*.proto",
+            "crates/syntra-core/tests/bench_allocations.rs",
+            "scripts/benchmark_baseline.py",
+            "crates/**/build.rs",
+            "Cargo.toml",
+            "Cargo.lock",
+            "crates/**/Cargo.toml",
+            "crates/**/Cargo.lock",
+            ".cargo/config",
+            ".cargo/config.toml",
+            "rust-toolchain.toml",
+        })
         job = bench["jobs"]["benches"]
         self.assertEqual(job["runs-on"], "blacksmith-4vcpu-ubuntu-2404-arm")
         no_previous_tip = "0" * 40
