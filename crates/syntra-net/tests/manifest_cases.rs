@@ -63,7 +63,7 @@ fn code(value: i32) -> &'static str {
     let (code, unknown) = ErrorCode::from_i32_lossy(value);
     assert_eq!(unknown, None, "unexpected error code in scenario");
     match code {
-        ErrorCode::Unspecified => "UNSPECIFIED",
+        ErrorCode::Invalid => "INVALID",
         ErrorCode::Cancelled => "CANCELLED",
         ErrorCode::Unknown => "UNKNOWN",
         ErrorCode::InvalidArgument => "INVALID_ARGUMENT",

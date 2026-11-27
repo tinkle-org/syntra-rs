@@ -2043,11 +2043,11 @@ fn outcome_error(code: ErrorCode, message: &str) -> syntra_core::wire::call_resu
     })
 }
 
-/// UNSPECIFIED (0) MUST NOT appear in a failure outcome (SNTR-ERR-001);
+/// INVALID (0) MUST NOT appear in a failure outcome (SNTR-ERR-001);
 /// normalize it to UNKNOWN defensively.
 fn sanitize_code(code: ErrorCode) -> ErrorCode {
     match code {
-        ErrorCode::Unspecified => ErrorCode::Unknown,
+        ErrorCode::Invalid => ErrorCode::Unknown,
         other => other,
     }
 }

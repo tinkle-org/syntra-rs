@@ -33,7 +33,7 @@ union CallOutcome {
 }
 
 enum ErrorCode : int32 {
-    Unspecified = 0;
+    Invalid = 0;
     Cancelled = 1;
     Unknown = 2;
     InvalidArgument = 3;

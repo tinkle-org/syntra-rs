@@ -814,7 +814,7 @@ impl<'raw> ::bebop::Record<'raw> for CallOutcome<'raw> {}
 #[repr(i32)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ErrorCode {
-    Unspecified = 0,
+    Invalid = 0,
     Cancelled = 1,
     Unknown = 2,
     InvalidArgument = 3,
@@ -838,7 +838,7 @@ impl ::core::convert::TryFrom<i32> for ErrorCode {
 
     fn try_from(value: i32) -> ::bebop::DeResult<Self> {
         match value {
-            0 => Ok(ErrorCode::Unspecified),
+            0 => Ok(ErrorCode::Invalid),
             1 => Ok(ErrorCode::Cancelled),
             2 => Ok(ErrorCode::Unknown),
             3 => Ok(ErrorCode::InvalidArgument),
@@ -863,7 +863,7 @@ impl ::core::convert::TryFrom<i32> for ErrorCode {
 impl ::core::convert::From<ErrorCode> for i32 {
     fn from(value: ErrorCode) -> Self {
         match value {
-            ErrorCode::Unspecified => 0,
+            ErrorCode::Invalid => 0,
             ErrorCode::Cancelled => 1,
             ErrorCode::Unknown => 2,
             ErrorCode::InvalidArgument => 3,

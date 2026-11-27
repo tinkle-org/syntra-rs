@@ -477,7 +477,7 @@ async fn direct_error_variants_are_sanitized_and_bounded() {
         Arc::new(AllowAnonymous),
         Arc::new(FnHandler(|_, _, _| async {
             HandlerOutcome::Error {
-                code: ErrorCode::Unspecified,
+                code: ErrorCode::Invalid,
                 message: "é".repeat(syntra_core::MAX_DIAGNOSTIC_BYTES),
             }
         })),
@@ -490,7 +490,7 @@ async fn direct_error_variants_are_sanitized_and_bounded() {
     assert_eq!(e.code, ErrorCode::Unknown.as_i32());
     assert!(e.message.len() <= syntra_core::MAX_DIAGNOSTIC_BYTES);
     assert!(std::str::from_utf8(e.message.as_bytes()).is_ok());
-    let Outcome::Error(e) = outcome_error(ErrorCode::Unspecified, &"x".repeat(10_000)) else {
+    let Outcome::Error(e) = outcome_error(ErrorCode::Invalid, &"x".repeat(10_000)) else {
         panic!("error")
     };
     assert_eq!(e.code, ErrorCode::Unknown.as_i32());
@@ -984,7 +984,7 @@ async fn authorization_codes_are_generic_and_never_replace_or_union_the_bound_pr
             "access denied",
         ),
         (
-            ErrorCode::Unspecified,
+            ErrorCode::Invalid,
             ErrorCode::PermissionDenied,
             "access denied",
         ),

@@ -30,7 +30,7 @@ pub fn bounded_diagnostic(message: impl Into<String>) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i32)]
 pub enum ErrorCode {
-    Unspecified = 0,
+    Invalid = 0,
     Cancelled = 1,
     Unknown = 2,
     InvalidArgument = 3,
@@ -55,7 +55,7 @@ impl ErrorCode {
     /// number is preserved by the caller for diagnostics.
     pub fn from_i32_lossy(v: i32) -> (Self, Option<i32>) {
         match v {
-            0 => (Self::Unspecified, None),
+            0 => (Self::Invalid, None),
             1 => (Self::Cancelled, None),
             2 => (Self::Unknown, None),
             3 => (Self::InvalidArgument, None),
@@ -98,7 +98,7 @@ impl ErrorCode {
             | Self::DataLoss
             | Self::PermissionDenied
             | Self::Unauthenticated => RetryClass::NotSafeToRetry,
-            Self::Internal | Self::Unknown | Self::Unspecified => RetryClass::UnknownOutcome,
+            Self::Internal | Self::Unknown | Self::Invalid => RetryClass::UnknownOutcome,
         }
     }
 }
@@ -231,7 +231,7 @@ mod tests {
             };
         }
         check_codes!(
-            Unspecified,
+            Invalid,
             Cancelled,
             Unknown,
             InvalidArgument,
