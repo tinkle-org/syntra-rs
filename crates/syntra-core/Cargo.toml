@@ -15,7 +15,7 @@ default = []
 http-candidate = []
 
 [dependencies]
-prost.workspace = true
+bebop.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -42,9 +42,6 @@ js-sys = "0.3"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
-
-[dev-dependencies]
-prost.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }

@@ -1,25 +1,25 @@
-//! Host-only RFC 0004 D2/D4 and RFC 0008 D2/D5 regressions. These exercise
-//! serialized wire frames locally; they are not an independent interop verdict.
+//! Host request admission, execution accounting, and terminal selection regressions.
 
 #[path = "host_request_budget_tests.rs"]
 mod request_budget_tests;
 
 use super::*;
+use crate::frame_fixture::FrameFixture;
 use crate::session::AllowAnonymous;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use syntra_core::proto::{rpc_result::Outcome, Cancel, ClientHello};
+use syntra_core::wire::{call_result::Outcome, Cancel, ClientHello};
 
 fn request(id: u64, method: &str, timeout_ms: u32) -> Vec<u8> {
     Frame {
         version: 1,
         request_id: id,
-        body: Some(Body::Request(RpcRequest {
+        body: Some(Body::Call(Call {
             method: method.into(),
             payload: vec![],
             timeout_ms,
         })),
     }
-    .encode_to_vec()
+    .fixture_bytes()
 }
 
 fn call(id: u64) -> Vec<u8> {
@@ -32,7 +32,7 @@ fn cancel(id: u64) -> Vec<u8> {
         request_id: id,
         body: Some(Body::Cancel(Cancel {})),
     }
-    .encode_to_vec()
+    .fixture_bytes()
 }
 
 async fn activate(host: &Host, writer: &mut mpsc::Receiver<Vec<u8>>) {
@@ -46,11 +46,11 @@ async fn activate(host: &Host, writer: &mut mpsc::Receiver<Vec<u8>>) {
                 credential: vec![],
             })),
         }
-        .encode_to_vec(),
+        .fixture_bytes(),
     )
     .await;
     assert!(matches!(
-        Frame::decode(writer.recv().await.unwrap().as_slice())
+        syntra_core::decode_frame_structure(writer.recv().await.unwrap().as_slice())
             .unwrap()
             .body,
         Some(Body::Ready(_))
@@ -58,9 +58,10 @@ async fn activate(host: &Host, writer: &mut mpsc::Receiver<Vec<u8>>) {
 }
 
 async fn result(writer: &mut mpsc::Receiver<Vec<u8>>, id: u64) -> Outcome {
-    let frame = Frame::decode(writer.recv().await.unwrap().as_slice()).unwrap();
+    let frame =
+        syntra_core::decode_frame_structure(writer.recv().await.unwrap().as_slice()).unwrap();
     assert_eq!(frame.request_id, id);
-    let Some(Body::Result(RpcResult {
+    let Some(Body::Result(CallResult {
         outcome: Some(outcome),
     })) = frame.body
     else {
@@ -185,7 +186,7 @@ async fn structural_and_nonzero_id_checks_precede_highwater() {
     activate(&host, &mut writer).await;
     host.ingest(&call(0)).await;
     let mut malformed = call(100);
-    malformed.extend([0x62, 0]); // repeated body, not a trustworthy request
+    malformed.pop(); // truncated call, not a trustworthy request
     host.ingest(&malformed).await;
     assert_eq!(*host.highwater.lock().unwrap(), 0);
     host.ingest(&call(7)).await;
@@ -218,9 +219,10 @@ async fn fifo_gate_and_receipt_timestamp_include_admission_delay() {
     second.await;
     let mut ids = Vec::new();
     for _ in 0..2 {
-        let frame = Frame::decode(writer.recv().await.unwrap().as_slice()).unwrap();
+        let frame =
+            syntra_core::decode_frame_structure(writer.recv().await.unwrap().as_slice()).unwrap();
         ids.push(frame.request_id);
-        let Some(Body::Result(RpcResult {
+        let Some(Body::Result(CallResult {
             outcome: Some(outcome),
         })) = frame.body
         else {
@@ -265,7 +267,8 @@ async fn selected_output_backpressure_neither_blocks_admission_nor_changes_termi
     // Results need not follow request order; only admission has that requirement.
     let mut outcomes = HashMap::new();
     for _ in 0..2 {
-        let frame = Frame::decode(writer.recv().await.unwrap().as_slice()).unwrap();
+        let frame =
+            syntra_core::decode_frame_structure(writer.recv().await.unwrap().as_slice()).unwrap();
         let Some(Body::Result(result)) = frame.body else {
             panic!("result")
         };

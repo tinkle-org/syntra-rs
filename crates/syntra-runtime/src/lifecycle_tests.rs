@@ -1,9 +1,9 @@
 //! Supplemental RFC0008 D2/D3 regressions, not physical suspend evidence.
+use crate::frame_fixture::FrameFixture;
 use crate::{
     elapsed::{ElapsedClock, ElapsedSource},
     *,
 };
-use prost::Message;
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -12,8 +12,8 @@ use std::{
     time::Duration,
 };
 use syntra_core::{
-    proto::{frame::Body, rpc_result::Outcome},
-    ErrorCode, Frame, RpcResult,
+    wire::{call_result::Outcome, frame::Body},
+    CallResult, ErrorCode, Frame,
 };
 
 struct Source(AtomicU64);
@@ -46,7 +46,7 @@ async fn pair() -> (
                     connection_id: "clock-test".into(),
                 })),
             }
-            .encode_to_vec(),
+            .fixture_bytes(),
         )
         .await;
     hello.await.unwrap();
@@ -57,11 +57,11 @@ fn result(id: u64) -> Vec<u8> {
     Frame {
         version: 1,
         request_id: id,
-        body: Some(Body::Result(RpcResult {
+        body: Some(Body::Result(CallResult {
             outcome: Some(Outcome::Payload(vec![7])),
         })),
     }
-    .encode_to_vec()
+    .fixture_bytes()
 }
 
 #[tokio::test(start_paused = true)]
@@ -84,7 +84,7 @@ async fn buffered_result_loses_to_elapsed_deadline_but_selected_terminal_survive
         let call = client.call("/test.Echo/Call", vec![], 1000);
         tokio::pin!(call);
         assert!(futures_util::poll!(&mut call).is_pending());
-        let frame = Frame::decode(
+        let frame = syntra_core::decode_frame_structure(
             client
                 .prepare_outbound(writer.recv().await.unwrap())
                 .unwrap()
@@ -159,7 +159,7 @@ async fn unknown_continuity_denies_new_rpc_and_retires_host_worker_without_new_i
                 credential: vec![],
             })),
         }
-        .encode_to_vec(),
+        .fixture_bytes(),
     )
     .await;
     writer.recv().await.unwrap();
@@ -167,13 +167,13 @@ async fn unknown_continuity_denies_new_rpc_and_retires_host_worker_without_new_i
         &Frame {
             version: 1,
             request_id: 1,
-            body: Some(Body::Request(syntra_core::RpcRequest {
+            body: Some(Body::Call(syntra_core::Call {
                 method: "/test.Echo/Call".into(),
                 payload: vec![],
                 timeout_ms: 1000,
             })),
         }
-        .encode_to_vec(),
+        .fixture_bytes(),
     )
     .await;
     let mut closed = host.subscribe_close();
@@ -220,7 +220,7 @@ async fn elapsed_handshake_expiry_precedes_buffered_ready_and_host_authenticatio
                     connection_id: "late".into(),
                 })),
             }
-            .encode_to_vec(),
+            .fixture_bytes(),
         )
         .await;
     assert!(client.is_closed());
@@ -254,7 +254,7 @@ async fn elapsed_handshake_expiry_precedes_buffered_ready_and_host_authenticatio
                 credential: vec![],
             })),
         }
-        .encode_to_vec(),
+        .fixture_bytes(),
     )
     .await;
     assert!(host.is_closed());
@@ -293,7 +293,7 @@ async fn host_elapsed_authorization_delay_never_dispatches_expired_effects() {
                 credential: vec![],
             })),
         }
-        .encode_to_vec(),
+        .fixture_bytes(),
     )
     .await;
     writer.recv().await.unwrap();
@@ -301,17 +301,18 @@ async fn host_elapsed_authorization_delay_never_dispatches_expired_effects() {
         &Frame {
             version: 1,
             request_id: 1,
-            body: Some(Body::Request(syntra_core::RpcRequest {
+            body: Some(Body::Call(syntra_core::Call {
                 method: "/test.Echo/Call".into(),
                 payload: vec![],
                 timeout_ms: 1000,
             })),
         }
-        .encode_to_vec(),
+        .fixture_bytes(),
     )
     .await;
-    let frame = Frame::decode(writer.recv().await.unwrap().as_slice()).unwrap();
-    let Some(Body::Result(RpcResult {
+    let frame =
+        syntra_core::decode_frame_structure(writer.recv().await.unwrap().as_slice()).unwrap();
+    let Some(Body::Result(CallResult {
         outcome: Some(Outcome::Error(error)),
     })) = frame.body
     else {

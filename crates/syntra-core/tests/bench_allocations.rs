@@ -6,7 +6,6 @@ mod frame;
 #[path = "../benches/fixtures/record.rs"]
 mod record;
 
-use prost::Message;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use syntra_core::ValidationContext;
@@ -40,7 +39,9 @@ unsafe impl GlobalAlloc for Counter {
 #[ignore = "allocation measurement runs with post-merge benchmarks"]
 fn allocations_per_operation() {
     for size in frame::ROUNDTRIP_SIZES {
-        let bytes = frame::request_frame(size).encode_to_vec();
+        let bytes =
+            syntra_core::encode_frame(&frame::request_frame(size), ValidationContext::active(1))
+                .unwrap();
         let before = CALLS.get();
         let result = frame::roundtrip(&bytes, ValidationContext::active(1));
         let calls = CALLS.get() - before;

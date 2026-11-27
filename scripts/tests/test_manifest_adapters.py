@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import conformance_evidence as evidence
 import manifest_adapters as adapters
-from upstream_snapshot import digest
+from local_inputs import digest
 
 
 class AdapterTests(unittest.TestCase):
@@ -94,6 +94,29 @@ class AdapterTests(unittest.TestCase):
             self.assertNotEqual(digest(adapters.canonical(scenario)), self.request['scenario_sha256'])
         self.assertNotEqual(adapters.request_for('wss-unknown-field')['nonce'], self.request['nonce'])
 
+    def test_request_cannot_mutate_or_replace_the_fixture_oracle(self):
+        self.request['scenario']['expected']['frames'][0]['payload_b64'] = '/w=='
+        fresh = adapters.request_for('wss-unknown-field')
+        self.assertEqual(fresh['scenario']['expected']['frames'][0]['payload_b64'], 'aGk=')
+        self.request['scenario_sha256'] = digest(adapters.canonical(self.request['scenario']))
+        result = self.result()
+        result['observation']['frames'][0]['payload_hex'] = 'ff'
+        with self.assertRaisesRegex(ValueError, 'request differs'):
+            adapters.validate_result(self.request, result)
+
+    def test_verification_binds_raw_fixture_and_captured_cases(self):
+        source = (adapters.ROOT / adapters.SCENARIO_FIXTURE).read_bytes() + b'\n# updated\n'
+        with mock.patch.object(adapters, 'regular_file', return_value=source):
+            self.request['fixture_sha256'] = digest(source)
+            with self.assertRaisesRegex(ValueError, 'fixture digest'):
+                adapters.validate_result(self.request, self.result())
+        identifier = self.request['scenario_id']
+        changed = {**self.request['scenario'], 'notes': 'not in fixture'}
+        with mock.patch.dict(adapters.SUPPLEMENTAL_SCENARIOS, {identifier: changed}):
+            request = adapters.request_for(identifier)
+            with self.assertRaisesRegex(ValueError, 'differ from fixture data'):
+                adapters.validate_result(request, self.result(request))
+
     def test_declared_assertions_without_an_oracle_are_refused(self):
         scenario = copy.deepcopy(self.request['scenario'])
         scenario['expected']['transport'] = {'must_be_observed': True}
@@ -103,9 +126,9 @@ class AdapterTests(unittest.TestCase):
 
     def test_fixture_encoder_preserves_unknown_field_and_empty_selection(self):
         frame = self.request['scenario']['input']['frames'][0]
-        self.assertTrue(adapters.frame_bytes(frame).endswith(bytes.fromhex('d2050178')))
+        self.assertTrue(adapters.frame_bytes(frame).endswith(bytes.fromhex('5a010000007800')))
         frame = {**frame, 'payload_b64': '', 'unknown_fields': []}
-        self.assertIn(bytes.fromhex('1200'), adapters.frame_bytes(frame))
+        self.assertIn(bytes.fromhex('020000000003'), adapters.frame_bytes(frame))
         no_timeout = {key: value for key, value in frame.items() if key != 'timeout_ms'}
         self.assertEqual(adapters.frame_bytes(no_timeout), adapters.frame_bytes({**frame, 'timeout_ms': 0}))
         with self.assertRaises(ValueError):
@@ -239,10 +262,10 @@ class AdapterTests(unittest.TestCase):
             unconfirmed_captures=0, control_captures=1, probe_after_control={'error': {'code': 'UNIMPLEMENTED'}})
         got['control_connection'] = {'connection_state': 'ACTIVE', 'session_state': 'unchanged',
             'sent_frames_hex': ['setup', *request['control_frames_hex']],
-            'frames': [{'request_id': 1, 'body': 'result', 'shape': 'RecoveryNegotiateResponse', 'decoded': {
+            'frames': [{'request_id': 1, 'body': 'result', 'shape': 'Negotiated', 'decoded': {
                 'profile_version': 1, 'selected_version': 1, 'max_subscriptions_per_connection': 64,
                 'max_pending_rpcs_per_connection': 16, 'max_page_bytes': 262144, 'max_snapshot_pages': 256}},
-                {'request_id': 3, 'body': 'result', 'shape': 'RecoverySubscribeResponse', 'decoded': {
+                {'request_id': 3, 'body': 'result', 'shape': 'SubscriptionAccepted', 'decoded': {
                     'profile_version': 1, 'generation': 7, 'subscription_handle_hex': 'abcd',
                     'catchup_boundary_hex': b'boundary-A'.hex()}}]}
         adapters.validate_result(request, result)

@@ -1,7 +1,7 @@
 # Syntra Rust
 
 Embeddable Rust implementation of Syntra 1.0 with an integral Noise-based
-encryption layer, bounded Protobuf codecs, client/host runtimes, negotiated
+encryption layer, bounded message codecs, client/host runtimes, negotiated
 update/recovery and full-state persistence adapters. Native drivers compose the
 portable encryption kernel and message runtime with platform I/O.
 
@@ -11,11 +11,10 @@ runtime scheduling and socket policy. Encryption is integral to the protocol. Se
 
 The implementation is experimental and distributed as release-candidate crates.
 No formal conformance or independent security-review verdict is claimed.
-The current candidate is recorded in
-[`protocol-contract.json`](protocol-contract.json); it pins `committed-candidate`
-inputs, not a release or specification freeze. See
-[input provenance](CONTRIBUTING.md#input-provenance-and-authority) for the separate
-11-input upstream lock, source credit and exact Git/offline checks.
+`syntra-rs` is the source of truth for the protocol. Its Bebop schemas are in
+`schemas/v1/*.bop`; the Rust implementation defines validation, session
+behavior, record protection, and carrier bindings. See the
+[schema conventions](CONTRIBUTING.md#schema-and-generated-code) before changing the wire format.
 
 Use **Rust 1.89.0** for production builds and current verification. The
 crate MSRV floor is **1.89**; it is a build compatibility constraint, not a
@@ -24,7 +23,7 @@ security-patched toolchain. Current dependency pins are:
 
 | Dependency | Version |
 | --- | --- |
-| `prost` | =0.14.4 |
+| `bebop` | =3.2.3 |
 | `snow` | =0.10.0 |
 | `getrandom` | 0.3 |
 | `tokio` | 1 |
@@ -32,12 +31,9 @@ security-patched toolchain. Current dependency pins are:
 | `rustls` | 0.23 |
 
 Cargo package release configuration is in [release-plz.toml](release-plz.toml).
-Protocol specification releases and package releases are separate.
 The public package set is `syntra-core`, `syntra-runtime`, `syntra-net` and
 `syntra-ffi`; `syntra-integration` remains unpublished test infrastructure.
 Each package is released separately on crates.io, not as a workspace bundle.
-Enabling net publication here still requires a reviewed release PR and its first
-successful upload before downstream registry dependencies can resolve it.
 
 ## Default: native async workspace
 
@@ -72,10 +68,8 @@ For downstream native TCP use, depend on `syntra-net` with `default-features = f
 and `features = ["tcp"]` when the application owns a Tokio runtime, or select
 `features = ["managed"]` for the library-owned runtime/reconnect lifecycle.
 See the [package README](crates/syntra-net/README.md) for the dependency declaration,
-first-publication status, security inputs and native/WASM boundaries. Pin compatible
-RC versions together when also using core/runtime types directly. Existing
-`syntra-ws` consumers must migrate their connection configuration and lifecycle;
-publishing a new crate does not change downstream dependencies automatically.
+security inputs, and native/WASM boundaries. Pin compatible
+RC versions together when also using core/runtime types directly.
 
 Runtime byte channels exchange serialized `Frame` values inside the embedder.
 Supplied connection drivers compose them with encrypted record framing and
@@ -89,7 +83,7 @@ carrier-neutral `pump` without socket dependencies. Select capabilities explicit
 | --- | --- |
 | `tcp` | Encrypted TCP dial, connected-stream composition, admission-bounded listener and `routes` module |
 | `cross-carrier-candidate` | Explicit opt-in sequential cross-carrier route policy; enables only `tcp`, with no implicit HTTP, TLS, managed runtime or reconnect support |
-| `http` | Draft RFC0013 candidate HTTP/HTTPS Noise/RPC connections, listeners and raw codec/pair APIs; enables `syntra-core/http-candidate`, `getrandom` and the application `tls` boundary, without implying WebSocket or a TLS implementation |
+| `http` | Candidate HTTP/HTTPS Noise/RPC connections, listeners and raw codec/pair APIs; enables `syntra-core/http-candidate`, `getrandom` and the application `tls` boundary, without implying WebSocket or a TLS implementation |
 | `websocket` | WebSocket framing/HTTP upgrade and loopback WS; application `tls` boundary, with no production TLS implementation dependency |
 | `tls-rustls` | Enables `websocket` plus optional rustls, native trust roots and Tokio TLS convenience APIs for WSS |
 | `reconnect` | Bounded reconnect helper with generation-fenced calls and explicit lifecycle controls |
@@ -135,10 +129,8 @@ route set, allowlist and bounded nonempty carrier policy are validated before
 inputs or dialing. WS is excluded. `client_routes` remains same-carrier even
 when Cargo features are unified. Permitting TCP explicitly allows absence of
 outer TLS; Noise remains mandatory. TLS-mandatory deployments permit only WSS
-and HTTPS. No unlisted direct route, RPC replay or live connection migration is
-introduced. Current upstream rules forbid automatic carrier fallback; this is
-an opt-in candidate policy, without formal adoption or security approval. See
-[CROSS-CARRIER.md](CROSS-CARRIER.md) for the proposed normative delta, failure
+and HTTPS. Retries never create an unlisted direct route, replay an RPC, or
+transfer a live connection. See [CROSS-CARRIER.md](CROSS-CARRIER.md) for policy, failure
 boundaries, enrollment constraints and validation commands.
 
 Credential verification is host-owned. `Authenticator` verifies opaque hello
@@ -175,7 +167,7 @@ production dependency graph does not select a TLS implementation.
 With the candidate feature, `--failover` first attempts a deliberately unresponsive
 local TCP endpoint, then establishes provider-verified WSS under the same reconnect
 policy. It checks route order, encrypted echo and complete owned shutdown.
-The HTTP example exercises the explicit RFC0013 candidate; `--https` supplies
+The HTTP example exercises the candidate carrier; `--https` supplies
 application TLS for both persistent streams without enabling WebSocket.
 
 Enable `syntra-net`'s `tls-rustls` feature and use
@@ -253,7 +245,7 @@ WebSocket/proxy paths. `proxy::HttpForwardTarget` is metadata only;
 `routes::Route::HttpForward` performs the candidate HTTP forward requests.
 UDP is deferred.
 Reliable-session helpers do not claim exactly-once effects or make arbitrary
-RPC retries safe. Recovery cursors and payloads stay opaque. The accepted
+RPC retries safe. Recovery cursors and payloads stay opaque. The
 update/recovery binding is explicitly configured and negotiated as described below;
 local helpers do not themselves supply wire behavior or durable effects.
 
@@ -284,10 +276,7 @@ same candidate connection path; the listener returns a control handle and a
 The raw `codec`, `client_pair` and `server_pair` APIs remain separate lower-level
 building blocks; raw record admission alone proves neither Noise nor RPC readiness.
 
-RFC0013 remains Draft upstream. This is full-RPC implementation-candidate
-capability, not registered, approved or shippable accepted-spec support.
-Local regression execution does not replace human security review. It makes no conformance claim and
-does not change the active three-carrier contract or its pins. See
+HTTP/HTTPS support is experimental and disabled by default. See
 [the candidate connection guide](CONNECTION.md#candidate-httphttps-connections).
 
 ### Negotiated update/recovery
@@ -347,12 +336,11 @@ they do not select a different encryption protocol.
   execution lease until it stops. See
   [CONNECTION.md](CONNECTION.md) and the source contracts for clocks, cancellation requirements and
   revocation checks.
-- Unknown metadata alongside a known body is tolerated. Metadata alone, with
-  no body, yields `INVALID_ARGUMENT`. Body tags are 10–15, 16–17 remain
-  forbidden, and a sole valid future 18–31 body yields `UNIMPLEMENTED`.
-  Reserved tags, duplicate oneof alternatives, malformed unknown wire data
-  and nesting beyond depth 32 are rejected by the bounded codec on decode
-  and emission; opaque payload bytes are not parsed.
+- Decode peer input with `syntra_core::decode_frame(bytes, ctx)`. The codec
+  checks lengths and union boundaries before dispatch. An unknown Bebop
+  message field ends interpretation of that message's bounded tail; it does
+  not permit trailing bytes after the frame or dispatch of an unknown union
+  arm. Application payloads remain opaque to the envelope codec.
 - Request IDs are permanently non-reused and ordered at FIFO enqueue/emission;
   host high-water violations close without an offending-ID result. Pending
   terminal gates check the deadline first; previously selected outcomes stay
@@ -362,7 +350,7 @@ they do not select a different encryption protocol.
 ## Host-local request budgets
 
 `Handler::request_budget(&Principal, &str, &[u8]) -> Option<Duration>` optionally
-shortens an application RPC's deadline under SNTR-RPC-004. The selector runs after
+shortens an application RPC's deadline. The selector runs after
 bounded envelope/method validation and ordered request-ID consumption, before
 initial authorization. Its payload is opaque, bounded, untrusted data. The callback
 must be prompt, nonblocking and side-effect-free; FIFO admission remains held,
@@ -417,7 +405,7 @@ The typed policy replaces the ordinary connection guard; combining it with an
 independent generic guard is refused. The runtime fences ordinary traffic and
 retires actual recovery attachments before transition. Raw/custom record, WASM,
 FFI, WS/WSS, and HTTP/HTTPS paths do not support terminal effects. Existing clients
-parse the same `RpcResult`, with no new wire message or peer option. See
+parse the same `CallResult`, with no new wire message or peer option. See
 [API, support, tests, and evidence limits](TERMINAL_RECEIPT_DESIGN.md).
 
 ## Native FFI
@@ -470,36 +458,9 @@ commands. Container tooling is documented in
 [crates/syntra-integration/README.md](crates/syntra-integration/README.md)
 and is not run by root `cargo test --workspace`.
 
-Generated files are committed under
-`crates/syntra-core/src/generated/`. Use Buf CLI **1.59.0**, the remote
-Rust plugin **`neoeinstein-prost:v0.4.0` revision 1**, as pinned in
-`buf.gen.yaml`. The eight logical schema paths have explicit mappings to
-this module. The `.proto` snapshots intentionally retain their original
-options; do not rewrite them by hand. Check local schema/test-asset digests with
-`python3 scripts/check-upstream-pin.py --offline`. For provenance verification,
-use `--upstream ../syntra` or set `SYNTRA_SDD_ROOT`; the local Git object database
-must contain the exact pinned upstream commit. No network fetch is performed.
-See [CONTRIBUTING.md](CONTRIBUTING.md#input-provenance-and-authority) for the
-scoped implementation inputs, candidate transformations and review requirements.
-
-```sh
-buf generate --template buf.gen.yaml
-python3 scripts/check-generated.py
-python3 scripts/check-upstream-pin.py --offline
-```
-
-The drift script uses Python's standard library and generates into a
-temporary directory, then compares filenames and bytes. It requires Buf and
-access to its remote plugin service, but no local `protoc`.
-
-Unified implementation evidence is produced by
-`scripts/conformance_evidence.py`, optionally with `--candidate-agreement offline`
-or `--candidate-agreement release` and supplemental `--run-local` lanes. The
-release mode verifies committed candidate inputs, not publication authorization. See
-[implementation evidence](CONTRIBUTING.md#implementation-evidence) for commands,
-the exact Git-input requirement and result interpretation. Candidate agreement,
-fixture transcription checks and local test execution have distinct scopes;
-formal conformance remains `NOT_EXECUTED` in this report.
+For wire changes, use `bebopc` **3.2.3** with `bebop.json` at the repository
+root. See [schema and generated code](CONTRIBUTING.md#schema-and-generated-code)
+for the inputs and review procedure. Normal builds use committed bindings.
 
 Run from the repository root:
 

@@ -3,14 +3,14 @@
 Run commands from the repository root. **Rust 1.89.0 is the toolchain**;
 the crate MSRV floor of **1.89** is an API/build compatibility constraint,
 not a secure-runtime recommendation. Production binaries must be built with
-a security-patched toolchain. Current pins are `prost =0.14.4`,
+a security-patched toolchain. Current dependency versions include
 `snow =0.10.0`, `getrandom 0.3`, `tokio 1`, `tungstenite`/`tokio-tungstenite`
 0.30 and `rustls 0.23`. Keep dependency versions and checksums consistent
 unless updating them is part of the change.
 
 Read [CONNECTION.md](CONNECTION.md) for Syntra 1.0 encryption and connection
-guidance. Keep pinned upstream inputs distinct from the candidate implementation
-and its verification; see [input provenance](#input-provenance-and-authority).
+guidance. Review protocol changes in this repository; see
+[schema and generated code](#schema-and-generated-code).
 The implementation remains experimental despite RC publication; formal conformance has
 not been executed and independent security review remains outstanding.
 
@@ -24,15 +24,13 @@ Add `websocket` for managed loopback WS and application-provider WSS listeners.
 The TCP-gated `routes` module composes explicit allowlisted endpoints with fresh
 per-attempt inputs. `proxy` enables TCP with SOCKS5/HTTP CONNECT, forward metadata
 helpers and proxied TCP/WSS routes.
-`http` independently enables Draft RFC0013 candidate HTTP/HTTPS connections with
+`http` independently enables candidate HTTP/HTTPS connections with
 Noise, hello/ready and RPC, a bounded listener/association registry and raw
 codec/pair APIs. It enables `syntra-core/http-candidate`, `getrandom` and the
 application TLS boundary without implying `websocket` or a TLS implementation.
 With `managed,http`, `Network::listen_http`/`listen_https` own the inline listener
 run; routes support direct, SOCKS5/CONNECT and real plain-HTTP forward paths.
-This is implementation-candidate capability under active resource review, not
-registered, approved or shippable accepted-spec support. RFC0013 authority and
-the active contract/pins are unchanged; no conformance claim follows from tests.
+These carriers are experimental; test the full connection separately from its raw codec.
 `native-enrollment` is explicitly opt-in. See the [feature table](README.md#workspace-and-scope).
 
 Keep the ownership boundaries: `syntra-core` owns framing and record protection
@@ -46,8 +44,7 @@ own checks.
 
 SDK-owned tests and tooling must run without another SDK checkout, toolchain or
 release. Keep developer experiments and their evidence in a developer-local cache
-outside this repository and its public documentation. Normative upstream SDD
-input/provenance checks remain separate and retain their pinned sources.
+outside this repository and its public documentation.
 
 ```sh
 export RUSTUP_TOOLCHAIN=1.89.0
@@ -76,7 +73,6 @@ python3 scripts/cargo_contracts.py websocket
 python3 scripts/cargo_contracts.py managed-websocket
 python3 scripts/cargo_contracts.py http
 python3 -B -m unittest discover -s scripts/tests -p 'test_*.py' -v
-python3 -B scripts/protocol_contract.py --offline
 cargo clippy --locked --workspace --all-targets -- --no-deps
 cargo test --locked -p syntra-ffi --no-default-features --features production
 cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
@@ -118,7 +114,7 @@ forward regressions require the named single-test execution proof in both modes.
 Core `http_candidate_context` runs without the feature to prove rejection and
 with it to check the fixture hash, golden contexts and full Noise prologue.
 Raw codec/record tests alone remain lower-level evidence; full-RPC tests are
-implementation evidence, not registration, completed review or conformance.
+implementation evidence, not independent interoperability or security review.
 Low-level native driver APIs require Tokio; managed networking owns its runtime.
 WASM embedders compose core/runtime with
 platform I/O.
@@ -154,18 +150,16 @@ validation. CI also checks the separate `fuzz/Cargo.lock` against RustSec and
 the workspace dependency policy. The 4 KiB fuzz input limit keeps these checks
 cheap. Run the full-size allocation, negative and regression suites when touching
 their parsers: `codec_vectors`, `encode_allocation`, `runtime_defects`,
-pump split-point and fault-injection tests. Pinned upstream conformance vectors
-and the selected local assets in `tests/interoperability/fixtures/` must retain
-their provenance. Local fixture tests and carrier integration tests have distinct
+pump split-point and fault-injection tests. Keep fixture inputs and their expected
+bytes together in review. Local fixture tests and carrier integration tests have distinct
 scopes; name the boundary actually exercised.
 
 The exact context/prologue fixture tests cover **public encoding only**, not
 independent Noise cryptographic vectors. The separate [resolver known-answer tests](crates/syntra-core/tests/fixtures/resolver_kats/README.md)
 check published primitive and Noise suite vectors through Syntra's Snow resolver;
 they do not exercise Syntra's wrapped flights or assert interoperability with another SDK.
-Preserve the scope and contract revision
-of each result. Same-library round trips, candidate agreement checks and pinned
-input checks do not establish formal conformance, device validation or independent
+Record the source revision and scope of each result. Same-library round trips
+and generated-byte checks do not establish formal conformance, device validation or independent
 security review.
 
 Workflows (all actions SHA-pinned, `contents: read`, timeouts, concurrency
@@ -174,10 +168,7 @@ cancel for PRs):
 - `CI` – PR/main validation (`clippy`, `rust`, `generated-rust`,
   `manifest-cases`, `package`, `security`, `actionlint`, `dependency-review`,
   aggregator `required`), including required macOS native validation. `fmt` is
-  informational. Require `required` in the main-branch ruleset. The retained
-  `manifest-cases` job ID produces unified
-  implementation evidence and ten supplemental WSS scenarios; it does not execute
-  an upstream transport-profile suite.
+  informational. Require `required` in the main-branch ruleset.
 - `Scheduled` – periodic Linux/macOS/Windows validation rechecks, coverage and
   vulnerability scans (does not gate PR/main validation).
 - `Integration` – separate Docker-based connectivity checks; see
@@ -190,7 +181,7 @@ cancel for PRs):
   and push protection in GitHub settings; never allowlist a whole fixture directory.
 - `Release-plz` – validated release PRs, per-package `syntra-<crate>-vX.Y.Z`
   tags and gated Cargo publishing for eligible packages. Packages marked
-  `publish = false` are excluded. Protocol releases remain separate; see
+  `publish = false` are excluded. See
   [release-plz.toml](release-plz.toml) and the workflow's credential gates.
 
 Dependabot updates `cargo` and `github-actions` weekly; update SHAs via
@@ -234,161 +225,52 @@ issues. Scope each verification claim to the code and boundary exercised.
 Repository implementation licensing is Apache-2.0 ([LICENSE](LICENSE) and the root
 manifest). Preserve source provenance when updating schemas and fixtures.
 
-## Input provenance and authority
+## Schema and generated code
 
-Rust source attribution:
-[`tinkle-org/syntra` at `2a91da7fdb96f3e75badf07614c14e4f85c9ba1c`](https://github.com/tinkle-org/syntra/commit/2a91da7fdb96f3e75badf07614c14e4f85c9ba1c).
+`syntra-rs` owns the wire contract. Edit [`frame.bop`](schemas/v1/frame.bop)
+for the envelope and [`recovery.bop`](schemas/v1/recovery.bop) for the
+negotiated service payloads. The root [`bebop.json`](bebop.json) selects the
+schemas and the Rust output, `crates/syntra-core/src/generated/syntra.rs`.
+Use exactly `bebopc` 3.2.3; do not hand-edit the generated file.
 
-[`upstream.lock.json`](upstream.lock.json) identifies the reviewed source repository
-`https://github.com/tinkle-org/syntra` and exact commit
-`8ede3810b29fbba4d0e6ae6751a0025ceedda140`. Lock format v2 has scope
-`implementation-inputs` and exactly **11 declared paths**: eight schemas, the
-Protobuf corpus, WebSocket fixtures and TCP byte vectors. The existing revision
-and input digests are preserved. It records consumed inputs rather than a complete
-upstream suite or root inventory.
-
-Local implementation inputs are the eight `.proto` files under `proto/` and one
-test asset, [`protobuf-vectors.yaml`](tests/interoperability/fixtures/protobuf-vectors.yaml),
-copied from upstream `conformance/test-vectors/protobuf/vectors.yaml`. The explicit
-allowlist and digest/Git verification live in
-[`scripts/sdd_inputs.py`](scripts/sdd_inputs.py) and
-[`scripts/upstream_snapshot.py`](scripts/upstream_snapshot.py). The two other
-declared vector sources are read from committed upstream blobs to verify
-handwritten transcriptions in [`vectors.rs`](tests/interoperability/vectors.rs);
-they are not additional local corpus copies. Resolve upstream-only document
-paths in the [pinned source tree](https://github.com/tinkle-org/syntra/tree/8ede3810b29fbba4d0e6ae6751a0025ceedda140).
+From the repository root, with `bebopc` on `PATH`:
 
 ```sh
-python3 scripts/check-upstream-pin.py --offline
-python3 scripts/check-upstream-pin.py --upstream ../syntra
+python3 scripts/check-generated.py --write  # Regenerate after editing a schema.
+python3 scripts/check-generated.py          # Check for drift without writing.
 ```
 
-`--offline` checks local input inventory and digests against the reviewed lock; it
-does not establish Git provenance. Default checking uses `SYNTRA_SDD_ROOT` or
-`../syntra`; `--upstream PATH` selects an explicit local Git object database.
-That database must contain the exact pinned commit. The checker compares the
-11 declared inputs with committed Git blobs, never HEAD or worktree files, and
-never fetches or writes. Unrelated upstream paths are intentionally ignored;
-the local `proto/` inventory must still match exactly, including filenames and
-bytes. The checks do not establish protocol acceptance or conformance. Review
-intentional source-revision, declared-input, copied-input and generated-output
-updates together; do not edit pinned bytes or their hashes just to make checks pass.
+The [generation script](scripts/check-generated.py) checks the compiler version,
+copies the root config and schemas into a temporary directory, and runs
+`bebopc build` there. It compares filenames and bytes after normalizing output
+to LF. Remove obsolete generated files explicitly; `--write` will not delete them.
 
-### Candidate agreement
-
-The separate v2 [`protocol-contract.json`](protocol-contract.json) records the
-current Syntra 1.0 candidate's domain, carrier bindings and context layout. Its
-`committed-candidate` record pins upstream commit
-`3f7e8ea037fefcc5c86101d23e7722c83e28a0d3`. Release-pin verification checks
-the actual committed blobs, not the current upstream worktree. A successful
-agreement check does not authorize publication or freeze the candidate SDD.
-
-The candidate context fixture is a **derived** artifact at
-[`syntra-1.0-context.json`](tests/interoperability/fixtures/syntra-1.0-context.json).
-The explicit `syntra-context-identifiers-by-source-order-v1` transformation maps
-context IDs to `SYNTRA-CONTEXT-01`, `SYNTRA-CONTEXT-02`, and so on, and negative
-recipe IDs to `SYNTRA-N01`, `SYNTRA-N02`, and so on, updating their base references
-by source-array order. Other fields, encoded bytes and mutation recipes are
-preserved. Raw source hashes are recorded separately from the derived fixture's
-hash. `carrier_bindings` uses `kind: CARRIER` through the recorded
-`transport-registry-to-carrier-bindings-v1` projection of the source registry;
-its canonical derived hash is separate from the raw registry hash. These are
-carrier bindings of one protocol, not selectable transport profiles.
-
-```sh
-python3 -B scripts/protocol_contract.py --offline
-python3 -B scripts/protocol_contract.py --release --upstream ../syntra
-```
-
-Offline candidate agreement checks the recorded local semantic artifacts and
-compiled source encoding probe without verifying external bytes. Release mode
-also verifies the exact candidate commit, baseline ancestry, machine-input Git
-blobs and derived transformations. Neither mode runs a complete crate or carrier
-suite. For a future uncommitted candidate, `--record-worktree` explicitly records
-its bytes and `--worktree` verifies that observation; publication stays blocked.
-Once those exact bytes are committed, use `--record-commit FULL_SHA --upstream
-PATH` to verify them before promoting the record. Do not change its kind or
-revision by hand to bypass failed verification.
-The separate `--run-rust --output NEW_EXTERNAL_DIRECTORY` option adds five exact
-supplemental Rust regressions with command logs. Candidate fixtures and
-implementation checks must not be presented as execution of the pinned upstream
-suite. Protocol specifications and conformance definitions remain upstream-owned;
-normative changes belong in that process first.
+- Use `PascalCase` for schema types and `lowerCamelCase` for fields (`requestId`
+  in the schema, `request_id` in Rust). Required `struct` fields are positional:
+  changing their order changes the bytes. Preserve numbered `message` fields
+  and `union` discriminators; do not recycle their IDs.
+- Use the owned [`syntra_core::wire`](crates/syntra-core/src/wire.rs) types in
+  caller-facing APIs. `FrameBody` selects one body; `CallResult` carries a
+  `CallOutcome` that distinguishes success (including empty bytes) from error.
+  Core validates the envelope; the negotiated service validates its payload.
+- Review schema, bindings, codec validation, and wire fixtures together in this
+  repository. Compare expected bytes as well as decoded values: a same-codec
+  round trip alone cannot detect a layout change on both sides. See
+  [records and carriers](CONNECTION.md#records-and-carriers) for framing outside Bebop.
 
 ## Implementation evidence
 
-[`scripts/conformance_evidence.py`](scripts/conformance_evidence.py) produces a
-unified implementation-evidence report. It verifies the 11 declared upstream Git
-inputs and local copies, checks fixture transcriptions, and optionally adds
-candidate agreement and supplemental local execution. It has no transport-profile
-selection or full-suite inventory mode. Install the parser from
-`scripts/requirements-evidence.txt` before running it.
-
-```sh
-python3 -B scripts/conformance_evidence.py --upstream ../syntra --candidate-agreement offline
-python3 -B scripts/conformance_evidence.py --upstream ../syntra --candidate-agreement release
-```
-
-Here `offline` applies only to candidate agreement: the evidence runner still
-requires the local Git object database containing the exact accepted-base commit.
-It performs no network fetch. Omit `--candidate-agreement` to collect input and
-transcription evidence without candidate agreement.
-
-Repeat `--run-local` to select supplemental lanes. The following runs all 14
-currently available lanes and writes command logs and `report.json` into a new
-directory outside the worktree. Choose a fresh output path for each run.
-
-```sh
-python3 -B scripts/conformance_evidence.py --upstream ../syntra \
-  --candidate-agreement offline \
-  --run-local corpus --run-local echo \
-  --run-local enrollment-preready --run-local enrollment-revocation \
-  --run-local wss-envelope --run-local wss-unknown-field --run-local wss-ready \
-  --run-local wss-reserved-method --run-local wss-payloads --run-local wss-duplicate-id \
-  --run-local wss-deadline --run-local wss-internal-error \
-  --run-local wss-reverse-completion --run-local wss-recovery-isolation \
-  --output /tmp/syntra-implementation-evidence
-```
-
-Each local result records its command, test, artifact hash and execution verdict.
-An exit code alone or a zero-test match does not prove execution. The runner
-records implementation identity before and after execution; a changed worktree
-invalidates passing execution claims and requires a stable-snapshot rerun.
-Supplemental rows retain `formal_conformance: false`; the report retains
-`formal_conformance_claimed: false` and an external formal-conformance gate of
-`NOT_EXECUTED`. Browser/device execution, independent cryptographic vectors,
-security review and specification freeze remain separate evidence requirements.
-A successful command does not turn those gates into passes.
-
-## Schema and generated code
-
-Use Buf CLI 1.59.0 with the remote Rust plugin `neoeinstein-prost:v0.4.0`
-revision 1 configured in `buf.gen.yaml`. Generated files are committed and
-must not be hand-edited.
-
-```sh
-buf format --diff --exit-code
-buf lint
-buf build
-python3 scripts/check-generated.py
-python3 scripts/check-upstream-pin.py --offline
-python3 -m pip install -r scripts/requirements-evidence.txt
-python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
-```
-
-The generated-code drift script uses Python's standard library and only writes to a
-temporary directory. To intentionally regenerate committed Rust output, run
-`buf generate --template buf.gen.yaml`, then inspect the resulting diff.
-The eight logical schema paths have explicit Rust mappings in `buf.gen.yaml`.
-Keep the pinned `.proto` options intact. Rust owns its compatibility and execution
-evidence; local fixture and byte-drift checks cover only their stated scope.
+Record the local revision, feature set, command, and named cases that actually
+ran. Distinguish a generated-file comparison from a codec fixture, an encrypted
+round trip, and a run with an independent peer. A zero-test filter or successful
+compilation is not an executed test. Report performance only from measurements
+with the setup and timing boundary described in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Reports and releases
 
 Open ordinary Rust implementation issues and pull requests in
 [`tinkle-org/syntra-rs`](https://github.com/tinkle-org/syntra-rs). Cargo packages
-use the per-package release process in [release-plz.toml](release-plz.toml),
-independently of upstream protocol specification releases.
+use the per-package release process in [release-plz.toml](release-plz.toml).
 Release-plz manages per-package changelogs when preparing releases.
 
 Make implementation and workflow changes on feature branches, never by pushing
@@ -398,7 +280,7 @@ applies to the generated release PR, including approving its workflow runs.
 
 On pushes to `main`, Release-plz opens or updates a release PR. With
 `release_always = false`, publication is attempted only when a release PR merges,
-and requires the committed candidate pin and release validation to pass. The
+and requires release validation to pass. The
 release job publishes Cargo packages, creates immutable per-package tags, and
 creates matching GitHub Releases with changelog notes. `git_release_type = "auto"`
 marks `1.0.0-rc.x` releases as prereleases. Keep GitHub Releases and crates.io
@@ -432,22 +314,12 @@ Only `syntra-integration` remains non-publishable: it is a fixture peer and test
 not a downstream library. The public set is derived from package metadata; no
 separate net publishing workflow or hard-coded package list is needed.
 
-Net's first registry publication must come from a new reviewed release PR that
-includes its publishable manifest and package documentation. Do not retry an
-older release commit where it was still marked `publish = false`, or move an
-existing core/runtime/FFI tag to include it. Release-plz can retain an unpublished
-crate's current RC version; inspect the generated shared-version and dependency
-diff rather than assuming every package needs another bump.
-
 `crates-io-publish` is the GitHub Actions environment used by the job,
 not a package registry or an alternative to the repository's Releases page.
 Configure its required reviewers and deployment branch restrictions in GitHub;
 the workflow's environment reference does not create those protections.
 The crates.io token must belong to an account authorized to publish these crates
-and permit publishing updates for core, runtime, net, and FFI. The first net
-upload also requires permission to create the `syntra-net` crate (`publish-new`)
-and an available crate name; a token restricted to the three existing crates is
-not sufficient. Subsequent net uploads use `publish-update`. Restrict its crate scope
+and permit publishing updates for core, runtime, net, and FFI. Restrict its crate scope
 and lifetime; rotate it before expiry. No OIDC permission or trusted-publisher
 configuration is required in this token-based workflow. Never log the token or
 put its value in a command, file, PR, or commit. See the
@@ -461,7 +333,9 @@ and rerun the failed merge run after reviewing its revision. A rerun uses the
 original source and workflow; it cannot pick up a later source fix. After a
 reviewed workflow-only fix, use the Release-plz workflow's manual Run workflow
 action on `main`, with `release_commit` set to the full lowercase SHA of the
-original release-PR squash merge. This retry verifies that the commit is on
+original release-PR squash merge. The target commit must contain the schema root
+`schemas/v1/syntra.bop`, `bebop.json`, `scripts/check-generated.py`, and the local
+`setup-bebopc` action. This retry verifies that the commit is on
 `main` and belongs to a merged release-plz PR, reruns all validation on that exact
 commit, then publishes from the same revision with the current workflow. It
 does not prepare another release PR or bypass `release_always = false`.

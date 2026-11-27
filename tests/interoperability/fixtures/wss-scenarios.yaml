@@ -1,0 +1,94 @@
+# Protected calls on a direct-host TLS 1.3/WSS connection. IDs, payloads and
+# expected observations are inputs; only an actual exchange supplies a verdict.
+wss-envelope: &echo
+  input: &one_call
+    frames: [{request_id: 7, body: request, method: /example.Echo/Echo, payload_b64: aGk=, timeout_ms: 500}]
+  expected: &echo_result
+    connection_state: ACTIVE
+    session_state: unchanged
+    frames: [{request_id: 7, body: result, payload_b64: aGk=}]
+wss-unknown-field:
+  input:
+    frames: [{request_id: 7, body: request, method: /example.Echo/Echo, payload_b64: aGk=, timeout_ms: 500, unknown_fields: [{number: 90, value_b64: eA==}]}]
+  expected: *echo_result
+wss-ready:
+  input: {frames: [{request_id: 0, body: hello, min_version: 1, max_version: 1}]}
+  expected: {connection_state: ACTIVE, session_state: active, frames: []}
+wss-reserved-method:
+  input:
+    frames: [{request_id: 7, body: request, method: /syntra.v1.UpdateRecovery/Future, payload_b64: aGk=, timeout_ms: 500}]
+  expected: &unimplemented
+    {connection_state: ACTIVE, session_state: unchanged, error: {code: UNIMPLEMENTED}}
+wss-payloads: *echo
+wss-duplicate-id:
+  input:
+    frames:
+      - {request_id: 7, body: request, method: /example.Echo/Echo, payload_b64: aGVsZC1maXJzdA==, timeout_ms: 500}
+      - {request_id: 7, body: request, method: /example.Echo/Echo, payload_b64: b2ZmZW5kaW5nLXNlY29uZA==, timeout_ms: 500}
+  expected:
+    connection_state: CLOSED
+    session_state: terminated_abnormally
+    frames: []
+    error: {code: FAILED_PRECONDITION, observer: detecting_host, carriage: local_only}
+wss-deadline:
+  input:
+    frames: [{request_id: 9, body: request, method: /example.Echo/Echo, payload_b64: aGk=, timeout_ms: 100}]
+    faults: {handler_delay_ms: 1000}
+  expected: {connection_state: ACTIVE, session_state: unchanged, error: {code: DEADLINE_EXCEEDED}}
+wss-internal-error:
+  input: *one_call
+  expected: {connection_state: ACTIVE, session_state: unchanged, error: {code: INTERNAL, message_pattern: 'NEGATIVE:private-detail'}}
+wss-reverse-completion:
+  input:
+    frames:
+      - {request_id: 21, body: request, method: /example.Echo/Echo, payload_b64: FQ==, timeout_ms: 5000}
+      - {request_id: 22, body: request, method: /example.Echo/Echo, payload_b64: Fg==, timeout_ms: 5000}
+      - {request_id: 23, body: request, method: /example.Echo/Echo, payload_b64: Fw==, timeout_ms: 5000}
+      - {request_id: 24, body: request, method: /example.Echo/Echo, payload_b64: GA==, timeout_ms: 5000}
+      - {request_id: 25, body: request, method: /example.Echo/Echo, payload_b64: GQ==, timeout_ms: 5000}
+      - {request_id: 26, body: request, method: /example.Echo/Echo, payload_b64: Gg==, timeout_ms: 5000}
+      - {request_id: 27, body: request, method: /example.Echo/Echo, payload_b64: Gw==, timeout_ms: 5000}
+      - {request_id: 28, body: request, method: /example.Echo/Echo, payload_b64: HA==, timeout_ms: 5000}
+      - {request_id: 29, body: request, method: /example.Echo/Echo, payload_b64: HQ==, timeout_ms: 5000}
+      - {request_id: 30, body: request, method: /example.Echo/Echo, payload_b64: Hg==, timeout_ms: 5000}
+      - {request_id: 31, body: request, method: /example.Echo/Echo, payload_b64: Hw==, timeout_ms: 5000}
+      - {request_id: 32, body: request, method: /example.Echo/Echo, payload_b64: IA==, timeout_ms: 5000}
+      - {request_id: 33, body: request, method: /example.Echo/Echo, payload_b64: IQ==, timeout_ms: 5000}
+      - {request_id: 34, body: request, method: /example.Echo/Echo, payload_b64: Ig==, timeout_ms: 5000}
+      - {request_id: 35, body: request, method: /example.Echo/Echo, payload_b64: Iw==, timeout_ms: 5000}
+      - {request_id: 36, body: request, method: /example.Echo/Echo, payload_b64: JA==, timeout_ms: 5000}
+  expected:
+    connection_state: ACTIVE
+    session_state: unchanged
+    frames:
+      - {request_id: 36, body: result, payload_b64: JA==}
+      - {request_id: 35, body: result, payload_b64: Iw==}
+      - {request_id: 34, body: result, payload_b64: Ig==}
+      - {request_id: 33, body: result, payload_b64: IQ==}
+      - {request_id: 32, body: result, payload_b64: IA==}
+      - {request_id: 31, body: result, payload_b64: Hw==}
+      - {request_id: 30, body: result, payload_b64: Hg==}
+      - {request_id: 29, body: result, payload_b64: HQ==}
+      - {request_id: 28, body: result, payload_b64: HA==}
+      - {request_id: 27, body: result, payload_b64: Gw==}
+      - {request_id: 26, body: result, payload_b64: Gg==}
+      - {request_id: 25, body: result, payload_b64: GQ==}
+      - {request_id: 24, body: result, payload_b64: GA==}
+      - {request_id: 23, body: result, payload_b64: Fw==}
+      - {request_id: 22, body: result, payload_b64: Fg==}
+      - {request_id: 21, body: result, payload_b64: FQ==}
+wss-recovery-isolation:
+  input:
+    frames:
+      - &subscribe {request_id: 3, body: request, method: /syntra.v1.UpdateRecovery/Subscribe, payload_b64: AQAAAA4AAABzdWJzY3JpcHRpb24tYQAAAAA=, timeout_ms: 500}
+  expected: *unimplemented
+  control_connection:
+    frames:
+      - {request_id: 1, body: request, method: /syntra.v1.UpdateRecovery/Negotiate, payload_b64: AQAAAAEAAAABAAAAGAAAAHN5bnRyYS51cGRhdGUtcmVjb3ZlcnkvMQ==, timeout_ms: 500}
+      - *subscribe
+    expected:
+      connection_state: ACTIVE
+      session_state: unchanged
+      frames:
+        - {request_id: 1, body: result, shape: Negotiated}
+        - {request_id: 3, body: result, shape: SubscriptionAccepted}

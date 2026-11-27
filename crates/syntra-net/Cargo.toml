@@ -37,7 +37,6 @@ syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.6" }
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-prost.workspace = true
 zeroize = { version = "1", features = ["alloc"] }
 futures-util.workspace = true
 getrandom = { version = "0.3", optional = true }

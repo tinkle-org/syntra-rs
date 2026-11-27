@@ -14,10 +14,10 @@ the three checks run sequentially. Setup and compilation are additional.
 Rust 1.89 builds the CLI; the dated nightly builds the instrumented targets
 from this workspace's `Cargo.lock`, not the production workspace lockfile.
 
-Each `seeds/*.hex` line is one hand-authored synthetic input, not a capture
-or upstream vector. Frame seeds are an empty notification and a v1 hello;
-the recovery seed is a v1 subscribe request for stream `s`. Stream seeds
-exercise byte-at-a-time and coalesced delivery of two nonempty bodies.
+Each `seeds/*.hex` line is one synthetic input. Frame seeds exercise Bebop
+envelopes, including both success and error results. Recovery seeds target the
+service payload decoder, not the outer envelope. Stream seeds exercise
+byte-at-a-time and coalesced delivery of two nonempty bodies.
 The stream target varies the chunk width and frame boundary and checks
 partial state, output order and contents. Frame and recovery targets check
 that accepted values survive encoding and decoding in the same context.

@@ -1,9 +1,9 @@
 use super::*;
-use prost::Message;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use syntra_core::secure_channel::{
     generate_server_key, Carrier, Context, KeyStore, Mode, Secret32,
 };
+use syntra_core::{encode_frame, Call, Frame};
 use syntra_runtime::{
     AllowAll, AllowAnonymous, CancelToken, ExecutionLease, FnHandler, HandlerFut, HandlerOutcome,
 };
@@ -1216,37 +1216,35 @@ async fn host_peer_uses_receipt_time_not_later_delivery_time() {
         })),
     );
     let peer = Peer::Host(host.clone());
-    let hello = syntra_core::Frame {
-        version: 1,
-        request_id: 0,
-        body: Some(Body::Hello(syntra_core::ClientHello {
-            min_version: 1,
-            max_version: 1,
-            credential: vec![],
-        })),
-    }
-    .encode_to_vec();
+    let hello = hello_bytes(1, 1, vec![]);
     peer.ingest_received_at(&hello, Instant::now().into_std())
         .await;
     assert!(outbound.recv().await.is_some());
-    let request = syntra_core::Frame {
-        version: 1,
-        request_id: 1,
-        body: Some(Body::Request(syntra_core::RpcRequest {
-            method: "/test.Service/Echo".into(),
-            payload: vec![],
-            timeout_ms: 10,
-        })),
-    }
-    .encode_to_vec();
+    let request = encode_frame(
+        &Frame {
+            version: 1,
+            request_id: 1,
+            body: Some(Body::Call(Call {
+                method: "/test.Service/Echo".into(),
+                payload: vec![],
+                timeout_ms: 10,
+            })),
+        },
+        ValidationContext::active(1),
+    )
+    .unwrap();
     let received_at = Instant::now().into_std();
     tokio::time::advance(Duration::from_millis(20)).await;
     peer.ingest_received_at(&request, received_at).await;
-    let frame = syntra_core::Frame::decode(outbound.recv().await.unwrap().as_slice()).unwrap();
+    let frame = decode_frame(
+        &outbound.recv().await.unwrap(),
+        ValidationContext::active(1),
+    )
+    .unwrap();
     assert_eq!(frame.request_id, 1);
     assert!(
-        matches!(frame.body, Some(Body::Result(syntra_core::RpcResult {
-        outcome: Some(syntra_core::proto::rpc_result::Outcome::Error(error)),
+        matches!(frame.body, Some(Body::Result(syntra_core::CallResult {
+        outcome: Some(syntra_core::wire::call_result::Outcome::Error(error)),
     })) if error.code == syntra_core::ErrorCode::DeadlineExceeded.as_i32())
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -1373,18 +1371,33 @@ async fn core_handshake_loss_and_deadline_remain_retryable() {
     }
 }
 
+fn hello_bytes(min_version: u32, max_version: u32, credential: Vec<u8>) -> Vec<u8> {
+    encode_frame(
+        &Frame {
+            version: max_version,
+            request_id: 0,
+            body: Some(Body::Hello(
+                syntra_core::build_hello(min_version, max_version, credential).unwrap(),
+            )),
+        },
+        ValidationContext::pre_handshake(ConnectionState::Connected),
+    )
+    .unwrap()
+}
+
 /// Encode a valid ready frame for tests that control coalescing and partial assembly.
 fn ready_bytes() -> Vec<u8> {
-    syntra_core::Frame {
-        version: 1,
-        request_id: 0,
-        body: Some(syntra_core::proto::frame::Body::Ready(
-            syntra_core::ServerReady {
+    encode_frame(
+        &Frame {
+            version: 1,
+            request_id: 0,
+            body: Some(Body::Ready(syntra_core::ServerReady {
                 connection_id: "0123456789abcdef0123456789abcdef".into(),
-            },
-        )),
-    }
-    .encode_to_vec()
+            })),
+        },
+        ValidationContext::pre_handshake(ConnectionState::Negotiating),
+    )
+    .unwrap()
 }
 
 #[tokio::test(start_paused = true)]
@@ -1398,16 +1411,17 @@ async fn ready_with_coalesced_notifications_accounts_for_the_entire_batch() {
         channel.decrypt(&server_rx.recv().await.unwrap()).unwrap();
         let mut stream = frame_plaintext(&ready_bytes()).unwrap().to_vec();
         for n in 0..500u32 {
-            let frame = syntra_core::Frame {
-                version: 1,
-                request_id: 0,
-                body: Some(syntra_core::proto::frame::Body::Notification(
-                    syntra_core::Notification {
+            let frame = encode_frame(
+                &Frame {
+                    version: 1,
+                    request_id: 0,
+                    body: Some(Body::Notification(syntra_core::Notification {
                         payload: n.to_be_bytes().to_vec(),
-                    },
-                )),
-            }
-            .encode_to_vec();
+                    })),
+                },
+                ValidationContext::active(1),
+            )
+            .unwrap();
             stream.extend_from_slice(&frame_plaintext(&frame).unwrap());
         }
         server_tx
@@ -1730,16 +1744,7 @@ async fn confirmation_cannot_outlive_noise_lifetime_in_either_mode() {
         to_server.send(first).await.unwrap();
         let mut client = client.finish(&replies.recv().await.unwrap()).unwrap();
         tokio::time::advance(Duration::from_millis(200)).await;
-        let hello = syntra_core::Frame {
-            version: 1,
-            request_id: 0,
-            body: Some(Body::Hello(syntra_core::ClientHello {
-                min_version: 1,
-                max_version: 1,
-                credential: vec![],
-            })),
-        }
-        .encode_to_vec();
+        let hello = hello_bytes(1, 1, vec![]);
         let record = client.encrypt(&frame_plaintext(&hello).unwrap()).unwrap();
         let _ = to_server.send(record).await;
         assert!(matches!(task.await.unwrap(), Err(Error::Timeout)));
@@ -1992,16 +1997,7 @@ async fn security_failures_abort_a_graceful_drain_without_waiting_for_grace() {
         assert_eq!(runtime.state().await, ConnectionState::Closing);
         let now = Instant::now();
         if runtime_protocol_failure {
-            let unexpected_hello = syntra_core::Frame {
-                version: 1,
-                request_id: 0,
-                body: Some(Body::Hello(syntra_core::ClientHello {
-                    min_version: 1,
-                    max_version: 1,
-                    credential: vec![],
-                })),
-            }
-            .encode_to_vec();
+            let unexpected_hello = hello_bytes(1, 1, vec![]);
             runtime.ingest(&unexpected_hello).await;
         } else {
             tamper.send(vec![0; 17]).await.unwrap();
@@ -2172,16 +2168,7 @@ async fn noise_host_deadline_precedes_wake_buffered_hello_and_factory_effects() 
     ));
     assert!(futures_util::poll!(&mut accept).is_pending());
     let mut client = handshake.finish(&emitted.try_recv().unwrap()).unwrap();
-    let hello = syntra_core::Frame {
-        version: 1,
-        request_id: 0,
-        body: Some(Body::Hello(syntra_core::ClientHello {
-            min_version: 1,
-            max_version: 1,
-            credential: vec![],
-        })),
-    }
-    .encode_to_vec();
+    let hello = hello_bytes(1, 1, vec![]);
     input
         .send(client.encrypt(&frame_plaintext(&hello).unwrap()).unwrap())
         .await
@@ -3039,16 +3026,7 @@ mod establishment_regressions {
     use std::task::Poll;
 
     fn hello(min_version: u32, max_version: u32) -> Vec<u8> {
-        syntra_core::Frame {
-            version: max_version,
-            request_id: 0,
-            body: Some(Body::Hello(syntra_core::ClientHello {
-                min_version,
-                max_version,
-                credential: vec![],
-            })),
-        }
-        .encode_to_vec()
+        hello_bytes(min_version, max_version, vec![])
     }
 
     fn timed_out<T>(result: Poll<Result<T, Error>>) {
@@ -3316,14 +3294,15 @@ mod establishment_regressions {
     #[tokio::test(start_paused = true)]
     async fn local_first_envelope_causes_are_typed_sanitized_and_never_sent_to_the_peer() {
         for mode in [Mode::Bootstrap, Mode::Returning] {
+            let mut future_body = hello(1, 1);
+            // Frame's fixed version, request ID and union length precede the discriminator.
+            future_body[16] = 18;
+            let mut truncated = hello(1, 1);
+            truncated.pop();
             for (frame, expected, expected_auth_calls) in [
                 (hello(2, 2), ErrorCode::Unimplemented, 1),
-                (
-                    vec![0x08, 0x01, 0x92, 0x01, 0x00],
-                    ErrorCode::Unimplemented,
-                    0,
-                ),
-                (vec![0x80], ErrorCode::InvalidArgument, 0),
+                (future_body, ErrorCode::Unimplemented, 0),
+                (truncated, ErrorCode::InvalidArgument, 0),
             ] {
                 let (client, server) = configs(mode);
                 let (handshake, first) = ClientHandshake::start(client).unwrap();

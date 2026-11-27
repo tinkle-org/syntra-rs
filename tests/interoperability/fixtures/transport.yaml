@@ -1,0 +1,20 @@
+# Selected transport-only inputs. The frame bound is for the authenticated inner
+# stream, not the u16BE outer TCP record. WebSocket control payloads are not envelopes.
+default_max_frame_bytes: 1048576
+fixtures:
+  - id: websocket/VEC-WS-005
+    server_wire_hex: "890670696e672d31"
+    client_wire_hex: "8a8637fa213d47934f5a1acb"
+  - id: websocket/VEC-WS-006
+    client_wire_hex: "888237fa213d3412"
+    server_wire_hex: "880203e8"
+  - id: websocket/VEC-WS-007
+    mapping:
+      text_message_received: 1003
+      protocol_error: 1002
+      invalid_payload: 1007
+      policy_violation: 1008
+      assembled_length_over_max: 1009
+      host_internal_failure: 1011
+      going_away_or_idle_or_shutdown: 1001
+    reserved: [1005, 1006, 1015]

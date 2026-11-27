@@ -56,8 +56,8 @@ jobs:
         run: python3 scripts/cargo_contracts.py managed-websocket
       - name: HTTP candidate provider-only production graphs
         run: python3 scripts/cargo_contracts.py http
-      - name: Candidate offline agreement (not external SDD provenance)
-        run: python3 -B scripts/protocol_contract.py --offline
+      - name: Local protocol and context checks
+        run: python3 -B scripts/protocol_contract.py
       - name: Locked default-members tests
         run: cargo test --locked
       - name: Locked workspace tests (carrier fixtures included)

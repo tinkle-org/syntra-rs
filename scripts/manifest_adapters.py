@@ -1,54 +1,40 @@
-"""Local supplemental Syntra 1.0/WSS scenarios, never upstream case executors.
+"""Local supplemental Syntra 1.0/WSS scenarios.
 
-Inputs and assertions are owned here, independently of upstream fixtures.
 The Rust test emits observations; Python checks fresh execution identity,
 stimuli, payloads, correlation and barriers. No CONF verdict is produced.
 """
 
 import base64
+from copy import deepcopy
 import json
 import os
 import re
 import secrets
 import subprocess
+import struct
 
-from upstream_snapshot import ROOT, digest
-
-
-IMPLEMENTATION_WIRE_CONTRACT = {
-    "domain": "syntra.1.0", "ws_path": "/syntra/1.0/ws", "subprotocol": "syntra.1.0",
-}
+from local_inputs import FIXTURES, ROOT, digest, read_json, regular_file
+from local_yaml import load_yaml
 
 
 CARRIER_ID = "SYNTRA-1.0-WSS"
-SUPPLEMENTAL_SCENARIOS = (
-    "wss-envelope", "wss-unknown-field", "wss-ready", "wss-reserved-method",
-    "wss-payloads", "wss-duplicate-id", "wss-deadline", "wss-internal-error",
-    "wss-reverse-completion", "wss-recovery-isolation",
-)
+contract = read_json(ROOT, 'protocol-contract.json')
+IMPLEMENTATION_WIRE_CONTRACT = {"domain": contract['domain_ascii'], "ws_path": contract['websocket_endpoint'],
+                                "subprotocol": contract['websocket_subprotocol']}
+
+
+SCENARIO_FIXTURE = FIXTURES / 'wss-scenarios.yaml'
+_scenario_source = regular_file(ROOT, SCENARIO_FIXTURE)
+SCENARIO_FIXTURE_SHA256 = digest(_scenario_source)
+SUPPLEMENTAL_SCENARIOS = load_yaml(_scenario_source)
 
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
 
-def varint(value):
-    if not isinstance(value, int) or value < 0 or value > (1 << 64) - 1:
-        raise ValueError("invalid fixture varint")
-    result = bytearray()
-    while value >= 128:
-        result.append((value & 127) | 128)
-        value >>= 7
-    result.append(value)
-    return bytes(result)
-
-
-def uint(tag, value):
-    return varint(tag << 3) + varint(value) if value else b""
-
-
-def blob(tag, value):
-    return varint((tag << 3) | 2) + varint(len(value)) + value
+def sized(data):
+    return struct.pack("<I", len(data)) + data
 
 
 def frame_bytes(frame):
@@ -60,69 +46,42 @@ def frame_bytes(frame):
     known = {"request_id", "body", "method", "payload_b64", "timeout_ms", "unknown_fields", "min_version", "max_version"}
     if set(frame) - known:
         raise ValueError("fixture encoder lacks declared input fields")
-    encoded = uint(1, 1) + uint(2, frame["request_id"])
     if frame["body"] == "request":
+        arm = 12
         payload = base64.b64decode(frame["payload_b64"], validate=True)
-        encoded += blob(12, blob(1, frame["method"].encode()) + blob(2, payload) + uint(3, frame.get("timeout_ms", 0)))
+        fields = b"\x01" + sized(frame["method"].encode()) + b"\x02" + sized(payload)
+        fields += b"\x03" + struct.pack("<I", frame.get("timeout_ms", 0))
     elif frame["body"] == "hello":
-        encoded += blob(10, uint(1, frame["min_version"]) + uint(2, frame["max_version"]))
+        arm = 10
+        fields = struct.pack("<BIBI", 1, frame["min_version"], 2, frame["max_version"]) + b"\x03" + sized(b"")
     else:
         raise ValueError("fixture body not implemented")
     for field in frame.get("unknown_fields", []):
-        if field["wire_type"] != 2 or field["number"] != 90:
+        if field["number"] != 90:
             raise ValueError("unreviewed unknown-field fixture")
-        encoded += blob(90, base64.b64decode(field["value_b64"], validate=True))
-    return encoded
+        fields += bytes([90]) + sized(base64.b64decode(field["value_b64"], validate=True))
+    message = sized(fields + b"\0")
+    # Bebop union length excludes both the length word and the discriminator.
+    return struct.pack("<IQIB", 1, frame["request_id"], len(message), arm) + message
 
 
 def scenario_for(identifier):
-    """Local regression inputs, not transcriptions or renamed upstream cases."""
     require(identifier in SUPPLEMENTAL_SCENARIOS, "unknown supplemental scenario")
+    return deepcopy(SUPPLEMENTAL_SCENARIOS[identifier])
 
-    def rpc(request_id=7, payload=b"hi", method="/example.Echo/Echo", timeout=500):
-        return {"request_id": request_id, "body": "request", "method": method,
-                "payload_b64": base64.b64encode(payload).decode(), "timeout_ms": timeout}
 
-    def result(frame):
-        return {"request_id": frame["request_id"], "body": "result", "payload_b64": frame["payload_b64"]}
+def verify_scenario_fixture(root, expected_sha256):
+    source = regular_file(root, SCENARIO_FIXTURE)
+    require(digest(source) == expected_sha256 == SCENARIO_FIXTURE_SHA256,
+            "WSS scenario fixture digest differs from captured input")
+    require(canonical(load_yaml(source)) == canonical(SUPPLEMENTAL_SCENARIOS),
+            "captured WSS scenarios differ from fixture data")
 
-    frames = [rpc()]
-    expected: dict = {"connection_state": "ACTIVE", "session_state": "unchanged"}
-    case = {"input": {"frames": frames}, "expected": expected}
-    if identifier == "wss-unknown-field":
-        frames[0]["unknown_fields"] = [{"number": 90, "wire_type": 2, "value_b64": "eA=="}]
-    elif identifier == "wss-ready":
-        frames[:] = [{"request_id": 0, "body": "hello", "min_version": 1, "max_version": 1}]
-        expected.update(session_state="active", frames=[])
-    elif identifier == "wss-duplicate-id":
-        frames[:] = [rpc(payload=b"held-first"), rpc(payload=b"offending-second")]
-        expected.update(connection_state="CLOSED", session_state="terminated_abnormally", frames=[],
-                        error={"code": "FAILED_PRECONDITION", "observer": "detecting_host", "carriage": "local_only"})
-    elif identifier == "wss-deadline":
-        frames[:] = [rpc(9, timeout=100)]
-        case["input"]["faults"] = {"handler_delay_ms": 1000}
-        expected["error"] = {"code": "DEADLINE_EXCEEDED"}
-    elif identifier == "wss-internal-error":
-        expected["error"] = {"code": "INTERNAL", "message_pattern": "NEGATIVE:private-detail"}
-    elif identifier == "wss-reverse-completion":
-        frames[:] = [rpc(i, bytes([i]), timeout=5000) for i in range(21, 37)]
-        expected["frames"] = [result(frame) for frame in reversed(frames)]
-    elif identifier == "wss-reserved-method":
-        frames[0]["method"] = "/syntra.v1.UpdateRecovery/Future"
-        expected["error"] = {"code": "UNIMPLEMENTED"}
-    elif identifier == "wss-recovery-isolation":
-        subscribe = uint(1, 1) + blob(2, b"subscription-a")
-        negotiate = uint(1, 1) + uint(2, 1) + uint(3, 1) + blob(4, b"syntra.update-recovery/1")
-        frames[:] = [rpc(3, subscribe, "/syntra.v1.UpdateRecovery/Subscribe")]
-        expected["error"] = {"code": "UNIMPLEMENTED"}
-        case["control_connection"] = {
-            "frames": [rpc(1, negotiate, "/syntra.v1.UpdateRecovery/Negotiate"), frames[0]],
-            "expected": {"connection_state": "ACTIVE", "session_state": "unchanged", "frames": [
-                {"request_id": 1, "body": "result", "shape": "RecoveryNegotiateResponse"},
-                {"request_id": 3, "body": "result", "shape": "RecoverySubscribeResponse"}]}}
-    if "frames" not in expected and "error" not in expected:
-        expected["frames"] = [result(frame) for frame in frames]
-    return case
+
+def scenario_inputs(case):
+    return {"scenario_sha256": digest(canonical(case)),
+            "frames_hex": [frame_bytes(frame).hex() for frame in case["input"].get("frames", [])],
+            "control_frames_hex": [frame_bytes(frame).hex() for frame in case.get("control_connection", {}).get("frames", [])]}
 
 
 def request_for(identifier):
@@ -137,10 +96,8 @@ def request_for(identifier):
                 "adapter lacks an oracle for declared error fields")
     return {"protocol": 2, "kind": "supplemental_local_scenario", "formal_conformance": False,
             "nonce": secrets.token_hex(24), "scenario_id": identifier,
-            "scenario_sha256": digest(canonical(case)), "role": "server",
-            "carrier_id": CARRIER_ID, "scenario": case,
-            "frames_hex": [frame_bytes(frame).hex() for frame in case["input"].get("frames", [])],
-            "control_frames_hex": [frame_bytes(frame).hex() for frame in case.get("control_connection", {}).get("frames", [])]}
+            "fixture_sha256": SCENARIO_FIXTURE_SHA256, "role": "server",
+            "carrier_id": CARRIER_ID, "scenario": case, **scenario_inputs(case)}
 
 
 def require(condition, reason):
@@ -180,13 +137,18 @@ def expected_observation(want, got):
             require(pattern.removeprefix("NEGATIVE:").lower() not in error.get("message", "").lower(), "forbidden diagnostic")
 
 
-def validate_result(request, result):
+def validate_result(request, result, root=ROOT):
+    verify_scenario_fixture(root, request["fixture_sha256"])
+    case = scenario_for(request["scenario_id"])
+    require(canonical(request["scenario"]) == canonical(case) and
+            all(request[key] == value for key, value in scenario_inputs(case).items()),
+            "request differs from captured scenario")
     for key in ("protocol", "kind", "formal_conformance", "nonce", "scenario_id", "scenario_sha256", "role", "carrier_id"):
         require(result.get(key) == request[key], f"stale/mismatched execution {key}")
-    require(result.get("carrier") == {"tls":"1.3", "termination":"direct_host", "noise_mode":"bootstrap",
+    wss = contract['carriers'][CARRIER_ID]
+    require(result.get("carrier") == {"tls":wss['tls_minimum'], "termination":wss['tls_termination'], "noise_mode":"bootstrap",
                                       "wire":"Syntra1.0/WSS", **IMPLEMENTATION_WIRE_CONTRACT}, "carrier execution proof missing")
     got = result["observation"]
-    case = request["scenario"]
     expected_observation(case["expected"], got)
     if "error" in case["expected"] and case["expected"]["error"].get("carriage", "wire") == "wire":
         require(len(got["frames"]) == 1, "wire error must be one correlated terminal result")
@@ -240,7 +202,7 @@ def execute_supplemental(identifier, output, execution_proof, root=ROOT):
     """Fresh local process, bounded logs, no imported verdict trust."""
     request = request_for(identifier)
     row = {"lane": identifier, "kind": request["kind"], "formal_conformance": False,
-           "scenario_sha256": request["scenario_sha256"], "carrier_id": CARRIER_ID}
+           "fixture_sha256": request["fixture_sha256"], "scenario_sha256": request["scenario_sha256"], "carrier_id": CARRIER_ID}
     stem = "local-" + identifier
     request_path, result_path = output / (stem + ".request.json"), output / (stem + ".observed.json")
     log = output / (stem + ".log")
@@ -275,7 +237,7 @@ def execute_supplemental(identifier, output, execution_proof, root=ROOT):
             verdict, reason = "FAIL", "executed test emitted no fresh observation artifact"
         else:
             result = json.loads(result_path.read_text())
-            validate_result(request, result)
+            validate_result(request, result, root)
             verdict, reason = "PASS", "local supplemental stimuli and observations verified on Syntra 1.0/WSS; not formal conformance"
     except (OSError, subprocess.TimeoutExpired) as error:
         reason = f"executor unavailable/incomplete: {type(error).__name__}"

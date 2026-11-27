@@ -9,9 +9,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use prost::Message;
-use syntra_core::proto::{recovery_batch_trailer::Outcome, recovery_notification::Notification};
-use syntra_core::proto::{RecoveryBatch, RecoveryBatchTrailer, RecoveryNotification};
+use syntra_core::wire::{recovery_batch_trailer::Outcome, recovery_notification::Notification};
+use syntra_core::wire::{RecoveryBatch, RecoveryBatchTrailer, RecoveryNotification};
 use tokio::sync::Notify;
 
 use super::super::wire::{codec, ProviderError, RecoveryLimits};
@@ -184,7 +183,7 @@ impl RecoveryInbox {
         match n {
             Notification::Batch(batch) => {
                 // Include a conservative core Notification/Frame overhead;
-                // unknown fields are charged at their original encoded size.
+                // charge the complete encoded notification.
                 let bytes = payload.len().saturating_add(32);
                 if slot.bytes.saturating_add(bytes) > self.limits.queued_bytes_per_stream
                     || total.saturating_add(bytes) > self.limits.queued_bytes_per_connection
@@ -337,7 +336,10 @@ impl RecoveryInbox {
         if slot.fenced || !slot.registered || !slot.replay.is_empty() {
             return Err(ProviderError::FailedPrecondition);
         }
-        let bytes = batches.iter().map(|b| b.encoded_len() + 40).sum::<usize>();
+        let bytes = batches
+            .iter()
+            .map(|b| codec::batch_size(b) + 40)
+            .sum::<usize>();
         if slot.bytes.saturating_add(bytes) > self.limits.queued_bytes_per_stream
             || total.saturating_add(bytes) > self.limits.queued_bytes_per_connection
             || slot.data.len() + batches.len() + usize::from(slot.leased != 0)
@@ -356,7 +358,7 @@ impl RecoveryInbox {
         }
         slot.bytes += bytes;
         slot.replay.extend(batches.into_iter().map(|batch| Queued {
-            bytes: batch.encoded_len() + 40,
+            bytes: codec::batch_size(&batch) + 40,
             batch,
         }));
         drop(s);

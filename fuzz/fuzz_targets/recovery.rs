@@ -1,7 +1,9 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use syntra_core::proto::{RecoveryNotification, RecoveryReplayPage, RecoverySubscribeRequest};
+use syntra_core::wire::{
+    RecoveryBatchTrailer, RecoveryNotification, RecoveryReplayPage, Subscribe,
+};
 use syntra_runtime::recovery::wire::codec::{decode, encode, ProfileMessage};
 
 fn roundtrip<M: ProfileMessage + PartialEq>(data: &[u8]) {
@@ -13,7 +15,8 @@ fn roundtrip<M: ProfileMessage + PartialEq>(data: &[u8]) {
 
 fuzz_target!(|data: &[u8]| {
     if data.len() <= 4096 {
-        roundtrip::<RecoverySubscribeRequest>(data);
+        roundtrip::<Subscribe>(data);
+        roundtrip::<RecoveryBatchTrailer>(data);
         roundtrip::<RecoveryNotification>(data);
         roundtrip::<RecoveryReplayPage>(data);
     }

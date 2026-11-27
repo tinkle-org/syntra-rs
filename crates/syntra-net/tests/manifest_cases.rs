@@ -8,7 +8,6 @@
 ))]
 
 use futures_util::{SinkExt, StreamExt};
-use prost::Message as _;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -24,8 +23,9 @@ use syntra_core::secure_channel::{
     FrameDecoder, Mode, ServerConfig, VerifiedIdentity, MAX_PLAINTEXT,
 };
 use syntra_core::{
-    proto::{frame::Body, rpc_result::Outcome, *},
-    ConnectionState, ErrorCode,
+    decode_frame, decode_frame_structure, encode_frame,
+    wire::{call_result::Outcome, frame::Body, *},
+    ConnectionState, ErrorCode, ValidationContext,
 };
 use syntra_net::{
     websocket as ws, AuthenticatorFactory, HostHandle, Limits, RecoveryAuthenticatorFactory,
@@ -60,11 +60,27 @@ fn unhex(value: &str) -> Vec<u8> {
         .collect()
 }
 fn code(value: i32) -> &'static str {
-    syntra_core::proto::ErrorCode::try_from(value)
-        .unwrap()
-        .as_str_name()
-        .strip_prefix("ERROR_CODE_")
-        .expect("IDL enum prefix")
+    let (code, unknown) = ErrorCode::from_i32_lossy(value);
+    assert_eq!(unknown, None, "unexpected error code in scenario");
+    match code {
+        ErrorCode::Unspecified => "UNSPECIFIED",
+        ErrorCode::Cancelled => "CANCELLED",
+        ErrorCode::Unknown => "UNKNOWN",
+        ErrorCode::InvalidArgument => "INVALID_ARGUMENT",
+        ErrorCode::DeadlineExceeded => "DEADLINE_EXCEEDED",
+        ErrorCode::NotFound => "NOT_FOUND",
+        ErrorCode::AlreadyExists => "ALREADY_EXISTS",
+        ErrorCode::PermissionDenied => "PERMISSION_DENIED",
+        ErrorCode::ResourceExhausted => "RESOURCE_EXHAUSTED",
+        ErrorCode::FailedPrecondition => "FAILED_PRECONDITION",
+        ErrorCode::Aborted => "ABORTED",
+        ErrorCode::OutOfRange => "OUT_OF_RANGE",
+        ErrorCode::Unimplemented => "UNIMPLEMENTED",
+        ErrorCode::Internal => "INTERNAL",
+        ErrorCode::Unavailable => "UNAVAILABLE",
+        ErrorCode::DataLoss => "DATA_LOSS",
+        ErrorCode::Unauthenticated => "UNAUTHENTICATED",
+    }
 }
 
 #[test]
@@ -102,10 +118,7 @@ impl Peer {
                         return Some(
                             frames
                                 .into_iter()
-                                .map(|bytes| {
-                                    syntra_core::validate_wire_structure(&bytes).unwrap();
-                                    Frame::decode(bytes.as_slice()).unwrap()
-                                })
+                                .map(|bytes| decode_frame_structure(&bytes).unwrap())
                                 .collect(),
                         );
                     }
@@ -271,28 +284,34 @@ impl Fixture {
     }
 }
 fn hello() -> Vec<u8> {
-    Frame {
-        version: 1,
-        request_id: 0,
-        body: Some(Body::Hello(ClientHello {
-            min_version: 1,
-            max_version: 1,
-            credential: Vec::new(),
-        })),
-    }
-    .encode_to_vec()
+    encode_frame(
+        &Frame {
+            version: 1,
+            request_id: 0,
+            body: Some(Body::Hello(ClientHello {
+                min_version: 1,
+                max_version: 1,
+                credential: Vec::new(),
+            })),
+        },
+        ValidationContext::pre_handshake(ConnectionState::Connected),
+    )
+    .unwrap()
 }
 fn request(id: u64, payload: Vec<u8>) -> Vec<u8> {
-    Frame {
-        version: 1,
-        request_id: id,
-        body: Some(Body::Request(RpcRequest {
-            method: "/example.Echo/Echo".into(),
-            payload,
-            timeout_ms: 500,
-        })),
-    }
-    .encode_to_vec()
+    encode_frame(
+        &Frame {
+            version: 1,
+            request_id: id,
+            body: Some(Body::Call(Call {
+                method: "/example.Echo/Echo".into(),
+                payload,
+                timeout_ms: 500,
+            })),
+        },
+        ValidationContext::active(1),
+    )
+    .unwrap()
 }
 fn observed(frame: &Frame) -> Value {
     assert_eq!(frame.version, 1);
@@ -409,8 +428,8 @@ async fn execute(input: &Value) -> Value {
     let gates: Arc<Mutex<HashMap<Vec<u8>, Arc<Semaphore>>>> = Arc::default();
     if id == "wss-duplicate-id" || id == "wss-reverse-completion" {
         for bytes in &frames {
-            let frame = Frame::decode(bytes.as_slice()).unwrap();
-            let Some(Body::Request(r)) = frame.body else {
+            let frame = decode_frame(bytes, ValidationContext::active(1)).unwrap();
+            let Some(Body::Call(r)) = frame.body else {
                 panic!("request");
             };
             gates
@@ -429,9 +448,9 @@ async fn execute(input: &Value) -> Value {
         let internal = id == "wss-internal-error";
         let fault_payload = frames
             .first()
-            .and_then(|bytes| Frame::decode(bytes.as_slice()).ok())
+            .and_then(|bytes| decode_frame_structure(bytes).ok())
             .and_then(|frame| {
-                if let Some(Body::Request(r)) = frame.body {
+                if let Some(Body::Call(r)) = frame.body {
                     Some(r.payload.to_vec())
                 } else {
                     None
@@ -513,8 +532,8 @@ async fn execute(input: &Value) -> Value {
             assert_eq!(completed.load(Ordering::SeqCst), 0);
             let mut release_order = Vec::new();
             for bytes in frames.iter().rev() {
-                let frame = Frame::decode(bytes.as_slice()).unwrap();
-                let Some(Body::Request(r)) = frame.body else {
+                let frame = decode_frame(bytes, ValidationContext::active(1)).unwrap();
+                let Some(Body::Call(r)) = frame.body else {
                     panic!("request");
                 };
                 gates
@@ -540,21 +559,21 @@ async fn execute(input: &Value) -> Value {
                 control.send(&unhex(bytes.as_str().unwrap())).await;
                 let frame = control.one().await;
                 let mut row = observed(&frame);
-                let Some(Body::Result(RpcResult {
+                let Some(Body::Result(CallResult {
                     outcome: Some(Outcome::Payload(bytes)),
                 })) = frame.body
                 else {
                     panic!("control success");
                 };
                 if frame.request_id == 1 {
-                    let n = RecoveryNegotiateResponse::decode(bytes.as_slice()).unwrap();
-                    row["shape"] = json!("RecoveryNegotiateResponse");
+                    let n: Negotiated = codec::decode(&bytes).unwrap();
+                    row["shape"] = json!("Negotiated");
                     row["decoded"] = json!({"profile_version":n.profile_version,"selected_version":n.selected_version,
                         "max_subscriptions_per_connection":n.max_subscriptions_per_connection,"max_pending_rpcs_per_connection":n.max_pending_rpcs_per_connection,
                         "max_page_bytes":n.max_page_bytes,"max_snapshot_pages":n.max_snapshot_pages});
                 } else {
-                    let s = RecoverySubscribeResponse::decode(bytes.as_slice()).unwrap();
-                    row["shape"] = json!("RecoverySubscribeResponse");
+                    let s: SubscriptionAccepted = codec::decode(&bytes).unwrap();
+                    row["shape"] = json!("SubscriptionAccepted");
                     row["decoded"] = json!({"profile_version":s.profile_version,"generation":s.generation,
                         "subscription_handle_hex":hex(&s.subscription_handle),"catchup_boundary_hex":hex(&s.catchup_boundary)});
                 }
@@ -565,9 +584,10 @@ async fn execute(input: &Value) -> Value {
             control_state["sent_frames_hex"] = json!(control.sent);
             observation["control_connection"] = control_state;
             assert_eq!(source.0.load(Ordering::SeqCst), 1);
-            let mut probe = Frame::decode(frames[0].as_slice()).unwrap();
+            let mut probe = decode_frame(&frames[0], ValidationContext::active(1)).unwrap();
             probe.request_id = 5;
-            peer.send(&probe.encode_to_vec()).await;
+            peer.send(&encode_frame(&probe, ValidationContext::active(1)).unwrap())
+                .await;
             let recheck = observed(&peer.one().await);
             assert_eq!(recheck["error"]["code"], "UNIMPLEMENTED");
             assert_eq!(source.0.load(Ordering::SeqCst), 1);
@@ -645,14 +665,18 @@ async fn deadline_artifact_uses_the_executed_handler_delay_and_waits_for_it() {
         json!({"handler_delay_ms": "1500"}),
         json!({"handler_delay_ms": 1500}),
     ] {
-        let mut frame = Frame::decode(request(1, b"delayed".to_vec()).as_slice()).unwrap();
-        let Some(Body::Request(r)) = frame.body.as_mut() else {
+        let mut frame = decode_frame(
+            &request(1, b"delayed".to_vec()),
+            ValidationContext::active(1),
+        )
+        .unwrap();
+        let Some(Body::Call(r)) = frame.body.as_mut() else {
             panic!("request");
         };
         r.timeout_ms = 50;
         let input = json!({
             "scenario_id": "wss-deadline",
-            "frames_hex": [hex(&frame.encode_to_vec())],
+            "frames_hex": [hex(&encode_frame(&frame, ValidationContext::active(1)).unwrap())],
             "scenario": {"input": {"faults": fault}},
         });
         let expected_delay = fault["handler_delay_ms"].as_u64().unwrap_or(0);

@@ -36,7 +36,7 @@ fn retirement_policy(authority: Arc<dyn Authority>) -> Policy {
 For multiple methods, override `AuthenticatorFactory::terminal_methods(identity)`.
 Its default converts `terminal_receipt` without changing existing `Policy`
 literals, `Observation` matches, or `Authority` implementations. An override
-returns the **complete** table, not additions to the legacy hook. For example:
+returns the **complete** table, including any fixed receipts. For example:
 
 ```rust
 use syntra_runtime::terminal::{MethodPolicy, MethodReceipts, Policy};
@@ -50,10 +50,10 @@ fn with_outcomes(fixed: Policy) -> MethodPolicy {
 ```
 
 Each outcome method has **1–8** non-sensitive payloads. ID 1 names the first
-entry (here, the empty encoding of a default protobuf message); ID 2 names the
+entry (here, an empty application payload); ID 2 names the
 second. Zero and IDs beyond the method's table are invalid. The table is fixed
 for the binding; keep the meaning of stored IDs stable for the operation. The
-client sees only the existing correlated `RpcResult`, never the ID or table.
+client sees only the correlated `CallResult`, never the ID or table.
 Forward `terminal_methods` in custom factory wrappers to preserve this policy.
 
 The typed adapter supplies **complete operation-aware connection authority**.
@@ -158,7 +158,7 @@ owner tombstone alone is insufficient.
 For an outcome method the SDK calls `Authority::observe_outcome_with_budget`
 after reservation, including the precommit barrier checks. It still calls
 `observe_with_budget(None, ...)` for ordinary connection authority. Use
-`OutcomeEvidence::Binding` for active, hard-denied or unknown state. A legacy
+`OutcomeEvidence::Binding` for active, hard-denied or unknown state. An
 `OwnedCommitted` observation is **not** outcome evidence, even for a one-entry table.
 
 1. Conditionally replace the expected active revision. Record the withdrawal,
@@ -277,7 +277,7 @@ deadline is registered for pending selection, dispatch and the request context.
 `Handler::authorize_with_budget` remains synchronous/nonblocking and defaults to
 the existing fail-closed `authorize`. `RequestContext::budget()` exposes a readonly
 `ElapsedDeadline` on that same clock for ordinary handlers as well as retirement.
-These hooks are additive: legacy handlers/authority adapters keep their methods,
+These hooks are optional: handlers and authority adapters keep their methods,
 and `AllowAll` forwards budget selection/context while keeping its explicit
 authorization bypass. They do not change the wire contract.
 
@@ -327,8 +327,9 @@ establish bulk-transfer capacity.
 `Host::install_terminal_tcp` and the doc-hidden driver bridge are trusted SDK
 internals, not an application escape hatch or arbitrary custom-driver support.
 No new wire message, peer option, advertised capability, or client API is needed;
-existing clients parse the correlated `RpcResult`. Protobuf sources and generated
-bindings are unchanged. Ordinary withdrawal and close defaults remain unchanged.
+clients parse the correlated `CallResult`. The payload is application data; the
+authority revision and outcome ID are not wire fields. Ordinary withdrawal and
+close keep their defaults.
 
 ## SDK tests and limits
 
@@ -390,30 +391,3 @@ tests do not establish formal conformance or independent security review.
 Production adapters must preserve the passed clock/cutoff, bound their own storage
 I/O, and retain execution leases until work actually stops. A timeout cannot prove
 rollback or guarantee receipt delivery.
-
-## Normative provenance
-
-Upstream SDD commit
-[`985d90eb5ee6d7aec0d20ea088430f271eed7cd7`](https://github.com/tinkle-org/syntra/commit/985d90eb5ee6d7aec0d20ea088430f271eed7cd7)
-contains canonical adoption of RFC 0014. Its
-[connection §6](https://github.com/tinkle-org/syntra/blob/985d90eb5ee6d7aec0d20ea088430f271eed7cd7/specifications/connection.md#6-scoped-terminal-receipt),
-[RPC §7](https://github.com/tinkle-org/syntra/blob/985d90eb5ee6d7aec0d20ea088430f271eed7cd7/specifications/rpc.md#7-scoped-terminal-result),
-[security §9](https://github.com/tinkle-org/syntra/blob/985d90eb5ee6d7aec0d20ea088430f271eed7cd7/specifications/security.md#9-terminal-transition-authority),
-and [transports §8](https://github.com/tinkle-org/syntra/blob/985d90eb5ee6d7aec0d20ea088430f271eed7cd7/specifications/transports.md#8-terminal-only-output)
-adopt thirteen `SNTR-TRC-*` requirements. The
-[RFC](https://github.com/tinkle-org/syntra/blob/985d90eb5ee6d7aec0d20ea088430f271eed7cd7/rfcs/0014-scoped-terminal-receipt.md)
-is marked **Implemented** for specification adoption and registration of fourteen
-conformance case groups, which remain **NOT_EXECUTED**. It records sole-maintainer
-human self-review/self-approval, not independent security review. Adoption does not
-activate host policy or establish durable application integration.
-
-The method-specific outcome table and distributed evidence hook described here
-are opt-in SDK behavior, not a change to those wire inputs or a claim of upstream
-adoption or conformance for distributed outcomes.
-
-`SNTR-RPC-004` already requires receipt-origin accounting and permits documented
-bounded host policy. The optional SDK-local request-budget hooks require no wire
-or normative specification change. Existing wire-input provenance pins remain
-valid for their unchanged inputs; this normative reference does not repin those
-inputs. See [input provenance](CONTRIBUTING.md#input-provenance-and-authority) for
-the separate implementation-input checks and source attribution.

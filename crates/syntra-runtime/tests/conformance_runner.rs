@@ -1,15 +1,14 @@
 //! Supplemental local scenarios — async Rust byte-pump leg.
 //!
-//! Exercises selected loopback/manual byte-pump cases described in
-//! historical scenario descriptions, not a manifest-driven CONF executor.
-//! No `conformance/runner/scenarios.yaml` exists at the accepted upstream pin.
-//! Recovery tests run separately; these SDK-local cases do not establish formal
-//! conformance. The corpus copy's committed origin is
-//! checked by scripts/check-upstream-pin.py before the evidence runner uses it.
+//! Exercises loopback byte-pump behavior. Recovery tests run separately;
+//! these local scenarios do not establish formal conformance.
 //!
 //! Fault injection is deterministic: a seeded counter decides drop/duplicate/
 //! truncate faults, so the same seed replays the same pattern.
 
+#[path = "support/frame.rs"]
+mod frame_fixture;
+use frame_fixture::FrameFixture;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -94,9 +93,8 @@ impl FaultInjector {
 }
 
 fn hello_bytes() -> Vec<u8> {
-    use prost::Message;
-    use syntra_core::proto::frame::Body;
-    use syntra_core::proto::{ClientHello, Frame};
+    use syntra_core::wire::frame::Body;
+    use syntra_core::wire::{ClientHello, Frame};
     Frame {
         version: 1,
         request_id: 0,
@@ -106,14 +104,14 @@ fn hello_bytes() -> Vec<u8> {
             credential: vec![].into(),
         })),
     }
-    .encode_to_vec()
+    .fixture_bytes()
 }
 
 /// Assert a decoded Result carries the expected request id and payload.
 /// This assertion alone says nothing about caller settlement or replay.
 fn assert_terminal_payload(frame_bytes: &[u8], expected: &[u8], request_id: u64) {
-    use syntra_core::proto::frame::Body;
-    use syntra_core::proto::rpc_result::Outcome;
+    use syntra_core::wire::call_result::Outcome;
+    use syntra_core::wire::frame::Body;
     let ctx = ValidationContext::active(1);
     let f = decode_frame(frame_bytes, ctx).expect("terminal must decode");
     assert_eq!(f.request_id, request_id, "terminal carries the delivery id");
@@ -420,9 +418,8 @@ async fn sc_oversize_handler_result_bounded() {
 
 #[tokio::test]
 async fn local_duplicate_id_violation_closes_without_same_id_result() {
-    use prost::Message;
-    use syntra_core::proto::frame::Body;
-    use syntra_core::proto::{Frame, RpcRequest};
+    use syntra_core::wire::frame::Body;
+    use syntra_core::wire::{Call, Frame};
     let release = Arc::new(tokio::sync::Notify::new());
     let started = Arc::new(tokio::sync::Barrier::new(2));
     let dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -448,7 +445,7 @@ async fn local_duplicate_id_violation_closes_without_same_id_result() {
         blocking,
     );
     {
-        use syntra_core::proto::ClientHello;
+        use syntra_core::wire::ClientHello;
         let raw = Frame {
             version: 1,
             request_id: 0,
@@ -458,7 +455,7 @@ async fn local_duplicate_id_violation_closes_without_same_id_result() {
                 credential: vec![].into(),
             })),
         }
-        .encode_to_vec();
+        .fixture_bytes();
         host.ingest(&raw).await;
     }
     expect_ready(&mut wrx, "ready").await;
@@ -466,13 +463,13 @@ async fn local_duplicate_id_violation_closes_without_same_id_result() {
         Frame {
             version: 1,
             request_id: id,
-            body: Some(Body::Request(RpcRequest {
+            body: Some(Body::Call(Call {
                 method: "/example.Echo/Echo".into(),
                 payload: vec![].into(),
                 timeout_ms: 5000,
             })),
         }
-        .encode_to_vec()
+        .fixture_bytes()
     };
     host.ingest(&req(7)).await;
     // Local RFC 0004 D2 regression only, not a formal CONF-RPC-004 verdict.
@@ -521,9 +518,8 @@ async fn sc_close_after_completed_echo() {
 async fn sc_fault_injection_deterministic() {
     // Separate request, response and hello streams. Request retries here
     // are ordinary RPC retries, not durable delivery reconciliation.
-    use prost::Message;
-    use syntra_core::proto::frame::Body;
-    use syntra_core::proto::{Frame, RpcRequest};
+    use syntra_core::wire::frame::Body;
+    use syntra_core::wire::{Call, Frame};
     let mut fi = FaultInjector::new(0x5EED1234);
     let mut resp_fi = FaultInjector::new(0xBE5E11);
     let mut hello_fi = FaultInjector::new(0xCAFE01);
@@ -540,13 +536,13 @@ async fn sc_fault_injection_deterministic() {
         let raw = Frame {
             version: 1,
             request_id: req_id,
-            body: Some(Body::Request(RpcRequest {
+            body: Some(Body::Call(Call {
                 method: "/example.Echo/Echo".into(),
                 payload: payload.clone().into(),
                 timeout_ms: 5000,
             })),
         }
-        .encode_to_vec();
+        .fixture_bytes();
         let sends = fi.transport_wrap(raw.clone());
         if sends.is_empty() {
             drops += 1;
@@ -577,7 +573,7 @@ async fn sc_fault_injection_deterministic() {
             let f = decode_frame(&resp, ctx).expect("valid");
             match f.body {
                 Some(Body::Result(r)) => {
-                    use syntra_core::proto::rpc_result::Outcome;
+                    use syntra_core::wire::call_result::Outcome;
                     match r.outcome {
                         Some(Outcome::Payload(p)) => {
                             assert_eq!(p, payload, "opaque payload preserved")
@@ -730,57 +726,37 @@ async fn sc_hello_faults_recover() {
     }
 }
 
-#[tokio::test]
-async fn sc_wire_vectors_decode() {
-    use syntra_core::proto::frame::Body;
-    for id in ["GOLD-PROT-HELLO-01", "GOLD-PROT-REQ-01"] {
-        let hex = corpus_hex(id);
-        let bytes: Vec<u8> = (0..hex.len())
-            .step_by(2)
-            .map(|n| u8::from_str_radix(&hex[n..n + 2], 16).unwrap())
-            .collect();
-        let ctx = if id == "GOLD-PROT-HELLO-01" {
-            ValidationContext::pre_handshake(syntra_core::ConnectionState::Connected)
-        } else {
-            ValidationContext::active(1)
-        };
-        let f = decode_frame(&bytes, ctx).expect("shared corpus decodes");
-        assert_eq!(f.version, 1);
-        match f.body {
-            Some(Body::Hello(h)) => {
-                assert_eq!((f.request_id, h.min_version, h.max_version), (0, 1, 1));
-                assert_eq!(&h.credential[..], b"opaque-test-credential-A");
-                println!("CORPUS {{\"id\":{id:?},\"frame_hex\":{hex:?},\"semantic_fields\":{{\"version\":{},\"request_id\":{},\"body\":\"hello\",\"min_version\":{},\"max_version\":{},\"credential\":{:?}}}}}",
-                    f.version, f.request_id, h.min_version, h.max_version, std::str::from_utf8(&h.credential).unwrap());
+#[test]
+fn sc_wire_vectors_decode() {
+    use syntra_core::wire::frame::Body;
+    use syntra_core::ConnectionState;
+    for (hex, ctx) in [
+        (
+            vectors::bebop::HELLO,
+            ValidationContext::pre_handshake(ConnectionState::Connected),
+        ),
+        (vectors::bebop::CALL, ValidationContext::active(1)),
+    ] {
+        let bytes = vectors::hex_to_bytes(hex);
+        let frame = decode_frame(&bytes, ctx).unwrap();
+        assert_eq!(frame.version, 1);
+        match frame.body.unwrap() {
+            Body::Hello(h) => {
+                assert_eq!((frame.request_id, h.min_version, h.max_version), (0, 1, 1));
+                assert_eq!(h.credential, [255, 0]);
             }
-            Some(Body::Request(r)) => {
-                assert_eq!(f.request_id, 7);
-                assert_eq!(r.method, "/example.Echo/Echo");
-                assert_eq!(&r.payload[..], b"hello");
-                assert_eq!(r.timeout_ms, 500);
-                println!("CORPUS {{\"id\":{id:?},\"frame_hex\":{hex:?},\"semantic_fields\":{{\"version\":{},\"request_id\":{},\"body\":\"request\",\"method\":{:?},\"payload\":{:?},\"timeout_ms\":{}}}}}",
-                    f.version, f.request_id, r.method, std::str::from_utf8(&r.payload).unwrap(), r.timeout_ms);
+            Body::Call(c) => {
+                assert_eq!(frame.request_id, 0x0102030405060708);
+                assert_eq!(c.method, "/a/B");
+                assert_eq!(c.timeout_ms, 0x11223344);
+                assert_eq!(c.payload, [255, 0]);
             }
-            other => panic!("unexpected corpus body {other:?}"),
+            other => panic!("unexpected Bebop fixture {other:?}"),
         }
+        assert!(decode_frame(&bytes[..bytes.len() - 1], ctx).is_err());
     }
 }
 
-fn corpus_hex(id: &str) -> String {
-    let text = include_str!("../../../tests/interoperability/fixtures/protobuf-vectors.yaml");
-    let marker = format!("  - id: {id}");
-    let mut selected = false;
-    let mut found = Vec::new();
-    for line in text.lines() {
-        if line.starts_with("  - id: ") {
-            selected = line == marker;
-        }
-        if selected {
-            if let Some(value) = line.strip_prefix("    frame_hex: ") {
-                found.push(value.trim_matches('"').to_string());
-            }
-        }
-    }
-    assert_eq!(found.len(), 1, "one shared corpus hex for {id}");
-    found.remove(0)
-}
+#[path = "../../../tests/interoperability/vectors.rs"]
+#[allow(dead_code)]
+mod vectors;

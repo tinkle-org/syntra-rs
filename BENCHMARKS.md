@@ -17,13 +17,10 @@ implementation; `tls-rustls` adds optional WSS convenience APIs. `managed`,
 explicit opt-ins. Pipe timings cover no managed WS/WSS listeners, route selection,
 HTTP/HTTPS connections or raw adapters, TLS/provider composition, managed runtime,
 proxies or reconnect behavior. Candidate full-RPC tests are separate from these
-timings and do not establish RFC0013 adoption, completed review or conformance. See
+timings. See
 [CONNECTION.md](CONNECTION.md) for encryption and connection guidance. These local
 harnesses do not establish operational budgets or real-device/network results.
 Retain the implementation revision and dirty-worktree state with measurements.
-The [candidate record](protocol-contract.json) pins committed candidate inputs;
-benchmark success does not authorize publication or satisfy the formal-conformance gate in
-[implementation evidence](CONTRIBUTING.md#implementation-evidence).
 
 ## Cases and accounting
 
@@ -111,7 +108,7 @@ the optimized bench profile, Rust 1.89.0 and each revision's lockfile. On the
 introducing push only, it copies the measurement harnesses into the old checkout
 and measures that same revision twice to check noise on the actual runner.
 Thereafter each harness compiles against its own codec; keep the five workloads
-and timing boundaries stable across the migration. No prior artifact is needed.
+and timing boundaries stable across comparisons. No prior artifact is needed.
 If the push creates `main`, the job skips because there is no previous tip.
 An incompatible build, missing case, or unreadable comparison fails the job.
 
@@ -144,14 +141,6 @@ python3 scripts/benchmark_baseline.py . . "$(mktemp -d)"
 python3 -m unittest scripts.tests.test_benchmark_baseline
 ```
 
-Local calibration, not a Blacksmith baseline: on an AC-powered Apple M4
-(Darwin 27.2.0, arm64), both sides used the same dirty `dd76d45` checkout,
-Rust 1.89.0 and the settings above. The 95% relative mean-time intervals
-were [−4.03%, +1.00%] and [+0.12%, +1.70%] for the two frames;
-[−0.71%, +0.86%], [−0.24%, +1.20%] and [−0.51%, −0.00%] for the three
-records in ascending size order. None triggered a repeat. The separate
-allocation counts were 6, 8 and 2, 2, 2 respectively.
-
 ## Comparing changes
 
 Use the same benchmark harness, Rust version, build profile and fixture sizes
@@ -167,8 +156,8 @@ cargo bench -p syntra-core --bench frame_codec -- --baseline main
 ```
 
 Inspect both timing and allocation behavior before introducing pools.
-Full Protobuf decoding owns messages and byte fields; zero-allocation header
-scanning does not mean full decoding or RPC dispatch is allocation-free.
+Measure full frame decoding separately from header scanning; a scan does not
+account for buffer ownership or RPC dispatch.
 Do not trade buffer ownership, authentication, or nonce safety for a lower
 allocation count.
 

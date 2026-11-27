@@ -26,7 +26,7 @@ pub fn bounded_diagnostic(message: impl Into<String>) -> String {
     message
 }
 
-/// Wire error codes. Mirrors `syntra.v1.ErrorCode` (errors.proto).
+/// Registered error codes. Unknown raw wire numbers remain diagnostic data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i32)]
 pub enum ErrorCode {
@@ -111,7 +111,7 @@ pub enum RetryClass {
     UnknownOutcome,
 }
 
-/// Public typed failure: `{code, message}` (errors.proto `RpcError`).
+/// Public typed failure with the classified and original code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcError {
     pub code: ErrorCode,
@@ -134,7 +134,7 @@ impl RpcError {
 /// All failures surfaced by the Syntra core and runtime.
 #[derive(Debug, Error, Clone)]
 pub enum SyntraError {
-    /// A terminal `RpcResult{error}` from the host.
+    /// A terminal `CallResult` error from the host.
     #[error("rpc failed [{code:?}]: {message}")]
     Rpc {
         code: ErrorCode,

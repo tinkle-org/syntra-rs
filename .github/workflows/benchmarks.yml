@@ -6,8 +6,8 @@ on:
     paths:
       - 'crates/**/src/**/*.rs'
       - 'crates/**/benches/**/*.rs'
-      - 'crates/**/*.bop'
-      - 'proto/**/*.proto'
+      - 'schemas/**/*.bop'
+      - 'bebop.json'
       - 'crates/syntra-core/tests/bench_allocations.rs'
       - 'scripts/benchmark_baseline.py'
       - 'crates/**/build.rs'

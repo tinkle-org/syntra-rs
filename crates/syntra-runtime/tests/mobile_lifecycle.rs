@@ -1,7 +1,6 @@
 #![cfg(not(target_arch = "wasm32"))]
 //! Local executable app/lifecycle harness, NOT mobile OS/device evidence. Each
 //! replacement is a fresh Core namespace; the fixture explicitly fences receipts.
-use prost::Message;
 use std::{
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -9,7 +8,7 @@ use std::{
     },
     time::Duration,
 };
-use syntra_core::{ErrorCode, Frame};
+use syntra_core::ErrorCode;
 use syntra_runtime::{
     elapsed::{ElapsedClock, ElapsedSource},
     *,
@@ -144,7 +143,9 @@ async fn app_mutation_suspend_wake_replacement_late_receipt_and_shutdown_script(
     let mutation = old.call("/fixture.App/Mutate", vec![1]);
     let buffered = old.handoff().await; // host effect happened; result not selected
     assert_eq!(effects.load(Ordering::SeqCst), 1);
-    let old_id = Frame::decode(buffered.bytes.as_slice()).unwrap().request_id;
+    let old_id = syntra_core::decode_frame_structure(buffered.bytes.as_slice())
+        .unwrap()
+        .request_id;
     old.suspend();
     source.0.fetch_add(2000, Ordering::SeqCst);
     old.wake().await;
@@ -156,7 +157,9 @@ async fn app_mutation_suspend_wake_replacement_late_receipt_and_shutdown_script(
     let echo = replacement.call("/fixture.App/Echo", vec![2]);
     let fresh = replacement.handoff().await;
     assert_eq!(
-        Frame::decode(fresh.bytes.as_slice()).unwrap().request_id,
+        syntra_core::decode_frame_structure(fresh.bytes.as_slice())
+            .unwrap()
+            .request_id,
         old_id,
         "IDs can restart only in a fresh namespace"
     );

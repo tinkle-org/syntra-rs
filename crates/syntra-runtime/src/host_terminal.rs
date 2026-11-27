@@ -1,6 +1,8 @@
 //! Opt-in, connection-local terminal receipt coordination. No wire extension.
 use super::*;
 use crate::elapsed::{ElapsedClock, ElapsedDeadline};
+#[cfg(test)]
+use crate::frame_fixture::FrameFixture;
 use futures_util::future::BoxFuture;
 use std::sync::atomic::Ordering;
 
@@ -550,14 +552,17 @@ impl Coordinator {
             let frame = Frame {
                 version,
                 request_id: id,
-                body: Some(Body::Result(RpcResult {
+                body: Some(Body::Result(CallResult {
                     outcome: Some(outcome_payload(payload.clone())),
                 })),
             };
             if frame.encoded_len() > 1024 {
                 return Err(Refused::Unavailable);
             }
-            frames.push(frame.encode_to_vec());
+            frames.push(
+                syntra_core::encode_frame(&frame, syntra_core::ValidationContext::active(version))
+                    .map_err(|_| Refused::Unavailable)?,
+            );
         }
         let _io = self.io_gate.lock().unwrap();
         let mut s = self.state.lock().unwrap();
@@ -1419,13 +1424,13 @@ mod tests {
             &Frame {
                 version: 1,
                 request_id: 0,
-                body: Some(Body::Hello(syntra_core::proto::ClientHello {
+                body: Some(Body::Hello(syntra_core::wire::ClientHello {
                     min_version: 1,
                     max_version: 1,
                     credential: b"fixture".to_vec(),
                 })),
             }
-            .encode_to_vec(),
+            .fixture_bytes(),
         )
         .await;
         ordinary.recv().await.unwrap();

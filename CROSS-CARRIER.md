@@ -1,33 +1,14 @@
 # Sequential cross-carrier failover candidate
 
-Status: opt-in implementation candidate. This document describes the implemented
-policy, proposed normative changes and reproducible validation commands. Local
-regressions are not formal adoption, conformance or human security approval.
+Status: opt-in implementation candidate. This document describes route selection,
+failure handling, and validation commands.
 
 See [README.md](README.md#candidate-cross-carrier-failover) for the feature overview
 and [CONNECTION.md](CONNECTION.md#candidate-cross-carrier-failover) for composition.
 
-## Current authority and scope
-
-Current upstream requirements conflict with automatic cross-carrier failover:
-
-| Owner | Current rule | Proposed change location |
-| --- | --- | --- |
-| [`specifications/security.md`](../syntra/specifications/security.md), `SNTR-TSEC-007` | Forbids automatically retrying another carrier, format or unprotected mode after failure; forbids lowering WSS below TLS 1.3 | Narrow exception for separately opted-in carrier policy after transient availability loss |
-| [`specifications/transports.md`](../syntra/specifications/transports.md), `SNTR-WS-202` / `SNTR-WSS-201` | Forbids automatic carrier/format fallback and identical rejected-trust retries | Cross-reference the same bounded exception while preserving terminal trust handling |
-| [Draft RFC0013](../syntra/rfcs/0013-http-tls-carriers.md), `R13-01`, `R13-26` | Forbids automatic carrier/format/mode fallback; automatic endpoint failover sets must select the same carrier | Permit mixed descriptors only under the separate explicit policy; retain endpoint-scoped inputs and fresh establishment |
-
-These links refer to the sibling upstream checkout for review. The active
-[candidate contract](protocol-contract.json) and [input lock](upstream.lock.json)
-remain the provenance authorities for this implementation. No active contract
-pin, source hash or protocol registry is edited by this documentation change.
-HTTP/HTTPS remain unregistered candidate bindings; RFC0013 remains Draft and
-does not already authorize mixed-carrier failover. Candidate code or passing
-local tests cannot constitute acceptance of this proposed exception.
-
 ## Feature and API boundary
 
-The new Cargo feature is exactly:
+The Cargo feature enables TCP:
 
 ```toml
 cross-carrier-candidate = ["tcp"]
@@ -77,55 +58,21 @@ Pass the returned connector directly to one of these owner APIs:
 | `ReconnectingClient::new_with_recovery_and_budget(config, connector, principal_scope, store, limits)` | `reconnect` | Same owner plus fresh wire recovery negotiation per connection generation |
 
 The connector accepts the owner's budget rather than manufacturing an independent
-one. Do not adapt it to the older zero-argument constructors by creating a new
+one. Do not adapt it to zero-argument constructors by creating a new
 budget inside a closure. Recovery uses the remaining attempt/outage cutoff;
 `CoreReady` and recovery readiness remain separate. Applications explicitly
 restore subscriptions and reconcile durable progress after negotiation.
 
-## Proposed normative delta
+## Route policy
 
-The uppercase obligations in this section are proposed candidate obligations
-only. They are not registered upstream requirements. The intended owner edits
-are the three narrowly scoped rule changes listed above, subject to upstream
-review and synchronized acceptance.
+### 1. Explicit permission to change carriers
 
-### 1. Explicit exception; default prohibition retained
-
-Replace the blanket carrier-retry prohibition in `SNTR-TSEC-007` with:
-
-> Peers MUST NOT downgrade WSS below TLS 1.3, change protocol format or
-> authentication mode, or use an unprotected mode after failure. Automatic
-> carrier changes MUST remain disabled unless the application explicitly selects
-> a cross-carrier policy with a finite nonempty permitted-carrier set and a
-> separately provisioned route allowlist. Under that policy, only retryable
-> availability loss MAY select a different permitted carrier on a fresh attempt.
-> Detected trust, protocol, credential or authorization failure MUST block
-> automatic continuation for that policy generation until explicit recovery.
-> Version/capability negotiation MUST NOT weaken the selected carrier's security.
-
-For `SNTR-WS-202` / `SNTR-WSS-201`, replace only their blanket carrier-fallback
-sentence with:
-
-> Automatic carrier changes MUST follow the explicit-policy exception in
-> `SNTR-TSEC-007`; otherwise they MUST NOT occur. Format fallback and identical
-> rejected-trust retries MUST NOT occur automatically. Each successor MUST
-> revalidate its endpoint and perform fresh authentication and explicit recovery.
-
-For Draft RFC0013 `R13-26`, replace its same-carrier-set requirement with:
-
-> Descriptors in an automatic failover set MUST select the same carrier unless
-> the application separately opts into the cross-carrier policy defined here.
-> Under that policy, every descriptor and every allowlist entry MUST select a
-> permitted carrier, and WS MUST be excluded. Both HTTP streams MUST remain on
-> one descriptor and use its carrier, authority and security policy for the whole
-> attempt. The explicit-policy exception MUST NOT permit cross-origin
-> association, carrier guessing, format or mode fallback, or credential forwarding.
-
-`R13-01`'s prohibition would cross-reference the same carrier-only exception;
-its format/mode prohibition remains. Existing transient-only failover, terminal
-rejection, endpoint-scoped credential and no-transfer obligations in `R13-26`
-continue to apply. The exception does not excuse downgrade/proxy inconsistency
-under `SNTR-WS-220` / `SNTR-WSS-220` or any selected carrier's trust checks.
+The default is same-carrier retry. With an explicit policy, retryable availability
+loss can select another permitted route on a fresh attempt. Never downgrade WSS
+below TLS 1.3, change the message format or authentication mode, or retry a
+rejected trust decision. Each successor revalidates the endpoint and authenticates
+afresh. Both streams of a paired HTTP connection use one descriptor, carrier,
+authority, and security policy for the entire attempt.
 
 ### 2. Whole-configuration validation before effects
 
@@ -228,7 +175,7 @@ not independent interoperability or a security-review verdict.
 | --- | --- |
 | Default and isolated feature builds | Defaults remain socket-free; candidate enables TCP only, with no HTTP/TLS implementation/managed/reconnect dependency activation |
 | Whole-policy validation | Empty/oversized lists, duplicate/empty permissions, WS, invalid unused entries, missing route allowlisting, bad authorities/proxy targets and context-carrier mismatch fail before inputs/provider/dial as applicable |
-| Selection and compatibility | Unpolled futures are inert; one endpoint per polled future; round-robin order; callbacks outside selection lock; homogeneous API still rejects mixed carriers with unified features; old loopback WS still works |
+| Selection and compatibility | Unpolled futures are inert; one endpoint per polled future; round-robin order; callbacks outside selection lock; same-carrier API rejects mixed carriers with unified features and permits homogeneous loopback WS |
 | Real mixed-carrier establishment | TCP to application-provider WSS and HTTPS, and later rotation back where permitted; bootstrap and returning modes with endpoint-scoped fresh inputs, real Noise, hello/ready and RPC |
 | Terminal and retryable paths | Trust/protocol/local AEAD/framing and proxy 403/407/ruleset failures leave successors untouched; transient I/O/timeout/close alone permit bounded continuation; typed active failures survive teardown |
 | Owner budgets and controls | Exact owner/clock identity reaches raw polls, both HTTP streams and recovery; stricter limits only shorten; expiry/overrun emits no late I/O; cancellation, pause/offline, wake, exhaustion and stale generations cannot bypass gates |

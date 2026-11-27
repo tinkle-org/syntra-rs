@@ -1,11 +1,13 @@
+#[path = "support/frame.rs"]
+mod frame_fixture;
+use frame_fixture::FrameFixture;
 use std::sync::Arc;
 use std::time::Duration;
 
-use prost::Message;
-use syntra_core::proto::{
-    frame::Body, rpc_result::Outcome, Cancel, ClientHello, Notification, RpcError, ServerReady,
+use syntra_core::wire::{
+    call_result::Outcome, frame::Body, Cancel, ClientHello, Notification, RpcError, ServerReady,
 };
-use syntra_core::{ConnectionState, ErrorCode, Frame, RpcRequest, RpcResult, SyntraError};
+use syntra_core::{Call, CallResult, ConnectionState, ErrorCode, Frame, SyntraError};
 use syntra_runtime::{
     AllowAnonymous, AuthError, ConnectionConfig, FnHandler, Handler, HandlerFut, HandlerOutcome,
     Host, Initiator, Principal,
@@ -25,13 +27,13 @@ fn frame(id: u64, body: Body) -> Frame {
 fn request(id: u64) -> Vec<u8> {
     frame(
         id,
-        Body::Request(RpcRequest {
+        Body::Call(Call {
             method: METHOD.into(),
             payload: vec![],
             timeout_ms: 5000,
         }),
     )
-    .encode_to_vec()
+    .fixture_bytes()
 }
 
 async fn client() -> (Initiator, mpsc::Receiver<Vec<u8>>) {
@@ -47,7 +49,7 @@ async fn client() -> (Initiator, mpsc::Receiver<Vec<u8>>) {
                     connection_id: "test-connection".into(),
                 }),
             )
-            .encode_to_vec(),
+            .fixture_bytes(),
         )
         .await;
     handshake.await.unwrap();
@@ -68,7 +70,7 @@ async fn host(
                 credential: vec![],
             }),
         )
-        .encode_to_vec(),
+        .fixture_bytes(),
     )
     .await;
     writer.recv().await.unwrap();
@@ -82,8 +84,8 @@ fn blocked() -> Arc<dyn Handler> {
 }
 
 fn error_code(bytes: &[u8]) -> (u64, ErrorCode) {
-    let frame = Frame::decode(bytes).unwrap();
-    let Some(Body::Result(RpcResult {
+    let frame = syntra_core::decode_frame_structure(bytes).unwrap();
+    let Some(Body::Result(CallResult {
         outcome: Some(Outcome::Error(error)),
     })) = frame.body
     else {
@@ -106,13 +108,13 @@ async fn malformed_correlated_outcomes_settle_only_their_rpc_once() {
         let mut other = Box::pin(client.call(METHOD, vec![], 5000));
         assert!(futures_util::poll!(&mut first).is_pending());
         assert!(futures_util::poll!(&mut other).is_pending());
-        let id = Frame::decode(writer.recv().await.unwrap().as_slice())
+        let id = syntra_core::decode_frame_structure(writer.recv().await.unwrap().as_slice())
             .unwrap()
             .request_id;
-        let other_id = Frame::decode(writer.recv().await.unwrap().as_slice())
+        let other_id = syntra_core::decode_frame_structure(writer.recv().await.unwrap().as_slice())
             .unwrap()
             .request_id;
-        let bad = frame(id, Body::Result(RpcResult { outcome })).encode_to_vec();
+        let bad = frame(id, Body::Result(CallResult { outcome })).fixture_bytes();
         client.ingest(&bad).await;
         client.ingest(&bad).await;
         assert_eq!(first.await.unwrap_err().code(), ErrorCode::InvalidArgument);
@@ -122,11 +124,11 @@ async fn malformed_correlated_outcomes_settle_only_their_rpc_once() {
             .ingest(
                 &frame(
                     id,
-                    Body::Result(RpcResult {
+                    Body::Result(CallResult {
                         outcome: Some(Outcome::Payload(b"late".to_vec())),
                     }),
                 )
-                .encode_to_vec(),
+                .fixture_bytes(),
             )
             .await;
         assert_eq!(client.pending_len(), 1);
@@ -134,11 +136,11 @@ async fn malformed_correlated_outcomes_settle_only_their_rpc_once() {
             .ingest(
                 &frame(
                     other_id,
-                    Body::Result(RpcResult {
+                    Body::Result(CallResult {
                         outcome: Some(Outcome::Payload(b"ok".to_vec())),
                     }),
                 )
-                .encode_to_vec(),
+                .fixture_bytes(),
             )
             .await;
         assert_eq!(other.await.unwrap(), b"ok");
@@ -150,21 +152,26 @@ async fn malformed_correlated_outcomes_settle_only_their_rpc_once() {
 
 #[tokio::test]
 async fn structurally_invalid_results_never_supply_correlation() {
-    for reserved in [false, true] {
+    for truncated in [false, true] {
         let (client, mut writer) = client().await;
         let mut call = Box::pin(client.call(METHOD, vec![], 5000));
         assert!(futures_util::poll!(&mut call).is_pending());
-        let id = Frame::decode(writer.recv().await.unwrap().as_slice())
+        let id = syntra_core::decode_frame_structure(writer.recv().await.unwrap().as_slice())
             .unwrap()
             .request_id;
-        let mut bytes = frame(id, Body::Result(RpcResult { outcome: None })).encode_to_vec();
-        if reserved {
-            bytes.extend_from_slice(&[0x80, 0x01, 0]);
+        let mut bytes = frame(
+            id,
+            Body::Result(CallResult {
+                outcome: Some(Outcome::Payload(vec![1])),
+            }),
+        )
+        .fixture_bytes();
+        if truncated {
+            bytes.pop();
         } else {
-            bytes.extend_from_slice(&[0x6a, 0]);
+            bytes.push(0);
         }
         assert!(syntra_core::validate_wire_structure(&bytes).is_err());
-        assert!(Frame::decode(bytes.as_slice()).is_ok());
         client.ingest(&bytes).await;
         assert_eq!(client.pending_len(), 1);
         assert!(futures_util::poll!(&mut call).is_pending());
@@ -172,11 +179,11 @@ async fn structurally_invalid_results_never_supply_correlation() {
             .ingest(
                 &frame(
                     id,
-                    Body::Result(RpcResult {
+                    Body::Result(CallResult {
                         outcome: Some(Outcome::Payload(vec![])),
                     }),
                 )
-                .encode_to_vec(),
+                .fixture_bytes(),
             )
             .await;
         assert_eq!(call.await.unwrap(), Vec::<u8>::new());
@@ -208,11 +215,11 @@ async fn active_handshake_frames_and_version_mismatch_are_immediately_fatal() {
         for mut invalid in [
             frame(
                 42,
-                Body::Result(RpcResult {
+                Body::Result(CallResult {
                     outcome: Some(Outcome::Payload(vec![])),
                 }),
             ),
-            Frame::decode(request(42).as_slice()).unwrap(),
+            syntra_core::decode_frame_structure(request(42).as_slice()).unwrap(),
             frame(0, Body::Notification(Notification { payload: vec![] })),
         ] {
             invalid.version = version;
@@ -225,7 +232,7 @@ async fn active_handshake_frames_and_version_mismatch_are_immediately_fatal() {
         } else {
             ErrorCode::FailedPrecondition
         };
-        let bytes = invalid.encode_to_vec();
+        let bytes = invalid.fixture_bytes();
         let (client, mut writer) = client().await;
         client.ingest(&bytes).await;
         assert!(client.is_closed());
@@ -269,25 +276,25 @@ async fn active_version_mismatch_preserves_an_already_selected_result() {
     let (client, mut writer) = client().await;
     let mut call = Box::pin(client.call(METHOD, vec![], 5000));
     assert!(futures_util::poll!(&mut call).is_pending());
-    let id = Frame::decode(writer.recv().await.unwrap().as_slice())
+    let id = syntra_core::decode_frame_structure(writer.recv().await.unwrap().as_slice())
         .unwrap()
         .request_id;
     let mut pending = Box::pin(client.call(METHOD, vec![], 5000));
     assert!(futures_util::poll!(&mut pending).is_pending());
-    let pending_id = Frame::decode(writer.recv().await.unwrap().as_slice())
+    let pending_id = syntra_core::decode_frame_structure(writer.recv().await.unwrap().as_slice())
         .unwrap()
         .request_id;
     let mut result = frame(
         id,
-        Body::Result(RpcResult {
+        Body::Result(CallResult {
             outcome: Some(Outcome::Payload(b"selected".to_vec())),
         }),
     );
-    client.ingest(&result.encode_to_vec()).await;
+    client.ingest(&result.fixture_bytes()).await;
     assert_eq!(client.pending_len(), 1);
     result.version = 2;
     result.request_id = pending_id;
-    client.ingest(&result.encode_to_vec()).await;
+    client.ingest(&result.fixture_bytes()).await;
     assert!(client.is_closed());
     assert_eq!(
         client.terminal_reason().unwrap().code(),
@@ -301,23 +308,23 @@ async fn active_version_mismatch_preserves_an_already_selected_result() {
 
 #[tokio::test]
 async fn structural_request_faults_are_not_semantic_rpc_errors() {
-    for reserved in [false, true] {
+    for truncated in [false, true] {
         let (host, mut writer) = host(ConnectionConfig::default(), blocked()).await;
         let mut bad = frame(
             77,
-            Body::Request(RpcRequest {
+            Body::Call(Call {
                 method: "malformed".into(),
                 payload: vec![],
                 timeout_ms: 0,
             }),
         )
-        .encode_to_vec();
-        if reserved {
-            bad.extend_from_slice(&[0x88, 0x01, 0]);
+        .fixture_bytes();
+        if truncated {
+            bad.pop();
         } else {
-            bad.extend_from_slice(&[0x62, 0]);
+            bad.push(0);
         }
-        assert!(Frame::decode(bad.as_slice()).is_ok());
+        assert!(syntra_core::validate_wire_structure(&bad).is_err());
         host.ingest(&bad).await;
         assert!(
             writer.try_recv().is_err(),
@@ -339,13 +346,17 @@ async fn initiator_graceful_close_drains_results_and_rejects_new_calls() {
     let bytes = client
         .prepare_outbound(writer.recv().await.unwrap())
         .unwrap();
-    let id = Frame::decode(bytes.as_slice()).unwrap().request_id;
+    let id = syntra_core::decode_frame_structure(bytes.as_slice())
+        .unwrap()
+        .request_id;
     let mut draining = Box::pin(client.call(METHOD, vec![], 5000));
     assert!(futures_util::poll!(&mut draining).is_pending());
     let bytes = client
         .prepare_outbound(writer.recv().await.unwrap())
         .unwrap();
-    let draining_id = Frame::decode(bytes.as_slice()).unwrap().request_id;
+    let draining_id = syntra_core::decode_frame_structure(bytes.as_slice())
+        .unwrap()
+        .request_id;
     let mut closing = Box::pin(client.close_gracefully(Duration::from_secs(1)));
     assert!(futures_util::poll!(&mut closing).is_pending());
     assert_eq!(client.state().await, ConnectionState::Closing);
@@ -353,24 +364,24 @@ async fn initiator_graceful_close_drains_results_and_rejects_new_calls() {
     assert!(client.call(METHOD, vec![], 100).await.is_err());
     client.cancel(id).await.unwrap();
     assert!(matches!(
-        Frame::decode(writer.recv().await.unwrap().as_slice())
+        syntra_core::decode_frame_structure(writer.recv().await.unwrap().as_slice())
             .unwrap()
             .body,
         Some(Body::Cancel(_))
     ));
     client
-        .ingest(&frame(id, Body::Cancel(Cancel {})).encode_to_vec())
+        .ingest(&frame(id, Body::Cancel(Cancel {})).fixture_bytes())
         .await;
     assert_eq!(client.state().await, ConnectionState::Closing);
     client
         .ingest(
             &frame(
                 id,
-                Body::Result(RpcResult {
+                Body::Result(CallResult {
                     outcome: Some(Outcome::Payload(b"drained".to_vec())),
                 }),
             )
-            .encode_to_vec(),
+            .fixture_bytes(),
         )
         .await;
     assert_eq!(call.await.unwrap_err().code(), ErrorCode::Cancelled);
@@ -384,11 +395,11 @@ async fn initiator_graceful_close_drains_results_and_rejects_new_calls() {
         .ingest(
             &frame(
                 draining_id,
-                Body::Result(RpcResult {
+                Body::Result(CallResult {
                     outcome: Some(Outcome::Payload(b"drained".to_vec())),
                 }),
             )
-            .encode_to_vec(),
+            .fixture_bytes(),
         )
         .await;
     assert_eq!(draining.await.unwrap(), b"drained");
@@ -408,15 +419,15 @@ async fn host_graceful_close_accepts_cancel_and_drains_one_terminal_result() {
     host.ingest(
         &frame(
             99,
-            Body::Result(RpcResult {
+            Body::Result(CallResult {
                 outcome: Some(Outcome::Payload(vec![])),
             }),
         )
-        .encode_to_vec(),
+        .fixture_bytes(),
     )
     .await;
     assert_eq!(host.state().await, ConnectionState::Closing);
-    host.ingest(&frame(1, Body::Cancel(Cancel {})).encode_to_vec())
+    host.ingest(&frame(1, Body::Cancel(Cancel {})).fixture_bytes())
         .await;
     let result = writer.recv().await.unwrap();
     assert_eq!(error_code(&result), (1, ErrorCode::Cancelled));
@@ -450,9 +461,10 @@ async fn host_graceful_close_waits_for_handler_success_and_writer_drain() {
         futures_util::poll!(&mut closing).is_pending(),
         "queued results must drain"
     );
-    let result = Frame::decode(writer.recv().await.unwrap().as_slice()).unwrap();
+    let result =
+        syntra_core::decode_frame_structure(writer.recv().await.unwrap().as_slice()).unwrap();
     assert!(
-        matches!(result.body, Some(Body::Result(RpcResult { outcome: Some(Outcome::Payload(payload)) })) if payload == b"finished")
+        matches!(result.body, Some(Body::Result(CallResult { outcome: Some(Outcome::Payload(payload)) })) if payload == b"finished")
     );
     closing.await;
     assert!(host.is_closed());
@@ -557,13 +569,13 @@ async fn authorization_unauthenticated_withdraws_other_calls_and_binding() {
     host.ingest(
         &frame(
             2,
-            Body::Request(RpcRequest {
+            Body::Call(Call {
                 method: "/example.Echo/Revoked".into(),
                 payload: vec![],
                 timeout_ms: 5000,
             }),
         )
-        .encode_to_vec(),
+        .fixture_bytes(),
     )
     .await;
     let mut ids = vec![];
@@ -599,11 +611,11 @@ async fn withdrawal_preserves_completed_results_and_prevents_late_handler_effect
     // Withdrawal fences the admitted second worker before its first poll.
     host.withdraw_principal().await;
     assert_eq!(effects.load(Ordering::SeqCst), 1);
-    let first = Frame::decode(writer.try_recv().unwrap().as_slice()).unwrap();
+    let first = syntra_core::decode_frame_structure(writer.try_recv().unwrap().as_slice()).unwrap();
     assert_eq!(first.request_id, 1);
     assert!(matches!(
         first.body,
-        Some(Body::Result(RpcResult {
+        Some(Body::Result(CallResult {
             outcome: Some(Outcome::Payload(_))
         }))
     ));
@@ -711,7 +723,7 @@ async fn graceful_drain_tolerates_queued_notifications() {
     let (client, mut writer) = client().await;
     let mut call = Box::pin(client.call(METHOD, vec![], 5000));
     assert!(futures_util::poll!(&mut call).is_pending());
-    let id = Frame::decode(writer.recv().await.unwrap().as_slice())
+    let id = syntra_core::decode_frame_structure(writer.recv().await.unwrap().as_slice())
         .unwrap()
         .request_id;
     let mut closing = Box::pin(client.close_gracefully(Duration::from_secs(1)));
@@ -726,7 +738,7 @@ async fn graceful_drain_tolerates_queued_notifications() {
                         payload: b"queued".to_vec(),
                     }),
                 )
-                .encode_to_vec(),
+                .fixture_bytes(),
             )
             .await;
     }
@@ -736,11 +748,11 @@ async fn graceful_drain_tolerates_queued_notifications() {
         .ingest(
             &frame(
                 id,
-                Body::Result(RpcResult {
+                Body::Result(CallResult {
                     outcome: Some(Outcome::Payload(b"drained".to_vec())),
                 }),
             )
-            .encode_to_vec(),
+            .fixture_bytes(),
         )
         .await;
     assert_eq!(call.await.unwrap(), b"drained");

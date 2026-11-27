@@ -1,0 +1,53 @@
+struct Frame {
+    uint32 version;
+    uint64 requestId;
+    FrameBody body;
+}
+
+union FrameBody {
+    10 -> message ClientHello {
+        1 -> uint32 minVersion;
+        2 -> uint32 maxVersion;
+        3 -> byte[] credential;
+    }
+    11 -> message ServerReady {
+        1 -> string connectionId;
+    }
+    12 -> message Call {
+        1 -> string method;
+        2 -> byte[] payload;
+        3 -> uint32 timeoutMs;
+    }
+    13 -> struct CallResult { CallOutcome outcome; }
+    14 -> message Cancel {}
+    15 -> message Notification { 1 -> byte[] payload; }
+}
+
+union CallOutcome {
+    1 -> struct Success { byte[] payload; }
+    2 -> message RpcError {
+        // Raw so an unrecognized numeric code can be reported as Unknown.
+        1 -> int32 code;
+        2 -> string diagnostic;
+    }
+}
+
+enum ErrorCode : int32 {
+    Unspecified = 0;
+    Cancelled = 1;
+    Unknown = 2;
+    InvalidArgument = 3;
+    DeadlineExceeded = 4;
+    NotFound = 5;
+    AlreadyExists = 6;
+    PermissionDenied = 7;
+    ResourceExhausted = 8;
+    FailedPrecondition = 9;
+    Aborted = 10;
+    OutOfRange = 11;
+    Unimplemented = 12;
+    Internal = 13;
+    Unavailable = 14;
+    DataLoss = 15;
+    Unauthenticated = 16;
+}

@@ -4,7 +4,6 @@
 #![cfg(all(feature = "tls-rustls", not(target_arch = "wasm32")))]
 
 use futures_util::{SinkExt, StreamExt};
-use prost::Message as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use std::{
     sync::{
@@ -16,6 +15,11 @@ use std::{
 use syntra_core::secure_channel::{
     generate_server_key, Carrier, ClientConfig, ClientHandshake, Context, FrameDecoder, KeyStore,
     Mode, Secret32, ServerConfig, VerifiedIdentity,
+};
+use syntra_core::{
+    decode_frame, encode_frame,
+    wire::{call_result::Outcome, frame::Body},
+    CallResult, ConnectionState, ValidationContext,
 };
 use syntra_net::{websocket as ws, AuthenticatorFactory, Error, HostHandle, Limits};
 #[cfg(feature = "reconnect")]
@@ -418,21 +422,26 @@ async fn connection_token_lists_and_repeated_fields_complete_channel_with_read_a
                 let mut frames = syntra_core::secure_channel::FrameDecoder::default();
                 let frames = frames.push(&plaintext).unwrap();
                 assert_eq!(frames.len(), 1);
-                let hello = syntra_core::Frame::decode(frames[0].as_slice()).unwrap();
-                let Some(syntra_core::proto::frame::Body::Hello(hello)) = hello.body else {
+                let hello = decode_frame(
+                    &frames[0],
+                    ValidationContext::pre_handshake(ConnectionState::Connected),
+                )
+                .unwrap();
+                let Some(Body::Hello(hello)) = hello.body else {
                     panic!("expected encrypted hello")
                 };
                 assert_eq!(hello.credential, CREDENTIAL);
-                let ready = syntra_core::Frame {
-                    version: 1,
-                    request_id: 0,
-                    body: Some(syntra_core::proto::frame::Body::Ready(
-                        syntra_core::ServerReady {
+                let ready = encode_frame(
+                    &syntra_core::Frame {
+                        version: 1,
+                        request_id: 0,
+                        body: Some(Body::Ready(syntra_core::ServerReady {
                             connection_id: "raw-upgrade-fixture".into(),
-                        },
-                    )),
-                }
-                .encode_to_vec();
+                        })),
+                    },
+                    ValidationContext::pre_handshake(ConnectionState::Negotiating),
+                )
+                .unwrap();
                 let ready = channel
                     .encrypt(&syntra_core::secure_channel::frame_plaintext(&ready).unwrap())
                     .unwrap();
@@ -1406,9 +1415,13 @@ async fn fragmented_m2_reassembles_before_noise_client_role_both_modes() {
             let mut decoder = FrameDecoder::default();
             let frames = decoder.push(&plaintext).expect("hello framing");
             assert_eq!(frames.len(), 1, "hello arrives as one frame");
-            let hello = syntra_core::Frame::decode(frames[0].as_slice()).expect("hello decode");
+            let hello = decode_frame(
+                &frames[0],
+                ValidationContext::pre_handshake(ConnectionState::Connected),
+            )
+            .expect("hello decode");
             match hello.body {
-                Some(syntra_core::proto::frame::Body::Hello(hello)) => {
+                Some(Body::Hello(hello)) => {
                     assert!(hello.credential == CREDENTIAL, "hello credential mismatch");
                 }
                 _ => panic!("expected encrypted hello"),
@@ -1420,16 +1433,17 @@ async fn fragmented_m2_reassembles_before_noise_client_role_both_modes() {
                 Carrier::SecureWebSocket,
                 "verified carrier"
             );
-            let ready = syntra_core::Frame {
-                version: 1,
-                request_id: 0,
-                body: Some(syntra_core::proto::frame::Body::Ready(
-                    syntra_core::ServerReady {
+            let ready = encode_frame(
+                &syntra_core::Frame {
+                    version: 1,
+                    request_id: 0,
+                    body: Some(Body::Ready(syntra_core::ServerReady {
                         connection_id: connection_id.clone(),
-                    },
-                )),
-            }
-            .encode_to_vec();
+                    })),
+                },
+                ValidationContext::pre_handshake(ConnectionState::Negotiating),
+            )
+            .unwrap();
             let plaintext =
                 syntra_core::secure_channel::frame_plaintext(&ready).expect("ready framing");
             let record = channel.encrypt(&plaintext).expect("ready encrypt");
@@ -1460,23 +1474,20 @@ async fn fragmented_m2_reassembles_before_noise_client_role_both_modes() {
                 let frames = decoder.push(&plaintext).expect("request framing");
                 for frame in frames {
                     let request =
-                        syntra_core::Frame::decode(frame.as_slice()).expect("request decode");
+                        decode_frame(&frame, ValidationContext::active(1)).expect("request decode");
                     match request.body {
-                        Some(syntra_core::proto::frame::Body::Request(call)) => {
-                            let result = syntra_core::Frame {
-                                version: request.version,
-                                request_id: request.request_id,
-                                body: Some(syntra_core::proto::frame::Body::Result(
-                                    syntra_core::proto::RpcResult {
-                                        outcome: Some(
-                                            syntra_core::proto::rpc_result::Outcome::Payload(
-                                                call.payload,
-                                            ),
-                                        ),
-                                    },
-                                )),
-                            }
-                            .encode_to_vec();
+                        Some(Body::Call(call)) => {
+                            let result = encode_frame(
+                                &syntra_core::Frame {
+                                    version: request.version,
+                                    request_id: request.request_id,
+                                    body: Some(Body::Result(CallResult {
+                                        outcome: Some(Outcome::Payload(call.payload)),
+                                    })),
+                                },
+                                ValidationContext::active(1),
+                            )
+                            .unwrap();
                             let plaintext = syntra_core::secure_channel::frame_plaintext(&result)
                                 .expect("result framing");
                             let record = channel.encrypt(&plaintext).expect("result encrypt");

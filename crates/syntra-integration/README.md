@@ -9,8 +9,7 @@ connectivity evidence, not a conformance verdict.
 
 SDK-owned tests and tooling must run without another SDK checkout, toolchain or
 release. Keep developer experiments and their evidence in a developer-local cache
-outside the SDK repository and its public documentation. Normative SDD provenance
-and pinned vector sources retain their separate input-checking requirements.
+outside the SDK repository and its public documentation.
 
 The peer and tests use `syntra_net::{tcp, websocket}`. Core owns message
 mechanics and record protection through `syntra_core::secure_channel`; runtime
@@ -48,10 +47,8 @@ establish TLS, browser or independent cryptographic-vector coverage.
 
 Record the peer revision, dirty-worktree state and actual carrier/mode results
 when executing the suite.
-The [unified implementation-evidence runner](../../CONTRIBUTING.md#implementation-evidence)
-has separate supplemental lanes; it does not run this Docker suite. Preserve each
-result's execution scope and candidate provenance. The candidate record pins
-committed inputs; that pin does not turn fixture execution into formal conformance.
+Report Docker execution separately from local codec checks; see
+[implementation evidence](../../CONTRIBUTING.md#implementation-evidence).
 
 ## Running the fixture suite
 
@@ -143,8 +140,6 @@ APIs. `managed,http` owns the listener run through `ManagedHttpServer`; candidat
 routes include direct, SOCKS5/CONNECT and real HTTP forward requests. HTTPS uses
 application TLS on both streams without a production TLS implementation dependency.
 Raw `http_records` tests remain distinct from the full-connection lanes.
-RFC0013 is Draft upstream; this candidate remains under resource review, without
-carrier registration, approval, accepted-spec shipping status or conformance claims.
 HTTP also supports WS upgrade and CONNECT tunneling. `HttpForwardTarget` alone is
 metadata; the explicit candidate `Route::HttpForward` sends forward requests.
 UDP and browser connections are excluded. This suite does not

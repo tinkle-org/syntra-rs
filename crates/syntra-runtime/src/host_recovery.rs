@@ -109,7 +109,7 @@ impl Host {
             .is_some()
     }
 
-    pub(super) fn request_timeout(&self, req: &RpcRequest) -> Duration {
+    pub(super) fn request_timeout(&self, req: &syntra_core::Call) -> Duration {
         if req.timeout_ms != 0 || !is_profile(&req.method) {
             return self.effective_timeout(req.timeout_ms);
         }
@@ -293,7 +293,7 @@ async fn notifications(
         let frame = Frame {
             version: ctx.negotiated_version.unwrap_or(0),
             request_id: 0,
-            body: Some(Body::Notification(syntra_core::proto::Notification {
+            body: Some(Body::Notification(syntra_core::wire::Notification {
                 payload,
             })),
         };
@@ -351,7 +351,7 @@ async fn notifications(
                     if now() >= deadline {
                         return Err(SyntraError::Unavailable("recovery writer stalled".into()));
                     }
-                    permit.send(frame.encode_to_vec());
+                    permit.send(syntra_core::encode_frame(&frame, ctx)?);
                     break;
                 }
                 Err(ProviderError::Unauthenticated) => {
