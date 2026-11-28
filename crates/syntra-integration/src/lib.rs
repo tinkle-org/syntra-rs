@@ -58,19 +58,7 @@ impl Loopback {
         factory: Arc<dyn AuthenticatorFactory>,
         handler: Arc<dyn Handler>,
     ) -> Result<(ClientHandle, HostHandle), Error> {
-        let context = Context {
-            mode: Mode::Returning,
-            carrier: Carrier::Tcp,
-            server_key_id: 1,
-            scope: SCOPE.to_vec(),
-            handle: [1; 8],
-            epoch: 1,
-        };
-        let client = ClientConfig {
-            authorization_key: Some(self.enrollment.lookup(&context)?),
-            context,
-            server_public_key: self.server_public_key,
-        };
+        let client = client_config(&self.enrollment, self.server_public_key)?;
         tokio::try_join!(
             tcp::connect(
                 self.listener.local_addr()?,
@@ -79,13 +67,55 @@ impl Loopback {
                 Default::default(),
                 Default::default()
             ),
-            self.listener.accept(
+            self.accept(factory, handler)
+        )
+    }
+
+    pub async fn accept(
+        &self,
+        factory: Arc<dyn AuthenticatorFactory>,
+        handler: Arc<dyn Handler>,
+    ) -> Result<HostHandle, Error> {
+        self.listener
+            .accept(
                 &self.server,
                 factory,
                 handler,
                 Default::default(),
-                Default::default()
+                Default::default(),
             )
-        )
+            .await
     }
+
+    #[cfg(feature = "managed-media")]
+    pub fn address(&self) -> Result<std::net::SocketAddr, Error> {
+        self.listener.local_addr()
+    }
+
+    #[cfg(feature = "managed-media")]
+    pub fn lane_inputs(
+        &self,
+    ) -> impl Fn() -> Result<(ClientConfig, Vec<u8>), Error> + Send + Sync + 'static + use<> {
+        let (enrollment, pin) = (self.enrollment.clone(), self.server_public_key);
+        move || Ok((client_config(&enrollment, pin)?, CREDENTIAL.to_vec()))
+    }
+}
+
+fn client_config(
+    enrollment: &Enrollment,
+    server_public_key: [u8; 32],
+) -> Result<ClientConfig, Error> {
+    let context = Context {
+        mode: Mode::Returning,
+        carrier: Carrier::Tcp,
+        server_key_id: 1,
+        scope: SCOPE.to_vec(),
+        handle: [1; 8],
+        epoch: 1,
+    };
+    Ok(ClientConfig {
+        authorization_key: Some(enrollment.lookup(&context)?),
+        context,
+        server_public_key,
+    })
 }

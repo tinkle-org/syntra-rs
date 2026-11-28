@@ -42,6 +42,7 @@ impl EventTrace {
 }
 /// Linearizable in-memory authority with explicit commit-return and denial controls.
 struct AuthorityFixture {
+    execution: ExecutionBudget,
     state: Mutex<(u64, Option<Transition>, bool, Option<u8>)>,
     commits: AtomicUsize,
     reads: AtomicUsize,
@@ -58,6 +59,7 @@ impl AuthorityFixture {
     /// Select one evidence/failure mode for a new active binding.
     fn new(mode: usize) -> Arc<Self> {
         Arc::new(Self {
+            execution: ExecutionBudget::new(32),
             state: Mutex::new((1, None, false, None)),
             commits: AtomicUsize::new(0),
             reads: AtomicUsize::new(0),
@@ -203,6 +205,9 @@ struct Factory {
     clock: Option<ElapsedClock>,
 }
 impl AuthenticatorFactory for Factory {
+    fn execution_budget(&self) -> ExecutionBudget {
+        self.authority.execution.clone()
+    }
     /// Use the explicitly driven clock when supplied, otherwise native elapsed time.
     fn elapsed_clock(&self) -> ElapsedClock {
         self.clock.clone().unwrap_or_default()
@@ -1041,6 +1046,75 @@ async fn partial_ordinary_frame_finishes_before_commit_and_queued_notifications_
     closed(&host).await;
     client.close().await;
     host.close().await;
+    time.finish().await;
+}
+
+/// Barrier discards a charged queued ordinary result, then the typed receipt
+/// carries only its own charge through the final protected TCP write.
+#[tokio::test(start_paused = true)]
+async fn terminal_barrier_and_partial_receipt_transfer_exact_output_charges() {
+    struct Owner;
+    impl OperationAuthority for Owner {
+        fn try_admit(
+            &self,
+            _: &Principal,
+            _: &str,
+            _: usize,
+        ) -> Result<OperationGrant, AdmissionRefusal> {
+            Ok(OperationGrant {
+                class: OperationClass::Interactive,
+                response_frame_bytes: 1024,
+                ownership: QuotaOwnership::ExclusiveProcess,
+            })
+        }
+    }
+    let time = ManualTime::new();
+    let authority = AuthorityFixture::new(5); // hold commit return while rearming the writer
+    let budget = &authority.execution;
+    budget
+        .configure_operations(
+            OperationLimits {
+                interactive_executions: 0,
+                bytes: 3072,
+                interactive_bytes: 0,
+            },
+            Arc::new(Owner),
+        )
+        .unwrap();
+    let gate = Arc::new(Gate::default());
+    let (client, host) =
+        controlled_pair_with_clock(authority.clone(), gate.clone(), Some(time.clock.clone())).await;
+    let call = |method: &'static str| {
+        let conn = client.conn.clone();
+        tokio::spawn(async move { conn.call(method, vec![], 2000).await })
+    };
+    gate.pause_after(1);
+    let active = call("/example.Authority/Echo");
+    gate.blocked.notified().await;
+    let queued = call("/example.Authority/Echo");
+    wait_for_fixture_state(
+        || host.host.shutdown_report().queued_frames == 1 && host.host.worker_len() == 0,
+        "second ordinary result not queued",
+    )
+    .await;
+    let receipt = call(METHOD);
+    authority.reserved.notified().await;
+    assert_eq!(budget.bytes_in_use(), 3072);
+    gate.release();
+    authority.committed.notified().await;
+    assert_eq!(budget.bytes_in_use(), 1024);
+    assert!(active.await.unwrap().unwrap().is_empty());
+    gate.pause_after(1);
+    authority.release.notify_one();
+    gate.blocked.notified().await;
+    assert_eq!(budget.in_use(), 0);
+    assert_eq!(budget.bytes_in_use(), 1024);
+    gate.release();
+    assert_eq!(receipt.await.unwrap().unwrap(), b"retired");
+    assert!(queued.await.unwrap().is_err());
+    closed(&host).await;
+    assert_eq!(budget.bytes_in_use(), 0);
+    tokio::join!(client.close(), host.close());
     time.finish().await;
 }
 

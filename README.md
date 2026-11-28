@@ -95,6 +95,7 @@ carrier-neutral `pump` without socket dependencies. Select capabilities explicit
 | `tls-rustls` | Enables `websocket` plus optional rustls, native trust roots and Tokio TLS convenience APIs for WSS |
 | `reconnect` | Bounded reconnect helper with generation-fenced calls and explicit lifecycle controls |
 | `managed` | Enables `tcp` and `reconnect`; owns runtime/clients/TCP listeners; add `websocket` for WS/WSS listeners or `http` for candidate HTTP/HTTPS listeners |
+| `media` | Enables `managed`, bundled SQLite, and SHA-256; adds returning-mode TCP lanes with slot and byte limits, optional interactive update restore, and immutable versioned transfers. See [MEDIA.md](MEDIA.md). |
 | `proxy` | Enables `tcp`; SOCKS5 and HTTP CONNECT tunnels, plus real HTTP forwarding through `routes` when combined with `http` |
 | `native-enrollment` | Native SQLite enrollment reference |
 
@@ -421,13 +422,18 @@ wire message or peer option. See
 Default `syntra-ffi` builds export no Syntra C ABI. Select the production
 frame-pump ABI explicitly; its header is
 [`syntra_production.h`](crates/syntra-ffi/include/syntra_production.h).
-Production FFI uses the shared Initiator/Host runtime and typed recovery client.
+The `production` frame pump uses the shared Initiator/Host runtime and typed recovery client.
 It exposes a low-level plaintext frame boundary, not a complete protected Syntra
 connection. The embedding driver must supply Syntra encrypted establishment,
 record protection and the selected carrier's security and ordered I/O.
 `SYNTRA_CAP_RECORD_PROTECTION` remains unset. TLS alone does not complete this
 interface's Syntra implementation. The test-fixture loopback ABI is a separate
 build for tests only.
+
+For a client that should **not** implement a frame pump, `managed-media` adds a
+separate protected TCP client to the production artifact. It does not change
+`syntra_t` or its capability mask. See [managed C usage, transfer resume, and
+build commands](MEDIA.md#use-the-managed-c-client).
 
 ```sh
 cargo build --locked -p syntra-ffi --no-default-features
@@ -441,7 +447,7 @@ python3 crates/syntra-ffi/tests/build_contract.py
 do not ship it or enable it through `--all-features`. The build-contract
 check needs Python 3, `nm`, a C compiler and the WASM target. It builds
 isolated artifacts, checks exports, runs C smoke tests and verifies the
-expected FFI WASM rejection in all three modes.
+expected FFI WASM rejection for default, fixture, production, and managed-media builds.
 
 ### WASM
 

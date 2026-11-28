@@ -10,6 +10,7 @@ description = "Syntra 1.0 container connectivity tests and loopback workload mea
 [features]
 # Install the counting allocator only in the mixed_traffic diagnostic binary.
 measure-heap = []
+managed-media = ["syntra-net/media"]
 
 [[bin]]
 name = "peer"

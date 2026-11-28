@@ -315,7 +315,7 @@ class NativeFeatureExecutionTests(unittest.TestCase):
 
     def test_candidate_feature_is_checked_independently_and_rejected_on_wasm(self):
         self.assertEqual(self.target["FEATURES"], (
-            "tcp", "http", "websocket", "tls-rustls", "reconnect", "managed", "proxy",
+            "tcp", "http", "websocket", "tls-rustls", "reconnect", "managed", "media", "proxy",
             "native-enrollment", "cross-carrier-candidate",
         ))
         contract = self.target["TargetContract"]

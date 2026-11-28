@@ -28,7 +28,7 @@ struct Fixture {
     oversized_snapshot: bool,
 }
 #[derive(Default)]
-struct Source {
+pub(super) struct Source {
     data: Mutex<Fixture>,
     replay_calls: AtomicUsize,
     issued_calls: AtomicUsize,
@@ -268,7 +268,7 @@ fn call<R: Message + Default>(
     let reply = s.handle(method, &request.encode_to_vec())?;
     Ok(R::decode(reply.as_slice()).unwrap())
 }
-fn negotiate(s: &RecoveryHostSession) {
+pub(super) fn negotiate(s: &RecoveryHostSession) {
     let n: RecoveryNegotiateResponse = call(
         s,
         NEGOTIATE,

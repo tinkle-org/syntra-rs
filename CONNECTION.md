@@ -17,7 +17,7 @@ protected record stream, and carrier framing have separate encodings.
 | Message runtime | `syntra-runtime` | Initiator/Host execution, queues, authentication/authorization hooks, recovery and lifecycle |
 | Encryption | `syntra_core::secure_channel` | Authenticated context, Noise handshake, ordered cipher state, protected record bounds and frame-stream assembly |
 | Native I/O | `syntra-net` | Record driver, TCP/WebSocket I/O, TLS provider composition, optional rustls WSS, managed runtime/listeners and proxy helpers |
-| Native ABI | `syntra-ffi` | Shared-runtime plaintext frame boundary; embedding driver supplies encryption and carrier I/O |
+| Native ABI | `syntra-ffi` | `production`: plaintext frame boundary, with encryption and carrier I/O supplied by the embedder. `managed-media`: also exports a separate Rust-driven protected TCP client. |
 | Verification | `syntra-integration` | Unpublished fixture peer and Docker carrier tests |
 
 The five-member workspace keeps core, runtime, net and FFI in the root defaults;
@@ -214,6 +214,11 @@ or waited from ordinary threads; blocking waits refuse a Tokio context. Pause,
 network availability and shutdown controls retain task ownership. Inspect the
 shutdown report: an expired wait retains unfinished runtime/work ownership,
 and drop transfers it to an observable process registry. No operation is replayed.
+
+For separate interactive and bulk TCP connections, select `media`, not just
+`managed`. The client authenticates each lane independently; lane choice grants
+no host permissions or additional quota. See [MEDIA.md](MEDIA.md) for admission
+on both sockets, durable update restore, file transfer, and failure handling.
 
 The `proxy` module supplies explicit SOCKS5 and HTTP CONNECT tunnels under the
 original establishment budget. Proxy authentication and destination authority
@@ -475,6 +480,10 @@ That driver must implement Syntra encrypted establishment and record protection,
 plus the selected carrier's security and ordered I/O. A raw TLS socket alone does
 not complete this ABI's Syntra implementation. The separate `test-fixture` ABI is
 loopback-only and must not ship.
+
+The additive `managed-media` feature leaves those frame-pump rules intact and
+adds a client that owns the encrypted TCP I/O. Its `syntra_managed_t` is not
+interchangeable with `syntra_t`; see the [C owner lifecycle](MEDIA.md#use-the-managed-c-client).
 
 ## Verification scope
 

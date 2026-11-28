@@ -4,6 +4,8 @@ use crate::elapsed::{ElapsedClock, ElapsedDeadline};
 use futures_util::future::BoxFuture;
 use std::sync::atomic::Ordering;
 
+pub(super) const MAX_RECEIPT_FRAME_BYTES: usize = 1024;
+
 /// SDK-generated private operation owner. Persist `as_bytes()` atomically with
 /// the conditional durable transition; never send it to a peer or log it.
 #[derive(Clone, PartialEq, Eq)]
@@ -554,7 +556,7 @@ impl Coordinator {
                     outcome: Some(outcome_payload(payload.clone())),
                 })),
             };
-            if prost::Message::encoded_len(&frame) > 1024 {
+            if prost::Message::encoded_len(&frame) > MAX_RECEIPT_FRAME_BYTES {
                 return Err(Refused::Unavailable);
             }
             frames.push(
@@ -897,7 +899,7 @@ impl Host {
                 let entries = receipts.payloads();
                 syntra_core::validate_method(method).is_err()
                     || !(1..=8).contains(&entries.len())
-                    || entries.iter().any(|p| p.len() > 1024)
+                    || entries.iter().any(|p| p.len() > MAX_RECEIPT_FRAME_BYTES)
             })
         {
             return Err(Refused::Unsupported);
@@ -1442,7 +1444,14 @@ mod tests {
                 selected,
             },
         );
-        let (lease, _observer) = ExecutionLease::acquire(&host.execution, None).unwrap();
+        let (lease, _observer) = ExecutionLease::acquire(
+            &host.execution,
+            None,
+            &Principal::new("fixture"),
+            "/example.Authority/Retire",
+            0,
+        )
+        .unwrap();
         let context = RequestContext::new(
             Arc::downgrade(&host),
             123,

@@ -75,6 +75,11 @@ pub fn peak_bytes() -> usize {
     ALLOC.peak.load(SeqCst)
 }
 
+#[cfg(feature = "managed-media")]
+pub fn live_bytes() -> usize {
+    ALLOC.live.load(SeqCst)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

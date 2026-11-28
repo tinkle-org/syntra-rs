@@ -14,6 +14,9 @@ use tokio::time::timeout;
 #[path = "terminal_failure_tests.rs"]
 mod terminal_failures;
 
+#[path = "operation_output_tests.rs"]
+mod operation_output;
+
 struct Store;
 impl KeyStore for Store {
     /// Supply the fixed Returning key shared by this module's handshake fixtures.
@@ -1923,6 +1926,37 @@ async fn graceful_close_flushes_pump_owned_multirecord_result() {
     client.close().await;
 }
 
+#[test]
+fn ordinary_record_parts_match_staged_frame_at_record_boundaries() {
+    use syntra_core::secure_channel::MAX_FRAME;
+    for len in [
+        1,
+        MAX_PLAINTEXT - 5,
+        MAX_PLAINTEXT - 4,
+        MAX_PLAINTEXT - 3,
+        2 * MAX_PLAINTEXT - 4,
+        2 * MAX_PLAINTEXT - 3,
+        MAX_FRAME,
+    ] {
+        let frame: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let staged = frame_plaintext(&frame).unwrap();
+        let (first, tail) = ordinary_record_parts(&frame).unwrap();
+        assert!(
+            std::iter::once(first.as_slice())
+                .chain(tail.chunks(MAX_PLAINTEXT))
+                .eq(staged.chunks(MAX_PLAINTEXT)),
+            "frame length {len}"
+        );
+        assert_eq!(tail.as_ptr(), frame[first.len() - 4..].as_ptr());
+    }
+    for len in [0, MAX_FRAME + 1] {
+        assert!(matches!(
+            ordinary_record_parts(&vec![0; len]),
+            Err(Error::Channel(syntra_core::secure_channel::Error::Limit))
+        ));
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn graceful_close_deadline_aborts_a_stalled_carrier() {
     let handler = Arc::new(FnHandler(|_, _, _| async move {
@@ -1966,6 +2000,12 @@ async fn cancelling_graceful_close_aborts_the_owned_writer() {
     assert!(request.await.unwrap().is_err());
     assert_eq!(Instant::now(), now);
     assert!(gate.dropped.load(Ordering::SeqCst));
+    assert_eq!(
+        gate.records.load(Ordering::SeqCst),
+        2,
+        "no replacement record started"
+    );
+    assert!(client.conn.next_notification().await.is_none());
     client.close().await;
 }
 

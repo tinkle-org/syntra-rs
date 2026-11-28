@@ -599,6 +599,10 @@ pub(crate) struct HandshakeDone {
     pub connection_id: String,
 }
 
+#[path = "connection_writer.rs"]
+mod writer;
+pub(crate) use writer::{Writer, WriterPermit};
+
 pub(crate) struct Shared {
     pub(crate) tasks: crate::shutdown::TaskGroup,
     pub(crate) shutdown: StdMutex<Option<crate::shutdown::ShutdownState>>,
@@ -618,7 +622,7 @@ pub(crate) struct Shared {
     /// Allocation through FIFO enqueue is one ordered admission operation.
     pub(crate) rpc_admission: AsyncMutex<()>,
     pub ids: RequestIdAllocator,
-    pub writer: mpsc::Sender<Vec<u8>>,
+    pub writer: Writer,
     pub notif_tx: mpsc::Sender<Bytes>,
     /// One immutable connection-owned recovery notification route. A closed
     /// attachment is never replaced by another generation on this connection.
@@ -676,7 +680,7 @@ impl Shared {
 
     pub(crate) fn new_with_clock(
         role: Role,
-        writer: mpsc::Sender<Vec<u8>>,
+        writer: impl Into<Writer>,
         config: ConnectionConfig,
         proposed_min: u32,
         proposed_max: u32,
@@ -702,7 +706,7 @@ impl Shared {
             emissions: StdMutex::new(crate::emission::Emissions::new()),
             rpc_admission: AsyncMutex::new(()),
             ids: RequestIdAllocator::new(),
-            writer,
+            writer: writer.into(),
             notif_tx,
             recovery_inbox: StdMutex::new(None),
             handshake_tx: AsyncMutex::new(None),
@@ -900,7 +904,7 @@ impl Connection {
         Ok(())
     }
 
-    pub(crate) async fn reserve_writer(&self) -> Result<mpsc::Permit<'_, Vec<u8>>, SyntraError> {
+    pub(crate) async fn reserve_writer(&self) -> Result<WriterPermit<'_>, SyntraError> {
         let mut closed = self.subscribe_close();
         if self.is_closed() || self.writer_is_fenced() || !self.carrier_io_allowed() {
             return Err(SyntraError::Closed("connection closed".to_string()));

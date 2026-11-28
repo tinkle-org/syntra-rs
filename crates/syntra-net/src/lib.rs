@@ -27,12 +27,13 @@
         feature = "tls-rustls",
         feature = "reconnect",
         feature = "managed",
+        feature = "media",
         feature = "proxy",
         feature = "native-enrollment"
     )
 ))]
 compile_error!(
-    "syntra-net features tcp, cross-carrier-candidate, http, websocket, tls-rustls, reconnect, managed, proxy, and native-enrollment require a non-wasm32 target; disable these features for wasm32 and compose syntra-core and syntra-runtime with platform I/O"
+    "syntra-net features tcp, cross-carrier-candidate, http, websocket, tls-rustls, reconnect, managed, media, proxy, and native-enrollment require a non-wasm32 target; disable these features for wasm32 and compose syntra-core and syntra-runtime with platform I/O"
 );
 
 #[cfg(all(feature = "reconnect", not(target_arch = "wasm32")))]
@@ -41,6 +42,10 @@ pub mod client;
 pub mod enrollment;
 #[cfg(all(feature = "http", not(target_arch = "wasm32")))]
 pub mod http;
+#[cfg(all(feature = "media", not(target_arch = "wasm32")))]
+pub mod lanes;
+#[cfg(all(feature = "media", not(target_arch = "wasm32")))]
+pub mod media;
 #[cfg(all(feature = "managed", not(target_arch = "wasm32")))]
 pub mod network;
 #[cfg(all(feature = "proxy", not(target_arch = "wasm32")))]

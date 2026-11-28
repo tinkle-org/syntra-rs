@@ -12,8 +12,10 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[3]
-FEATURES = ("tcp", "http", "websocket", "tls-rustls", "reconnect", "managed", "proxy", "native-enrollment", "cross-carrier-candidate")
+FEATURES = ("tcp", "http", "websocket", "tls-rustls", "reconnect", "managed", "media", "proxy", "native-enrollment", "cross-carrier-candidate")
 REGRESSIONS = (
+    ("media", ("--lib", "lanes::tests::")),
+    ("media", ("--lib", "media::tests::")),
     ("http", ("--test", "http_records")),
     ("http", ("--test", "http_connections")),
     ("http", ("--lib", "http::")),

@@ -3,7 +3,13 @@ use crate::pump;
 use crate::stream::EstablishmentIo;
 
 pub use pump::{AuthenticatorFactory, ClientHandle, Error, HostHandle, Limits};
-use std::{sync::Arc, time::Duration};
+use std::{
+    io::{self, IoSlice},
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 use syntra_core::secure_channel::{Carrier, ClientConfig, ServerConfig, MAX_CIPHERTEXT};
 use syntra_runtime::{ConnectionConfig, Handler};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -30,15 +36,62 @@ impl<W: AsyncWrite + Unpin + Send + 'static> pump::RecordWriter for StreamWriter
         if !(17..=MAX_CIPHERTEXT).contains(&bytes.len()) {
             return Err(Error::Framing);
         }
-        self.0
-            .write_all(&(bytes.len() as u16).to_be_bytes())
-            .await?;
-        self.0.write_all(bytes).await?;
+        let prefix = (bytes.len() as u16).to_be_bytes();
+        let mut slices = [IoSlice::new(&prefix), IoSlice::new(bytes)];
+        let mut remaining = &mut slices[..];
+        while !remaining.is_empty() {
+            let n = self.0.write_vectored(remaining).await?;
+            if n == 0 {
+                return Err(io::Error::from(io::ErrorKind::WriteZero).into());
+            }
+            IoSlice::advance_slices(&mut remaining, n);
+        }
         self.0.flush().await?;
         Ok(())
     }
     async fn shutdown(&mut self) -> Result<(), Error> {
         self.0.shutdown().await.map_err(Into::into)
+    }
+}
+
+// Keep scatter/gather specific to TCP. Scalar operations, including the read
+// post-check, retain the same establishment gate as the other stream bindings.
+struct TcpIo<S>(EstablishmentIo<S>);
+
+impl<S: AsyncRead + Unpin> AsyncRead for TcpIo<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for TcpIo<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.0.inner.is_write_vectored()
+    }
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.0.budget.check()?;
+        Pin::new(&mut self.0.inner).poll_write_vectored(cx, bufs)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
     }
 }
 
@@ -75,10 +128,10 @@ where
     if security.context.carrier != Carrier::Tcp {
         return Err(Error::Framing);
     }
-    let stream = EstablishmentIo {
+    let stream = TcpIo(EstablishmentIo {
         inner: stream,
         budget: budget.io.clone(),
-    };
+    });
     let (read, write) = tokio::io::split(stream);
     pump::connect_records_with_budget(
         StreamReader(read),
@@ -134,10 +187,10 @@ where
     if security.carrier != Carrier::Tcp {
         return Err(Error::Framing);
     }
-    let stream = EstablishmentIo {
+    let stream = TcpIo(EstablishmentIo {
         inner: stream,
         budget: budget.io.clone(),
-    };
+    });
     let (read, write) = tokio::io::split(stream);
     pump::accept_tcp_records_with_budget(
         StreamReader(read),
@@ -353,6 +406,16 @@ impl AsyncWrite for AdmittedStream {
     ) -> std::task::Poll<std::io::Result<usize>> {
         std::pin::Pin::new(&mut self.socket).poll_write(cx, bytes)
     }
+    fn is_write_vectored(&self) -> bool {
+        self.socket.is_write_vectored()
+    }
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.socket).poll_write_vectored(cx, bufs)
+    }
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -372,6 +435,7 @@ pub const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pump::RecordWriter;
     use std::{
         pin::Pin,
         sync::atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -379,6 +443,88 @@ mod tests {
     };
     use syntra_core::secure_channel::{generate_server_key, Context as ChannelContext, Mode};
     use syntra_runtime::elapsed::{ElapsedClock, ElapsedSource};
+
+    #[derive(Default)]
+    struct ShortWriter {
+        steps: std::collections::VecDeque<Option<usize>>,
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl AsyncWrite for ShortWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            panic!("expected a vectored write")
+        }
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let Some(limit) = self.steps.pop_front().expect("unexpected write") else {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            };
+            let before = self.bytes.len();
+            if before == 0 {
+                assert_eq!(bufs.len(), 2);
+                assert_eq!(&*bufs[0], &(bufs[1].len() as u16).to_be_bytes());
+            }
+            self.bytes
+                .extend(bufs.iter().flat_map(|buf| buf.iter().copied()).take(limit));
+            Poll::Ready(Ok(self.bytes.len() - before))
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_vectored_short_writes_resume_or_cancel_at_every_split() {
+        let bytes: Vec<u8> = (1..=17).collect();
+        let wire = [&[0, 17], bytes.as_slice()].concat();
+        for split in 1..wire.len() {
+            for cancel in [false, true] {
+                let mut writer = StreamWriter(ShortWriter {
+                    steps: [Some(split), None, Some(usize::MAX)].into(),
+                    ..Default::default()
+                });
+                let mut write = Box::pin(writer.write_record(&bytes));
+                assert!(futures_util::poll!(&mut write).is_pending());
+                if cancel {
+                    drop(write);
+                    assert_eq!(writer.0.bytes, wire[..split]);
+                    assert_eq!(writer.0.flushes, 0);
+                } else {
+                    write.await.unwrap();
+                    assert_eq!(writer.0.bytes, wire);
+                    assert_eq!(writer.0.flushes, 1);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_vectored_zero_after_partial_output_is_fatal() {
+        let mut writer = StreamWriter(ShortWriter {
+            steps: [Some(3), Some(0)].into(),
+            ..Default::default()
+        });
+        let err = writer.write_record(&[7; 17]).await.unwrap_err();
+        assert!(matches!(err, Error::Io(e) if e.kind() == io::ErrorKind::WriteZero));
+        assert_eq!(writer.0.bytes, [0, 17, 7]);
+        assert_eq!(writer.0.flushes, 0);
+    }
 
     #[test]
     fn accept_error_classification_preserves_stage_and_public_io_error() {
@@ -499,11 +645,22 @@ mod tests {
         fn poll_write(
             self: Pin<&mut Self>,
             _: &mut Context<'_>,
-            bytes: &[u8],
+            _: &[u8],
         ) -> Poll<std::io::Result<usize>> {
+            panic!("TCP stream did not forward vectored writes")
+        }
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             self.source.0.store(1000, Ordering::SeqCst);
-            Poll::Ready(Ok(bytes.len()))
+            assert_eq!(bufs.len(), 2);
+            Poll::Ready(Ok(1)) // The exact cutoff must deny the next prefix byte.
         }
         fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))

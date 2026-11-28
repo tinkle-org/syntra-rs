@@ -1619,6 +1619,23 @@ impl RecoveryHostSession {
         Ok(None)
     }
 
+    fn notification_operation(&self) -> Result<Option<Operation<'_>>, ProviderError> {
+        // An empty session has nothing to emit or reauthorize. Claiming it
+        // just to discover that can make the first Negotiate fail as busy.
+        let has_slots = self
+            .state
+            .lock()
+            .expect("recovery state poisoned")
+            .as_ref()
+            .is_some_and(|state| !state.slots.is_empty());
+        if has_slots {
+            self.operation().map(Some)
+        } else {
+            // If another operation owns the state, its drop wakes us for work.
+            Ok(None)
+        }
+    }
+
     /// Cancellation-safe wait: register before checking the queue, then await
     /// without a provider/state lock. The parent uses one bounded writer worker.
     /// Non-retryable production errors explicitly close the session; synchronous
@@ -1641,9 +1658,9 @@ impl RecoveryHostSession {
             // Only operation-ownership contention is retryable here. A provider
             // ResourceExhausted/Unavailable is an actual production failure,
             // not a reason to leave Core idle or spin forever on a ready queue.
-            let result = match self.operation() {
-                Ok(mut op) => self.observe_source(self.pop_notification_step(&mut op.state)),
-                Err(ProviderError::ResourceExhausted) => {
+            let result = match self.notification_operation() {
+                Ok(Some(mut op)) => self.observe_source(self.pop_notification_step(&mut op.state)),
+                Ok(None) | Err(ProviderError::ResourceExhausted) => {
                     notified.await;
                     continue;
                 }
@@ -1668,6 +1685,17 @@ impl Drop for RecoveryHostSession {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+#[test]
+fn first_notification_poll_cannot_preempt_negotiate() {
+    use super::tests::{negotiate, Source};
+    let service = RecoveryService::new(Arc::new(Source::default()), Default::default()).unwrap();
+    let session = service.open_connection(Principal::new("p")).unwrap();
+    // Pause the worker immediately after its acquisition decision, before pop/drop.
+    let worker = session.notification_operation().unwrap();
+    negotiate(&session);
+    assert!(worker.is_none());
 }
 
 fn counts(state: &State) -> QueueCounts {

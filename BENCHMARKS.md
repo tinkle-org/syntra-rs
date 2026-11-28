@@ -194,6 +194,106 @@ candidate/baseline speedup or a CI threshold. Fixed, drained bursts do not
 model open-loop arrivals, streaming, or an actual client. These measurements
 establish no production limits, physical-network throughput, or mobile energy costs.
 
+### Production lanes: matched loopback comparison
+
+`--production-lanes` adds a third topology and **one tagged 8-byte host notification
+per burst in all three topologies**. Without that flag, the runner keeps the original
+workload and output, even when built with `managed-media`. The comparison uses the
+[same burst driver](crates/syntra-integration/src/bin/mixed_traffic.rs) for
+one direct connection, two manually opened connections, and the native
+[`LaneClient::tcp` path](crates/syntra-integration/src/production_lanes.rs).
+The latter submits echoes via `call_interactive` and bulk RPCs via media
+reservations with exact request/response bounds. Every accepted socket serves all
+three methods with the same authentication and payload checks. The separate
+[`managed_media_fault` integration test](crates/syntra-integration/tests/managed_media_fault.rs)
+checks which socket received each call by logging dispatches of the *same* method.
+The timed workload exercises generic RPCs, not file transfers, FFI or durable recovery.
+
+Each trial gets a fresh listener and four Tokio **workers total**: one shared pool
+of four for the direct cases; two for host/burst tasks plus one per client pool
+for `LaneClient`. Runtime ownership, scheduling and cross-pool submission differ.
+This measures **scheduler + topology**, not a pure wire effect. After one warmup,
+each case verifies 64 drained bursts (256 echoes, 64 updates, 16 MiB per enabled
+bulk direction). Pass 2 reverses all 12 cases. `update_us` starts immediately before
+host `notify` and ends when the interactive receive returns; `update_overlap` counts
+those intervals overlapping all enabled bulk calls. Rates use the same denominator
+as above, now including notification verification if it finishes last.
+
+`cold_media_open_us` is first demand on a parked media lane to observed authenticated
+readiness, before warmup. The no-bulk case makes no media demand. `media_idle_close_us`
+is measured after the last drain until both the lane is parked and the host sees closure,
+with `media_idle` set to 250 ms. An interactive echo then checks that the owner is
+still usable. The heap run counts live Rust allocations for the whole process: a
+peak during measured bursts and a snapshot at idle before teardown. It does not measure RSS.
+
+**Local release measurement (2026-11-28 UTC).** Apple M4 on AC, macOS 27.2.1
+(26B131), `aarch64-apple-darwin`, rustc 1.89.0 (`29483883e`), `--locked --release`.
+Both passes used this PR's uncommitted implementation on `b0b9fdc`,
+not the historical runner at that SHA. Values are pass 1 / pass 2.
+
+| Metric | One connection | Manual two | Managed lanes |
+| --- | ---: | ---: | ---: |
+| No bulk: echo offer-to-result p95 (µs) | 194 / 494 | 498 / 525 | 554 / 252 |
+| Upload + download: echo offer-to-result p95 (µs) | 3,145 / 3,122 | 1,444 / 1,336 | 315 / 617 |
+| Upload + download: notification delay p95 (µs) | 302 / 305 | 53 / 62 | 51 / 45 |
+| Upload + download: verified MiB/s per direction | 87.23 / 89.33 | 93.76 / 91.56 | 97.52 / 96.48 |
+| Upload + download: peak live process Rust heap (bytes) | 1,838,333 / 1,772,798 | 1,833,354 / 1,886,234 | 1,983,936 / 2,000,241 |
+
+The managed client reduced loaded echo and notification p95 in both passes;
+the no-bulk passes did not show a consistent latency advantage. In the bidirectional
+managed case, the cold open was 1.65 / 1.45 ms, and media closed after 253 / 255 ms
+of idle time. These figures do not measure battery use or predict WAN latency.
+The [timing stdout](crates/syntra-integration/measurements/production-lanes-release.txt)
+and [separate heap stdout](crates/syntra-integration/measurements/production-lanes-heap.txt)
+each contain all 24 rows, including p99. Their executables had SHA-256 prefixes
+`2a40d342dbed71f9` and `63145d692f8f48f5`, respectively. Lockfile SHA-256:
+`c114aa5912f236a68761adf519e680bde32448ab4a3f1c1e4a63b96bcd009dac`.
+
+**Reproduce from a clean checkout.** Use a revision containing the final runtime,
+the uniform-handler runner, the routing test and their `Cargo.lock`; the base SHA
+alone does not reproduce uncommitted sources. From that checkout's repository root,
+on an otherwise idle host, use the installed rustup toolchain, no custom sysroot
+and a fresh target directory. The following macOS commands stop on the first failure:
+
+```sh
+set -eu
+test "$(pwd -P)" = "$(git rev-parse --show-toplevel)"
+test -z "$(git status --porcelain)"
+out=$(mktemp -d)
+export CARGO_TARGET_DIR="$out/target"
+export RUSTC="$(rustup which --toolchain 1.89.0 rustc)"
+export RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER='' CARGO_ENCODED_RUSTFLAGS=''
+test "$("$RUSTC" --print sysroot)" = "$(dirname "$(dirname "$RUSTC")")"
+{
+  date -u; git rev-parse HEAD; git status --porcelain; shasum -a 256 Cargo.lock
+  "$RUSTC" -Vv; "$RUSTC" --print sysroot; cargo +1.89.0 -V
+  sw_vers; sysctl -n machdep.cpu.brand_string; pmset -g batt
+} > "$out/provenance.txt"
+
+cargo +1.89.0 test --locked -p syntra-integration --features managed-media --test managed_media_fault
+cargo +1.89.0 test --locked -p syntra-integration --features managed-media,measure-heap --bin mixed_traffic --test connection_purpose
+cargo +1.89.0 run --locked -p syntra-integration --features managed-media --bin mixed_traffic -- --production-lanes --smoke
+
+for mode in release heap; do
+  features=managed-media
+  if [ "$mode" = heap ]; then features=managed-media,measure-heap; fi
+  cargo +1.89.0 run --locked --release -p syntra-integration --features "$features" --bin mixed_traffic -- --production-lanes > "$out/production-lanes-$mode.txt"
+  shasum -a 256 "$CARGO_TARGET_DIR/release/mixed_traffic" > "$out/$mode.sha256"
+  test "$(grep -c '^pass=' "$out/production-lanes-$mode.txt")" -eq 24
+done
+```
+
+Keep both complete stdout files with the provenance and executable hashes. Read
+`offer_to_result_us_p95` for `bulk=None` and `bulk=Both` from the **release**
+file only; use the heap file only for bytes. A timeout, failed overlap check or
+partial file is a failed run, not a sample to omit.
+
+To measure a **dirty** implementation before it has a commit, omit only the
+clean-status assertion. Before building, save `git diff --binary HEAD` and copies
+of the untracked runtime, integration fixture, test and runner sources alongside
+the provenance. Keep the working tree unchanged through both processes. Label
+those results dirty; do not identify them as a measurement of unmodified `HEAD`.
+
 ## Main-push CPU baseline
 
 When source or build inputs change on `main`, `benchmarks.yml` checks out the
