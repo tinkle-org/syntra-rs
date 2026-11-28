@@ -171,6 +171,12 @@ impl Secret32 {
     pub fn new(bytes: [u8; 32]) -> Self {
         Self(Zeroizing::new(bytes))
     }
+    /// Copy borrowed material directly into its erasing owner.
+    pub fn from_borrowed(bytes: &[u8; 32]) -> Self {
+        let mut secret = Self(Zeroizing::new([0; 32]));
+        secret.0.copy_from_slice(bytes);
+        secret
+    }
     pub fn generate() -> Result<Self, Error> {
         let mut bytes = Zeroizing::new([0; 32]);
         getrandom::fill(bytes.as_mut()).map_err(|_| Error::Entropy)?;

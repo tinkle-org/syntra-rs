@@ -2005,7 +2005,12 @@ async fn cancelling_graceful_close_aborts_the_owned_writer() {
         2,
         "no replacement record started"
     );
-    assert!(client.conn.next_notification().await.is_none());
+    assert!(
+        timeout(Duration::from_secs(1), client.conn.next_notification())
+            .await
+            .expect("client notification stream did not close after writer cancellation")
+            .is_none()
+    );
     client.close().await;
 }
 

@@ -2058,10 +2058,31 @@ pub async fn connect_records_with_clock<R: RecordReader, W: RecordWriter>(
 /// before handing the record halves to the pump. Cancellation before that handoff
 /// drops both halves without leaving a background establishment task.
 pub async fn connect_records_with_budget<R: RecordReader, W: RecordWriter>(
+    reader: R,
+    writer: W,
+    security: ClientConfig,
+    credential: Vec<u8>,
+    runtime: ConnectionConfig,
+    limits: Limits,
+    establishment: EstablishmentBudget,
+) -> Result<ClientHandle, Error> {
+    connect_records_zeroizing(
+        reader,
+        writer,
+        security,
+        Zeroizing::new(credential),
+        runtime,
+        limits,
+        establishment,
+    )
+    .await
+}
+
+pub(crate) async fn connect_records_zeroizing<R: RecordReader, W: RecordWriter>(
     mut reader: R,
     mut writer: W,
     security: ClientConfig,
-    credential: Vec<u8>,
+    credential: Zeroizing<Vec<u8>>,
     runtime: ConnectionConfig,
     limits: Limits,
     establishment: EstablishmentBudget,
@@ -2106,7 +2127,7 @@ pub async fn connect_records_with_budget<R: RecordReader, W: RecordWriter>(
     // release both carrier halves before a lifecycle replacement can begin.
     let peer = Peer::Client(conn.clone());
     let id = elapsed_timeout(&clock, core_deadline, async {
-        let handshake = conn.handshake(credential);
+        let handshake = conn.handshake_zeroizing(credential);
         tokio::pin!(handshake);
         let mut hello_sent = false;
         loop {

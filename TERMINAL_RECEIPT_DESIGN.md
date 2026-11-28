@@ -56,6 +56,14 @@ for the binding; keep the meaning of stored IDs stable for the operation. The
 client sees only the correlated `RpcResult`, never the ID or table.
 Forward `terminal_methods` in custom factory wrappers to preserve this policy.
 
+At installation, every fixed payload and every outcome entry must fit in a
+**1,024-byte serialized Protobuf result frame** with `request_id = u64::MAX`
+and the highest version the host supports. The four-byte frame-stream prefix
+does not count. This keeps a policy from working for early calls and failing
+as request IDs grow. If even one candidate is too large, native TCP acceptance
+returns a configuration error before Ready, the first terminal authority read,
+or any RPC dispatch. The connection does not fall back to ordinary service.
+
 The typed adapter supplies **complete operation-aware connection authority**.
 It replaces the ordinary connection guard for this connection. TCP establishment
 refuses a terminal policy combined with a separate generic
@@ -213,10 +221,10 @@ The runtime coordinator in `crates/syntra-runtime/src/host_terminal.rs` and nati
 pump in `crates/syntra-net/src/pump.rs` implement this sequence:
 
 1. Validate policy, native TCP support, call ownership, revision, time, and size.
-2. Encode **every** candidate success `Frame` with this call's version and request
-   ID before fencing or mutation. Each must fit **1,024 serialized Protobuf frame bytes**,
-   excluding the four-byte frame-stream prefix. Even an oversized unselected
-   candidate refuses reservation. Reserve one private owner for the call.
+2. Recheck the same frame limit and encode **every** candidate success `Frame`
+   with this call's actual version and request ID. Only then reserve a private
+   owner for the call. A size or encoding failure refuses reservation before
+   fencing or mutation.
 3. Fence ordinary dispatch and output, notifications, recovery, and sibling
    results. Discard unstarted ordinary output.
 4. Wait for an active ordinary **whole frame**, including all its records, to
@@ -348,8 +356,10 @@ Runtime coverage includes `crates/syntra-runtime/src/host_terminal.rs`,
 `crates/syntra-net/tests/terminal_receipt.rs` and
 `crates/syntra-net/src/pump/terminal_failure_tests.rs`. These exercise:
 
-- Exact/private ownership, stable newer revisions, disabled/unsupported preflight,
-  and the 1,024/1,025-byte complete-frame boundary.
+- Exact/private ownership, stable newer revisions, and disabled/unsupported preflight.
+  An encrypted TCP peer receives a 1,024-byte result for `u64::MAX`; a policy
+  with a 1,025-byte candidate is rejected during establishment without a terminal
+  authority read or commit.
 - Both authoritative choices (including empty bytes) over encrypted native TCP,
   with an observed pending interval and fixed/outcome methods in one policy;
   refusal when a different candidate exceeds the frame bound or commit returns

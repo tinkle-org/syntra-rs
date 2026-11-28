@@ -54,6 +54,55 @@ async fn outcome_table_must_have_one_to_eight_entries() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn install_bounds_the_complete_receipt_for_every_supported_call() {
+    // With a ten-byte request ID, these payloads fill the frame exactly at
+    // one- and five-byte versions, respectively (including both nested lengths).
+    for (version, exact) in [(1, 1005), (u32::MAX, 1001)] {
+        for size in [exact, exact + 1] {
+            for receipts in [
+                MethodReceipts::Fixed(vec![0; size]),
+                MethodReceipts::Outcomes(vec![vec![], vec![0; size]]),
+            ] {
+                let (host, _) = Host::new_with_versions(
+                    ConnectionConfig::default(),
+                    Arc::new(crate::AllowAnonymous),
+                    Arc::new(super::super::FnHandler(|_, p, _| async {
+                        HandlerOutcome::Payload(p)
+                    })),
+                    vec![version, 1],
+                );
+                let result = host.install_terminal_methods_tcp(MethodPolicy {
+                    methods: [(METHOD.into(), receipts)].into(),
+                    authority: Arc::new(Evidence::default()),
+                    read_timeout: Duration::from_millis(100),
+                });
+                if size == exact {
+                    let c = result.unwrap();
+                    c.refresh().await.unwrap();
+                    c.reserve(
+                        METHOD,
+                        u64::MAX,
+                        version,
+                        c.clock.now() + Duration::from_secs(1),
+                        7,
+                        Principal::new("fixture"),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        c.state.lock().unwrap().frames.last().unwrap().len(),
+                        MAX_RECEIPT_FRAME_BYTES
+                    );
+                } else {
+                    assert!(matches!(result, Err(Refused::Unsupported)));
+                    assert!(host.terminal_coordinator().is_none());
+                }
+                host.close().await;
+            }
+        }
+    }
+}
+
 /// Reserve and model the interval after the barrier while commit is in flight.
 async fn committing() -> (Arc<Host>, Arc<Coordinator>, Arc<Evidence>, ReservationId) {
     let (host, authority, result) = install(8);

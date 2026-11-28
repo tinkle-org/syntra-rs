@@ -13,6 +13,7 @@ use std::{
 use syntra_core::secure_channel::{Carrier, ClientConfig, ServerConfig, MAX_CIPHERTEXT};
 use syntra_runtime::{ConnectionConfig, Handler};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use zeroize::Zeroizing;
 
 pub const BINDING: &str = "syntra.1.0";
 
@@ -124,6 +125,28 @@ pub async fn connect_stream_with_budget<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    connect_stream_zeroizing(
+        stream,
+        security,
+        Zeroizing::new(credential),
+        runtime,
+        limits,
+        budget,
+    )
+    .await
+}
+
+pub(crate) async fn connect_stream_zeroizing<S>(
+    stream: S,
+    security: ClientConfig,
+    credential: Zeroizing<Vec<u8>>,
+    runtime: ConnectionConfig,
+    limits: Limits,
+    budget: pump::EstablishmentBudget,
+) -> Result<ClientHandle, Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     limits.validate(&runtime)?;
     if security.context.carrier != Carrier::Tcp {
         return Err(Error::Framing);
@@ -133,7 +156,7 @@ where
         budget: budget.io.clone(),
     });
     let (read, write) = tokio::io::split(stream);
-    pump::connect_records_with_budget(
+    pump::connect_records_zeroizing(
         StreamReader(read),
         StreamWriter(write),
         security,

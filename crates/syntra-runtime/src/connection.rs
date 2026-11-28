@@ -888,7 +888,10 @@ impl Connection {
         Ok(())
     }
 
-    pub(crate) async fn send_bytes(&self, bytes: Vec<u8>) -> Result<(), SyntraError> {
+    pub(crate) async fn send_hello(
+        &self,
+        mut bytes: zeroize::Zeroizing<Vec<u8>>,
+    ) -> Result<(), SyntraError> {
         let permit = self.reserve_writer().await?;
         // Close and queue admission linearize on state. No lifecycle lock
         // is held while waiting for channel capacity.
@@ -900,7 +903,8 @@ impl Connection {
         {
             return Err(SyntraError::Closed("connection closed".to_string()));
         }
-        permit.send(bytes);
+        // The public transport receiver owns plain serialized frames from here.
+        permit.send(std::mem::take(&mut *bytes));
         Ok(())
     }
 

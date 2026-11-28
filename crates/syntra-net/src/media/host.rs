@@ -14,8 +14,10 @@ use syntra_runtime::{
 /// against an independent mutable store/cache does NOT fence its revocations.
 /// Called on a blocking worker before any object lookup, read or effect. Do
 /// not commit the transaction or perform non-transactional side effects here.
-/// Finalize calls this policy in both a read-only verification snapshot and
-/// the conditional publish transaction. The policy must be read-only.
+/// Describe, Query and Read see ACLs and data from the same WAL snapshot. A
+/// later revocation does not interrupt that read. Writes hold the writer lock
+/// from authorization through commit. Finalize checks both its verification
+/// snapshot and its publish transaction. The policy must be read-only.
 pub type ObjectPolicy = dyn Fn(&Transaction<'_>, &Principal, Method, ObjectVersion) -> std::result::Result<(), AuthError>
     + Send
     + Sync;
@@ -84,7 +86,7 @@ impl SqliteMediaHost {
                 Ok(state.bytes())
             });
         }
-        self.db.transaction(|tx| {
+        let execute = |tx: &Transaction<'_>| {
             authorize(tx)?;
             let reply = if method == Method::Describe {
                 end(src)?;
@@ -125,7 +127,11 @@ impl SqliteMediaHost {
             };
             check()?;
             Ok(reply)
-        })
+        };
+        match method {
+            Method::Describe | Method::Query | Method::Read => self.db.snapshot(execute),
+            _ => self.db.transaction(execute),
+        }
     }
 }
 
@@ -142,7 +148,12 @@ fn failure(e: MediaError) -> HandlerOutcome {
         MediaError::Refused(code) => code,
         _ => ErrorCode::Internal,
     };
-    HandlerOutcome::error(code, "media operation refused")
+    let message = if code == ErrorCode::Internal {
+        "media operation failed"
+    } else {
+        "media operation refused"
+    };
+    HandlerOutcome::error(code, message)
 }
 
 impl Handler for MediaHandler {
@@ -203,5 +214,20 @@ impl Handler for MediaHandler {
                 Err(e) => failure(e),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_failure_hides_the_cause() {
+        let err = std::io::Error::other("private storage path");
+        assert!(matches!(
+            failure(err.into()),
+            HandlerOutcome::Error { code: ErrorCode::Internal, message }
+                if message == "media operation failed"
+        ));
     }
 }

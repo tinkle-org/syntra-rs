@@ -129,10 +129,10 @@ class BuildContract(unittest.TestCase):
                             "--features", features)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def link_consumer(self, name):
+    def link_consumer(self, name, *cflags):
         executable = self.target / name
         subprocess.run(
-            ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+            ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", *cflags,
              "-I", str(ROOT / "crates/syntra-ffi/include"),
              str(ROOT / f"crates/syntra-ffi/tests/{name}.c"),
              "-L", str(self.target / "debug"), "-lsyntra_ffi",
@@ -164,7 +164,7 @@ class BuildContract(unittest.TestCase):
         subprocess.run([self.link_consumer("production_smoke")], check=True, timeout=30)
         test = self.cargo("test", "--locked", "-p", "syntra-ffi", "--features", "managed-media",
                           "--test", "managed_host", "--", "--ignored", "--nocapture",
-                          env={"SYNTRA_MANAGED_C": str(self.link_consumer("managed_smoke"))})
+                          env={"SYNTRA_MANAGED_C": str(self.link_consumer("managed_smoke", "-DNDEBUG"))})
         self.assertEqual(test.returncode, 0, test.stdout + test.stderr)
 
     def test_explicit_native_fixture_exports_abi(self):

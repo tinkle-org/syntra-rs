@@ -125,7 +125,7 @@ fn code(e: MediaError) -> i32 {
         MediaError::Corrupt => 15,
         MediaError::Refused(c) => c.as_i32(),
         MediaError::Call(e) => match e.downcast_ref::<LaneError>() {
-            Some(LaneError::Call(CallError::Rpc { source, .. })) => source.code().as_i32(),
+            Some(LaneError::Call(CallError::Rpc { source, .. })) => managed_error_code(source),
             Some(LaneError::Busy | LaneError::ResponseTooLarge { .. }) => 8,
             Some(LaneError::Expired) => 4,
             _ => 14,
@@ -321,4 +321,29 @@ pub unsafe extern "C" fn syntra_managed_cancel(
         }
         Ok(OK)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syntra_core::{ErrorCode, SyntraError};
+
+    #[test]
+    fn managed_call_and_transfer_preserve_rpc_codes() {
+        for raw in [1000, 2, 7] {
+            let (code, raw_code) = ErrorCode::from_i32_lossy(raw);
+            let call = || CallError::Rpc {
+                generation: 9,
+                source: SyntraError::Rpc {
+                    code,
+                    raw_code,
+                    message: String::new(),
+                },
+            };
+            let ordinary = Reply::from(call()).export().unwrap();
+            let transfer = super::code(MediaError::Call(Box::new(LaneError::Call(call()))));
+            assert_eq!((ordinary.grpc_code, transfer), (raw, raw));
+            assert_eq!(ordinary.generation, 9);
+        }
+    }
 }

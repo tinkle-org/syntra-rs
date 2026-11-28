@@ -2126,7 +2126,9 @@ fn bounded_outcome(
     match outcome {
         HandlerOutcome::Error { code, message } => {
             // At most 32 envelope bytes with a bounded diagnostic, including
-            // maximal version and correlation varints. Preserve the error code.
+            // maximal version and correlation varints. Keep the handler's code;
+            // if the text exceeds the grant, send a known-fitting diagnostic
+            // rather than a potentially misleading fragment of the original.
             if frame_limit < syntra_core::MAX_DIAGNOSTIC_BYTES + 32
                 && message.len() > frame_limit - 32
             {

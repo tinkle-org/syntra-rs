@@ -72,6 +72,7 @@ impl Store {
     pub fn transaction<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         let mut conn = self.writer.lock().map_err(|_| MediaError::Worker)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        check_scope(&tx, self.role, &self.scope)?;
         let result = f(&tx)?;
         tx.commit()?;
         Ok(result)

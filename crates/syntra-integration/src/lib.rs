@@ -71,6 +71,9 @@ impl Loopback {
         )
     }
 
+    /// Accept the next stream with this handler. When handlers differ, start one
+    /// dial and await its accept before starting the next pair: the listener
+    /// matches arrival order, not connection purpose.
     pub async fn accept(
         &self,
         factory: Arc<dyn AuthenticatorFactory>,

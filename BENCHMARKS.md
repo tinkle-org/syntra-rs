@@ -245,9 +245,10 @@ managed case, the cold open was 1.65 / 1.45 ms, and media closed after 253 / 255
 of idle time. These figures do not measure battery use or predict WAN latency.
 The [timing stdout](crates/syntra-integration/measurements/production-lanes-release.txt)
 and [separate heap stdout](crates/syntra-integration/measurements/production-lanes-heap.txt)
-each contain all 24 rows, including p99. Their executables had SHA-256 prefixes
-`2a40d342dbed71f9` and `63145d692f8f48f5`, respectively. Lockfile SHA-256:
-`c114aa5912f236a68761adf519e680bde32448ab4a3f1c1e4a63b96bcd009dac`.
+each contain all 24 rows, including p99. The [provenance record](crates/syntra-integration/measurements/provenance.txt)
+includes hashes of both stdout files. The [release](crates/syntra-integration/measurements/release.sha256)
+and [heap](crates/syntra-integration/measurements/heap.sha256) checksums identify the executables,
+not their stdout; checking either executable hash requires the corresponding binary.
 
 **Reproduce from a clean checkout.** Use a revision containing the final runtime,
 the uniform-handler runner, the routing test and their `Cargo.lock`; the base SHA

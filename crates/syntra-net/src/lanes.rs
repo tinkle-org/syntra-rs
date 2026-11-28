@@ -38,6 +38,7 @@ use syntra_runtime::{
     ConnectionConfig,
 };
 use tokio::sync::{watch, Notify, Semaphore};
+use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lane {
@@ -203,7 +204,7 @@ impl Future for NotificationOperation {
         Poll::Ready(Ok(value))
     }
 }
-type Inputs = Arc<dyn Fn() -> Result<(ClientConfig, Vec<u8>), Error> + Send + Sync>;
+type Inputs = Arc<dyn Fn() -> Result<(ClientConfig, Zeroizing<Vec<u8>>), Error> + Send + Sync>;
 type Connector = Box<dyn Fn(EstablishmentBudget) -> DialFuture + Send + Sync>;
 
 struct Provision {
@@ -214,7 +215,7 @@ struct Provision {
 }
 
 impl Provision {
-    async fn fresh(&self, lane: Lane) -> Result<(ClientConfig, Vec<u8>), Error> {
+    async fn fresh(&self, lane: Lane) -> Result<(ClientConfig, Zeroizing<Vec<u8>>), Error> {
         if lane == Lane::Media {
             self.authority
                 .subscribe()
@@ -247,7 +248,7 @@ impl Provision {
             )
             .chain_update(security.server_public_key)
             .chain_update(key.expose())
-            .chain_update(&credential)
+            .chain_update(credential.as_slice())
             .finalize()
             .into();
         if lane == Lane::Interactive {
@@ -290,7 +291,7 @@ fn connector(
                 .run(tokio::net::TcpStream::connect(address))
                 .await??;
             socket.set_nodelay(true)?;
-            tcp::connect_stream_with_budget(socket, security, credential, runtime, limits, budget)
+            tcp::connect_stream_zeroizing(socket, security, credential, runtime, limits, budget)
                 .await
         })
     })
@@ -314,6 +315,12 @@ impl State {
         if self.active_generation != generation {
             self.active_generation = generation;
             self.active = 0;
+            // Either admission or the idle worker can observe cold readiness first.
+            // Only that generation gets a fresh interval, not unsolicited reconnects.
+            if self.first_ready {
+                self.first_ready = false;
+                self.last_use = Instant::now();
+            }
         }
     }
 }
@@ -352,12 +359,6 @@ impl Media {
                 }
                 if let LifecycleStatus::CoreReady(r) = status {
                     s.observe(r.generation);
-                    if s.first_ready {
-                        // A slow cold dial gets a usable interval. Subsequent
-                        // reconnects without demand cannot renew the idle timer.
-                        s.first_ready = false;
-                        s.last_use = Instant::now();
-                    }
                     if s.demanded && s.active == 0 && !s.paused && s.online {
                         let until = s.last_use + self.config.media_idle;
                         if Instant::now() >= until {
@@ -421,6 +422,17 @@ impl LaneClient {
         address: SocketAddr,
         config: LaneConfig,
         inputs: impl Fn() -> Result<(ClientConfig, Vec<u8>), Error> + Send + Sync + 'static,
+    ) -> Result<Self, LaneError> {
+        Self::tcp_zeroizing(address, config, move || {
+            inputs().map(|(cfg, cred)| (cfg, Zeroizing::new(cred)))
+        })
+    }
+
+    /// Like [`Self::tcp`], with an already guarded per-attempt credential.
+    pub fn tcp_zeroizing(
+        address: SocketAddr,
+        config: LaneConfig,
+        inputs: impl Fn() -> Result<(ClientConfig, Zeroizing<Vec<u8>>), Error> + Send + Sync + 'static,
     ) -> Result<Self, LaneError> {
         Self::open(
             address,
@@ -887,6 +899,23 @@ impl LaneClient {
         stream: UpdateStream<S>,
         app: Arc<dyn UpdateApplication>,
     ) -> Result<Self, LaneError> {
+        Self::tcp_with_updates_zeroizing(
+            address,
+            config,
+            move || inputs().map(|(cfg, cred)| (cfg, Zeroizing::new(cred))),
+            stream,
+            app,
+        )
+    }
+
+    /// Like [`Self::tcp_with_updates`], with an already guarded per-attempt credential.
+    pub fn tcp_with_updates_zeroizing<S: RecoveryPersistence + Send + Sync + 'static>(
+        address: SocketAddr,
+        config: LaneConfig,
+        inputs: impl Fn() -> Result<(ClientConfig, Zeroizing<Vec<u8>>), Error> + Send + Sync + 'static,
+        stream: UpdateStream<S>,
+        app: Arc<dyn UpdateApplication>,
+    ) -> Result<Self, LaneError> {
         let UpdateStream {
             principal_scope,
             stable_stream,
@@ -1035,6 +1064,7 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(5);
     const ECHO: &str = "/fixture.Lanes/Echo";
 
+    #[track_caller]
     fn until<T>(mut probe: impl FnMut() -> Option<T>) -> T {
         let end = Instant::now() + WAIT;
         loop {
@@ -1348,19 +1378,54 @@ mod tests {
         .unwrap();
         let _interactive = peer.accept(echo(), None);
         until(|| ready(&c.status(Lane::Interactive)));
-        first_demand(&c);
-        let first = peer.accept(echo(), None);
-        let old_a = reserve(&c, 1, 7);
+        // Service each cold dial until admission actually owns a generation. A
+        // slow fixture thread can miss even the initial ready interval.
+        let cold_reserve = |resp| {
+            let mut accepted = peer.dials.load(SeqCst);
+            let mut host = None;
+            first_demand(&c);
+            let permit = until(|| {
+                if peer.dials.load(SeqCst) > accepted {
+                    host = Some(peer.accept(echo(), None));
+                    accepted += 1;
+                }
+                match c.try_reserve_media(1, resp) {
+                    Ok(r) => Some(r),
+                    Err(LaneError::Busy | LaneError::NotReady) => None,
+                    Err(e) => panic!("{e}"),
+                }
+            });
+            (host.unwrap(), permit)
+        };
+        let (first, old_a) = cold_reserve(7);
         let old_b = reserve(&c, 1, 7);
+        let old_use = c.media.lock().last_use;
         peer.rt.block_on(first.close());
-        let _second = peer.accept(echo(), None);
-        until(|| ready(&c.status(Lane::Media)).filter(|g| *g > old_a.generation));
-        let fresh = reserve(&c, 1, 1);
+        // Withhold the replacement handshake until its inherited deadline is past.
+        // Paused is stable without demand; CoreReady is not an event queue.
+        until(|| (old_use.elapsed() >= idle).then_some(()));
+        let second = peer.accept(echo(), None);
+        until(|| (c.status(Lane::Media) == LifecycleStatus::Paused).then_some(()));
+        until(|| second.is_closed().then_some(()));
+        let parked = {
+            let s = c.media.lock();
+            assert_eq!(s.active_generation, old_a.generation + 1);
+            assert!(!s.demanded);
+            assert_eq!((s.operations, s.bytes, s.active), (2, 16, 0));
+            assert_eq!(s.last_use, old_use);
+            s.active_generation
+        };
+        let (_third, fresh) = cold_reserve(1);
+        assert!(fresh.generation > parked);
         assert_eq!(c.media.lock().bytes, 18);
         assert!(matches!(c.try_reserve_media(0, 1), Err(LaneError::Busy)));
         let last_use = c.media.lock().last_use;
         drop(old_a);
-        assert_eq!(c.media.lock().last_use, last_use);
+        {
+            let s = c.media.lock();
+            assert_eq!((s.operations, s.bytes, s.active), (2, 10, 1));
+            assert_eq!(s.last_use, last_use);
+        }
         thread::sleep(2 * idle);
         assert_eq!(ready(&c.status(Lane::Media)), Some(fresh.generation));
         drop(fresh);
@@ -1392,7 +1457,7 @@ mod tests {
                     7 => credential.push(42),
                     _ => unreachable!(),
                 }
-                Ok((cfg, credential))
+                Ok((cfg, Zeroizing::new(credential)))
             }),
         };
         peer.rt.block_on(async {

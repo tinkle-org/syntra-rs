@@ -1,0 +1,14 @@
+Production-lanes TCP loopback, 2026-11-28 UTC
+Apple M4 on AC; macOS 27.2.1 (26B131); aarch64-apple-darwin
+rustc 1.89.0 (29483883eed69d5fb4db01964cdf2af4d86e9cb2); LLVM 20.1.7
+cargo 1.89.0 (c24e10642 2025-06-23); official rustup sysroot
+Source at measurement: dirty working tree on b0b9fdcbef59aa7a157ce537eb58fbafcb8c92e3
+Implementation subsequently committed at 41fcb1b9e26f78c48f92f200e02a10b98f171c04.
+Lockfile SHA-256: c114aa5912f236a68761adf519e680bde32448ab4a3f1c1e4a63b96bcd009dac
+Build/run per mode: cargo +1.89.0 run --locked --release -p syntra-integration --features FEATURES --bin mixed_traffic -- --production-lanes
+FEATURES: managed-media (release), managed-media,measure-heap (heap)
+Worker placement and burst settings appear in each stdout header. Each process completed both passes (24 result rows).
+release.sha256 and heap.sha256 identify the executable after each build, before the next build replaced it. Executables are not archived here.
+SHA-256 of the archived stdout files (verify with shasum -a 256):
+29e6a797cd26cfe8485f9432d091486744e0bb48ad839ec3fe2709421f969b34  production-lanes-release.txt
+52a0eff2222ac321927954c785d6216263d16a9fba404f3efc3715a7c71b67d6  production-lanes-heap.txt

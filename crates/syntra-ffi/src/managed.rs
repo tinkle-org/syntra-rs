@@ -38,13 +38,13 @@ impl syntra_view_t {
         // SAFETY: the header requires an immutable live region for this call.
         unsafe { bytes(self.data, self.len, max) }
     }
-    unsafe fn array<const N: usize>(self) -> AbiResult<[u8; N]> {
+    unsafe fn array<const N: usize>(&self) -> AbiResult<&[u8; N]> {
         if self.len != N || self.data.is_null() {
             return Err(INVALID);
         }
-        // SAFETY: exact size checked; arrays of bytes have alignment 1. Copy
-        // directly rather than passing a key through an intermediate heap Vec.
-        Ok(unsafe { self.data.cast::<[u8; N]>().read() })
+        // SAFETY: exact size checked; alignment is 1. The caller keeps the
+        // underlying immutable C region live for this borrow.
+        Ok(unsafe { &*self.data.cast::<[u8; N]>() })
     }
 }
 
@@ -83,20 +83,20 @@ impl Provision {
             {
                 return Err(INVALID);
             }
-            let key = Secret32::new(c.authorization_key.array()?);
+            let key = Secret32::from_borrowed(c.authorization_key.array()?);
             if key.expose().iter().fold(0u8, |a, b| a | b) == 0 {
                 return Err(INVALID);
             }
             let context = Context {
                 mode: Mode::Returning,
-                handle: c.handle.array()?,
+                handle: *c.handle.array()?,
                 epoch: c.epoch,
                 carrier: Carrier::Tcp,
                 server_key_id: c.server_key_id,
                 scope: c.scope.copy(255)?,
             };
             context.encode().map_err(|_| INVALID)?;
-            let pin = c.server_pin.array()?;
+            let pin = *c.server_pin.array()?;
             if pin == [0; 32] {
                 return Err(INVALID);
             }
@@ -109,14 +109,14 @@ impl Provision {
             })
         }
     }
-    fn inputs(&self) -> (ClientConfig, Vec<u8>) {
+    fn inputs(&self) -> (ClientConfig, Zeroizing<Vec<u8>>) {
         (
             ClientConfig {
                 context: self.context.clone(),
                 server_public_key: self.pin,
-                authorization_key: Some(Secret32::new(*self.key.expose())),
+                authorization_key: Some(Secret32::from_borrowed(self.key.expose())),
             },
-            self.credential.to_vec(),
+            self.credential.clone(),
         )
     }
 }
@@ -172,11 +172,22 @@ struct Reply {
     lost: u64,
     lost_bytes: u64,
 }
+
+fn managed_error_code(error: &syntra_core::SyntraError) -> i32 {
+    match error {
+        syntra_core::SyntraError::Rpc {
+            raw_code: Some(raw),
+            ..
+        } => *raw,
+        _ => error.code().as_i32(),
+    }
+}
+
 impl From<CallError> for Reply {
     fn from(e: CallError) -> Self {
         let (code, generation) = match e {
             CallError::Unavailable { generation } => (14, generation.unwrap_or(0)),
-            CallError::Rpc { generation, source } => (source.code().as_i32(), generation),
+            CallError::Rpc { generation, source } => (managed_error_code(&source), generation),
         };
         Self {
             code,
@@ -410,10 +421,10 @@ unsafe fn open(
                     let address = provision.address;
                     let inputs = move || Ok(provision.inputs());
                     match updates {
-                        None => LaneClient::tcp(address, LaneConfig::default(), inputs),
+                        None => LaneClient::tcp_zeroizing(address, LaneConfig::default(), inputs),
                         Some(u) => {
                             let (stream, app) = u.into_stream();
-                            LaneClient::tcp_with_updates(
+                            LaneClient::tcp_with_updates_zeroizing(
                                 address,
                                 LaneConfig::default(),
                                 inputs,

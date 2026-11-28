@@ -1042,7 +1042,12 @@ where
                 _ = shared.revised(revision) => continue,
                 _ = closed(&handle.conn) => {}
             }
-            shared.lock().active = None;
+            // A control can win between the two select polls. If it already
+            // claimed the generation, let its revision retire the handle (in
+            // particular, an idle park is not a transport outage).
+            if shared.lock().active.take().is_none() {
+                continue;
+            }
             outage = Some(shared.now());
             let (_, mut handle) = active.take().expect("active handle");
             if !retire(&shared, &mut handle, config.close_timeout).await {

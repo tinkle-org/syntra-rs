@@ -91,6 +91,27 @@ fn read_req(spec: Manifest, pos: u64) -> Vec<u8> {
 }
 
 #[test]
+fn open_store_rechecks_role_and_scope_before_running_callbacks() {
+    let dir = Dir::new();
+    let path = dir.file("host");
+    let db = store::Store::open(&path, "host", "authority-A").unwrap();
+    let admin = Connection::open(&path).unwrap();
+    for binding in [["host", "authority-B"], ["download", "authority-A"]] {
+        admin
+            .execute("UPDATE media_v1_scope SET role=?1, scope=?2", binding)
+            .unwrap();
+        let unexpected = |_: &rusqlite::Transaction<'_>| -> Result<()> {
+            panic!("callback ran with a mismatched binding")
+        };
+        assert!(matches!(
+            db.transaction(unexpected),
+            Err(MediaError::Conflict)
+        ));
+        assert!(matches!(db.snapshot(unexpected), Err(MediaError::Conflict)));
+    }
+}
+
+#[test]
 fn precommit_failure_rolls_back_both_data_and_cursor() {
     use std::cell::Cell;
     let dir = Dir::new();
@@ -531,7 +552,7 @@ async fn runtime_principal_and_sqlite_acl_fence() {
     let d = Dir::new();
     let path = d.file("host");
     let s = spec(b"");
-    let admin = Connection::open(&path).unwrap();
+    let mut admin = Connection::open(&path).unwrap();
     admin
         .execute_batch(
             "CREATE TABLE acl(subject TEXT PRIMARY KEY); INSERT INTO acl VALUES('owner');",
@@ -541,7 +562,7 @@ async fn runtime_principal_and_sqlite_acl_fence() {
     let h = SqliteMediaHost::open(
         &path,
         "authority-A",
-        Arc::new(move |tx, caller, _, key| {
+        Arc::new(move |tx, caller, method, key| {
             let allowed: bool = tx
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM acl WHERE subject=?1)",
@@ -552,7 +573,10 @@ async fn runtime_principal_and_sqlite_acl_fence() {
             if !allowed || key.object != [11; 16] {
                 return Err(AuthError::denied());
             }
-            // Independent revocation cannot slip between this decision and commit.
+            // Independent revocation cannot slip between the Begin decision and commit.
+            if method != Method::Begin {
+                return Ok(());
+            }
             let revoker = Connection::open(&other).unwrap();
             revoker.busy_timeout(Duration::ZERO).unwrap();
             assert_eq!(
@@ -600,13 +624,25 @@ async fn runtime_principal_and_sqlite_acl_fence() {
     admin
         .execute("INSERT INTO acl VALUES('owner')", [])
         .unwrap();
-    assert_eq!(
-        client
-            .call(Method::Query.path(), s.bytes(), 5000)
-            .await
-            .unwrap(),
-        UploadState::Uploading(0).bytes()
-    );
+    run(&h, "owner", Method::Finalize, &s.bytes()).unwrap();
+    let reads = [
+        (Method::Query, s.bytes(), UploadState::Committed.bytes()),
+        (Method::Describe, s.key.bytes(), s.bytes()),
+        (Method::Read, read_req(s, 0), eof(s)),
+    ];
+    let revocation = admin.transaction().unwrap();
+    revocation.execute("DELETE FROM acl", []).unwrap();
+    // The revoker holds the WAL writer lock, but its deletion isn't visible yet.
+    for (method, request, reply) in &reads {
+        assert_eq!(run(&h, "owner", *method, request).unwrap(), *reply);
+    }
+    revocation.commit().unwrap();
+    for (method, request, _) in reads {
+        assert!(matches!(
+            run(&h, "owner", method, &request),
+            Err(MediaError::Refused(ErrorCode::PermissionDenied))
+        ));
+    }
     client.close().await;
 }
 
