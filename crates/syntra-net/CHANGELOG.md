@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.7](https://github.com/tinkle-org/syntra-rs/compare/syntra-net-v1.0.0-rc.6...syntra-net-v1.0.0-rc.7) - 2026-11-28
+
+### Added
+
+- *(wire)* [**breaking**] restore Protobuf with fewer allocations ([#55](https://github.com/tinkle-org/syntra-rs/pull/55))
+- *(wire)* [**breaking**] adopt Bebop v3 for Syntra ([#54](https://github.com/tinkle-org/syntra-rs/pull/54))
+
+### Other
+
+- *(transport)* add mixed-traffic loopback baseline ([#59](https://github.com/tinkle-org/syntra-rs/pull/59))
+- *(deps)* bump rusqlite from 0.42.0 to 0.43.0 ([#49](https://github.com/tinkle-org/syntra-rs/pull/49))
+- *(transport)* add security checks and benchmark baselines ([#51](https://github.com/tinkle-org/syntra-rs/pull/51))
+
 ## [1.0.0-rc.6](https://github.com/tinkle-org/syntra-rs/compare/syntra-net-v1.0.0-rc.5...syntra-net-v1.0.0-rc.6) - 2026-11-23
 
 ### Added
