@@ -101,9 +101,10 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(config['breaking'], {'use': ['FILE']})
 
     def test_parser_budgets_and_main_only_benchmark_trigger(self):
-        for workflow, seconds in ((self.workflow, "60"), (self.scheduled, "900")):
+        for workflow, inputs in ((self.workflow, {"seconds": "60"}),
+                                 (self.scheduled, {"seconds": "900", "large_frame": "true"})):
             self.assertEqual(workflow["jobs"]["parser-checks"], {
-                "uses": "./.github/workflows/parser-checks.yml", "with": {"seconds": seconds},
+                "uses": "./.github/workflows/parser-checks.yml", "with": inputs,
             })
         bench = yaml.load((ROOT / ".github/workflows/benchmarks.yml").read_text(), Loader=yaml.BaseLoader)
         self.assertEqual(set(bench["on"]), {"push"})
@@ -130,6 +131,16 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(job["if"], f"${{{{ github.event.before && github.event.before != '{no_previous_tip}' }}}}")
         old, = [step for step in job["steps"] if step.get("with", {}).get("path") == "old"]
         self.assertEqual(old["with"]["ref"], "${{ github.event.before }}")
+
+    def test_parser_failure_upload_is_short_lived_and_allowlisted(self):
+        workflow = yaml.load((ROOT / '.github/workflows/parser-checks.yml').read_text(), Loader=yaml.BaseLoader)
+        self.assertEqual(workflow['permissions'], {'contents': 'read'})
+        upload, = [s for s in workflow['jobs']['parsers']['steps'] if 'upload-artifact' in s.get('uses', '')]
+        self.assertEqual(upload['if'], "failure() && steps.checks.outcome == 'failure' && steps.checks.outputs.replay == 'true'")
+        self.assertEqual(upload['with']['retention-days'], '1')
+        self.assertEqual(upload['with']['path'].splitlines(), [
+            '${{ runner.temp }}/parser-failure/input.bin', '${{ runner.temp }}/parser-failure/replay.txt',
+        ])
 
     def test_codeql_cancels_stale_scans_without_cross_event_cancellation(self):
         codeql = yaml.load((ROOT / ".github/workflows/codeql.yml").read_text(), Loader=yaml.BaseLoader)

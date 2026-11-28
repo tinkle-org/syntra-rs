@@ -590,6 +590,7 @@ name = "syntra-parser-checks"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "prost",
  "syntra-core",
  "syntra-runtime",
 ]

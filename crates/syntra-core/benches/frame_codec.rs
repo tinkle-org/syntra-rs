@@ -58,6 +58,27 @@ mod native {
                 },
             );
         }
+        // Hold the payload at 64 B so decode_request/64 is the one-byte ID control.
+        for request_id in [128, u64::MAX] {
+            let frame = Frame {
+                request_id,
+                ..request_frame(64)
+            };
+            let bytes = frame.encode_to_vec();
+            group.throughput(Throughput::Bytes(bytes.len() as u64));
+            group.bench_with_input(
+                BenchmarkId::new("decode_request_64B_by_id", request_id),
+                &bytes,
+                |b, bytes| {
+                    b.iter(|| decode_frame(bytes, ctx).unwrap());
+                },
+            );
+        }
+        let bytes = notification_frame(64).encode_to_vec();
+        group.throughput(Throughput::Bytes(bytes.len() as u64));
+        group.bench_function(BenchmarkId::new("decode_notification", 64), |b| {
+            b.iter(|| decode_frame(&bytes, ctx).unwrap());
+        });
         for size in [0, 64, 1024] {
             for (name, frame) in [
                 ("roundtrip_notification", notification_frame(size)),

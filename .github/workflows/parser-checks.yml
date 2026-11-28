@@ -7,6 +7,10 @@ on:
         description: Seconds per target (1–900)
         required: true
         type: number
+      large_frame:
+        description: Include larger synthetic raw frame seeds (up to 1 MiB + 1)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -24,6 +28,21 @@ jobs:
           rustup toolchain install 1.89.0 nightly-2026-03-15 --profile minimal
           cargo +1.89.0 install --locked cargo-fuzz --version 0.13.1
       - name: Run bounded parser properties
+        id: checks
         env:
           PARSER_SECONDS: ${{ inputs.seconds }}
-        run: python3 fuzz/check.py "$PARSER_SECONDS"
+          LARGE_FRAME: ${{ inputs.large_frame }}
+        run: |
+          args=()
+          if [[ "$LARGE_FRAME" == true ]]; then args+=(--large-frame); fi
+          python3 fuzz/check.py "$PARSER_SECONDS" "${args[@]}" --failure-dir "$RUNNER_TEMP/parser-failure"
+      - name: Retain only the synthetic failure input and replay instructions
+        if: failure() && steps.checks.outcome == 'failure' && steps.checks.outputs.replay == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: parser-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/parser-failure/input.bin
+            ${{ runner.temp }}/parser-failure/replay.txt
+          if-no-files-found: error
+          retention-days: 1

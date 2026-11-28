@@ -13,6 +13,7 @@ members = ["."]
 
 [dependencies]
 libfuzzer-sys = "=0.4.13"
+prost = "=0.14.6"
 syntra-core = { path = "../crates/syntra-core", default-features = false }
 syntra-runtime = { path = "../crates/syntra-runtime", default-features = false }
 
