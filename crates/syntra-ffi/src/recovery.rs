@@ -10,7 +10,7 @@ use syntra_runtime::recovery::wire_client::{
     Negotiation, RecoveryClient, RecoveryClientError, RecoveryEvent, SubscribeIntent,
 };
 
-const STATE_MAX: usize = 1_048_576;
+pub(super) const STATE_MAX: usize = 1_048_576;
 const STORAGE_SLOTS: usize = 1;
 
 #[repr(C)]
@@ -72,7 +72,7 @@ fn store_limits() -> StoreLimits {
         max_total_bytes: 8 * STATE_MAX,
     }
 }
-fn limits() -> RecoveryLimits {
+pub(super) fn limits() -> RecoveryLimits {
     RecoveryLimits {
         subscriptions_per_connection: 4,
         handles_per_connection: 32,
@@ -119,14 +119,26 @@ pub(super) struct StorageWaitPause {
     pub(super) reached: std::sync::Barrier,
     pub(super) release: std::sync::Barrier,
 }
-struct Storage {
+pub(super) struct Storage {
     clock: ElapsedClock,
     state: Mutex<StorageState>,
     #[cfg(test)]
     wait_pause: Mutex<Option<Arc<StorageWaitPause>>>,
 }
 impl Storage {
-    fn retire(&self) -> AbiResult<()> {
+    pub(super) fn new(clock: ElapsedClock) -> Arc<Self> {
+        Arc::new(Self {
+            clock,
+            state: Mutex::new(StorageState::default()),
+            #[cfg(test)]
+            wait_pause: Mutex::new(None),
+        })
+    }
+    #[cfg(feature = "managed-media")]
+    pub(super) fn pending(&self) -> AbiResult<bool> {
+        Ok(!self.state.lock().map_err(|_| INTERNAL)?.slots.is_empty())
+    }
+    pub(super) fn retire(&self) -> AbiResult<()> {
         let mut state = self.state.lock().map_err(|_| INTERNAL)?;
         state.retire();
         Ok(())
@@ -208,7 +220,7 @@ impl Storage {
         }
     }
 }
-struct ForeignPersistence(Arc<Storage>);
+pub(super) struct ForeignPersistence(pub(super) Arc<Storage>);
 impl RecoveryPersistence for ForeignPersistence {
     fn load(&self, scope: &PersistenceScope) -> Result<Option<DurableRecord>, PersistenceError> {
         self.0.request(StorageInput::Load(scope.clone()))
@@ -596,12 +608,7 @@ mod exports {
             if slot.is_some() {
                 return Err(INVALID);
             }
-            let storage = Arc::new(Storage {
-                clock: client.elapsed_clock(),
-                state: Mutex::new(StorageState::default()),
-                #[cfg(test)]
-                wait_pause: Mutex::new(None),
-            });
+            let storage = Storage::new(client.elapsed_clock());
             let engine = RecoveryClient::new(
                 client.clone(),
                 principal,
@@ -807,45 +814,55 @@ mod exports {
             };
             let r = h.recovery()?;
             let _state = h.state.lock().map_err(|_| INTERNAL)?;
-            let mut storage = r.storage.state.lock().map_err(|_| INTERNAL)?;
-            if _state.retired || storage.retired {
+            if _state.retired {
                 return Err(CLOSED);
             }
-            let Some((&token, slot)) = storage.slots.iter_mut().find(|(_, s)| !s.delivered) else {
-                return Ok(EMPTY);
-            };
-            let mut output = syntra_storage_request_t {
-                token,
-                ..Default::default()
-            };
-            let scope = match slot.input.take().ok_or(INTERNAL)? {
-                StorageInput::Load(scope) => {
-                    output.kind = 1;
-                    scope
-                }
-                StorageInput::Commit(scope, expected, record) => {
-                    output.kind = 2;
-                    if let Some(expected) = expected {
-                        output.expected_present = 1;
-                        output.expected_generation = expected.generation;
-                        output.expected_checkpoint = owned(expected.checkpoint);
-                    }
-                    output.generation = record.generation;
-                    output.checkpoint = owned(record.checkpoint);
-                    output.application_state = owned(record.application_state);
-                    scope
-                }
-            };
-            output.principal_scope = owned(scope.principal_scope().to_vec());
-            output.stable_stream = owned(scope.stable_stream().to_vec());
-            slot.delivered = true;
-            // SAFETY: output checked before marking storage delivery; only
-            // owned slices cross the ABI, not references into the slot table.
-            unsafe {
-                write(out, output)?;
-            }
-            Ok(OK)
+            unsafe { take_storage(&r.storage, out) }
         })
+    }
+
+    pub(in crate::production) unsafe fn take_storage(
+        bridge: &Storage,
+        out: *mut syntra_storage_request_t,
+    ) -> AbiResult<i32> {
+        let mut storage = bridge.state.lock().map_err(|_| INTERNAL)?;
+        if storage.retired {
+            return Err(CLOSED);
+        }
+        let Some((&token, slot)) = storage.slots.iter_mut().find(|(_, s)| !s.delivered) else {
+            return Ok(EMPTY);
+        };
+        let mut output = syntra_storage_request_t {
+            token,
+            ..Default::default()
+        };
+        let scope = match slot.input.take().ok_or(INTERNAL)? {
+            StorageInput::Load(scope) => {
+                output.kind = 1;
+                scope
+            }
+            StorageInput::Commit(scope, expected, record) => {
+                output.kind = 2;
+                if let Some(expected) = expected {
+                    output.expected_present = 1;
+                    output.expected_generation = expected.generation;
+                    output.expected_checkpoint = owned(expected.checkpoint);
+                }
+                output.generation = record.generation;
+                output.checkpoint = owned(record.checkpoint);
+                output.application_state = owned(record.application_state);
+                scope
+            }
+        };
+        output.principal_scope = owned(scope.principal_scope().to_vec());
+        output.stable_stream = owned(scope.stable_stream().to_vec());
+        slot.delivered = true;
+        // SAFETY: output checked before marking storage delivery; only
+        // owned slices cross the ABI, not references into the slot table.
+        unsafe {
+            write(out, output)?;
+        }
+        Ok(OK)
     }
 
     #[no_mangle]
@@ -860,77 +877,83 @@ mod exports {
             // SAFETY: live owner; optional immutable record copied and bounded.
             let h = unsafe { owner(p, g)? };
             let r = h.recovery()?;
-            let result = match status {
-                0 | 2 => {
-                    if !record.is_null() {
-                        return Err(INVALID);
-                    }
-                    Ok(None)
+            unsafe { complete_storage(&r.storage, token, status, record) }
+        })
+    }
+
+    pub(in crate::production) unsafe fn complete_storage(
+        bridge: &Storage,
+        token: u64,
+        status: u32,
+        record: *const syntra_record_t,
+    ) -> AbiResult<i32> {
+        let result = match status {
+            0 | 2 => {
+                if !record.is_null() {
+                    return Err(INVALID);
                 }
-                1 => {
-                    // SAFETY: FOUND requires a live aligned immutable record;
-                    // both slices are copied/bounded, never kept by reference.
-                    let value = unsafe {
-                        let record = record.as_ref().ok_or(INVALID)?;
-                        DurableRecord {
-                            generation: record.generation,
-                            checkpoint: bytes(record.checkpoint, record.checkpoint_len, 4096)?,
-                            application_state: bytes(
-                                record.application_state,
-                                record.application_state_len,
-                                STATE_MAX,
-                            )?,
-                        }
-                    };
-                    value.validate(&store_limits()).map_err(|_| INVALID)?;
-                    Ok(Some(value))
-                }
-                3..=7 => {
-                    if !record.is_null() {
-                        return Err(INVALID);
-                    }
-                    Err(match status {
-                        3 => PersistenceError::Unavailable,
-                        4 => PersistenceError::Corrupt,
-                        5 => PersistenceError::Conflict,
-                        6 => PersistenceError::CommitUnknown,
-                        _ => PersistenceError::OverLimit,
-                    })
-                }
-                _ => return Err(INVALID),
-            };
-            let mut storage = r.storage.state.lock().map_err(|_| INTERNAL)?;
-            let slot = storage.slots.get(&token).ok_or(STALE)?;
-            if !slot.delivered {
-                return Err(STALE);
+                Ok(None)
             }
-            if status <= 2 && ((slot.commit && status != 2) || (!slot.commit && status == 2)) {
-                return Err(INVALID);
-            }
-            // This lock is the receipt's terminal gate, shared with timer,
-            // cancellation and wake retirement. Expiry wins exact ties. A late
-            // DURABLE acknowledgement releases foreign ownership but publishes
-            // only CommitUnknown (or Unavailable for load), never success that
-            // could authorize Confirm. Actual durable state remains untouched.
-            if storage.retired
-                || !r.storage.clock.is_continuous()
-                || r.storage.clock.now() >= slot.deadline
-            {
-                storage.retire();
-                storage.slots.remove(&token);
-                return Ok(STALE);
-            }
-            let slot = storage.slots.remove(&token).ok_or(STALE)?;
-            Ok(match slot.reply {
-                Some(reply) => {
-                    if reply.send(result).is_ok() {
-                        OK
-                    } else {
-                        STALE
+            1 => {
+                // SAFETY: FOUND requires a live aligned immutable record;
+                // both slices are copied/bounded, never kept by reference.
+                let value = unsafe {
+                    let record = record.as_ref().ok_or(INVALID)?;
+                    DurableRecord {
+                        generation: record.generation,
+                        checkpoint: bytes(record.checkpoint, record.checkpoint_len, 4096)?,
+                        application_state: bytes(
+                            record.application_state,
+                            record.application_state_len,
+                            STATE_MAX,
+                        )?,
                     }
+                };
+                value.validate(&store_limits()).map_err(|_| INVALID)?;
+                Ok(Some(value))
+            }
+            3..=7 => {
+                if !record.is_null() {
+                    return Err(INVALID);
                 }
-                None => STALE,
-            })
+                Err(match status {
+                    3 => PersistenceError::Unavailable,
+                    4 => PersistenceError::Corrupt,
+                    5 => PersistenceError::Conflict,
+                    6 => PersistenceError::CommitUnknown,
+                    _ => PersistenceError::OverLimit,
+                })
+            }
+            _ => return Err(INVALID),
+        };
+        let mut storage = bridge.state.lock().map_err(|_| INTERNAL)?;
+        let slot = storage.slots.get(&token).ok_or(STALE)?;
+        if !slot.delivered {
+            return Err(STALE);
+        }
+        if status <= 2 && ((slot.commit && status != 2) || (!slot.commit && status == 2)) {
+            return Err(INVALID);
+        }
+        // This lock is the receipt's terminal gate, shared with timer,
+        // cancellation and wake retirement. Expiry wins exact ties. A late
+        // DURABLE acknowledgement releases foreign ownership but publishes
+        // only CommitUnknown (or Unavailable for load), never success that
+        // could authorize Confirm. Actual durable state remains untouched.
+        if storage.retired || !bridge.clock.is_continuous() || bridge.clock.now() >= slot.deadline {
+            storage.retire();
+            storage.slots.remove(&token);
+            return Ok(STALE);
+        }
+        let slot = storage.slots.remove(&token).ok_or(STALE)?;
+        Ok(match slot.reply {
+            Some(reply) => {
+                if reply.send(result).is_ok() {
+                    OK
+                } else {
+                    STALE
+                }
+            }
+            None => STALE,
         })
     }
 

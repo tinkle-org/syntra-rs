@@ -11,6 +11,8 @@
 //!   transport security, peer verification and ordered I/O.
 //!   The application owns authentication policy, authorization policy, method
 //!   effects and actual durable persistence.
+//! - `managed-media`: additional protected managed client owner and lane/transfer
+//!   operations (`include/syntra_managed.h`). Includes the production ABI.
 //!
 //! All WASM targets are rejected at compile time. The production ABI is
 //! native-only; no browser ABI is defined here.

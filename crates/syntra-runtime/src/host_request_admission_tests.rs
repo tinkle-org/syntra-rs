@@ -25,6 +25,79 @@ fn call(id: u64) -> Vec<u8> {
     request(id, "/example.Echo/Echo", 1000)
 }
 
+#[tokio::test(start_paused = true)]
+async fn lost_managed_receiver_fences_an_already_reserved_result_slot() {
+    struct Owner;
+    impl OperationAuthority for Owner {
+        fn try_admit(
+            &self,
+            _: &Principal,
+            _: &str,
+            _: usize,
+        ) -> Result<OperationGrant, AdmissionRefusal> {
+            Ok(OperationGrant {
+                class: OperationClass::Interactive,
+                response_frame_bytes: 1024,
+                ownership: QuotaOwnership::ExclusiveProcess,
+            })
+        }
+    }
+    let budget = ExecutionBudget::new(1);
+    budget
+        .configure_operations(
+            OperationLimits {
+                bytes: 1024,
+                interactive_bytes: 0,
+                interactive_executions: 0,
+            },
+            Arc::new(Owner),
+        )
+        .unwrap();
+    let (host, mut writer) = Host::try_new_with_managed_output(
+        ConnectionConfig {
+            writer_capacity: 1,
+            ..Default::default()
+        },
+        Arc::new(AllowAnonymous),
+        Arc::new(FnHandler(
+            |_, p, _| async move { HandlerOutcome::Payload(p) },
+        )),
+        budget.clone(),
+        crate::elapsed::ElapsedClock::new(),
+    )
+    .unwrap();
+    host.ingest(
+        &Frame {
+            version: 1,
+            request_id: 0,
+            body: Some(Body::Hello(ClientHello {
+                min_version: 1,
+                max_version: 1,
+                credential: vec![],
+            })),
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    host.ingest(&call(1)).await;
+    spin_until(|| host.inflight_len() == 0 && host.execution_len() == 0).await;
+    assert_eq!(budget.bytes_in_use(), 1024);
+    // Worker can now reserve the freed slot, but cannot take the lifecycle
+    // read guard for its final send until after the receiver has disappeared.
+    let state = host.conn.shared.state.write().await;
+    writer.recv().await.unwrap(); // ready
+    spin_until(|| host.conn.shared.writer.capacity() == 0).await;
+    drop(writer);
+    drop(state);
+    spin_until(|| host.worker_len() == 0).await;
+    assert_eq!(
+        budget.bytes_in_use(),
+        0,
+        "retained Host must not strand the late send"
+    );
+    host.close().await;
+}
+
 fn cancel(id: u64) -> Vec<u8> {
     Frame {
         version: 1,

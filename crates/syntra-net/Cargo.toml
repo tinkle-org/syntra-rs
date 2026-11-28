@@ -13,7 +13,7 @@ description = "Syntra native networking, protected connections and managed clien
 [package.metadata.docs.rs]
 # Document native APIs without changing consumer defaults. HTTP and cross-carrier
 # APIs remain explicitly labelled candidates in their module documentation.
-features = ["tcp", "websocket", "tls-rustls", "reconnect", "managed", "proxy", "native-enrollment", "http", "cross-carrier-candidate"]
+features = ["tcp", "websocket", "tls-rustls", "reconnect", "managed", "media", "proxy", "native-enrollment", "http", "cross-carrier-candidate"]
 default-target = "x86_64-unknown-linux-gnu"
 targets = []
 
@@ -26,6 +26,7 @@ websocket = ["tokio/io-util", "tokio/net", "dep:url", "dep:tokio-tungstenite", "
 tls-rustls = ["websocket", "dep:rustls", "dep:rustls-native-certs", "dep:tokio-rustls"]
 reconnect = []
 managed = ["tcp", "reconnect", "tokio/rt-multi-thread"]
+media = ["managed", "dep:rusqlite", "dep:sha2"]
 proxy = ["tcp"]
 # Explicit native host reference; never enabled implicitly by a carrier.
 native-enrollment = ["dep:rusqlite", "dep:fs2", "dep:serde", "dep:serde_json", "dep:sha2"]

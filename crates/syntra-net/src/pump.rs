@@ -22,6 +22,7 @@ use syntra_core::{
 };
 use syntra_runtime::connection::validate_close_grace;
 use syntra_runtime::elapsed::ElapsedClock;
+use syntra_runtime::host::DriverReceiver;
 use syntra_runtime::recovery::wire::RecoveryService;
 use syntra_runtime::terminal::{
     Coordinator, DriverCommand, MethodPolicy, Policy as TerminalPolicy, TerminalOutput,
@@ -1648,15 +1649,36 @@ async fn drain_gracefully(
     }
 }
 
-struct PumpState {
+struct PumpState<Q> {
     channel: Channel,
     receive: ReceiveState,
     peer: Peer,
-    outbound: mpsc::Receiver<Vec<u8>>,
+    outbound: Q,
     limits: Limits,
     end: Instant,
     authorization: Option<Arc<FreshAuthorization>>,
     policy_jobs: Option<Arc<PolicyJobs>>,
+}
+
+// Field drop order matters on task abort (including before first poll): fence
+// producers in DriverReceiver::drop before discarding either queue's charges.
+struct WriterQueues {
+    ordinary: DriverReceiver,
+    terminal: Option<mpsc::Receiver<DriverCommand>>,
+}
+
+/// Only the first record needs contiguous scratch for the inner length prefix.
+fn ordinary_record_parts(frame: &[u8]) -> Result<(Zeroizing<Vec<u8>>, &[u8]), Error> {
+    use syntra_core::secure_channel::{Error::Limit, MAX_FRAME};
+    if !(1..=MAX_FRAME).contains(&frame.len()) {
+        return Err(Limit.into());
+    }
+    let prefix = (frame.len() as u32).to_be_bytes();
+    let (head, tail) = frame.split_at(frame.len().min(MAX_PLAINTEXT - prefix.len()));
+    let mut first = Zeroizing::new(Vec::with_capacity(prefix.len() + head.len()));
+    first.extend_from_slice(&prefix);
+    first.extend_from_slice(head);
+    Ok((first, tail))
 }
 
 /// Own accepted carrier halves until the registered owner is allowed to start.
@@ -1687,25 +1709,28 @@ impl<R, W> Drop for PendingCarrier<R, W> {
     }
 }
 
-fn spawn_pump<R: RecordReader, W: RecordWriter>(
+fn spawn_pump<R: RecordReader, W: RecordWriter, Q: Into<DriverReceiver>>(
     reader: R,
     writer: W,
-    state: PumpState,
+    state: PumpState<Q>,
 ) -> Result<Pump, Error> {
     let PumpState {
         channel,
         receive,
         peer,
-        mut outbound,
+        outbound,
         limits,
         end,
         authorization,
         policy_jobs,
     } = state;
     let clock = peer.clock();
-    let mut terminal_commands = match &peer {
-        Peer::Host(host) => host.take_terminal_commands(),
-        _ => None,
+    let queues = WriterQueues {
+        ordinary: outbound.into(),
+        terminal: match &peer {
+            Peer::Host(host) => host.take_terminal_commands(),
+            _ => None,
+        },
     };
     let coordinator = match &peer {
         Peer::Host(host) => host.terminal_coordinator(),
@@ -1768,6 +1793,7 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
         let write_terminal = owner_terminal.clone();
         let write_coordinator = coordinator.clone();
         tasks.spawn(async move {
+            let mut queues = queues;
             let _panic_guard = TransportPanicGuard(write_terminal.clone());
             let mut teardown_deadline = end;
             let result = async {
@@ -1776,17 +1802,17 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
                     if let Some(deadline) = *draining.borrow_and_update() {
                         drain_deadline = Some(deadline);
                         teardown_deadline = deadline;
-                        outbound.close();
+                        queues.ordinary.close();
                     }
-                    let frame = tokio::select! {
+                    let mut owner = tokio::select! {
                         biased;
-                        command = async { match &mut terminal_commands { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {
+                        command = async { match &mut queues.terminal { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {
                             let coordinator = write_coordinator.as_ref().ok_or(Error::Configuration)?;
                             match command.ok_or(Error::Closed)? {
                                 DriverCommand::Barrier(ack) => {
                                     // Sole writer reached this arm only after its active full
                                     // frame completed; drop every unstarted ordinary frame.
-                                    while outbound.try_recv().is_ok() {}
+                                    queues.ordinary.discard_queued();
                                     coordinator.refresh().await.map_err(|_| Error::Authentication)?;
                                     ack.send(()).map_err(|_| Error::Closed)?;
                                     continue;
@@ -1811,7 +1837,7 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
                             }
                         },
                         _ = draining.changed(), if drain_deadline.is_none() => continue,
-                        frame = outbound.recv() => match frame { Some(frame) => frame, None => break },
+                        frame = queues.ordinary.recv() => match frame { Some(frame) => frame, None => break },
                     };
                     // Gate exactly once before framing/encryption. A selected
                     // frame's record sequence must finish in order or abort;
@@ -1820,6 +1846,7 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
                     // after that backpressure, immediately before encryption.
                     check_authorization(&write_authorization, &write_clock).await?;
                     if !write_peer.delivery_open() { return Err(Error::Closed); }
+                    let frame = owner.take_bytes();
                     let frame = match &write_peer {
                         Peer::Client(client) => match client.prepare_outbound(frame) {
                             Some(frame) => frame,
@@ -1830,10 +1857,11 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
                     let frame = Zeroizing::new(frame);
                     let authorization_end = write_authorization.as_ref().map_or(end, |g| elapsed_now(&write_clock) + g.interval());
                     let deadline = (elapsed_now(&write_clock) + limits.write_timeout).min(end).min(drain_deadline.unwrap_or(end)).min(authorization_end);
-                    let plaintext = frame_plaintext(&frame)?;
+                    let (first, tail) = ordinary_record_parts(&frame)?;
                     // One frame's complete record sequence is owned until completion or abort.
                     elapsed_timeout(&write_clock, deadline, async {
-                        for (index, chunk) in plaintext.chunks(MAX_PLAINTEXT).enumerate() {
+                        let chunks = std::iter::once(first.as_slice()).chain(tail.chunks(MAX_PLAINTEXT));
+                        for (index, chunk) in chunks.enumerate() {
                             if !write_peer.delivery_open() || elapsed_now(&write_clock) >= deadline { return Err(Error::Timeout); }
                             let encrypt = || write_channel.lock().map_err(|_| Error::Closed)?.encrypt(chunk).map_err(Error::from);
                             let ciphertext = if index == 0 {
@@ -1848,6 +1876,7 @@ fn spawn_pump<R: RecordReader, W: RecordWriter>(
                         }
                         Ok::<(), Error>(())
                     }).await.map_err(|_| Error::Timeout)??;
+                    drop(owner); // all records completed, or an unstarted fenced frame was discarded
                 }
                 Ok::<(), Error>(())
             }.await;
@@ -2029,10 +2058,31 @@ pub async fn connect_records_with_clock<R: RecordReader, W: RecordWriter>(
 /// before handing the record halves to the pump. Cancellation before that handoff
 /// drops both halves without leaving a background establishment task.
 pub async fn connect_records_with_budget<R: RecordReader, W: RecordWriter>(
+    reader: R,
+    writer: W,
+    security: ClientConfig,
+    credential: Vec<u8>,
+    runtime: ConnectionConfig,
+    limits: Limits,
+    establishment: EstablishmentBudget,
+) -> Result<ClientHandle, Error> {
+    connect_records_zeroizing(
+        reader,
+        writer,
+        security,
+        Zeroizing::new(credential),
+        runtime,
+        limits,
+        establishment,
+    )
+    .await
+}
+
+pub(crate) async fn connect_records_zeroizing<R: RecordReader, W: RecordWriter>(
     mut reader: R,
     mut writer: W,
     security: ClientConfig,
-    credential: Vec<u8>,
+    credential: Zeroizing<Vec<u8>>,
     runtime: ConnectionConfig,
     limits: Limits,
     establishment: EstablishmentBudget,
@@ -2068,7 +2118,7 @@ pub async fn connect_records_with_budget<R: RecordReader, W: RecordWriter>(
     let core_deadline = attempt
         .min(end)
         .min(elapsed_now(&clock) + runtime.handshake_timeout);
-    let (conn, mut outbound) =
+    let (conn, outbound) =
         Initiator::try_new_with_clock(runtime, clock.clone()).map_err(|_| Error::Configuration)?;
     let mut channel = channel;
     let mut receive = ReceiveState::default();
@@ -2077,7 +2127,8 @@ pub async fn connect_records_with_budget<R: RecordReader, W: RecordWriter>(
     // release both carrier halves before a lifecycle replacement can begin.
     let peer = Peer::Client(conn.clone());
     let id = elapsed_timeout(&clock, core_deadline, async {
-        let handshake = conn.handshake(credential);
+        let (hello_tx, mut hello_rx) = oneshot::channel();
+        let handshake = conn.handshake_with_protected_hello(credential, hello_tx);
         tokio::pin!(handshake);
         let mut hello_sent = false;
         loop {
@@ -2088,8 +2139,8 @@ pub async fn connect_records_with_budget<R: RecordReader, W: RecordWriter>(
                 biased;
                 _ = clock.sleep_until(core_deadline.into_std()) => return Err(Error::Timeout),
                 result = &mut handshake => break result.map_err(runtime_error),
-                hello = outbound.recv(), if !hello_sent => {
-                    let hello = Zeroizing::new(hello.ok_or(Error::Closed)?);
+                hello = &mut hello_rx, if !hello_sent => {
+                    let hello = hello.map_err(|_| Error::Closed)?;
                     let plaintext = frame_plaintext(&hello)?;
                     let write_deadline = core_deadline.min(channel_deadline).min(elapsed_now(&clock) + limits.write_timeout);
                     io.until(write_deadline)?;
@@ -2469,7 +2520,7 @@ async fn accept_records_impl<R: RecordReader, W: RecordWriter>(
     if elapsed_now(&clock) >= core_deadline {
         return Err(Error::Timeout);
     }
-    let (host, mut outbound) = Host::try_new_with_execution_budget_and_clock(
+    let (host, mut outbound) = Host::try_new_with_managed_output(
         runtime,
         auth,
         handler,
@@ -2526,7 +2577,7 @@ async fn accept_records_impl<R: RecordReader, W: RecordWriter>(
     }
     // Flush ready before transferring the carrier to background tasks. A
     // cancelled accept owns/drops its partial carrier just like a cancelled dial.
-    let ready = elapsed_timeout(&clock, core_deadline, outbound.recv())
+    let mut ready = elapsed_timeout(&clock, core_deadline, outbound.recv())
         .await
         .map_err(|_| Error::Timeout)?
         .ok_or(Error::Closed)?;
@@ -2537,7 +2588,7 @@ async fn accept_records_impl<R: RecordReader, W: RecordWriter>(
     )
     .await
     .map_err(|_| Error::Timeout)??;
-    let plaintext = frame_plaintext(&Zeroizing::new(ready))?;
+    let plaintext = frame_plaintext(&Zeroizing::new(ready.take_bytes()))?;
     let mut channel = channel;
     let authorization_end = authorization
         .as_ref()

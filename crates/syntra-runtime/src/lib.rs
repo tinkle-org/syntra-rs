@@ -41,7 +41,9 @@ pub use connection::{
 };
 pub use host::terminal;
 pub use host::{
-    AllowAll, ExecutionBudget, ExecutionLease, FnHandler, Handler, HandlerFut, HandlerOutcome, Host,
+    AdmissionRefusal, AllowAll, ExecutionBudget, ExecutionLease, FnHandler, Handler, HandlerFut,
+    HandlerOutcome, Host, OperationAuthority, OperationClass, OperationGrant, OperationLimits,
+    QuotaOwnership,
 };
 pub use initiator::Initiator;
 pub use policy::{

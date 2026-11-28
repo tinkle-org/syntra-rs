@@ -1523,6 +1523,10 @@ pub use exports::*;
 
 #[path = "recovery.rs"]
 mod recovery;
+
+#[cfg(feature = "managed-media")]
+#[path = "managed.rs"]
+mod managed;
 pub use recovery::*;
 
 #[cfg(test)]

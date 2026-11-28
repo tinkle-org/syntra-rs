@@ -42,6 +42,7 @@ impl EventTrace {
 }
 /// Linearizable in-memory authority with explicit commit-return and denial controls.
 struct AuthorityFixture {
+    execution: ExecutionBudget,
     state: Mutex<(u64, Option<Transition>, bool, Option<u8>)>,
     commits: AtomicUsize,
     reads: AtomicUsize,
@@ -58,6 +59,7 @@ impl AuthorityFixture {
     /// Select one evidence/failure mode for a new active binding.
     fn new(mode: usize) -> Arc<Self> {
         Arc::new(Self {
+            execution: ExecutionBudget::new(32),
             state: Mutex::new((1, None, false, None)),
             commits: AtomicUsize::new(0),
             reads: AtomicUsize::new(0),
@@ -199,10 +201,14 @@ impl Authority for AuthorityFixture {
 struct Factory {
     authority: Arc<AuthorityFixture>,
     payload: Vec<u8>,
+    outcome_payload: Vec<u8>,
     enabled: bool,
     clock: Option<ElapsedClock>,
 }
 impl AuthenticatorFactory for Factory {
+    fn execution_budget(&self) -> ExecutionBudget {
+        self.authority.execution.clone()
+    }
     /// Use the explicitly driven clock when supplied, otherwise native elapsed time.
     fn elapsed_clock(&self) -> ElapsedClock {
         self.clock.clone().unwrap_or_default()
@@ -230,7 +236,7 @@ impl AuthenticatorFactory for Factory {
         let mut policy: MethodPolicy = self.terminal_receipt(identity)?.into();
         policy.methods.insert(
             CHOICE.into(),
-            MethodReceipts::Outcomes(vec![vec![], self.payload.clone()]),
+            MethodReceipts::Outcomes(vec![vec![], self.outcome_payload.clone()]),
         );
         Some(policy)
     }
@@ -340,25 +346,17 @@ async fn pair_with_handler(
     enabled: bool,
     handler: Arc<dyn Handler>,
 ) -> (tcp::ClientHandle, tcp::HostHandle) {
-    let (client, server) = configs();
-    let listener = tcp::Listener::bind("127.0.0.1:0", 2).await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let accept = tokio::spawn(async move {
-        listener
-            .accept(
-                &server,
-                Arc::new(Factory {
-                    authority,
-                    payload,
-                    enabled,
-                    clock: None,
-                }),
-                handler,
-                ConnectionConfig::default(),
-                Limits::default(),
-            )
-            .await
-    });
+    let (client, address, accept) = listen(
+        Factory {
+            authority,
+            outcome_payload: payload.clone(),
+            payload,
+            enabled,
+            clock: None,
+        },
+        handler,
+    )
+    .await;
     let client = tcp::connect(
         address,
         client,
@@ -369,6 +367,31 @@ async fn pair_with_handler(
     .await
     .unwrap();
     (client, accept.await.unwrap().unwrap())
+}
+
+async fn listen(
+    factory: Factory,
+    handler: Arc<dyn Handler>,
+) -> (
+    ClientConfig,
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<Result<tcp::HostHandle, tcp::Error>>,
+) {
+    let (client, server) = configs();
+    let listener = tcp::Listener::bind("127.0.0.1:0", 2).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let accept = tokio::spawn(async move {
+        listener
+            .accept(
+                &server,
+                Arc::new(factory),
+                handler,
+                ConnectionConfig::default(),
+                Limits::default(),
+            )
+            .await
+    });
+    (client, address, accept)
 }
 
 /// Add only a local request cap, forwarding the existing context-aware handler.
@@ -524,21 +547,58 @@ async fn pending_after_commit_returns_closes_without_a_result() {
 }
 
 #[tokio::test]
-async fn oversized_unselected_candidate_refuses_before_fencing_or_mutation() {
-    let authority = AuthorityFixture::new(6);
-    let (client, host) = pair(authority.clone(), vec![0; 1024], true).await;
-    assert!(client.conn.call(CHOICE, vec![], 2000).await.is_err());
+async fn oversized_unselected_candidate_refuses_establishment_before_authority_reads() {
+    // Only outcome 2 is too large. Mode 6 would choose the empty outcome 1.
+    assert_refused_before_authority(
+        AuthorityFixture::new(6),
+        vec![],
+        vec![0; BOUNDARY_PAYLOAD + 1],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn oversized_fixed_receipt_refuses_establishment_before_authority_reads() {
+    // The fixed method has just one possible result; all outcome candidates fit.
+    assert_refused_before_authority(
+        AuthorityFixture::new(0),
+        vec![0; BOUNDARY_PAYLOAD + 1],
+        vec![],
+    )
+    .await;
+}
+
+async fn assert_refused_before_authority(
+    authority: Arc<AuthorityFixture>,
+    payload: Vec<u8>,
+    outcome_payload: Vec<u8>,
+) {
+    let (config, address, accept) = listen(
+        Factory {
+            authority: authority.clone(),
+            payload,
+            outcome_payload,
+            enabled: true,
+            clock: None,
+        },
+        Arc::new(AllowAll(Retire)),
+    )
+    .await;
+    assert!(tcp::connect(
+        address,
+        config,
+        b"fixture".to_vec(),
+        ConnectionConfig::default(),
+        Limits::default()
+    )
+    .await
+    .is_err());
+    assert!(matches!(
+        accept.await.unwrap(),
+        Err(tcp::Error::Configuration)
+    ));
+    assert_eq!(authority.reads.load(Ordering::SeqCst), 0);
     assert_eq!(authority.commits.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        client
-            .conn
-            .call("/example.Authority/Echo", vec![1], 1000)
-            .await
-            .unwrap(),
-        [1]
-    );
-    client.close().await;
-    host.close().await;
 }
 
 /// Default-disabled retirement leaves ordinary RPCs available and commits nothing.
@@ -620,43 +680,109 @@ async fn surviving_authority_work_keeps_execution_charge_after_deadline() {
     host.close().await;
 }
 
-/// The size ceiling counts the complete serialized result frame, not just its payload.
+// Fills a v1 result with the ten-byte request ID; checked against received bytes below.
+const BOUNDARY_PAYLOAD: usize = 1005;
+
+/// Send the widest legal ID instead of the SDK initiator's usual first ID of one.
 #[tokio::test]
 async fn complete_frame_limit_is_1024_not_payload_limit() {
     use syntra_core::{
-        encode_frame,
+        decode_frame_structure, encode_frame,
         proto::{frame::Body, rpc_result::Outcome},
-        Frame, RpcResult, ValidationContext,
+        ClientHello, ConnectionState, Frame, RpcRequest, RpcResult, ValidationContext,
     };
-    let size = |n| {
-        let frame = Frame {
-            version: 1,
-            request_id: 1,
-            body: Some(Body::Result(RpcResult {
-                outcome: Some(Outcome::Payload(vec![0; n])),
-            })),
+    use syntra_net::pump::{RecordReader, RecordWriter};
+    let authority = AuthorityFixture::new(0);
+    let payload = vec![42; BOUNDARY_PAYLOAD];
+    let (config, address, accept) = listen(
+        Factory {
+            authority: authority.clone(),
+            payload: payload.clone(),
+            outcome_payload: vec![],
+            enabled: true,
+            clock: None,
+        },
+        Arc::new(AllowAll(Retire)),
+    )
+    .await;
+    let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let (read, write) = stream.into_split();
+    let (mut reader, mut writer) = (tcp::StreamReader(read), tcp::StreamWriter(write));
+    let (handshake, first) = ClientHandshake::start(config).unwrap();
+    writer.write_record(&first).await.unwrap();
+    let mut channel = handshake
+        .finish(&reader.read_record(MAX_WRAPPER).await.unwrap())
+        .unwrap();
+    let mut decoder = FrameDecoder::default();
+    for (id, body, ctx) in [
+        (
+            0,
+            Body::Hello(ClientHello {
+                min_version: 1,
+                max_version: 1,
+                credential: b"fixture".to_vec(),
+            }),
+            ValidationContext::pre_handshake(ConnectionState::Connected),
+        ),
+        (
+            u64::MAX,
+            Body::Request(RpcRequest {
+                method: METHOD.into(),
+                payload: vec![],
+                timeout_ms: 1000,
+            }),
+            ValidationContext::active(1),
+        ),
+    ] {
+        let request = encode_frame(
+            &Frame {
+                version: 1,
+                request_id: id,
+                body: Some(body),
+            },
+            ctx,
+        )
+        .unwrap();
+        writer
+            .write_record(
+                &channel
+                    .encrypt(&frame_plaintext(&request).unwrap())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let frames = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let record = reader.read_record(MAX_CIPHERTEXT).await.unwrap();
+                let frames = decoder.push(&channel.decrypt(&record).unwrap()).unwrap();
+                if !frames.is_empty() {
+                    break frames;
+                }
+            }
+        })
+        .await
+        .expect("peer response deadline");
+        let [bytes] = frames.as_slice() else {
+            panic!("expected one complete frame")
         };
-        encode_frame(&frame, ValidationContext::active(1))
-            .unwrap()
-            .len()
-    };
-    let n = (0..1024).find(|n| size(*n) == 1024).unwrap();
-    for (payload, success) in [(vec![0; n], true), (vec![0; n + 1], false)] {
-        let authority = AuthorityFixture::new(0);
-        let (client, host) = pair(authority.clone(), payload.clone(), true).await;
-        let result = client.conn.call(METHOD, vec![], 1000).await;
-        if success {
-            assert_eq!(result.unwrap(), payload);
+        let reply = decode_frame_structure(bytes).unwrap();
+        assert_eq!((reply.version, reply.request_id), (1, id));
+        if id == 0 {
+            assert!(matches!(reply.body, Some(Body::Ready(_))));
         } else {
-            assert!(result.is_err());
+            assert_eq!(bytes.len(), 1024);
+            assert_eq!(
+                reply.body,
+                Some(Body::Result(RpcResult {
+                    outcome: Some(Outcome::Payload(payload.clone()))
+                }))
+            );
         }
-        assert_eq!(
-            authority.commits.load(Ordering::SeqCst),
-            usize::from(success)
-        );
-        client.close().await;
-        host.close().await;
     }
+    let host = accept.await.unwrap().unwrap();
+    closed(&host).await;
+    assert_eq!(authority.commits.load(Ordering::SeqCst), 1);
+    host.close().await;
 }
 
 /// Wire cancellation before selection aborts despite a visible durable owner.
@@ -812,6 +938,7 @@ async fn controlled_pair_with_handler_and_clock(
             Arc::new(Factory {
                 authority,
                 payload: b"retired".to_vec(),
+                outcome_payload: b"retired".to_vec(),
                 enabled: true,
                 clock: host_clock,
             }),
@@ -1044,6 +1171,75 @@ async fn partial_ordinary_frame_finishes_before_commit_and_queued_notifications_
     time.finish().await;
 }
 
+/// Barrier discards a charged queued ordinary result, then the typed receipt
+/// carries only its own charge through the final protected TCP write.
+#[tokio::test(start_paused = true)]
+async fn terminal_barrier_and_partial_receipt_transfer_exact_output_charges() {
+    struct Owner;
+    impl OperationAuthority for Owner {
+        fn try_admit(
+            &self,
+            _: &Principal,
+            _: &str,
+            _: usize,
+        ) -> Result<OperationGrant, AdmissionRefusal> {
+            Ok(OperationGrant {
+                class: OperationClass::Interactive,
+                response_frame_bytes: 1024,
+                ownership: QuotaOwnership::ExclusiveProcess,
+            })
+        }
+    }
+    let time = ManualTime::new();
+    let authority = AuthorityFixture::new(5); // hold commit return while rearming the writer
+    let budget = &authority.execution;
+    budget
+        .configure_operations(
+            OperationLimits {
+                interactive_executions: 0,
+                bytes: 3072,
+                interactive_bytes: 0,
+            },
+            Arc::new(Owner),
+        )
+        .unwrap();
+    let gate = Arc::new(Gate::default());
+    let (client, host) =
+        controlled_pair_with_clock(authority.clone(), gate.clone(), Some(time.clock.clone())).await;
+    let call = |method: &'static str| {
+        let conn = client.conn.clone();
+        tokio::spawn(async move { conn.call(method, vec![], 2000).await })
+    };
+    gate.pause_after(1);
+    let active = call("/example.Authority/Echo");
+    gate.blocked.notified().await;
+    let queued = call("/example.Authority/Echo");
+    wait_for_fixture_state(
+        || host.host.shutdown_report().queued_frames == 1 && host.host.worker_len() == 0,
+        "second ordinary result not queued",
+    )
+    .await;
+    let receipt = call(METHOD);
+    authority.reserved.notified().await;
+    assert_eq!(budget.bytes_in_use(), 3072);
+    gate.release();
+    authority.committed.notified().await;
+    assert_eq!(budget.bytes_in_use(), 1024);
+    assert!(active.await.unwrap().unwrap().is_empty());
+    gate.pause_after(1);
+    authority.release.notify_one();
+    gate.blocked.notified().await;
+    assert_eq!(budget.in_use(), 0);
+    assert_eq!(budget.bytes_in_use(), 1024);
+    gate.release();
+    assert_eq!(receipt.await.unwrap().unwrap(), b"retired");
+    assert!(queued.await.unwrap().is_err());
+    closed(&host).await;
+    assert_eq!(budget.bytes_in_use(), 0);
+    tokio::join!(client.close(), host.close());
+    time.finish().await;
+}
+
 /// Exact whole-frame write expiry aborts without commit even with fresh authority.
 #[tokio::test(start_paused = true)]
 async fn partial_ordinary_frame_exact_write_cutoff_aborts_before_commit_with_fresh_authority() {
@@ -1165,6 +1361,7 @@ async fn custom_record_driver_refuses_policy_before_handler_effects() {
             Arc::new(Factory {
                 authority: a,
                 payload: b"retired".to_vec(),
+                outcome_payload: b"retired".to_vec(),
                 enabled: true,
                 clock: None,
             }),
@@ -1359,6 +1556,7 @@ impl ReturningFixture {
         Arc::new(Factory {
             authority: self.authority.clone(),
             payload: b"retired".to_vec(),
+            outcome_payload: b"retired".to_vec(),
             enabled: true,
             clock: None,
         })

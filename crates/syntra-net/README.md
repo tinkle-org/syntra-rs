@@ -63,6 +63,12 @@ adds SOCKS5/HTTP CONNECT routes, and `native-enrollment` selects the SQLite
 enrollment reference explicitly. `http` and `cross-carrier-candidate` select
 separate candidate APIs; neither is enabled by a TCP dependency.
 
+Select `media` for a returning-mode TCP `LaneClient` and resumable media RPCs.
+It enables `managed`, bundled SQLite, and SHA-256; `managed` alone does not
+enable lanes or storage. The workspace [media guide](https://github.com/tinkle-org/syntra-rs/blob/main/MEDIA.md)
+describes shared credit for interactive calls and notification pulls, cold bulk
+admission, update restore, and the v1 authorization checks at EOF and publication.
+
 Every explicit feature requires a non-wasm32 target. On wasm32, default builds
 expose no drivers; browser embedders use core/runtime with platform-owned I/O.
 Rust 1.89 is the build compatibility floor, not a security recommendation; build

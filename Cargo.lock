@@ -1610,8 +1610,10 @@ version = "1.0.0-rc.6"
 dependencies = [
  "getrandom 0.3.4",
  "syntra-core",
+ "syntra-net",
  "syntra-runtime",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -1675,6 +1677,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-time",
+ "zeroize",
 ]
 
 [[package]]

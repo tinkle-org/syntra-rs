@@ -31,6 +31,7 @@
 //!   unvalidated buffered bytes do not win retroactively.
 
 use web_time::Duration;
+use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(test)]
 use prost::Message;
@@ -48,6 +49,18 @@ use crate::connection::{Connection, ConnectionConfig, HandshakeDone, Role, Share
 #[derive(Clone)]
 pub struct Initiator {
     conn: Connection,
+}
+
+// Prost requires an owned Vec. Move the allocation into the frame only for
+// synchronous encoding and wipe it even if encoding fails or unwinds.
+struct HelloFrame(Frame);
+
+impl Drop for HelloFrame {
+    fn drop(&mut self) {
+        if let Some(Body::Hello(hello)) = &mut self.0.body {
+            hello.credential.zeroize();
+        }
+    }
 }
 
 impl Initiator {
@@ -271,6 +284,35 @@ impl Initiator {
     /// `ClientHello.credential`. This function never logs it and the
     /// caller should drop it after the handshake where possible.
     pub async fn handshake(&self, credential: Vec<u8>) -> Result<String, SyntraError> {
+        self.handshake_zeroizing(Zeroizing::new(credential)).await
+    }
+
+    /// Send `hello` using an already guarded credential, without copying it into prost.
+    /// The serialized hello enters the raw writer as a plain `Vec`, just as in
+    /// [`Self::handshake`]; dropping that queue does not wipe it.
+    pub async fn handshake_zeroizing(
+        &self,
+        credential: Zeroizing<Vec<u8>>,
+    ) -> Result<String, SyntraError> {
+        self.handshake_impl(credential, None).await
+    }
+
+    /// Deliver only the serialized hello to a protected driver instead of the raw
+    /// writer. Drive this future alongside the receiver; encrypt the hello before
+    /// ingesting ready. On cancellation, discard both and retire the connection.
+    pub async fn handshake_with_protected_hello(
+        &self,
+        credential: Zeroizing<Vec<u8>>,
+        hello: oneshot::Sender<Zeroizing<Vec<u8>>>,
+    ) -> Result<String, SyntraError> {
+        self.handshake_impl(credential, Some(hello)).await
+    }
+
+    async fn handshake_impl(
+        &self,
+        mut credential: Zeroizing<Vec<u8>>,
+        hello: Option<oneshot::Sender<Zeroizing<Vec<u8>>>>,
+    ) -> Result<String, SyntraError> {
         let deadline = self.conn.shared.clock.now() + self.conn.shared.config.handshake_timeout;
         let (min_version, max_version) = {
             let shared = &self.conn.shared;
@@ -283,20 +325,20 @@ impl Initiator {
             ));
         }
 
-        let hello = ClientHello {
-            min_version,
-            max_version,
-            credential,
-        };
-        let frame = Frame {
+        let frame = HelloFrame(Frame {
             version: max_version,
             request_id: 0,
-            body: Some(Body::Hello(hello)),
-        };
-        let bytes = encode_frame(
-            &frame,
+            body: Some(Body::Hello(ClientHello {
+                min_version,
+                max_version,
+                credential: std::mem::take(&mut *credential),
+            })),
+        });
+        let bytes = Zeroizing::new(encode_frame(
+            &frame.0,
             ValidationContext::pre_handshake(ConnectionState::Connected),
-        )?;
+        )?);
+        drop(frame);
 
         let (tx, rx) = oneshot::channel();
         {
@@ -318,7 +360,7 @@ impl Initiator {
         let sent = tokio::select! {
             biased;
             _ = self.conn.shared.clock.sleep_until(deadline) => Err(SyntraError::DeadlineExceeded("handshake timed out".to_string())),
-            sent = self.conn.send_bytes(bytes) => sent,
+            sent = self.conn.send_hello(bytes, hello) => sent,
         };
         if let Err(e) = sent {
             self.conn
@@ -1197,6 +1239,64 @@ mod tests {
     use super::*;
     use syntra_core::proto::rpc_result::Outcome;
     use syntra_core::proto::{RpcError as ProtoError, RpcResult};
+
+    #[tokio::test]
+    async fn guarded_credential_is_bounded_before_handoff_and_arrives_intact() {
+        let (c, mut writer) = Initiator::new(ConnectionConfig::default());
+        let oversized = Zeroizing::new(vec![1; syntra_core::MAX_CREDENTIAL_BYTES + 1]);
+        let error = c.handshake_zeroizing(oversized).await.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+        assert!(matches!(
+            writer.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let mut handshake = Box::pin(c.handshake_zeroizing(Zeroizing::new(vec![0, 255, 1])));
+        assert!(futures_util::poll!(&mut handshake).is_pending());
+        let bytes = writer.try_recv().unwrap();
+        let hello = Frame::decode(bytes.as_slice()).unwrap();
+        assert!(matches!(hello.body, Some(Body::Hello(h)) if h.credential == [0, 255, 1]));
+        c.inject_frame(ready_frame(1)).await;
+        assert_eq!(handshake.await.unwrap(), "conn-test-1");
+    }
+
+    #[tokio::test]
+    async fn protected_hello_discard_never_enters_raw_queue() {
+        let (c, writer) = Initiator::new(ConnectionConfig::default());
+        let (tx, rx) = oneshot::channel::<Zeroizing<Vec<u8>>>();
+        let mut handshake = Box::pin(c.handshake_with_protected_hello(Zeroizing::new(vec![1]), tx));
+        assert!(futures_util::poll!(&mut handshake).is_pending());
+        assert!(!rx.is_empty(), "hello admitted but not consumed");
+        assert!(writer.is_empty());
+        drop(handshake);
+        drop(c);
+        drop(rx); // discard the queued Zeroizing, without polling a cleanup task
+
+        let (c, writer) = Initiator::new(ConnectionConfig::default());
+        let (tx, rx) = oneshot::channel();
+        drop(rx); // opposite ordering: failed send returns the guarded item
+        let result = c
+            .handshake_with_protected_hello(Zeroizing::new(vec![1]), tx)
+            .await;
+        assert!(matches!(result, Err(SyntraError::Closed(_))));
+        assert!(c.is_closed());
+        assert!(writer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn protected_hello_reaches_driver_with_credential_and_completes() {
+        let (c, writer) = Initiator::new(ConnectionConfig::default());
+        let (tx, mut rx) = oneshot::channel();
+        let mut handshake =
+            Box::pin(c.handshake_with_protected_hello(Zeroizing::new(vec![42]), tx));
+        assert!(futures_util::poll!(&mut handshake).is_pending());
+        let bytes: Zeroizing<Vec<u8>> = rx.try_recv().unwrap();
+        let frame = Frame::decode(bytes.as_slice()).unwrap();
+        assert!(matches!(frame.body, Some(Body::Hello(h)) if h.credential == [42]));
+        assert!(writer.is_empty());
+        c.inject_frame(ready_frame(1)).await;
+        assert_eq!(handshake.await.unwrap(), "conn-test-1");
+    }
 
     #[tokio::test]
     async fn concurrent_handshake_does_not_replace_original_waiter() {

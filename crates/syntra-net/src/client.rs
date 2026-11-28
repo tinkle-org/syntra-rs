@@ -228,6 +228,9 @@ struct Controls {
     online: bool,
     stopped: bool,
     invalidated_at: Option<Instant>,
+    /// A deliberately closed healthy lane is not an outage while it is unused.
+    #[cfg(feature = "media")]
+    idle_generation: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -507,6 +510,8 @@ impl ReconnectingClient {
                     online: config.initial_network_available,
                     stopped: false,
                     invalidated_at: None,
+                    #[cfg(feature = "media")]
+                    idle_generation: None,
                 },
                 active: None,
             }),
@@ -542,9 +547,24 @@ impl ReconnectingClient {
     }
 
     fn control(&self, update: impl FnOnce(&mut Controls)) {
+        self.control_if_current(None, update);
+    }
+
+    fn control_if_current(
+        &self,
+        generation: Option<u64>,
+        update: impl FnOnce(&mut Controls),
+    ) -> bool {
         let mut state = self.shared.lock();
-        if state.controls.stopped {
-            return;
+        if state.controls.stopped
+            || generation.is_some_and(|g| {
+                !state
+                    .active
+                    .as_ref()
+                    .is_some_and(|a| a.generation == g && Shared::current(&state, a))
+            })
+        {
+            return false;
         }
         // No wrap/ABA even for a pathological stream of coalesced controls.
         let Some(revision) = state.controls.revision.checked_add(1) else {
@@ -556,7 +576,7 @@ impl ReconnectingClient {
                 .status
                 .send_replace(LifecycleStatus::Retired(Failure::RevisionExhausted));
             self.shared.changed.notify_one();
-            return;
+            return false;
         };
         state.controls.revision = revision;
         update(&mut state.controls);
@@ -577,6 +597,7 @@ impl ReconnectingClient {
             LifecycleStatus::Starting
         });
         self.shared.changed.notify_one();
+        true
     }
 
     pub fn pause(&self) {
@@ -584,6 +605,15 @@ impl ReconnectingClient {
             c.paused = true;
             c.permit_revision = None;
         });
+    }
+
+    #[cfg(feature = "media")]
+    pub(crate) fn park_idle(&self, generation: u64) -> bool {
+        self.control_if_current(Some(generation), |c| {
+            c.paused = true;
+            c.permit_revision = None;
+            c.idle_generation = Some(generation);
+        })
     }
 
     /// Resume, granting one immediate attempt even if the network hint is offline.
@@ -670,11 +700,11 @@ impl ReconnectingClient {
     }
 
     async fn forward<T>(
-        &self,
+        shared: &Shared,
         active: &Active,
         future: impl Future<Output = T>,
     ) -> Result<GenerationValue<T>, CallError> {
-        let mut status = self.subscribe_status();
+        let mut status = shared.status.subscribe();
         tokio::pin!(future);
         loop {
             let result = tokio::select! {
@@ -683,7 +713,7 @@ impl ReconnectingClient {
                 result = std::future::poll_fn(|cx| {
                     // Serialize each poll (including first admission and final
                     // delivery) with controls. Never hold this lock across await.
-                    let state = self.shared.lock();
+                    let state = shared.lock();
                     if !Shared::current(&state, active) {
                         return Poll::Ready(Err(CallError::Unavailable {
                             generation: Some(active.generation),
@@ -697,7 +727,7 @@ impl ReconnectingClient {
             if let Some(result) = result {
                 return result;
             }
-            if !Shared::current(&self.shared.lock(), active) {
+            if !Shared::current(&shared.lock(), active) {
                 return Err(CallError::Unavailable {
                     generation: Some(active.generation),
                 });
@@ -717,9 +747,12 @@ impl ReconnectingClient {
         let snapshot = self.snapshot();
         async move {
             let active = snapshot?;
-            let delivered = self
-                .forward(&active, active.conn.call(method, payload, timeout_ms))
-                .await?;
+            let delivered = Self::forward(
+                &self.shared,
+                &active,
+                active.conn.call(method, payload, timeout_ms),
+            )
+            .await?;
             delivered
                 .value
                 .map(|value| GenerationValue {
@@ -738,13 +771,14 @@ impl ReconnectingClient {
     /// Like `call`, the snapshot is taken at invocation, before polling/awaiting.
     pub fn next_notification(
         &self,
-    ) -> impl Future<Output = Result<GenerationValue<Notification>, CallError>> + Send + '_ {
+    ) -> impl Future<Output = Result<GenerationValue<Notification>, CallError>> + Send + 'static
+    {
         let snapshot = self.snapshot();
+        let shared = self.shared.clone();
         async move {
             let active = snapshot?;
-            let delivered = self
-                .forward(&active, active.conn.next_notification_with_loss())
-                .await?;
+            let delivered =
+                Self::forward(&shared, &active, active.conn.next_notification_with_loss()).await?;
             let (payload, (dropped_count, dropped_bytes)) = delivered.value;
             Ok(GenerationValue {
                 generation: delivered.generation,
@@ -983,6 +1017,10 @@ where
                     blocked = Some(reason);
                     last_failure = Some(reason);
                 }
+                #[cfg(feature = "media")]
+                if controls.idle_generation == Some(generation) && !reason.terminal() {
+                    outage = None;
+                }
             }
             revision = controls.revision;
             // Explicit controls may expedite a single attempt, but never reset
@@ -1004,7 +1042,12 @@ where
                 _ = shared.revised(revision) => continue,
                 _ = closed(&handle.conn) => {}
             }
-            shared.lock().active = None;
+            // A control can win between the two select polls. If it already
+            // claimed the generation, let its revision retire the handle (in
+            // particular, an idle park is not a transport outage).
+            if shared.lock().active.take().is_none() {
+                continue;
+            }
             outage = Some(shared.now());
             let (_, mut handle) = active.take().expect("active handle");
             if !retire(&shared, &mut handle, config.close_timeout).await {
@@ -3623,7 +3666,7 @@ mod tests {
         let third = ready(&client).await;
         assert_eq!(third, second + 1);
         assert!(
-            matches!(client.forward(&old, old.conn.next_notification_with_loss()).await,
+            matches!(ReconnectingClient::forward(&client.shared, &old, old.conn.next_notification_with_loss()).await,
             Err(CallError::Unavailable { generation: Some(g) }) if g == second)
         );
         pairs.notify(2, vec![3]).await;

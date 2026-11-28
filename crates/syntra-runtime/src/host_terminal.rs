@@ -4,6 +4,22 @@ use crate::elapsed::{ElapsedClock, ElapsedDeadline};
 use futures_util::future::BoxFuture;
 use std::sync::atomic::Ordering;
 
+pub(super) const MAX_RECEIPT_FRAME_BYTES: usize = 1024;
+
+fn bounded_receipt_frame(id: u64, version: u32, payload: &[u8]) -> Option<Frame> {
+    if payload.len() > MAX_RECEIPT_FRAME_BYTES {
+        return None; // Avoid copying an oversized policy entry.
+    }
+    let frame = Frame {
+        version,
+        request_id: id,
+        body: Some(Body::Result(RpcResult {
+            outcome: Some(outcome_payload(payload.to_vec())),
+        })),
+    };
+    (prost::Message::encoded_len(&frame) <= MAX_RECEIPT_FRAME_BYTES).then_some(frame)
+}
+
 /// SDK-generated private operation owner. Persist `as_bytes()` atomically with
 /// the conditional durable transition; never send it to a peer or log it.
 #[derive(Clone, PartialEq, Eq)]
@@ -547,16 +563,7 @@ impl Coordinator {
             .ok_or(Refused::Unsupported)?;
         let mut frames = Vec::with_capacity(receipts.payloads().len());
         for payload in receipts.payloads() {
-            let frame = Frame {
-                version,
-                request_id: id,
-                body: Some(Body::Result(RpcResult {
-                    outcome: Some(outcome_payload(payload.clone())),
-                })),
-            };
-            if prost::Message::encoded_len(&frame) > 1024 {
-                return Err(Refused::Unavailable);
-            }
+            let frame = bounded_receipt_frame(id, version, payload).ok_or(Refused::Unavailable)?;
             frames.push(
                 encode_frame(&frame, syntra_core::ValidationContext::active(version))
                     .map_err(|_| Refused::Unavailable)?,
@@ -889,6 +896,13 @@ impl Host {
         &self,
         policy: MethodPolicy,
     ) -> Result<Arc<Coordinator>, Refused> {
+        // Before hello, size for the widest version this host can negotiate and any RPC ID.
+        let max_version = self
+            .host_supported
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(syntra_core::MAX_VERSION);
         if cfg!(target_arch = "wasm32")
             || policy.read_timeout < Duration::from_millis(100)
             || policy.read_timeout > Duration::from_millis(250)
@@ -897,7 +911,9 @@ impl Host {
                 let entries = receipts.payloads();
                 syntra_core::validate_method(method).is_err()
                     || !(1..=8).contains(&entries.len())
-                    || entries.iter().any(|p| p.len() > 1024)
+                    || entries
+                        .iter()
+                        .any(|p| bounded_receipt_frame(u64::MAX, max_version, p).is_none())
             })
         {
             return Err(Refused::Unsupported);
@@ -1442,7 +1458,14 @@ mod tests {
                 selected,
             },
         );
-        let (lease, _observer) = ExecutionLease::acquire(&host.execution, None).unwrap();
+        let (lease, _observer) = ExecutionLease::acquire(
+            &host.execution,
+            None,
+            &Principal::new("fixture"),
+            "/example.Authority/Retire",
+            0,
+        )
+        .unwrap();
         let context = RequestContext::new(
             Arc::downgrade(&host),
             123,

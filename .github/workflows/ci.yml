@@ -77,7 +77,7 @@ jobs:
   rust:
     name: locked tests + FFI/WASM contract
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -103,6 +103,14 @@ jobs:
         run: cargo test --locked
       - name: Locked workspace tests (includes integration carrier fixtures)
         run: cargo test --locked --workspace
+      - name: Mixed-traffic runner tests with heap accounting enabled
+        run: cargo test --locked -p syntra-integration --features managed-media,measure-heap --bin mixed_traffic --test connection_purpose
+      - name: Mixed-traffic loopback smoke (correctness only)
+        run: cargo run --locked -p syntra-integration --bin mixed_traffic -- --smoke
+      - name: Managed interactive/media loopback smoke (correctness only)
+        run: cargo run --locked -p syntra-integration --features managed-media --bin mixed_traffic -- --production-lanes --smoke
+      - name: Media interruption and idle-wake isolation
+        run: cargo test --locked -p syntra-integration --features managed-media --test managed_media_fault
       - name: Default dependency isolation (host + WASM, no dev/test graph)
         run: python3 scripts/cargo_contracts.py isolation
       - name: WebSocket production graph excludes TLS implementations and HTTP/cross-carrier opt-ins
@@ -163,6 +171,8 @@ jobs:
         run: cargo test --locked -p syntra-ffi --no-default-features
       - name: Production FFI tests
         run: cargo test --locked -p syntra-ffi --no-default-features --features production
+      - name: Managed media FFI tests
+        run: cargo test --locked -p syntra-ffi --no-default-features --features managed-media --lib
       - name: Test-fixture FFI tests
         run: cargo test --locked -p syntra-ffi --no-default-features --features test-fixture
       - name: WASM baseline (core, runtime and record-protection kernel)

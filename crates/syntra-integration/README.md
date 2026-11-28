@@ -29,6 +29,12 @@ The draft RFC0013 HTTP/HTTPS bindings are unregistered candidates. Their tests u
 These native tests run outside the TCP/WS Docker fixture and do not establish
 carrier approval or conformance.
 
+The non-Docker `connection_purpose` and `operation_admission` targets use
+separate returning-mode TCP connections to check object access and shared host
+quotas. They do not drive the managed C client or the durable transfer protocol.
+See [media verification](../../MEDIA.md#verify-from-the-workspace-root) for those
+separate Rust and linked-C checks.
+
 The WS endpoint is `/syntra/1.0/ws` (`websocket::ENDPOINT_PATH`) with exact
 subprotocol `syntra.1.0`. The harness dials mapped ports on `127.0.0.1` to meet
 the WS dial restriction. Both TCP and WS carry Syntra encrypted records;

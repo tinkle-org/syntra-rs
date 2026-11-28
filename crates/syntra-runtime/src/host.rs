@@ -59,7 +59,10 @@ use crate::session::{AuthError, Authenticator, Principal, Session, SessionManage
 
 #[path = "host_execution.rs"]
 mod execution;
-pub use execution::{ExecutionBudget, ExecutionLease};
+pub use execution::{
+    AdmissionRefusal, ExecutionBudget, ExecutionLease, ManagedOutput, OperationAuthority,
+    OperationClass, OperationGrant, OperationLimits, QuotaOwnership,
+};
 
 #[path = "host_terminal.rs"]
 pub mod terminal;
@@ -272,6 +275,59 @@ struct PendingCall {
     deadline: Instant,
     cancel: crate::connection::CancelToken,
     selected: oneshot::Sender<HandlerOutcome>,
+}
+
+type Admission = Result<(execution::Execution, Option<recovery::Call>), HandlerOutcome>;
+
+/// Sole native writer's ordinary queue. A dequeued host result retains its
+/// operation charge. Client frames never carry a host charge.
+#[doc(hidden)]
+pub struct DriverReceiver(DriverQueue);
+
+enum DriverQueue {
+    Raw(mpsc::Receiver<Vec<u8>>),
+    Host(mpsc::Receiver<ManagedOutput>, Arc<Mutex<Calls>>),
+}
+
+impl From<mpsc::Receiver<Vec<u8>>> for DriverReceiver {
+    fn from(raw: mpsc::Receiver<Vec<u8>>) -> Self {
+        Self(DriverQueue::Raw(raw))
+    }
+}
+
+impl DriverReceiver {
+    pub async fn recv(&mut self) -> Option<ManagedOutput> {
+        match &mut self.0 {
+            DriverQueue::Raw(rx) => rx.recv().await.map(Into::into),
+            DriverQueue::Host(rx, _) => rx.recv().await,
+        }
+    }
+    pub fn close(&mut self) {
+        match &mut self.0 {
+            DriverQueue::Raw(rx) => rx.close(),
+            DriverQueue::Host(rx, _) => rx.close(),
+        }
+    }
+    pub fn discard_queued(&mut self) {
+        match &mut self.0 {
+            DriverQueue::Raw(rx) => while rx.try_recv().is_ok() {},
+            DriverQueue::Host(rx, _) => while rx.try_recv().is_ok() {},
+        }
+    }
+}
+
+impl Drop for DriverReceiver {
+    fn drop(&mut self) {
+        if let DriverQueue::Host(_, calls) = &self.0 {
+            // A reserved mpsc permit can send AFTER receiver drop. Fence under
+            // the final enqueue lock before dropping/draining the receiver, so
+            // a retained Host cannot strand a charged item in a dead channel.
+            calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .stop_delivery("transport writer gone");
+        }
+    }
 }
 
 struct WithdrawalOwner {
@@ -599,14 +655,39 @@ impl Host {
         )
     }
 
-    fn try_build(
+    /// Protected native writer boundary. The driver owns each dequeued result
+    /// through completion of its entire record sequence or abort.
+    #[doc(hidden)]
+    pub fn try_new_with_managed_output(
+        config: ConnectionConfig,
+        auth: Arc<dyn Authenticator>,
+        handler: Arc<dyn Handler>,
+        budget: ExecutionBudget,
+        clock: crate::elapsed::ElapsedClock,
+    ) -> Result<(Arc<Self>, DriverReceiver), SyntraError> {
+        let (host, rx) = Self::try_build(
+            config,
+            auth,
+            handler,
+            vec![syntra_core::MAX_VERSION],
+            Some(budget),
+            clock,
+        )?;
+        let receiver = DriverReceiver(DriverQueue::Host(rx, host.calls.clone()));
+        Ok((host, receiver))
+    }
+
+    fn try_build<T>(
         config: ConnectionConfig,
         auth: Arc<dyn Authenticator>,
         handler: Arc<dyn Handler>,
         host_supported: Vec<u32>,
         shared_execution: Option<ExecutionBudget>,
         clock: crate::elapsed::ElapsedClock,
-    ) -> Result<(Arc<Self>, mpsc::Receiver<Vec<u8>>), SyntraError> {
+    ) -> Result<(Arc<Self>, mpsc::Receiver<T>), SyntraError>
+    where
+        mpsc::Sender<T>: Into<crate::connection::Writer>,
+    {
         config.validate()?;
         let (wtx, wrx) = mpsc::channel(config.writer_capacity);
         let (shared, notif_rx) = Shared::new_with_clock(
@@ -1218,7 +1299,7 @@ impl Host {
         }
         // Check before policy AND after synchronous policy; even a policy that
         // exceeds its nonblocking contract cannot cause expired handler effects.
-        let mut rejection = if self.conn.shared.clock.now() >= deadline {
+        let rejection = if self.conn.shared.clock.now() >= deadline {
             Some(HandlerOutcome::error(
                 ErrorCode::DeadlineExceeded,
                 "deadline exceeded",
@@ -1262,23 +1343,19 @@ impl Host {
                 )),
             }
         };
-        let profile = if rejection.is_none()
-            && self.conn.shared.clock.now() < deadline
-            && recovery::is_profile(&req.method)
-        {
-            match self.prepare_recovery(&session.as_ref().expect("checked binding").principal) {
-                Ok(call) => Some(call),
-                Err(error) => {
-                    rejection = Some(recovery::outcome(error));
-                    None
-                }
-            }
+        let admission = if let Some(reason) = rejection {
+            Err(reason)
+        } else if self.conn.shared.clock.now() >= deadline {
+            Err(HandlerOutcome::error(
+                ErrorCode::DeadlineExceeded,
+                "deadline exceeded",
+            ))
         } else {
-            None
+            self.admit_execution(&session.as_ref().expect("checked binding").principal, &req)
         };
         let withdraw = matches!(
-            &rejection,
-            Some(HandlerOutcome::Error {
+            &admission,
+            Err(HandlerOutcome::Error {
                 code: ErrorCode::Unauthenticated,
                 ..
             })
@@ -1286,15 +1363,15 @@ impl Host {
         // Withdrawal is a connection policy action even if the elapsed RPC
         // deadline wins its terminal result. Never turn revocation back into a
         // valid binding merely because synchronous policy returned late.
-        let rejection = if self.conn.shared.clock.now() >= deadline {
-            Some(HandlerOutcome::error(
+        let admission = if self.conn.shared.clock.now() >= deadline {
+            Err(HandlerOutcome::error(
                 ErrorCode::DeadlineExceeded,
                 "deadline exceeded",
             ))
         } else {
-            rejection
+            admission
         };
-        let admitted = self.start_request(id, version, req, deadline, rejection, profile);
+        let admitted = self.start_request(id, version, req, deadline, admission);
         if withdraw {
             // Reservation needs the lifecycle write guard. Publish sticky denial
             // before releasing our read guard, including when the RPC deadline
@@ -1323,6 +1400,44 @@ impl Host {
         }
     }
 
+    fn admit_execution(&self, principal: &Principal, req: &RpcRequest) -> Admission {
+        // Only the FIFO admission owner can insert another pending request. No
+        // registry mutex spans the quota provider or recovery session setup.
+        if self.inflight_len() >= self.conn.shared.config.max_outstanding {
+            return Err(HandlerOutcome::error(
+                ErrorCode::ResourceExhausted,
+                "too many outstanding RPCs",
+            ));
+        }
+        let execution = ExecutionLease::acquire(
+            &self.execution,
+            self.shared_execution.as_ref(),
+            principal,
+            &req.method,
+            req.payload.len(),
+        )
+        .map_err(|e| match e {
+            AdmissionRefusal::Exhausted => {
+                HandlerOutcome::error(ErrorCode::ResourceExhausted, "execution budget exhausted")
+            }
+            AdmissionRefusal::Unavailable => {
+                HandlerOutcome::error(ErrorCode::Unavailable, "admission unavailable")
+            }
+            AdmissionRefusal::Revoked => {
+                HandlerOutcome::error(ErrorCode::Unauthenticated, "credential not accepted")
+            }
+        })?;
+        let profile = if recovery::is_profile(&req.method) {
+            Some(
+                self.prepare_recovery(principal)
+                    .map_err(recovery::outcome)?,
+            )
+        } else {
+            None
+        };
+        Ok((execution, profile))
+    }
+
     /// Register a correlated rejection under its existing absolute deadline without
     /// acquiring an execution lease. Close if bounded terminal output is exhausted.
     async fn reject_request(
@@ -1336,14 +1451,8 @@ impl Host {
         if *state != ConnectionState::Active || self.conn.is_closed() {
             return;
         }
-        let admitted = self.start_request(
-            id,
-            version,
-            RpcRequest::default(),
-            deadline,
-            Some(outcome),
-            None,
-        );
+        let admitted =
+            self.start_request(id, version, RpcRequest::default(), deadline, Err(outcome));
         drop(state);
         if !admitted {
             self.output_exhausted().await;
@@ -1366,10 +1475,9 @@ impl Host {
         &self,
         id: u64,
         version: u32,
-        req: RpcRequest,
+        mut req: RpcRequest,
         deadline: Instant,
-        mut rejection: Option<HandlerOutcome>,
-        profile: Option<recovery::Call>,
+        admission: Admission,
     ) -> bool {
         if self
             .conn
@@ -1382,35 +1490,23 @@ impl Host {
         if self.conn.terminal_fenced() {
             return true;
         }
-        let Some(output) = self.output.try_acquire() else {
+        let Some(mut output) = self.output.try_acquire() else {
             return false;
         };
         let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
         if calls.delivery_stopped {
             return true;
         }
-        // Correlation has its own explicit ceiling, independent of execution
-        // and output. Rejections below select terminal under this same gate
-        // before becoming visible to another registry reader.
-        if rejection.is_none() && calls.pending.len() >= self.conn.shared.config.max_outstanding {
-            rejection = Some(HandlerOutcome::error(
-                ErrorCode::ResourceExhausted,
-                "too many outstanding RPCs",
-            ));
-        }
-        let execution = if rejection.is_none() {
-            match ExecutionLease::acquire(&self.execution, self.shared_execution.as_ref()) {
-                Some(execution) => Some(execution),
-                None => {
-                    rejection = Some(HandlerOutcome::error(
-                        ErrorCode::ResourceExhausted,
-                        "too many live executions",
-                    ));
-                    None
-                }
+        let (lease, observer, profile, rejection) = match admission {
+            Ok(((lease, observer), profile)) => {
+                lease.retain_output(&mut output);
+                (Some(lease), Some(observer), profile, None)
             }
-        } else {
-            None
+            Err(outcome) => {
+                // A backpressured rejection must not retain uncharged request bytes.
+                req = RpcRequest::default();
+                (None, None, None, Some(outcome))
+            }
         };
         let cancel = crate::connection::CancelToken::new();
         let (selected, mut result) = oneshot::channel();
@@ -1428,10 +1524,6 @@ impl Host {
         let registry = self.calls.clone();
         let handler = self.handler.clone();
         let sender = self.conn.clone();
-        let (lease, observer) = match execution {
-            Some((lease, observer)) => (Some(lease), Some(observer)),
-            None => (None, None),
-        };
         let owner_registry = registry.clone();
         let owner_sender = sender.clone();
         let progress = self.progress.clone();
@@ -1513,7 +1605,8 @@ impl Host {
                         )
                     };
                     drop(state);
-                    let outcome = bounded_outcome(id, version, work.await);
+                    let outcome =
+                        bounded_outcome(id, version, work.await, lease.response_frame_bytes());
                     registry
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -1604,7 +1697,7 @@ impl Host {
         id: u64,
         version: u32,
         outcome: HandlerOutcome,
-        _output: execution::BudgetPermit,
+        mut output: execution::BudgetPermit,
     ) {
         let outcome = match outcome {
             HandlerOutcome::Payload(payload) => outcome_payload(payload),
@@ -1631,7 +1724,7 @@ impl Host {
             .clone();
         if let Some(terminal) = terminal {
             if terminal.fenced() {
-                terminal.emit(id, bytes, _output);
+                terminal.emit(id, bytes, output);
                 return;
             }
         }
@@ -1656,7 +1749,10 @@ impl Host {
             && !sender.terminal_fenced()
             && !sender.lifecycle_blocked()
         {
-            permit.send(bytes);
+            match permit {
+                crate::connection::WriterPermit::Raw(p) => p.send(bytes),
+                crate::connection::WriterPermit::Managed(p) => p.send(output.managed_output(bytes)),
+            }
         }
     }
 
@@ -2021,9 +2117,26 @@ fn outcome_payload(b: Vec<u8>) -> syntra_core::proto::rpc_result::Outcome {
     syntra_core::proto::rpc_result::Outcome::Payload(b)
 }
 
-fn bounded_outcome(id: u64, version: u32, outcome: HandlerOutcome) -> HandlerOutcome {
+fn bounded_outcome(
+    id: u64,
+    version: u32,
+    outcome: HandlerOutcome,
+    frame_limit: usize,
+) -> HandlerOutcome {
     match outcome {
-        HandlerOutcome::Error { code, message } => HandlerOutcome::error(code, message),
+        HandlerOutcome::Error { code, message } => {
+            // At most 32 envelope bytes with a bounded diagnostic, including
+            // maximal version and correlation varints. Keep the handler's code;
+            // if the text exceeds the grant, send a known-fitting diagnostic
+            // rather than a potentially misleading fragment of the original.
+            if frame_limit < syntra_core::MAX_DIAGNOSTIC_BYTES + 32
+                && message.len() > frame_limit - 32
+            {
+                HandlerOutcome::error(code, "request failed")
+            } else {
+                HandlerOutcome::error(code, message)
+            }
+        }
         HandlerOutcome::Payload(payload) => {
             let frame = Frame {
                 version,
@@ -2032,7 +2145,7 @@ fn bounded_outcome(id: u64, version: u32, outcome: HandlerOutcome) -> HandlerOut
                     outcome: Some(outcome_payload(payload)),
                 })),
             };
-            if prost::Message::encoded_len(&frame) > syntra_core::MAX_FRAME_BYTES {
+            if prost::Message::encoded_len(&frame) > frame_limit {
                 HandlerOutcome::error(ErrorCode::ResourceExhausted, "result exceeds bound")
             } else {
                 let Some(Body::Result(RpcResult {

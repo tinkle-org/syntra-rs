@@ -615,6 +615,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-time",
+ "zeroize",
 ]
 
 [[package]]

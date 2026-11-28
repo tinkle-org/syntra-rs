@@ -21,10 +21,13 @@ test-fixture = ["dep:syntra-core", "dep:syntra-runtime", "dep:tokio"]
 # Sole production ABI: shared Host/Initiator/recovery, native-only. Mutually
 # exclusive with test-fixture (their intentionally separate C contracts differ).
 production = ["dep:syntra-core", "dep:syntra-runtime", "dep:tokio"]
+managed-media = ["production", "dep:syntra-net", "dep:zeroize"]
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 syntra-core = { path = "../syntra-core", version = "1.0.0-rc.6", optional = true }
 syntra-runtime = { path = "../syntra-runtime", version = "1.0.0-rc.6", optional = true }
+syntra-net = { path = "../syntra-net", version = "1.0.0-rc.6", default-features = false, features = ["media"], optional = true }
+zeroize = { version = "1", features = ["alloc"], optional = true }
 tokio = { version = "1", default-features = false, features = ["sync", "time", "rt-multi-thread", "macros"], optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]

@@ -114,9 +114,26 @@ pub struct NetworkStatus {
 }
 
 struct ResultCell<T> {
-    value: Mutex<Option<Result<T, WaitError>>>,
+    value: Mutex<Slot<T>>,
     changed: Condvar,
     waker: AtomicWaker,
+}
+
+pub(crate) type ResultCredit = (OwnedSemaphorePermit, OwnedSemaphorePermit);
+
+struct Slot<T> {
+    result: Option<Result<T, WaitError>>,
+    // Shared by job and observer: abandoning a mutation cannot free its charge
+    // early, and completing a job cannot free an unread result's charge.
+    credit: Option<ResultCredit>,
+}
+
+impl<T> Slot<T> {
+    fn take(&mut self) -> Option<Result<T, WaitError>> {
+        let result = self.result.take()?;
+        self.credit.take();
+        Some(result)
+    }
 }
 
 /// A result driven on the library pool, usable from std threads or any executor.
@@ -138,6 +155,11 @@ pub enum WaitError {
 }
 
 impl<T> Operation<T> {
+    /// Consume a completed result without blocking or installing a waker.
+    pub fn try_take(&mut self) -> Option<Result<T, WaitError>> {
+        lock(&self.0.value).take()
+    }
+
     pub fn wait(self, timeout: Duration) -> Result<T, WaitError> {
         if Handle::try_current().is_ok() {
             return Err(WaitError::WouldBlockRuntime);
@@ -182,7 +204,7 @@ struct ResultSender<T> {
 impl<T> Drop for ResultSender<T> {
     fn drop(&mut self) {
         if !self.sent {
-            *lock(&self.cell.value) = Some(Err(WaitError::OwnerFailed));
+            lock(&self.cell.value).result = Some(Err(WaitError::OwnerFailed));
             self.cell.changed.notify_all();
             self.cell.waker.wake();
         }
@@ -191,14 +213,17 @@ impl<T> Drop for ResultSender<T> {
 
 fn result_pair<T>() -> (Operation<T>, ResultSender<T>) {
     let cell = Arc::new(ResultCell {
-        value: Mutex::new(None),
+        value: Mutex::new(Slot {
+            result: None,
+            credit: None,
+        }),
         changed: Condvar::new(),
         waker: AtomicWaker::new(),
     });
     (Operation(cell.clone()), ResultSender { cell, sent: false })
 }
 fn deliver<T>(mut sender: ResultSender<T>, value: T) {
-    *lock(&sender.cell.value) = Some(Ok(value));
+    lock(&sender.cell.value).result = Some(Ok(value));
     sender.sent = true;
     sender.cell.changed.notify_all();
     sender.cell.waker.wake();
@@ -397,6 +422,21 @@ impl Network {
     /// Repeated waits do not extend any connection's first shutdown grace budget.
     pub fn shutdown(&mut self, timeout: Duration) -> ShutdownReport {
         self.stop();
+        let report = self.wait_stopped(timeout);
+        if report.complete
+            && self
+                .owner
+                .as_ref()
+                .is_some_and(thread::JoinHandle::is_finished)
+        {
+            if let Some(owner) = self.owner.take() {
+                let _ = owner.join();
+            }
+        }
+        report
+    }
+
+    pub(crate) fn wait_stopped(&self, timeout: Duration) -> ShutdownReport {
         if Handle::try_current().is_ok() {
             return self.report();
         }
@@ -416,19 +456,7 @@ impl Network {
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
-        let report = state.report;
-        drop(state);
-        if report.complete
-            && self
-                .owner
-                .as_ref()
-                .is_some_and(thread::JoinHandle::is_finished)
-        {
-            if let Some(owner) = self.owner.take() {
-                let _ = owner.join();
-            }
-        }
-        report
+        state.report
     }
 
     /// The connector creates fresh security inputs per attempt. Its routes and
@@ -471,6 +499,16 @@ impl Network {
         F: Fn(EstablishmentBudget) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ClientHandle, Error>> + Send + 'static,
     {
+        self.client_from_factory(config, move |cfg| {
+            ReconnectingClient::new_with_budget(cfg, connector)
+        })
+    }
+
+    pub(crate) fn client_from_factory(
+        &self,
+        config: ReconnectConfig,
+        create: impl FnOnce(ReconnectConfig) -> Result<ReconnectingClient, Error> + Send + 'static,
+    ) -> Result<Operation<Result<ManagedClient, Error>>, Error> {
         config.validate()?;
         let (operation, result) = result_pair();
         let network = self.shared.clone();
@@ -485,7 +523,7 @@ impl Network {
                 let mut config = config;
                 config.start_paused |= state.controls.paused || state.controls.stopped;
                 config.initial_network_available &= !state.controls.offline;
-                let reconnect = match ReconnectingClient::new_with_budget(config, connector) {
+                let reconnect = match create(config) {
                     Ok(client) => client,
                     Err(error) => {
                         deliver(result, Err(error));
@@ -941,13 +979,24 @@ pub struct ManagedClient {
     network: Arc<Shared>,
 }
 impl ManagedClient {
-    fn active(&self) -> Result<Arc<ReconnectingClient>, CallError> {
+    pub(crate) fn active(&self) -> Result<Arc<ReconnectingClient>, CallError> {
         lock(&self.state.client)
             .clone()
             .ok_or(CallError::Unavailable { generation: None })
     }
     pub fn status(&self) -> LifecycleStatus {
         lock(&self.state.status).snapshot()
+    }
+
+    #[cfg(feature = "media")]
+    pub(crate) fn operation<T: Send + 'static>(
+        &self,
+        job: impl Future<Output = T> + Send + 'static,
+    ) -> Result<Operation<T>, Error> {
+        let (op, sender) = result_pair();
+        self.network
+            .submit(async move { deliver(sender, job.await) })?;
+        Ok(op)
     }
     pub fn subscribe_status(&self) -> crate::client::StatusReceiver {
         lock(&self.state.status).clone()
@@ -996,6 +1045,16 @@ impl ManagedClient {
         payload: Vec<u8>,
         timeout_ms: u32,
     ) -> Result<CallOperation, Error> {
+        self.call_with_credit(method, payload, timeout_ms, None)
+    }
+
+    pub(crate) fn call_with_credit(
+        &self,
+        method: String,
+        payload: Vec<u8>,
+        timeout_ms: u32,
+        credit: Option<ResultCredit>,
+    ) -> Result<CallOperation, Error> {
         let active = self.active();
         let generation = active.as_ref().ok().and_then(|c| match c.status() {
             LifecycleStatus::CoreReady(r) | LifecycleStatus::RecoveryNegotiated(r) => {
@@ -1004,6 +1063,8 @@ impl ManagedClient {
             _ => None,
         });
         let (operation, result) = result_pair();
+        let bounded = credit.is_some();
+        lock(&operation.0.value).credit = credit;
         self.network.submit(async move {
             let value = match (active, generation) {
                 (Ok(client), Some(generation)) => {
@@ -1012,7 +1073,12 @@ impl ManagedClient {
                     // cannot slip a successor between this check and the snapshot.
                     let call = client.call(&method, payload, timeout_ms);
                     if client.is_generation_current(generation) {
-                        call.await
+                        call.await.map(|mut response| {
+                            if bounded && response.value.capacity() > response.value.len() {
+                                response.value = response.value.into_boxed_slice().into_vec();
+                            }
+                            response
+                        })
                     } else {
                         Err(CallError::Unavailable {
                             generation: Some(generation),
