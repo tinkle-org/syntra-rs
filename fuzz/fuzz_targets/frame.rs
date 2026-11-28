@@ -47,9 +47,15 @@ fn legal_request(data: &[u8]) -> Vec<u8> {
         len_field(2, b"old", &mut request);
         uint32::encode(3, &1, &mut request);
     }
-    let mut fields = [1, 2, 3];
-    fields.rotate_left(usize::from(flags >> 4) % 3);
-    for tag in fields {
+    const ORDERS: [[u32; 3]; 6] = [
+        [1, 2, 3],
+        [1, 3, 2],
+        [2, 1, 3],
+        [2, 3, 1],
+        [3, 1, 2],
+        [3, 2, 1],
+    ];
+    for tag in ORDERS[usize::from(flags >> 4) % ORDERS.len()] {
         match tag {
             1 => string::encode(tag, &method, &mut request),
             2 if with_payload => len_field(tag, payload, &mut request),
