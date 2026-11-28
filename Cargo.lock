@@ -1586,7 +1586,7 @@ dependencies = [
 
 [[package]]
 name = "syntra-core"
-version = "1.0.0-rc.6"
+version = "1.0.0-rc.7"
 dependencies = [
  "bytes",
  "criterion",
@@ -1606,7 +1606,7 @@ dependencies = [
 
 [[package]]
 name = "syntra-ffi"
-version = "1.0.0-rc.6"
+version = "1.0.0-rc.7"
 dependencies = [
  "getrandom 0.3.4",
  "syntra-core",
@@ -1618,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "syntra-integration"
-version = "1.0.0-rc.6"
+version = "1.0.0-rc.7"
 dependencies = [
  "futures-util",
  "syntra-core",
@@ -1631,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "syntra-net"
-version = "1.0.0-rc.6"
+version = "1.0.0-rc.7"
 dependencies = [
  "criterion",
  "fs2",
@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "syntra-runtime"
-version = "1.0.0-rc.6"
+version = "1.0.0-rc.7"
 dependencies = [
  "bytes",
  "fs2",
