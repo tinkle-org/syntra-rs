@@ -432,7 +432,17 @@ fn lawful_unknown_groups_are_bounded_and_do_not_inherit_parent_schema() {
 fn tags_varints_lengths_and_fixed_fields_are_bounded() {
     let overflow = [vec![0x80; 9], vec![2]].concat();
     let overlong = [vec![0x80; 10], vec![0]].concat();
-    for bad in [overflow, overlong, vec![0x80]] {
+    let method = len(1, b"/a/B");
+    for (bad, message) in [
+        (overflow, "overflowing protobuf varint"),
+        (overlong, "overflowing protobuf varint"),
+        (vec![0x80], "truncated varint"),
+    ] {
+        let bad_id = [frame(12, &method), field(2, 0, &bad)].concat();
+        let bad_payload_len = frame(12, &[method.as_slice(), &[0x12], &bad].concat());
+        for raw in [bad_id, bad_payload_len] {
+            assert_eq!(rejected(&raw, ErrorCode::InvalidArgument), message);
+        }
         rejected(&bad, ErrorCode::InvalidArgument); // tag
         rejected(&field(90, 0, &bad), ErrorCode::InvalidArgument);
         let raw = [varint(90 << 3 | 2), bad].concat();
@@ -481,6 +491,15 @@ fn nonminimal_encodings_and_ordinary_scalar_merge_are_preserved() {
     }
 }
 
+fn assert_request_parity(raw: &[u8]) -> Frame {
+    validate_wire_structure(raw).unwrap();
+    let expected = Frame::decode(raw).unwrap();
+    assert_eq!(decode_frame_structure(raw).unwrap(), expected);
+    let decoded = decode_frame(raw, active()).unwrap();
+    assert_eq!(decoded, expected);
+    decoded
+}
+
 #[test]
 fn admitted_requests_match_prost_field_order_defaults_and_merge() {
     let unknown = group(90, &[len(1, b"ignored"), len(2, &[0xff])].concat());
@@ -508,9 +527,59 @@ fn admitted_requests_match_prost_field_order_defaults_and_merge() {
             field(1, 0, &varint((1 << 32) + 1)),
         ]
         .concat();
-        let expected = Frame::decode(raw.as_slice()).unwrap();
-        assert_eq!(decode_frame_structure(&raw).unwrap(), expected);
-        assert_eq!(decode_frame(&raw, active()).unwrap(), expected);
+        assert_request_parity(&raw);
+    }
+}
+
+#[test]
+fn request_id_and_payload_length_varint_boundaries() {
+    for (value, wire) in [
+        (127, &[0x7f][..]),
+        (128, &[0x80, 0x01]),
+        (16_383, &[0xff, 0x7f]),
+        (16_384, &[0x80, 0x80, 0x01]),
+        (1, &[0x81, 0]),
+        (
+            1,
+            &[0x81, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0],
+        ),
+    ] {
+        let payload = vec![0xff; value];
+        let mut request = len(1, b"/a/B");
+        request.push(0x12); // RpcRequest.payload
+        request.extend_from_slice(wire);
+        request.extend_from_slice(&payload);
+        let raw = [vec![8, 1], field(2, 0, wire), len(12, &request)].concat();
+
+        let decoded = assert_request_parity(&raw);
+        assert_eq!(decoded.request_id, value as u64);
+        let Some(Body::Request(req)) = decoded.body else {
+            panic!("expected request");
+        };
+        assert_eq!(req.payload, payload);
+    }
+}
+
+#[test]
+fn request_size_limit_counts_discarded_metadata() {
+    let base = frame(12, &len(1, b"/a/B"));
+    let expected = Frame::decode(base.as_slice()).unwrap();
+    for size in [MAX_FRAME_BYTES - 1, MAX_FRAME_BYTES, MAX_FRAME_BYTES + 1] {
+        let mut raw = base.clone();
+        raw.push(0x1a); // Frame metadata field 3; its length takes three bytes here.
+        let padding = size - raw.len() - 3;
+        raw.extend(varint(padding as u64));
+        raw.resize(raw.len() + padding, 0xff);
+        assert_eq!(raw.len(), size);
+
+        if size <= MAX_FRAME_BYTES {
+            assert_eq!(assert_request_parity(&raw), expected);
+        } else {
+            assert_eq!(
+                rejected(&raw, ErrorCode::ResourceExhausted),
+                "frame exceeds maximum envelope size"
+            );
+        }
     }
 }
 

@@ -229,3 +229,36 @@ not a frame case. The full gate passed against both baselines. Allocation calls
 are now 2 / 3 at the same 29 / 1,048,355 encoded bytes. These are in-memory
 results from a local Linux VM, not a rerun on the hosted runner or an RPC
 latency measurement.
+
+### One-byte varint experiment (2026-11-27)
+
+On an Apple M4 (arm64, macOS 27.2.1, AC power), Rust 1.89.0 built two
+versions of `frame_codec` with the same harness and lockfile. A used the
+decoder from `cfdf38c`; B differed only in `read_varint`: read the first
+byte, return if it is below 128, otherwise continue the checked loop from
+byte two. Each column is a separate Criterion run, in execution order.
+Values are time per operation (Criterion slope point estimate).
+
+| Case | A1 | B1 | B2 | A2 |
+| --- | ---: | ---: | ---: | ---: |
+| Request, empty, ID 7 (ns) | 58.54 | 53.62 | 54.59 | 57.13 |
+| Request, 64 B, ID 7 (ns) | 72.66 | 68.92 | 69.25 | 71.05 |
+| Request, 64 B, ID 128 (ns) | 78.77 | 75.88 | 74.14 | 74.80 |
+| Request, 64 B, 10-byte ID (ns) | 81.96 | 74.60 | 78.68 | 79.72 |
+| Request, near 1 MiB, ID 7 (µs) | 14.52 | 14.50 | 14.83 | 14.51 |
+| Notification, 64 B (ns) | 79.15 | 82.74 | 82.94 | 78.79 |
+| Structural scan only, 64 B request (ns) | 41.41 | 36.37 | 36.97 | 40.91 |
+
+The full 64 B request decode with ID 7 took 2.5–5.2% less time, but the
+notification took 4.5–5.3% more in the paired runs. Its 95% slope intervals
+did not overlap between builds in either order. The decoder therefore retains
+the shared loop. These measurements cover in-memory decoding, not RPC latency.
+
+To measure the same workloads, build with `cargo +1.89.0 bench --locked
+-p syntra-core --bench frame_codec --no-run`, then invoke the executable it
+prints for each build, with a distinct `RUN` label:
+
+```sh
+"$BIN" --bench '^frame/(decode_request/(0|64)|decode_request_64B_by_id/.*|decode_notification/64|decode_near_1MiB|scan/64)$' \
+  --warm-up-time 0.5 --measurement-time 1 --sample-size 30 --noplot --save-baseline "$RUN"
+```

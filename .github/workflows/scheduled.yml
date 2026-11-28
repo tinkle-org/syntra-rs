@@ -21,6 +21,7 @@ jobs:
     uses: ./.github/workflows/parser-checks.yml
     with:
       seconds: 900
+      large_frame: true
 
   full-linux:
     name: full validation (linux, 1.89.0)

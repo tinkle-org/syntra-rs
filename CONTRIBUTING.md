@@ -144,15 +144,20 @@ findings. See [the security policy](.github/SECURITY.md) for private vulnerabili
 
 Fuzz and negative tests:
 
-The isolated [parser checks](fuzz/README.md) use cargo-fuzz with AddressSanitizer
-for 60 seconds per target on PRs/main, and 900 seconds per target in scheduled
-validation. CI also checks the separate `fuzz/Cargo.lock` against RustSec and
-the workspace dependency policy. The 4 KiB fuzz input limit keeps these checks
-cheap. Run the full-size allocation, negative and regression suites when touching
-their parsers: `codec_vectors`, `encode_allocation`, `runtime_defects`,
-pump split-point and fault-injection tests. Keep fixture inputs and their expected
-bytes together in review. Local fixture tests and carrier integration tests have distinct
-scopes; name the boundary actually exercised.
+The isolated [parser checks](fuzz/README.md) use cargo-fuzz with AddressSanitizer.
+The frame target compares structurally admitted raw requests and generated legal
+requests with Prost. PRs and `main` cap inputs at 4 KiB and run for 60 seconds
+per target. Scheduled runs use 900 seconds per target; `--large-frame` raises
+only the frame input cap to 1 MiB + 1 byte. See the
+[failure replay instructions](fuzz/README.md#retain-and-replay-a-failure)
+for the one-day synthetic artifact and local `--failure-dir` usage. CI also checks
+`fuzz/Cargo.lock` against RustSec and the workspace dependency policy.
+
+For request decoder changes, run `cargo test --locked -p syntra-core --test phase2_wire`
+for deterministic parity, varint, and envelope-size cases. Run `codec_vectors`,
+`encode_allocation`, `runtime_defects`, and pump split-point and fault-injection
+tests when touching their parsers. Keep fixture inputs and expected bytes together
+in review; distinguish local parser checks from carrier integration tests.
 
 The exact context/prologue fixture tests cover **public encoding only**, not
 independent Noise cryptographic vectors. The separate [resolver known-answer tests](crates/syntra-core/tests/fixtures/resolver_kats/README.md)
