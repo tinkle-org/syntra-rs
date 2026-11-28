@@ -2118,7 +2118,7 @@ pub(crate) async fn connect_records_zeroizing<R: RecordReader, W: RecordWriter>(
     let core_deadline = attempt
         .min(end)
         .min(elapsed_now(&clock) + runtime.handshake_timeout);
-    let (conn, mut outbound) =
+    let (conn, outbound) =
         Initiator::try_new_with_clock(runtime, clock.clone()).map_err(|_| Error::Configuration)?;
     let mut channel = channel;
     let mut receive = ReceiveState::default();
@@ -2127,7 +2127,8 @@ pub(crate) async fn connect_records_zeroizing<R: RecordReader, W: RecordWriter>(
     // release both carrier halves before a lifecycle replacement can begin.
     let peer = Peer::Client(conn.clone());
     let id = elapsed_timeout(&clock, core_deadline, async {
-        let handshake = conn.handshake_zeroizing(credential);
+        let (hello_tx, mut hello_rx) = oneshot::channel();
+        let handshake = conn.handshake_with_protected_hello(credential, hello_tx);
         tokio::pin!(handshake);
         let mut hello_sent = false;
         loop {
@@ -2138,8 +2139,8 @@ pub(crate) async fn connect_records_zeroizing<R: RecordReader, W: RecordWriter>(
                 biased;
                 _ = clock.sleep_until(core_deadline.into_std()) => return Err(Error::Timeout),
                 result = &mut handshake => break result.map_err(runtime_error),
-                hello = outbound.recv(), if !hello_sent => {
-                    let hello = Zeroizing::new(hello.ok_or(Error::Closed)?);
+                hello = &mut hello_rx, if !hello_sent => {
+                    let hello = hello.map_err(|_| Error::Closed)?;
                     let plaintext = frame_plaintext(&hello)?;
                     let write_deadline = core_deadline.min(channel_deadline).min(elapsed_now(&clock) + limits.write_timeout);
                     io.until(write_deadline)?;

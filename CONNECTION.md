@@ -371,6 +371,15 @@ or ciphertext. The native pump additionally rechecks connection authorization
 and lifecycle gates before encrypting output and before carrier I/O. Custom
 drivers must preserve these checks for both initiator and host output.
 
+During native protected establishment, the serialized `ClientHello` goes directly
+to the record driver in a handshake-only `Zeroizing<Vec<u8>>` channel. A failed
+send or discard before encryption drops the guarded buffer. Ordinary RPCs still
+use the original writer queue. With raw `Initiator::handshake` or
+`handshake_zeroizing`, the writer receives a plain `Vec<u8>` even for the hello:
+discarding that queue does not wipe its contents. The production FFI frame pump
+uses this raw path too. Embedders must protect and wipe plaintext buffers they
+own; neither raw API guarantees erasure of a hello discarded inside its queue.
+
 `Channel::encrypt` consumes the next send nonce. Retain the resulting immutable
 ciphertext and its write future across partial writes/backpressure; finish it in
 order or abort. Never re-encrypt a replacement or relabel ciphertext after a

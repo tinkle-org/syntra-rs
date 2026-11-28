@@ -59,7 +59,15 @@ async fn install_bounds_the_complete_receipt_for_every_supported_call() {
     // With a ten-byte request ID, these payloads fill the frame exactly at
     // one- and five-byte versions, respectively (including both nested lengths).
     for (version, exact) in [(1, 1005), (u32::MAX, 1001)] {
-        for size in [exact, exact + 1] {
+        for (size, expected_bytes) in [(exact, 1024), (exact + 1, 1025)] {
+            let frame = Frame {
+                version,
+                request_id: u64::MAX,
+                body: Some(Body::Result(RpcResult {
+                    outcome: Some(outcome_payload(vec![0; size])),
+                })),
+            };
+            assert_eq!(prost::Message::encode_to_vec(&frame).len(), expected_bytes);
             for receipts in [
                 MethodReceipts::Fixed(vec![0; size]),
                 MethodReceipts::Outcomes(vec![vec![], vec![0; size]]),

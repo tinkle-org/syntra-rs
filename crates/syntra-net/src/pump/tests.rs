@@ -1305,11 +1305,12 @@ async fn application_close_grace_accepts_30_seconds_but_not_more() {
 async fn cancelled_post_channel_dial_releases_carrier_before_replacement() {
     // Poll establishment ourselves: no owner task gets a chance to clean up
     // between cancellation and starting the next dial.
-    for _ in 0..8 {
+    for stall_hello in [true, false] {
         let (client, server) = configs(Mode::Returning);
         let (client_tx, mut server_rx) = mpsc::channel(8);
         let (server_tx, client_rx) = mpsc::channel(8);
         let gate = Arc::new(Gate::default());
+        gate.armed.store(stall_hello, Ordering::SeqCst);
         let mut dial = Box::pin(connect_records(
             reader(client_rx),
             QueueWriter {
@@ -1317,7 +1318,7 @@ async fn cancelled_post_channel_dial_releases_carrier_before_replacement() {
                 gate: gate.clone(),
             },
             client,
-            vec![],
+            vec![42],
             ConnectionConfig::default(),
             Limits::default(),
         ));
@@ -1326,8 +1327,13 @@ async fn cancelled_post_channel_dial_releases_carrier_before_replacement() {
         let (mut channel, second) = respond(&server, &first).unwrap();
         server_tx.send(second).await.unwrap();
         assert!(futures_util::poll!(&mut dial).is_pending());
-        let hello = server_rx.try_recv().unwrap();
-        assert!(channel.decrypt(&hello).is_ok());
+        if stall_hello {
+            assert!(gate.entered.try_acquire().is_ok(), "hello write is pending");
+            assert!(server_rx.is_empty());
+        } else {
+            let hello = server_rx.try_recv().unwrap();
+            assert!(channel.decrypt(&hello).is_ok());
+        }
         assert!(!gate.dropped.load(Ordering::SeqCst));
         drop(dial);
         assert!(gate.dropped.load(Ordering::SeqCst));

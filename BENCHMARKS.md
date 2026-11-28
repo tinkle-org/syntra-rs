@@ -226,10 +226,12 @@ with `media_idle` set to 250 ms. An interactive echo then checks that the owner 
 still usable. The heap run counts live Rust allocations for the whole process: a
 peak during measured bursts and a snapshot at idle before teardown. It does not measure RSS.
 
-**Local release measurement (2026-11-28 UTC).** Apple M4 on AC, macOS 27.2.1
+**Historical dirty-tree measurement (2026-11-28 UTC), not PR-head performance.** Apple M4 on AC, macOS 27.2.1
 (26B131), `aarch64-apple-darwin`, rustc 1.89.0 (`29483883e`), `--locked --release`.
-Both passes used this PR's uncommitted implementation on `b0b9fdc`,
-not the historical runner at that SHA. Values are pass 1 / pass 2.
+Both passes ran on uncommitted sources based on `b0b9fdc`, before `a01b169`
+changed the measured paths and lockfile. The source patch and untracked inputs
+were not archived. Neither `41fcb1b` nor the current head is a verified match
+for those binaries. Values are pass 1 / pass 2.
 
 | Metric | One connection | Manual two | Managed lanes |
 | --- | ---: | ---: | ---: |
@@ -250,7 +252,7 @@ includes hashes of both stdout files. The [release](crates/syntra-integration/me
 and [heap](crates/syntra-integration/measurements/heap.sha256) checksums identify the executables,
 not their stdout; checking either executable hash requires the corresponding binary.
 
-**Reproduce from a clean checkout.** Use a revision containing the final runtime,
+**Collect a new comparison from a clean checkout.** Use a revision containing the final runtime,
 the uniform-handler runner, the routing test and their `Cargo.lock`; the base SHA
 alone does not reproduce uncommitted sources. From that checkout's repository root,
 on an otherwise idle host, use the installed rustup toolchain, no custom sysroot

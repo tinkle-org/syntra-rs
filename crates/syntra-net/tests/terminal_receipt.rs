@@ -548,13 +548,36 @@ async fn pending_after_commit_returns_closes_without_a_result() {
 
 #[tokio::test]
 async fn oversized_unselected_candidate_refuses_establishment_before_authority_reads() {
-    let authority = AuthorityFixture::new(6);
+    // Only outcome 2 is too large. Mode 6 would choose the empty outcome 1.
+    assert_refused_before_authority(
+        AuthorityFixture::new(6),
+        vec![],
+        vec![0; BOUNDARY_PAYLOAD + 1],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn oversized_fixed_receipt_refuses_establishment_before_authority_reads() {
+    // The fixed method has just one possible result; all outcome candidates fit.
+    assert_refused_before_authority(
+        AuthorityFixture::new(0),
+        vec![0; BOUNDARY_PAYLOAD + 1],
+        vec![],
+    )
+    .await;
+}
+
+async fn assert_refused_before_authority(
+    authority: Arc<AuthorityFixture>,
+    payload: Vec<u8>,
+    outcome_payload: Vec<u8>,
+) {
     let (config, address, accept) = listen(
         Factory {
             authority: authority.clone(),
-            payload: vec![],
-            // Only outcome 2 is too large. Mode 6 would choose the empty outcome 1.
-            outcome_payload: vec![0; BOUNDARY_PAYLOAD + 1],
+            payload,
+            outcome_payload,
             enabled: true,
             clock: None,
         },

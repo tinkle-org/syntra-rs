@@ -288,9 +288,30 @@ impl Initiator {
     }
 
     /// Send `hello` using an already guarded credential, without copying it into prost.
+    /// The serialized hello enters the raw writer as a plain `Vec`, just as in
+    /// [`Self::handshake`]; dropping that queue does not wipe it.
     pub async fn handshake_zeroizing(
         &self,
+        credential: Zeroizing<Vec<u8>>,
+    ) -> Result<String, SyntraError> {
+        self.handshake_impl(credential, None).await
+    }
+
+    /// Deliver only the serialized hello to a protected driver instead of the raw
+    /// writer. Drive this future alongside the receiver; encrypt the hello before
+    /// ingesting ready. On cancellation, discard both and retire the connection.
+    pub async fn handshake_with_protected_hello(
+        &self,
+        credential: Zeroizing<Vec<u8>>,
+        hello: oneshot::Sender<Zeroizing<Vec<u8>>>,
+    ) -> Result<String, SyntraError> {
+        self.handshake_impl(credential, Some(hello)).await
+    }
+
+    async fn handshake_impl(
+        &self,
         mut credential: Zeroizing<Vec<u8>>,
+        hello: Option<oneshot::Sender<Zeroizing<Vec<u8>>>>,
     ) -> Result<String, SyntraError> {
         let deadline = self.conn.shared.clock.now() + self.conn.shared.config.handshake_timeout;
         let (min_version, max_version) = {
@@ -339,7 +360,7 @@ impl Initiator {
         let sent = tokio::select! {
             biased;
             _ = self.conn.shared.clock.sleep_until(deadline) => Err(SyntraError::DeadlineExceeded("handshake timed out".to_string())),
-            sent = self.conn.send_hello(bytes) => sent,
+            sent = self.conn.send_hello(bytes, hello) => sent,
         };
         if let Err(e) = sent {
             self.conn
@@ -1235,6 +1256,44 @@ mod tests {
         let bytes = writer.try_recv().unwrap();
         let hello = Frame::decode(bytes.as_slice()).unwrap();
         assert!(matches!(hello.body, Some(Body::Hello(h)) if h.credential == [0, 255, 1]));
+        c.inject_frame(ready_frame(1)).await;
+        assert_eq!(handshake.await.unwrap(), "conn-test-1");
+    }
+
+    #[tokio::test]
+    async fn protected_hello_discard_never_enters_raw_queue() {
+        let (c, writer) = Initiator::new(ConnectionConfig::default());
+        let (tx, rx) = oneshot::channel::<Zeroizing<Vec<u8>>>();
+        let mut handshake = Box::pin(c.handshake_with_protected_hello(Zeroizing::new(vec![1]), tx));
+        assert!(futures_util::poll!(&mut handshake).is_pending());
+        assert!(!rx.is_empty(), "hello admitted but not consumed");
+        assert!(writer.is_empty());
+        drop(handshake);
+        drop(c);
+        drop(rx); // discard the queued Zeroizing, without polling a cleanup task
+
+        let (c, writer) = Initiator::new(ConnectionConfig::default());
+        let (tx, rx) = oneshot::channel();
+        drop(rx); // opposite ordering: failed send returns the guarded item
+        let result = c
+            .handshake_with_protected_hello(Zeroizing::new(vec![1]), tx)
+            .await;
+        assert!(matches!(result, Err(SyntraError::Closed(_))));
+        assert!(c.is_closed());
+        assert!(writer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn protected_hello_reaches_driver_with_credential_and_completes() {
+        let (c, writer) = Initiator::new(ConnectionConfig::default());
+        let (tx, mut rx) = oneshot::channel();
+        let mut handshake =
+            Box::pin(c.handshake_with_protected_hello(Zeroizing::new(vec![42]), tx));
+        assert!(futures_util::poll!(&mut handshake).is_pending());
+        let bytes: Zeroizing<Vec<u8>> = rx.try_recv().unwrap();
+        let frame = Frame::decode(bytes.as_slice()).unwrap();
+        assert!(matches!(frame.body, Some(Body::Hello(h)) if h.credential == [42]));
+        assert!(writer.is_empty());
         c.inject_frame(ready_frame(1)).await;
         assert_eq!(handshake.await.unwrap(), "conn-test-1");
     }

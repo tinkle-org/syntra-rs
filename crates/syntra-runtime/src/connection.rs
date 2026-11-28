@@ -891,6 +891,7 @@ impl Connection {
     pub(crate) async fn send_hello(
         &self,
         mut bytes: zeroize::Zeroizing<Vec<u8>>,
+        protected: Option<oneshot::Sender<zeroize::Zeroizing<Vec<u8>>>>,
     ) -> Result<(), SyntraError> {
         let permit = self.reserve_writer().await?;
         // Close and queue admission linearize on state. No lifecycle lock
@@ -903,8 +904,13 @@ impl Connection {
         {
             return Err(SyntraError::Closed("connection closed".to_string()));
         }
-        // The public transport receiver owns plain serialized frames from here.
-        permit.send(std::mem::take(&mut *bytes));
+        // Both paths require writer admission, but only the legacy queue takes a bare Vec.
+        if let Some(tx) = protected {
+            tx.send(bytes)
+                .map_err(|_| SyntraError::Closed("hello receiver gone".into()))?;
+        } else {
+            permit.send(std::mem::take(&mut *bytes));
+        }
         Ok(())
     }
 
