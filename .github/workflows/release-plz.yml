@@ -206,8 +206,34 @@ jobs:
         with:
           toolchain: "stable"
       - name: Run release-plz release-pr
+        id: release-pr
         uses: MarcoIeni/release-plz-action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
         with:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Sync the fuzz workspace lockfile on the generated release PR
+        if: steps.release-pr.outputs.prs_created == 'true'
+        shell: bash
+        env:
+          BRANCH: ${{ fromJSON(steps.release-pr.outputs.pr).head_branch }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$BRANCH" == release-plz-* ]]
+          git fetch --no-tags origin "refs/heads/$BRANCH"
+          head=$(git rev-parse FETCH_HEAD)
+          # Never run Cargo on a contributor's edit to the release branch.
+          gh api "repos/$GITHUB_REPOSITORY/commits/$head" | jq -e --arg base "$GITHUB_SHA" '
+            .author.login == "github-actions[bot]" and .commit.verification.verified and [.parents[].sha] == [$base]
+          ' >/dev/null
+          git switch --detach "$head"
+          rustup toolchain install 1.89.0 --profile minimal
+          cargo +1.89.0 update --workspace --manifest-path fuzz/Cargo.toml
+          cargo +1.89.0 fetch --locked --manifest-path fuzz/Cargo.toml
+          if git diff --quiet -- fuzz/Cargo.lock; then exit 0; fi
+          # shellcheck disable=SC2016 # The variables in the mutation belong to GraphQL.
+          gh api graphql -f query='mutation($repo:String!, $branch:String!, $head:GitObjectID!, $lock:Base64String!) {
+            createCommitOnBranch(input:{branch:{repositoryNameWithOwner:$repo,branchName:$branch},expectedHeadOid:$head,
+              message:{headline:"chore(release): sync fuzz workspace lockfile"},
+              fileChanges:{additions:[{path:"fuzz/Cargo.lock",contents:$lock}]}}) { commit { oid } }
+          }' -f repo="$GITHUB_REPOSITORY" -f branch="$BRANCH" -f head="$head" -f lock="$(base64 -w0 fuzz/Cargo.lock)"

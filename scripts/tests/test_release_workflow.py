@@ -74,6 +74,38 @@ class ReleaseWorkflowTests(unittest.TestCase):
         del action["env"]["CARGO_REGISTRY_TOKEN"]
         self.assertNotIn("CARGO_REGISTRY_TOKEN", str(workflow))
 
+    def test_release_bump_refreshes_the_separate_fuzz_lock(self):
+        steps = self.workflow["jobs"]["release-plz-pr"]["steps"]
+        action, = [s for s in steps if s.get("with", {}).get("command") == "release-pr"]
+        sync, = [s for s in steps if "fuzz/Cargo.lock" in s.get("run", "")]
+        self.assertLess(steps.index(action), steps.index(sync))
+        self.assertEqual(sync["if"], f"steps.{action['id']}.outputs.prs_created == 'true'")
+        update, fetch = [line.split() for line in sync["run"].splitlines() if line.startswith("cargo ")]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("core", "fuzz"):
+                (root / name / "src").mkdir(parents=True)
+                (root / name / "src/lib.rs").touch()
+                (root / name / "Cargo.toml").write_text(
+                    f'[package]\nname = "{name}"\nversion = "1.0.0-rc.1"\nedition = "2021"\n'
+                    + ('[workspace]\n[dependencies]\ncore = { path = "../core" }\n' if name == "fuzz" else ''))
+            def cargo(args, check=True):
+                return subprocess.run([*args, "--offline"], cwd=root, capture_output=True, check=check)
+
+            cargo(update)
+            lock = root / "fuzz/Cargo.lock"
+            before = lock.read_text()
+            manifest = root / "core/Cargo.toml"
+            manifest.write_text(manifest.read_text().replace("rc.1", "rc.2"))
+            self.assertNotEqual(cargo(fetch, check=False).returncode, 0)
+            cargo(update)
+            cargo(fetch)
+            expected = before.replace('name = "core"\nversion = "1.0.0-rc.1"', 'name = "core"\nversion = "1.0.0-rc.2"')
+            self.assertNotEqual(expected, before)
+            self.assertEqual(lock.read_text(), expected)
+            cargo(update)
+            self.assertEqual(lock.read_text(), expected)
+
     def test_manual_retry_checks_a_merged_release_commit_before_validation(self):
         dispatch = self.workflow["on"]["workflow_dispatch"]
         self.assertEqual(set(dispatch["inputs"]), {"release_commit"})
