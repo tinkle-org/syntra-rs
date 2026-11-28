@@ -4,7 +4,7 @@ Use **Rust 1.89.0** for current benchmarks and the current CI configuration,
 selecting it with `export RUSTUP_TOOLCHAIN=1.89.0`. The crate MSRV floor of 1.89
 is a build compatibility constraint; production binaries need a security-patched
 toolchain.
-Benchmarks use the locked Criterion 0.8 with `--bench` targets and report timing plus
+The `--bench` targets use the locked Criterion 0.8 and report timing plus
 throughput. Root benchmarks require no Docker. Session cases exercise the
 linked Tokio runtime; channel and transport cases exercise local Syntra 1.0
 record protection.
@@ -100,11 +100,93 @@ cargo bench --locked -p syntra-core --bench channel -- --test
 cargo bench --locked -p syntra-net --no-default-features --features tcp --bench pipe -- --test
 ```
 
-To smoke-test every benchmark in the workspace:
+To smoke-test every Criterion benchmark in the workspace:
 
 ```sh
 cargo bench --locked --workspace --features syntra-net/tcp -- --test
 ```
+
+## Mixed traffic on TCP loopback
+
+The unpublished `syntra-integration` package includes a standalone
+[`mixed_traffic` runner](crates/syntra-integration/src/bin/mixed_traffic.rs).
+It measures how long small RPCs take to return when bulk traffic shares their
+connection or uses a separate one. The [fixture](crates/syntra-integration/src/lib.rs)
+uses one IPv4 loopback listener. Each connection authenticates independently in
+returning mode with the same test credential and fresh traffic keys. With one connection,
+all calls share it; with two, echoes use the first and both bulk directions use
+the second (idle for `None`). There is no wire change.
+
+Run from the workspace root; no Docker is needed:
+
+```sh
+export RUSTUP_TOOLCHAIN=1.89.0
+cargo test --locked -p syntra-integration --features measure-heap --bin mixed_traffic --test connection_purpose
+cargo run --locked --release -p syntra-integration --bin mixed_traffic -- --smoke
+cargo run --locked --release -p syntra-integration --bin mixed_traffic
+# Separate process: use this run for heap bytes, not latency or throughput.
+cargo run --locked --release -p syntra-integration --features measure-heap --bin mixed_traffic
+```
+
+The binary tests check whole-block verification, percentile rank, paired
+timestamps, overlap, and the heap measurement window. The
+[`connection_purpose` tests](crates/syntra-integration/tests/connection_purpose.rs)
+check method and object access on both connections, shared caller quota and
+permit reuse, result correlation, and continued interactive use after bulk
+closes. They also check that revocation reaches both connections on their next
+call and blocks an admitted operation from committing an effect.
+
+**Workload.** Each burst offers four 8-byte echoes to one FIFO caller at a
+common barrier release. Independent callers upload one tagged 256 KiB block
+for an 8-byte receipt, download one such block for an 8-byte request, do both,
+or do neither. Every burst drains before the next; faster cases get no extra
+work. Each trial warms up for one burst, then measures 64 (256 echoes). The
+second pass reverses case order. `--smoke` uses two measured bursts per case
+and one pass; it checks the workload, not performance.
+
+**Reading the output:**
+
+- Echo times are nearest-rank p50/p95/p99 in µs: `queue_us` is burst offer to
+  call start, `rtt_us` is call start to return, and `offer_to_result_us` is
+  offer to that echo's return, not a sum of percentiles. `overlap` counts echoes
+  with a positive call interval common to *all* enabled bulk directions. A bulk
+  trial fails if none overlap or the verified workload is incomplete.
+- `up_MiB_s` and `down_MiB_s` divide verified bulk payload bytes in each
+  direction by `active_s`, the sum of burst times from offer to last verified
+  completion. Timing includes scheduling, encrypted I/O, and payload generation
+  and checks by the host; the active interval also includes client verification.
+  Connection setup, warmup, task creation, client input staging, and shutdown
+  are outside the timed intervals.
+- `staged_input_bytes` is the largest per-burst sum of client input `Vec`
+  capacities at offer. The separate `measure-heap` run reports
+  `peak_rust_heap_bytes`: peak live Rust heap across the process during the
+  measured burst loop, including bytes already live after warmup. It is neither
+  RSS nor an allocation delta.
+
+### Local mixed-traffic baseline
+
+Full runs at `805284d4e8d265858b20d4ab784152df03425579`, dirty (new harness
+only; unchanged transport). Apple M4 on AC, macOS 27.2.1 (26B131), rustc
+1.89.0 targeting `aarch64-apple-darwin`, four Tokio workers, `--release --locked`.
+Cells show pass 1 / pass 2. Latency and throughput come from the uninstrumented run.
+
+| Bulk load | Echo offer-to-result p95, 1 connection (µs) | Echo offer-to-result p95, 2 connections (µs) |
+| --- | ---: | ---: |
+| None | 194 / 197 | 197 / 198 |
+| Upload | 1678 / 1640 | 217 / 215 |
+| Download | 1661 / 1661 | 416 / 212 |
+| Both | 3004 / 3021 | 377 / 233 |
+
+| Both directions active | 1 connection | 2 connections |
+| --- | ---: | ---: |
+| Verified MiB/s per direction, uninstrumented (approx.) | 99.86 / 100.16 | 105.37 / 104.98 |
+| `peak_rust_heap_bytes`, separate process | 2137636 / 2137594 | 2190737 / 2193513 |
+
+Separating bulk calls lowered echo p95 under load in both passes; the no-bulk
+control was similar. This compares two topologies on the same transport, not a
+candidate/baseline speedup or a CI threshold. Fixed, drained bursts do not
+model open-loop arrivals, streaming, or an actual client. These measurements
+establish no production limits, physical-network throughput, or mobile energy costs.
 
 ## Main-push CPU baseline
 

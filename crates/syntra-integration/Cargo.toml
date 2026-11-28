@@ -5,7 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Docker-based Syntra 1.0 TCP/WebSocket connectivity tests; not published or a conformance verdict"
+description = "Syntra 1.0 container connectivity tests and loopback workload measurements; not published or a conformance verdict"
+
+[features]
+# Install the counting allocator only in the mixed_traffic diagnostic binary.
+measure-heap = []
 
 [[bin]]
 name = "peer"
