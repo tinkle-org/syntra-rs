@@ -246,7 +246,7 @@ async fn revoking_one_account_withdraws_both_live_bindings_on_their_next_call() 
 }
 
 #[tokio::test]
-async fn withdrawal_before_commit_blocks_an_already_admitted_effect() {
+async fn handler_rechecks_revocation_before_committing_an_admitted_effect() {
     bounded(async {
         let gate = Arc::new(Gate::default());
         let (interactive, bulk, account) = peers(1, Some(gate.clone())).await;

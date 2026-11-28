@@ -9,6 +9,7 @@ use syntra_runtime::Handler;
 
 pub const CREDENTIAL: &[u8] = b"loopback-test-caller";
 const SCOPE: &[u8] = b"mixed-traffic-fixture";
+const MAX_LIVE_PAIRS: usize = 2;
 
 struct Enrollment(Secret32);
 
@@ -29,12 +30,14 @@ pub struct Loopback {
 }
 
 impl Loopback {
+    /// Bind one listener for at most two live client/host pairs.
     pub async fn bind() -> Result<Self, Error> {
         let (private_key, server_public_key) = generate_server_key()?;
         // Fixed test enrollment; each connection still establishes fresh traffic keys.
         let enrollment = Arc::new(Enrollment(Secret32::new([7; 32])));
         Ok(Self {
-            listener: tcp::Listener::bind((std::net::Ipv4Addr::LOCALHOST, 0), 2).await?,
+            listener: tcp::Listener::bind((std::net::Ipv4Addr::LOCALHOST, 0), MAX_LIVE_PAIRS)
+                .await?,
             server: ServerConfig {
                 mode: Mode::Returning,
                 carrier: Carrier::Tcp,
@@ -49,6 +52,7 @@ impl Loopback {
     }
 
     /// Open pairs serially so the accepted stream gets the intended handler.
+    /// Close a live pair before opening a third; each holds a listener permit.
     pub async fn open(
         &mut self,
         factory: Arc<dyn AuthenticatorFactory>,

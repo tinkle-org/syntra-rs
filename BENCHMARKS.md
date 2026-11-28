@@ -133,21 +133,27 @@ timestamps, overlap, and the heap measurement window. The
 [`connection_purpose` tests](crates/syntra-integration/tests/connection_purpose.rs)
 check method and object access on both connections, shared caller quota and
 permit reuse, result correlation, and continued interactive use after bulk
-closes. They also check that revocation reaches both connections on their next
-call and blocks an admitted operation from committing an effect.
+closes. After the fixture marks the account revoked, each connection's next RPC
+fails authorization and that connection closes. A separate test pauses an
+admitted handler, revokes the account, and resumes the handler. Its own check
+under the effect lock returns `PermissionDenied` without incrementing the effect
+counter. Neither test demonstrates proactive withdrawal of an idle connection.
 
-**Workload.** Each burst offers four 8-byte echoes to one FIFO caller at a
-common barrier release. Independent callers upload one tagged 256 KiB block
+**Workload.** Each burst starts at a common barrier. One caller submits four
+8-byte echoes sequentially, waiting for each reply before submitting the next.
+At most one echo is in flight. Independent callers upload one tagged 256 KiB block
 for an 8-byte receipt, download one such block for an 8-byte request, do both,
 or do neither. Every burst drains before the next; faster cases get no extra
 work. Each trial warms up for one burst, then measures 64 (256 echoes). The
 second pass reverses case order. `--smoke` uses two measured bursts per case
-and one pass; it checks the workload, not performance.
+and one pass; it checks the workload, not performance. CI executes this smoke
+run in debug mode and runs the binary's unit tests with `measure-heap` enabled.
 
 **Reading the output:**
 
 - Echo times are nearest-rank p50/p95/p99 in µs: `queue_us` is burst offer to
-  call start, `rtt_us` is call start to return, and `offer_to_result_us` is
+  call start, including earlier echoes' round trips, not transport queue time.
+  `rtt_us` is call start to return, and `offer_to_result_us` is
   offer to that echo's return, not a sum of percentiles. `overlap` counts echoes
   with a positive call interval common to *all* enabled bulk directions. A bulk
   trial fails if none overlap or the verified workload is incomplete.

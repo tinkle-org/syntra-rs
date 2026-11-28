@@ -103,6 +103,10 @@ jobs:
         run: cargo test --locked
       - name: Locked workspace tests (includes integration carrier fixtures)
         run: cargo test --locked --workspace
+      - name: Mixed-traffic runner tests with heap accounting enabled
+        run: cargo test --locked -p syntra-integration --features measure-heap --bin mixed_traffic
+      - name: Mixed-traffic loopback smoke (correctness only)
+        run: cargo run --locked -p syntra-integration --bin mixed_traffic -- --smoke
       - name: Default dependency isolation (host + WASM, no dev/test graph)
         run: python3 scripts/cargo_contracts.py isolation
       - name: WebSocket production graph excludes TLS implementations and HTTP/cross-carrier opt-ins

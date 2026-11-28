@@ -1,5 +1,5 @@
 //! Established loopback RPCs, not a streaming protocol or an open-loop arrival model.
-//! Each burst offers four small requests to one FIFO caller. Independent bulk
+//! Each burst has one caller await four small RPCs in sequence. Independent bulk
 //! callers can offer one large upload, one large download, both, or neither.
 //! Bursts drain completely; a faster connection cannot earn extra work.
 //! Setup, warmup, task creation, client input allocation and teardown are untimed.
